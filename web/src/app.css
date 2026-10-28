@@ -1,0 +1,198 @@
+:root {
+	color-scheme: dark;
+	--bg: #0a0b0e;
+	--bg-raised: #121419;
+	--bg-overlay: rgb(10 11 14 / 0.72);
+	--surface: rgb(255 255 255 / 0.045);
+	--surface-hover: rgb(255 255 255 / 0.08);
+	--border: rgb(255 255 255 / 0.08);
+	--border-strong: rgb(255 255 255 / 0.16);
+	--text: #eef0f4;
+	--text-2: #a7adba;
+	--text-3: #6e7584;
+	--accent: hsl(252 85% 74%);
+	--accent-ink: #0a0b0e;
+	--danger: hsl(358 80% 68%);
+	--success: hsl(150 55% 58%);
+	--radius: 14px;
+	--radius-sm: 9px;
+	--shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -8px rgb(0 0 0 / 0.55);
+	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+	--ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+	--player-h: 84px;
+	--topbar-h: 68px;
+	--sidebar-w: 240px;
+	--rail-w: 68px;
+	--font:
+		'Inter Variable', system-ui, 'Noto Sans CJK JP', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+	:root:not([data-theme='dark']) {
+		color-scheme: light;
+		--bg: #f5f5f7;
+		--bg-raised: #ffffff;
+		--bg-overlay: rgb(245 245 247 / 0.75);
+		--surface: rgb(0 0 0 / 0.04);
+		--surface-hover: rgb(0 0 0 / 0.07);
+		--border: rgb(0 0 0 / 0.08);
+		--border-strong: rgb(0 0 0 / 0.16);
+		--text: #14161b;
+		--text-2: #4d5361;
+		--text-3: #858b98;
+		--accent-ink: #ffffff;
+		--shadow: 0 1px 2px rgb(0 0 0 / 0.08), 0 12px 32px -10px rgb(0 0 0 / 0.22);
+	}
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font);
+	font-size: 15px;
+	line-height: 1.45;
+	-webkit-font-smoothing: antialiased;
+	font-feature-settings: 'cv11', 'ss01';
+}
+
+body {
+	min-height: 100dvh;
+}
+
+button,
+input {
+	font: inherit;
+	color: inherit;
+}
+
+button {
+	cursor: pointer;
+	background: none;
+	border: 0;
+	padding: 0;
+}
+
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+	border-radius: 6px;
+}
+
+::selection {
+	background: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+
+.sr-only {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+.tabular {
+	font-variant-numeric: tabular-nums;
+}
+
+/* Shared buttons */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.5em;
+	height: 38px;
+	padding: 0 16px;
+	border-radius: 999px;
+	font-weight: 560;
+	font-size: 14px;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	transition:
+		background 160ms,
+		transform 160ms var(--ease-out),
+		border-color 160ms,
+		opacity 160ms;
+}
+.btn:hover:not(:disabled) {
+	background: var(--surface-hover);
+	border-color: var(--border-strong);
+}
+.btn:active:not(:disabled) {
+	transform: scale(0.97);
+}
+.btn:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+.btn.primary {
+	background: var(--accent);
+	border-color: transparent;
+	color: var(--accent-ink);
+}
+.btn.primary:hover:not(:disabled) {
+	background: color-mix(in oklab, var(--accent) 88%, white);
+}
+.icon-btn {
+	display: inline-grid;
+	place-items: center;
+	width: 36px;
+	height: 36px;
+	border-radius: 999px;
+	color: var(--text-2);
+	transition:
+		background 160ms,
+		color 160ms,
+		transform 160ms var(--ease-out);
+}
+.icon-btn:hover {
+	background: var(--surface-hover);
+	color: var(--text);
+}
+.icon-btn:active {
+	transform: scale(0.92);
+}
+
+/* Album cover morph between grid and detail */
+::view-transition-group(album-cover) {
+	animation-duration: 460ms;
+	animation-timing-function: var(--ease-out);
+	z-index: 10;
+}
+::view-transition-image-pair(album-cover) {
+	isolation: auto;
+}
+::view-transition-old(album-cover),
+::view-transition-new(album-cover) {
+	animation: none;
+	mix-blend-mode: normal;
+	height: 100%;
+	object-fit: cover;
+	border-radius: var(--radius);
+	overflow: clip;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+	animation-duration: 280ms;
+	animation-timing-function: var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after,
+	::view-transition-group(*),
+	::view-transition-old(*),
+	::view-transition-new(*) {
+		animation-duration: 1ms !important;
+		animation-delay: 0ms !important;
+		transition-duration: 1ms !important;
+	}
+}

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/coversync-core", "crates/coversyncd"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
