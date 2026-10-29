@@ -41,6 +41,7 @@ crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 web/                    SvelteKit / Svelte 5 single-page app
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
+packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
 
 ## Install on Arch Linux
