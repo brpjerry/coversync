@@ -113,7 +113,12 @@ export interface ArtRules {
 export const ART = 'album_art';
 
 export interface LibrarySetup {
-	rules: { required_tags: string[]; art: ArtRules };
+	rules: {
+		required_tags: string[];
+		art: ArtRules;
+		/** Joins several values of one tag in MusicBrainz suggestions, e.g. ";". */
+		separator: string;
+	};
 	folder: string | null;
 	structure: string;
 }

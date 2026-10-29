@@ -157,6 +157,7 @@ pub async fn start(
         };
         let outcome = (|| -> coversync_core::Result<(Option<Evidence>, Identification)> {
             let setup = state.lib.inbox_setup()?.suggestions;
+            let separator = state.lib.library_setup()?.rules.separator;
             let romanize = asked
                 .unwrap_or(setup.prefer_english)
                 .then_some(romanize::Options {
@@ -170,7 +171,7 @@ pub async fn start(
             match (release.as_deref().or(best.as_deref()), evidence) {
                 (Some(r), Some(ev)) => Ok((
                     None,
-                    identify::suggest(&ev, r, release.is_some(), romanize, &progress)?,
+                    identify::suggest(&ev, r, release.is_some(), romanize, &separator, &progress)?,
                 )),
                 _ => {
                     let key = state.lib.acoustid_key()?;
@@ -179,10 +180,13 @@ pub async fn start(
                         &album_id,
                         key.as_deref(),
                         romanize,
+                        &separator,
                         &progress,
                     )?;
                     let result = match release.as_deref() {
-                        Some(r) => identify::suggest(&ev, r, true, romanize, &progress)?,
+                        Some(r) => {
+                            identify::suggest(&ev, r, true, romanize, &separator, &progress)?
+                        }
                         None => best,
                     };
                     Ok((Some(ev), result))

@@ -264,7 +264,7 @@ async fn save_library_setup(
     Json(setup): Json<LibrarySetup>,
 ) -> ApiResult<Json<SetupResponse>> {
     let (response, moved) = blocking(&state, move |s| {
-        let before = s.lib.library_setup()?.folder;
+        let before = s.lib.library_setup()?;
         let setup = setup.normalize()?;
         must_be_folder(setup.folder.as_deref(), "library folder")?;
         inbox::check_folders(
@@ -272,7 +272,11 @@ async fn save_library_setup(
             setup.folder.as_deref(),
         )?;
         let saved = s.lib.set_library_setup(setup)?;
-        let moved = before != saved.folder;
+        // Suggestions joined with the old separator shouldn't linger.
+        if before.rules.separator != saved.rules.separator {
+            s.identify.clear();
+        }
+        let moved = before.folder != saved.folder;
         Ok((setup_response(saved), moved))
     })
     .await?;

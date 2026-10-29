@@ -525,6 +525,7 @@ pub fn identify(
     album_id: &str,
     key: Option<&str>,
     romanize: Option<romanize::Options>,
+    separator: &str,
     step: &(dyn Fn(Step) + Sync),
 ) -> Result<(Evidence, Identification)> {
     let detail = lib.album(album_id)?.ok_or(Error::NotFound)?;
@@ -684,7 +685,14 @@ pub fn identify(
         releases: Mutex::default(),
     };
     let result = match evidence.candidates.first() {
-        Some(best) => suggest(&evidence, &best.id.clone(), false, romanize, step)?,
+        Some(best) => suggest(
+            &evidence,
+            &best.id.clone(),
+            false,
+            romanize,
+            separator,
+            step,
+        )?,
         None => Identification {
             method,
             release: None,
@@ -702,11 +710,13 @@ pub fn identify(
 /// Suggest tags from release `release_id`; `chosen` when picked by hand.
 /// With `romanize`, titles and names that don't sort A–Z are suggested in
 /// Latin script where MusicBrainz has them, written as its options say.
+/// Tags with several values have them joined by `separator`.
 pub fn suggest(
     evidence: &Evidence,
     release_id: &str,
     chosen: bool,
     romanize: Option<romanize::Options>,
+    separator: &str,
     step: &(dyn Fn(Step) + Sync),
 ) -> Result<Identification> {
     step(Step {
@@ -769,8 +779,8 @@ pub fn suggest(
         fingerprinted: evidence.fingerprinted,
         recognized: evidence.recognized,
         tracks: match &shown {
-            Some(romanized) => suggestions(&evidence.tracks, romanized, Some(&release)),
-            None => suggestions(&evidence.tracks, &release, None),
+            Some(romanized) => suggestions(&evidence.tracks, romanized, Some(&release), separator),
+            None => suggestions(&evidence.tracks, &release, None, separator),
         },
         notes: evidence.notes.clone(),
         romanization,
@@ -892,6 +902,19 @@ fn map_tracks(
     out
 }
 
+/// The values in order, without repeats or blanks, joined by `separator`;
+/// None when there are none.
+fn joined(values: impl IntoIterator<Item = String>, separator: &str) -> Option<String> {
+    let mut seen = Vec::new();
+    for v in values {
+        let v = v.trim().to_string();
+        if !v.is_empty() && !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join(separator))
+}
+
 fn push(out: &mut Vec<(&'static str, String)>, kind: &'static str, value: Option<String>) {
     if let Some(v) = value
         .map(|v| v.trim().to_string())
@@ -901,8 +924,9 @@ fn push(out: &mut Vec<(&'static str, String)>, kind: &'static str, value: Option
     }
 }
 
-/// Values every track of the release shares.
-fn release_values(r: &Release) -> Vec<(&'static str, String)> {
+/// Values every track of the release shares; several of one kind are
+/// joined by `separator`.
+fn release_values(r: &Release, separator: &str) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let rg = r.release_group.as_ref();
     push(&mut out, "album", Some(r.title.clone()));
@@ -910,6 +934,11 @@ fn release_values(r: &Release) -> Vec<(&'static str, String)> {
         &mut out,
         "album_artist",
         Some(mb::credit_name(&r.artist_credit)),
+    );
+    push(
+        &mut out,
+        "album_artists",
+        joined(r.artist_credit.iter().map(|c| c.name.clone()), separator),
     );
     push(
         &mut out,
@@ -927,9 +956,14 @@ fn release_values(r: &Release) -> Vec<(&'static str, String)> {
     } else {
         &r.genres
     };
-    // The most voted; ties go to the first listed.
-    let top = genres.iter().rev().max_by_key(|g| g.count);
-    push(&mut out, "genre", top.map(|g| genre_case(&g.name)));
+    // The most voted first; ties keep MusicBrainz's order.
+    let mut genres: Vec<_> = genres.iter().collect();
+    genres.sort_by_key(|g| std::cmp::Reverse(g.count));
+    push(
+        &mut out,
+        "genre",
+        joined(genres.iter().map(|g| genre_case(&g.name)), separator),
+    );
     let label = r.label_info.iter().find(|l| {
         l.label.as_ref().is_some_and(|l| l.name != "[no label]") || l.catalog_number.is_some()
     });
@@ -956,12 +990,7 @@ fn release_values(r: &Release) -> Vec<(&'static str, String)> {
         rg.and_then(|g| {
             let primary = g.primary_type.as_ref()?.to_lowercase();
             let rest = g.secondary_types.iter().map(|t| t.to_lowercase());
-            Some(
-                std::iter::once(primary)
-                    .chain(rest)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
+            joined(std::iter::once(primary).chain(rest), separator)
         }),
     );
     push(
@@ -971,8 +1000,15 @@ fn release_values(r: &Release) -> Vec<(&'static str, String)> {
     );
     push(&mut out, "mb_release_id", Some(r.id.clone()));
     push(&mut out, "mb_release_group_id", rg.map(|g| g.id.clone()));
+    push(
+        &mut out,
+        "mb_release_artist_id",
+        joined(
+            r.artist_credit.iter().map(|c| c.artist.id.clone()),
+            separator,
+        ),
+    );
     let first = r.artist_credit.first().map(|c| &c.artist.id);
-    push(&mut out, "mb_release_artist_id", first.cloned());
     push(
         &mut out,
         "compilation",
@@ -993,12 +1029,14 @@ fn release_values(r: &Release) -> Vec<(&'static str, String)> {
     out
 }
 
-/// Values for one track of the release.
+/// Values for one track of the release; several of one kind are joined by
+/// `separator`.
 fn track_values(
     r: &Release,
     medium: &Medium,
     track: &mb::Track,
     acoustid: Option<&str>,
+    separator: &str,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let credit = if track.artist_credit.is_empty() {
@@ -1008,6 +1046,11 @@ fn track_values(
     };
     push(&mut out, "title", Some(track.title.clone()));
     push(&mut out, "artist", Some(mb::credit_name(credit)));
+    push(
+        &mut out,
+        "artists",
+        joined(credit.iter().map(|c| c.name.clone()), separator),
+    );
     push(&mut out, "artist_sort", Some(mb::credit_sort(credit)));
     push(
         &mut out,
@@ -1037,7 +1080,7 @@ fn track_values(
     push(
         &mut out,
         "mb_artist_id",
-        credit.first().map(|c| c.artist.id.clone()),
+        joined(credit.iter().map(|c| c.artist.id.clone()), separator),
     );
     push(
         &mut out,
@@ -1055,9 +1098,12 @@ fn suggestions(
     tracks: &[Local],
     release: &Release,
     original: Option<&Release>,
+    separator: &str,
 ) -> Vec<TrackSuggestions> {
-    let shared = release_values(release);
-    let shared_original = original.map(release_values).unwrap_or_default();
+    let shared = release_values(release, separator);
+    let shared_original = original
+        .map(|o| release_values(o, separator))
+        .unwrap_or_default();
     let mapped = map_tracks(tracks, release, original);
     let multi_disc = release.media.len() > 1;
     tracks
@@ -1078,10 +1124,11 @@ fn suggestions(
                     .filter(|(rec, _, _)| Some(rec.as_str()) == recording)
                     .max_by(|a, b| a.2.total_cmp(&b.2))
                     .map(|(_, id, _)| id.as_str());
-                values.extend(track_values(release, medium, track, acoustid));
+                values.extend(track_values(release, medium, track, acoustid, separator));
                 if let Some(o) = original {
                     let medium = &o.media[m];
-                    originals.extend(track_values(o, medium, &medium.tracks[t], acoustid));
+                    let track = &medium.tracks[t];
+                    originals.extend(track_values(o, medium, track, acoustid, separator));
                 }
                 let pos = track.position.unwrap_or(t as u32 + 1);
                 position = Some(if multi_disc {
@@ -1233,6 +1280,49 @@ mod tests {
     }
 
     #[test]
+    fn several_values_are_joined_by_the_separator() {
+        let mut r = release();
+        r.artist_credit = serde_json::from_str(
+            r#"[{"name": "4ikai", "joinphrase": " & ", "artist": {"id": "a-1", "sort-name": "Aikai"}},
+                {"name": "Friend", "joinphrase": "", "artist": {"id": "a-2", "sort-name": "Friend"}}]"#,
+        )
+        .unwrap();
+        let group = r.release_group.as_mut().unwrap();
+        group.secondary_types = vec!["Soundtrack".into(), "Live".into()];
+        let values = release_values(&r, " / ");
+        let get = |k: &str| {
+            values
+                .iter()
+                .find(|(kind, _)| *kind == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("album_artist"), Some("4ikai & Friend"));
+        assert_eq!(get("album_artists"), Some("4ikai / Friend"));
+        assert_eq!(get("mb_release_artist_id"), Some("a-1 / a-2"));
+        assert_eq!(get("release_type"), Some("single / soundtrack / live"));
+        // The most voted first.
+        assert_eq!(get("genre"), Some("Drum and Bass / Ambient"));
+
+        // The second track has no credit of its own: the release's applies.
+        let medium = &r.media[0];
+        let values = track_values(&r, medium, &medium.tracks[1], None, ";");
+        let get = |k: &str| {
+            values
+                .iter()
+                .find(|(kind, _)| *kind == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("artist"), Some("4ikai & Friend"));
+        assert_eq!(get("artists"), Some("4ikai;Friend"));
+        assert_eq!(get("mb_artist_id"), Some("a-1;a-2"));
+        assert_eq!(
+            joined(["a".into(), " ".into(), "a".into(), "b".into()], ";").as_deref(),
+            Some("a;b")
+        );
+        assert_eq!(joined([], ";"), None);
+    }
+
+    #[test]
     fn fills_empty_tags_and_suggests_changes() {
         let mut first = local(
             10,
@@ -1249,7 +1339,7 @@ mod tests {
             .recordings
             .push(("rec-1".into(), "acoustid-1".into(), 0.98));
         let second = local(11, &[("title", "Don't look back"), ("track_number", "2")]);
-        let out = suggestions(&[first, second], &release(), None);
+        let out = suggestions(&[first, second], &release(), None, ";");
 
         let t = &out[0];
         assert_eq!(t.via, Some(Via::Acoustid));
@@ -1279,7 +1369,7 @@ mod tests {
         let t = &out[1];
         assert_eq!(t.via, Some(Via::Position));
         assert_eq!(find(t, "title").unwrap().value, "Don’t Look Back");
-        assert_eq!(find(t, "genre").unwrap().value, "Drum and Bass");
+        assert_eq!(find(t, "genre").unwrap().value, "Drum and Bass;Ambient");
         // No track credit: the release's.
         assert_eq!(find(t, "artist").unwrap().value, "4ikai");
         assert_eq!(find(t, "isrc").unwrap().value, "SEABC1500001");
@@ -1314,7 +1404,7 @@ mod tests {
                 ("track_number", "2"),
             ],
         );
-        let out = suggestions(&[first, second], &romanized_partly, Some(&original));
+        let out = suggestions(&[first, second], &romanized_partly, Some(&original), ";");
 
         // The tag is the original-script value: a pure romanization.
         let album = find(&out[0], "album").unwrap();
@@ -1333,7 +1423,7 @@ mod tests {
         let mut ours = local(1, &[("artist", "Someone Else"), ("track_number", "1")]);
         ours.recordings.push(("rec-1".into(), "a".into(), 1.0));
         let theirs = local(2, &[("track_number", "2")]);
-        let out = suggestions(&[ours, theirs], &release(), None);
+        let out = suggestions(&[ours, theirs], &release(), None, ";");
         // The artist differs: no sort name for an artist the track may keep.
         assert!(find(&out[0], "artist").is_some());
         assert!(find(&out[0], "artist_sort").is_none());
@@ -1349,7 +1439,7 @@ mod tests {
             local(2, &[("title", "Outro"), ("track_number", "2")]),
             local(3, &[("title", "Bonus"), ("track_number", "3")]),
         ];
-        let out = suggestions(&tracks, &release(), None);
+        let out = suggestions(&tracks, &release(), None, ";");
         assert!(out.iter().all(|t| t.via.is_none()));
         assert!(find(&out[0], "title").is_none());
     }
@@ -1360,7 +1450,7 @@ mod tests {
             local(1, &[("title", "don't look back")]),
             local(2, &[("title", "Bonus")]),
         ];
-        let out = suggestions(&tracks, &release(), None);
+        let out = suggestions(&tracks, &release(), None, ";");
         assert_eq!(out[0].via, Some(Via::Title));
         assert_eq!(out[0].position.as_deref(), Some("2"));
         assert_eq!(out[1].via, None);
