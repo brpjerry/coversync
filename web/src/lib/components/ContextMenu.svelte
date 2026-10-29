@@ -7,6 +7,10 @@
 		run: () => void;
 		/** Emphasized action, e.g. Import. */
 		primary?: boolean;
+		/** Where the user is now, e.g. the open setup screen. */
+		current?: boolean;
+		/** A word after the label, e.g. "Unsaved". */
+		note?: string;
 	}
 	export type MenuEntry = MenuItem | 'separator';
 </script>
@@ -21,9 +25,11 @@
 		y: number;
 		title?: string;
 		items: MenuEntry[];
+		/** The button that opened the menu: clicking it again isn't clicking away, and keyboard dismissal returns to it. */
+		anchor?: HTMLElement;
 		onclose: () => void;
 	}
-	let { x, y, title, items, onclose }: Props = $props();
+	let { x, y, title, items, anchor, onclose }: Props = $props();
 
 	let menu = $state<HTMLElement>();
 	// Placed in onMount, once the menu's size is known.
@@ -44,7 +50,8 @@
 		buttons()[0]?.focus({ preventScroll: true });
 
 		const away = (e: Event) => {
-			if (!menu?.contains(e.target as Node)) onclose();
+			const target = e.target as Node;
+			if (!menu?.contains(target) && !anchor?.contains(target)) onclose();
 		};
 		const close = () => onclose();
 		// Defer so the opening right-click doesn't count as clicking away.
@@ -73,8 +80,10 @@
 		else if (e.key === 'ArrowUp') go(i - 1);
 		else if (e.key === 'Home') go(0);
 		else if (e.key === 'End') go(list.length - 1);
-		else if (e.key === 'Escape' || e.key === 'Tab') onclose();
-		else return;
+		else if (e.key === 'Escape' || e.key === 'Tab') {
+			onclose();
+			anchor?.focus();
+		} else return;
 		e.preventDefault();
 		e.stopPropagation();
 	}
@@ -101,6 +110,8 @@
 			<button
 				role="menuitem"
 				class:primary={item.primary}
+				class:current={item.current}
+				aria-current={item.current ? 'page' : undefined}
 				onclick={() => {
 					onclose();
 					item.run();
@@ -108,6 +119,7 @@
 			>
 				{#if item.icon}<item.icon size={16} />{/if}
 				{item.label}
+				{#if item.note}<span class="note">{item.note}</span>{/if}
 			</button>
 		{/if}
 	{/each}
@@ -159,7 +171,18 @@
 	button:focus-visible {
 		background: var(--surface-hover);
 	}
-	button.primary :global(svg) {
+	button.primary :global(svg),
+	button.current :global(svg) {
+		color: var(--accent);
+	}
+	button.current {
+		font-weight: 600;
+	}
+	.note {
+		margin-left: auto;
+		padding-left: 12px;
+		font-size: 12px;
+		font-weight: 500;
 		color: var(--accent);
 	}
 	button.primary:hover,

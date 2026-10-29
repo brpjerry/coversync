@@ -182,7 +182,9 @@ pub fn scan(
     lib.remove_paths(&removed)?;
     update(progress, |p| p.phase = "covers".into());
     refresh_covers(lib, covers, progress)?;
-    let albums = lib.albums(Collection::Inbox, &[], &[], None)?.len() as u64;
+    let albums = lib
+        .albums(Collection::Inbox, &[], &[], "", &[], None)?
+        .len() as u64;
     update(progress, |p| {
         p.running = false;
         p.phase = "idle".into();
