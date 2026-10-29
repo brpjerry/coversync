@@ -41,6 +41,8 @@ struct Args {
 pub struct AppState {
     pub lib: Library,
     pub covers: CoverCache,
+    /// MusicBrainz's cover images, downloaded for suggestions.
+    pub mb_art: PathBuf,
     pub progress: Progress,
     pub allow_writes: bool,
     /// Serializes scans, tag writes and imports.
@@ -174,6 +176,7 @@ async fn run() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         lib,
         covers,
+        mb_art: cache_dir.join("musicbrainz"),
         progress: Arc::new(RwLock::new(ScanProgress::default())),
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),

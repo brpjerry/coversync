@@ -1,19 +1,25 @@
 //! Smart suggestions as background jobs. Identifying an album takes a few
 //! seconds (fingerprinting, rate-limited web lookups), so the import dialog
-//! starts a job and polls it for progress and the result.
+//! starts a job and polls it for progress and the result. MusicBrainz's
+//! cover art is downloaded when the dialog asks for it, and cached.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::response::Response;
+use coversync_core::art::{self, Art};
 use coversync_core::identify::{self, Evidence, Identification, Stage, Step};
+use coversync_core::musicbrainz::CoverFrom;
 use coversync_core::{musicbrainz, romanize};
 use serde::{Deserialize, Serialize};
 
-use crate::Shared;
-use crate::api::ApiResult;
+use crate::api::{ApiResult, blocking, serve_file};
+use crate::{AppState, Shared};
 
 /// Finished identifications are reused for this long.
 const KEEP: Duration = Duration::from_secs(30 * 60);
@@ -151,6 +157,7 @@ pub async fn start(
         };
         let outcome = (|| -> coversync_core::Result<(Option<Evidence>, Identification)> {
             let setup = state.lib.inbox_setup()?.suggestions;
+            let separator = state.lib.library_setup()?.rules.separator;
             let romanize = asked
                 .unwrap_or(setup.prefer_english)
                 .then_some(romanize::Options {
@@ -164,7 +171,7 @@ pub async fn start(
             match (release.as_deref().or(best.as_deref()), evidence) {
                 (Some(r), Some(ev)) => Ok((
                     None,
-                    identify::suggest(&ev, r, release.is_some(), romanize, &progress)?,
+                    identify::suggest(&ev, r, release.is_some(), romanize, &separator, &progress)?,
                 )),
                 _ => {
                     let key = state.lib.acoustid_key()?;
@@ -173,10 +180,13 @@ pub async fn start(
                         &album_id,
                         key.as_deref(),
                         romanize,
+                        &separator,
                         &progress,
                     )?;
                     let result = match release.as_deref() {
-                        Some(r) => identify::suggest(&ev, r, true, romanize, &progress)?,
+                        Some(r) => {
+                            identify::suggest(&ev, r, true, romanize, &separator, &progress)?
+                        }
                         None => best,
                     };
                     Ok((Some(ev), result))
@@ -232,4 +242,134 @@ pub async fn status(
     let jobs = state.identify.lock();
     let job = jobs.get(&album_id).ok_or(coversync_core::Error::NotFound)?;
     Ok(Json(job.into()))
+}
+
+/// MusicBrainz's front cover for a release, as downloaded into the cache.
+#[derive(Serialize, Deserialize)]
+pub struct MbArt {
+    width: u32,
+    height: u32,
+    /// The image file's extension: "jpg", "png" or "webp".
+    extension: String,
+    from: CoverFrom,
+}
+
+#[derive(Deserialize)]
+pub struct ArtQuery {
+    /// The release's group, whose cover stands in when the release has none.
+    group: Option<String>,
+    /// MusicBrainz says the release has a front cover of its own.
+    #[serde(default = "yes")]
+    front: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// One download at a time, so a cover asked for twice is fetched once.
+static FETCHING: Mutex<()> = Mutex::new(());
+
+fn check_mbid(id: &str) -> coversync_core::Result<()> {
+    if musicbrainz::is_mbid(id) {
+        Ok(())
+    } else {
+        Err(coversync_core::Error::Invalid(format!(
+            "'{id}' isn't a MusicBrainz id"
+        )))
+    }
+}
+
+/// The cover cached for `release` and its image file. The description is
+/// written after the image, so one always has the other.
+fn cached(dir: &FsPath, release: &str) -> Option<(MbArt, PathBuf)> {
+    let meta: MbArt =
+        serde_json::from_slice(&fs::read(dir.join(format!("{release}.json"))).ok()?).ok()?;
+    let image = dir.join(format!("{release}.{}", meta.extension));
+    image.is_file().then_some((meta, image))
+}
+
+fn write_replacing(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)
+        .and_then(|_| fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+}
+
+/// MusicBrainz's cover for `release`, downloaded unless it's cached; None
+/// when the Cover Art Archive has none.
+fn fetch_art(
+    dir: &FsPath,
+    release: &str,
+    q: &ArtQuery,
+) -> coversync_core::Result<Option<(MbArt, PathBuf)>> {
+    let _one = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cached(dir, release) {
+        return Ok(Some(hit));
+    }
+    let Some((bytes, from)) = musicbrainz::front_cover(
+        q.front.then_some(release),
+        q.group.as_deref(),
+        art::MAX_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let art = Art::new(bytes).map_err(|_| {
+        coversync_core::Error::Remote(
+            "The Cover Art Archive's image isn't a JPEG, PNG or WebP.".into(),
+        )
+    })?;
+    let meta = MbArt {
+        width: art.width,
+        height: art.height,
+        extension: art.file_extension().to_string(),
+        from,
+    };
+    fs::create_dir_all(dir)?;
+    let image = dir.join(format!("{release}.{}", meta.extension));
+    write_replacing(&image, &art.file_bytes()?)?;
+    let json = serde_json::to_vec(&meta).expect("MbArt serializes");
+    write_replacing(&dir.join(format!("{release}.json")), &json)?;
+    Ok(Some((meta, image)))
+}
+
+/// Download MusicBrainz's front cover for a release (once) and describe it;
+/// null when the Cover Art Archive has none.
+pub async fn art(
+    State(state): State<Shared>,
+    Path(release): Path<String>,
+    Query(q): Query<ArtQuery>,
+) -> ApiResult<Json<Option<MbArt>>> {
+    check_mbid(&release)?;
+    if let Some(g) = &q.group {
+        check_mbid(g)?;
+    }
+    blocking(&state, move |s| fetch_art(&s.mb_art, &release, &q))
+        .await
+        .map(|found| Json(found.map(|(meta, _)| meta)))
+}
+
+/// The cover image `art` downloaded.
+pub async fn art_image(
+    State(state): State<Shared>,
+    Path(release): Path<String>,
+    req: Request,
+) -> ApiResult<Response> {
+    check_mbid(&release)?;
+    let (_, path) = cached(&state.mb_art, &release).ok_or(coversync_core::Error::NotFound)?;
+    Ok(serve_file(path, req, "private, max-age=86400").await)
+}
+
+/// MusicBrainz's cover for `release`, as `art` downloaded it, for an import.
+pub fn chosen_art(state: &AppState, release: &str) -> coversync_core::Result<Art> {
+    check_mbid(release)?;
+    let (_, path) = cached(&state.mb_art, release).ok_or_else(|| {
+        coversync_core::Error::Invalid(
+            "MusicBrainz's cover isn't downloaded any more; open the import again.".into(),
+        )
+    })?;
+    Art::new(fs::read(path)?)
 }

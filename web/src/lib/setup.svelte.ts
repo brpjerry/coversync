@@ -34,19 +34,22 @@ class SetupStore {
 		required: [] as string[],
 		folder: '',
 		structure: '',
-		art: { required: false, placement: 'file', file_name: 'cover' } as ArtRules
+		art: { required: false, placement: 'file', file_name: 'cover' } as ArtRules,
+		separator: ';'
 	});
 	/** Being edited. */
 	required = new SvelteSet<string>();
 	folder = $state('');
 	structure = $state('');
 	art = $state<ArtRules>({ required: false, placement: 'file', file_name: 'cover' });
+	/** Kept as typed, spaces included: "; " isn't ";". */
+	separator = $state(';');
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
-	/** Tags added or removed, plus a changed folder, structure or art rule. */
+	/** Tags added or removed, plus a changed folder, structure, art rule or separator. */
 	changes = $derived(
 		this.saved.required.filter((id) => !this.required.has(id)).length +
 			[...this.required].filter((id) => !this.saved.required.includes(id)).length +
@@ -54,7 +57,8 @@ class SetupStore {
 			(this.structure.trim() !== this.saved.structure ? 1 : 0) +
 			(this.art.required !== this.saved.art.required ? 1 : 0) +
 			(this.art.placement !== this.saved.art.placement ? 1 : 0) +
-			((this.art.file_name.trim() || 'cover') !== this.saved.art.file_name ? 1 : 0)
+			((this.art.file_name.trim() || 'cover') !== this.saved.art.file_name ? 1 : 0) +
+			(this.separator !== this.saved.separator ? 1 : 0)
 	);
 
 	#loading: Promise<void> | null = null;
@@ -105,13 +109,15 @@ class SetupStore {
 			required: s.rules.required_tags,
 			folder: s.folder ?? '',
 			structure: s.structure,
-			art: s.rules.art
+			art: s.rules.art,
+			separator: s.rules.separator
 		};
 		this.required.clear();
 		for (const id of s.rules.required_tags) this.required.add(id);
 		this.folder = this.saved.folder;
 		this.structure = this.saved.structure;
 		this.art = { ...s.rules.art };
+		this.separator = s.rules.separator;
 		this.folderStatus = r.folder;
 	}
 
@@ -135,6 +141,7 @@ class SetupStore {
 		this.folder = this.saved.folder;
 		this.structure = this.saved.structure;
 		this.art = { ...this.saved.art };
+		this.separator = this.saved.separator;
 	}
 
 	async save() {
@@ -143,7 +150,11 @@ class SetupStore {
 			// Send in catalog order; the daemon normalizes the same way.
 			const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
 			const r = await api.saveSetup({
-				rules: { required_tags: ids, art: { ...this.art, file_name: this.art.file_name.trim() } },
+				rules: {
+					required_tags: ids,
+					art: { ...this.art, file_name: this.art.file_name.trim() },
+					separator: this.separator
+				},
 				folder: this.folder.trim() || null,
 				structure: this.structure.trim()
 			});

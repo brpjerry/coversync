@@ -17,6 +17,7 @@
 	import ImageIcon from '@lucide/svelte/icons/image';
 	import FileImage from '@lucide/svelte/icons/file-image';
 	import FileMusic from '@lucide/svelte/icons/file-music';
+	import Combine from '@lucide/svelte/icons/combine';
 	import Toggle from './Toggle.svelte';
 	import type { ArtPlacement, TagKind } from '#lib/api.ts';
 	import { count, fold } from '#lib/format.ts';
@@ -106,6 +107,10 @@
 	/** The cover file name as it will be saved (the daemon trims the same way). */
 	let artName = $derived(setup.art.file_name.trim().replace(/\.(jpe?g|png|webp)$/i, '') || 'cover');
 	let artNameBad = $derived(/[/\\]/.test(artName) || artName.startsWith('.'));
+	/** Offered beside the separator field. */
+	const SEPARATORS = [';', '; ', '/', ' / '];
+	const joinedExample = (separator: string) => `Rock${separator}Pop`;
+	let separatorBad = $derived(!setup.separator.trim() || [...setup.separator].length > 8);
 	const placements: { id: ArtPlacement; label: string; file: boolean; embedded: boolean }[] = [
 		{ id: 'file', label: 'Cover file', file: true, embedded: false },
 		{ id: 'embedded', label: 'Embedded', file: false, embedded: true },
@@ -187,6 +192,54 @@
 					variables={setup.variables}
 					label={(id) => setup.label(id)}
 				/>
+			</div>
+		</section>
+
+		<section
+			class="card"
+			aria-labelledby="separator-title"
+			in:fly={{ y: 12, duration: 420, delay: 90 }}
+		>
+			<header class="card-head">
+				<span class="card-icon"><Combine size={20} /></span>
+				<div>
+					<h2 id="separator-title">Multiple values</h2>
+					<p>
+						When MusicBrainz has several values for one tag, such as artists, genres or release
+						types, they're joined into one with this separator.
+					</p>
+				</div>
+			</header>
+			<div class="card-body art-name">
+				<label class="name-field" class:bad={separatorBad}>
+					<span class="name-label">Separator</span>
+					<span class="name-input separator-input">
+						<input
+							bind:value={setup.separator}
+							placeholder=";"
+							spellcheck="false"
+							autocomplete="off"
+							aria-describedby="separator-hint"
+						/>
+					</span>
+				</label>
+				<div class="name-suggestions" role="group" aria-label="Common separators">
+					{#each SEPARATORS as s (s)}
+						<button
+							class="suggestion joined"
+							class:on={setup.separator === s}
+							onclick={() => (setup.separator = s)}>{joinedExample(s)}</button
+						>
+					{/each}
+				</div>
+				<p class="name-hint" class:bad={separatorBad} id="separator-hint">
+					{#if separatorBad}
+						The separator needs a character other than a space, and at most 8 in all.
+					{:else}
+						Two genres are suggested as <code class="joined">{joinedExample(setup.separator)}</code
+						>. Tags already in your files stay as they are.
+					{/if}
+				</p>
 			</div>
 		</section>
 
@@ -641,6 +694,14 @@
 	.name-hint code {
 		font-size: 12.5px;
 		color: var(--text-2);
+	}
+	.separator-input input {
+		width: 8ch;
+		text-align: left;
+	}
+	/* Spaces in a separator are part of it, so they show. */
+	.joined {
+		white-space: pre;
 	}
 
 	.impact {

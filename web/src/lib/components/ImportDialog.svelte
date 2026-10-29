@@ -21,12 +21,14 @@
 		api,
 		ApiError,
 		coverUrl,
+		fullCoverUrl,
+		musicbrainzArtUrl,
 		type Album,
 		type ImportEdits,
 		type ImportPlan
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
-	import SuggestPanel from './SuggestPanel.svelte';
+	import SuggestPanel, { type ChosenArt } from './SuggestPanel.svelte';
 
 	interface Props {
 		album: Album;
@@ -43,10 +45,16 @@
 		kindOrder: string[];
 		onclose: () => void;
 		/**
-		 * Runs the import (with album art chosen here, base64, and how many
-		 * suggested values were accepted); resolves to an error or null.
+		 * Runs the import (with album art chosen here, base64, how many
+		 * suggested values were accepted, and the release whose MusicBrainz
+		 * cover to use); resolves to an error or null.
 		 */
-		onimport: (edits: ImportEdits, art?: string, suggested?: number) => Promise<string | null>;
+		onimport: (
+			edits: ImportEdits,
+			art?: string,
+			suggested?: number,
+			musicbrainzArt?: string
+		) => Promise<string | null>;
 	}
 	let {
 		album,
@@ -66,7 +74,9 @@
 	const initial = untrack(() => $state.snapshot(plan)) as ImportPlan;
 	const tracks = initial.tracks;
 	const failing = initial.failing;
-	const albumCols = failing.filter((k) => albumKinds.includes(k));
+	/** Album-wide tags the tracks differ in: one value keeps the album in one folder. */
+	const disagree = initial.disagree.filter((k) => !failing.includes(k));
+	const albumCols = [...failing.filter((k) => albumKinds.includes(k)), ...disagree];
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
 	const original = (id: number, k: string) => tracks.find((t) => t.id === id)?.values[k] ?? '';
 
@@ -107,10 +117,13 @@
 	}
 	const missingOnTracks = (k: string) => tracks.filter((t) => !t.values[k]?.trim()).length;
 
-	// Album fields count once (one input), track fields once per track.
+	// Album fields count once (one input), track fields once per track. A
+	// field for tracks that differ needs a value even though each has one.
 	let missing = $derived(
-		albumCols.filter((k) => tracks.some((t) => !effective(t.id, k))).length +
-			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
+		albumCols.filter(
+			(k) =>
+				(disagree.includes(k) && !albumValues[k].trim()) || tracks.some((t) => !effective(t.id, k))
+		).length + tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
 	);
 	/** The rules require album art and the album has none. */
 	const artNeeded = initial.art.missing;
@@ -125,6 +138,8 @@
 		height: number;
 	};
 	let upload = $state<Upload | null>(null);
+	/** MusicBrainz's cover, ticked among the suggestions; an upload takes its place. */
+	let mbArt = $state<ChosenArt | null>(null);
 	let artError = $state<string | null>(null);
 	let dragging = $state(false);
 	let picker = $state<HTMLInputElement>();
@@ -163,6 +178,7 @@
 			width: img.naturalWidth,
 			height: img.naturalHeight
 		};
+		mbArt = null;
 	}
 
 	function ondrop(e: DragEvent) {
@@ -184,22 +200,25 @@
 	/** What the import does with the album art, in a sentence. */
 	let artNote = $derived.by(() => {
 		const a = live.art;
-		const from = upload ? 'The image you chose' : a.source;
+		// An image chosen here replaces the art the tracks have.
+		const chosen = !!(upload || mbArt);
+		const from = upload ? 'The image you chose' : mbArt ? "MusicBrainz's cover" : a.source;
 		if (!from) return null;
 		const ext = upload
 			? ({ 'image/png': 'png', 'image/webp': 'webp' }[upload.type] ?? 'jpg')
-			: null;
+			: mbArt?.extension;
 		const file = a.placement === 'embedded' ? null : ext ? `${a.file_name}.${ext}` : a.file;
 		const embed = a.placement === 'embedded' || a.placement === 'both';
 		const into = embed
-			? upload
+			? chosen
 				? 'embedded in every track'
 				: a.embed
 					? `embedded in ${a.embed} ${a.embed === 1 ? 'track' : 'tracks'} without art`
 					: null
 			: null;
 		const did = [file && `saved as ${file}`, into].filter(Boolean).join(', and ');
-		const what = upload ? from : `${from[0].toUpperCase()}${from.slice(1)}`;
+		// "the art embedded in …" starts the sentence; a file name stays as it's spelled.
+		const what = from.startsWith('the ') ? `T${from.slice(1)}` : from;
 		return did ? `${what} is ${did}.` : `${what} is kept as it is.`;
 	});
 
@@ -209,7 +228,7 @@
 		const out: ImportEdits = structuredClone(base);
 		for (const [id, values] of Object.entries(accepted)) Object.assign((out[+id] ??= {}), values);
 		for (const t of tracks) {
-			for (const k of failing) {
+			for (const k of [...failing, ...disagree]) {
 				const v = effective(t.id, k);
 				if (v && v !== original(t.id, k)) (out[t.id] ??= {})[k] = v;
 			}
@@ -245,7 +264,7 @@
 
 	let busy = $state(false);
 	let error = $state<string | null>(null);
-	let artMissing = $derived(artNeeded && !upload);
+	let artMissing = $derived(artNeeded && !upload && !mbArt);
 	/** Missing values plus the album art, if it's needed. */
 	let outstanding = $derived(missing + (artMissing ? 1 : 0));
 	let ready = $derived(outstanding === 0 && live.problems.length === 0 && !busy);
@@ -261,7 +280,12 @@
 		if (!ready) return;
 		busy = true;
 		error = null;
-		error = await onimport($state.snapshot(edits) as ImportEdits, upload?.data, suggested);
+		error = await onimport(
+			$state.snapshot(edits) as ImportEdits,
+			upload?.data,
+			suggested,
+			upload ? undefined : mbArt?.release
+		);
 		busy = false;
 	}
 
@@ -311,8 +335,8 @@
 	>
 		<header class="head">
 			<span class="art">
-				{#if upload}<img
-						src={upload.url}
+				{#if upload}<img src={upload.url} alt="" in:fade={{ duration: 240 }} />{:else if mbArt}<img
+						src={musicbrainzArtUrl(mbArt.release)}
 						alt=""
 						in:fade={{ duration: 240 }}
 					/>{:else if album.has_cover}<img src={coverUrl(album.id, 256)} alt="" />{:else}<Disc3
@@ -364,6 +388,22 @@
 					onaccept={(e, n) => {
 						accepted = e;
 						suggested = n;
+					}}
+					original={initial.art.source
+						? {
+								thumb: coverUrl(album.id, 256),
+								full: fullCoverUrl(album.id),
+								width: initial.art.width,
+								height: initial.art.height,
+								source: initial.art.source
+							}
+						: null}
+					artChosen={mbArt?.release ?? null}
+					onart={(art, auto) => {
+						// Ticked by default, it never replaces an image chosen by hand.
+						if (art && auto && upload) return;
+						mbArt = art;
+						if (art) upload = null;
 					}}
 				/>
 			{/if}
@@ -420,6 +460,27 @@
 									aria-label="Remove the chosen image"><Trash2 size={16} /></button
 								>
 							</span>
+						{:else if mbArt}
+							<img
+								class="art-preview"
+								src={musicbrainzArtUrl(mbArt.release)}
+								alt="MusicBrainz's cover"
+								in:fade
+							/>
+							<span class="art-text">
+								<b>MusicBrainz's cover</b>
+								<span class="tabular">{mbArt.width} × {mbArt.height}</span>
+							</span>
+							<span class="art-actions">
+								<button class="btn art-choose" onclick={() => picker?.click()}>
+									<ImagePlus size={14} /> Choose another
+								</button>
+								<button
+									class="icon-btn"
+									onclick={() => (mbArt = null)}
+									aria-label="Don't use MusicBrainz's cover"><Trash2 size={16} /></button
+								>
+							</span>
 						{:else}
 							<span class="art-empty"><ImagePlus size={24} strokeWidth={1.6} /></span>
 							<span class="art-text">
@@ -454,13 +515,19 @@
 					<h3>Album</h3>
 					<div class="album-fields">
 						{#each albumCols as k (k)}
-							{@const empty = !albumValues[k].trim() && tracks.some((t) => !original(t.id, k))}
+							{@const differs = disagree.includes(k)}
+							{@const empty =
+								!albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
 							<label class="field">
 								<span class="field-label">
 									{label(k)}
 									<span class="note" class:bad={empty}>
-										{#if empty}
+										{#if empty && differs}
+											differs between tracks; one value keeps the album in one folder
+										{:else if empty}
 											missing on {missingOnTracks(k)} of {tracks.length}
+										{:else if differs && albumValues[k] === consensus(k)}
+											differs between tracks; this is what most have
 										{:else if prefilled.has(k) && albumValues[k] === consensus(k)}
 											filled in from the other tracks
 										{/if}

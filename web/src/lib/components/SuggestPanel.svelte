@@ -6,9 +6,11 @@
 		key: string;
 		kind: string;
 		scope: Scope;
-		/** Tracks it applies to, with the value for each. */
+		/** Tracks it applies to, with the value for each, as edited here. */
 		ids: number[];
 		values: Record<number, string>;
+		/** MusicBrainz's value for each track, before any edits. */
+		suggested: Record<number, string>;
 		/** The value shown: the album-wide one, or an example for a bundle. */
 		value: string;
 		current: string | null;
@@ -25,6 +27,21 @@
 		/** Every track it covers has `original` now: it only romanizes the tag. */
 		romanizes: boolean;
 	}
+
+	/** The album's own art, to set MusicBrainz's beside. */
+	export interface OriginalArt {
+		thumb: string;
+		full: string;
+		width: number | null;
+		height: number | null;
+		/** e.g. "cover.jpg". */
+		source: string;
+	}
+
+	/** MusicBrainz's cover, ticked for the import. */
+	export interface ChosenArt extends MbArt {
+		release: string;
+	}
 </script>
 
 <script lang="ts">
@@ -40,15 +57,21 @@
 	import CircleCheck from '@lucide/svelte/icons/circle-check';
 	import Info from '@lucide/svelte/icons/info';
 	import Languages from '@lucide/svelte/icons/languages';
+	import Undo2 from '@lucide/svelte/icons/undo-2';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import {
 		api,
 		ApiError,
+		musicbrainzArtUrl,
 		type IdentifyState,
 		type Identification,
 		type ImportEdits,
-		type ImportTrack
+		type ImportTrack,
+		type MbArt
 	} from '#lib/api.ts';
 	import ShowAll from './ShowAll.svelte';
+	import ArtViewer, { type ViewedArt } from './ArtViewer.svelte';
 
 	interface Props {
 		albumId: string;
@@ -67,6 +90,12 @@
 		setField: (id: number | null, kind: string, value: string) => void;
 		/** Accepted suggestions for tags without fields, and how many values are accepted in all. */
 		onaccept: (edits: ImportEdits, count: number) => void;
+		/** The album's own art; null if it has none. */
+		original: OriginalArt | null;
+		/** The release whose MusicBrainz cover the import uses, if any. */
+		artChosen: string | null;
+		/** `auto`: ticked by default rather than by hand. */
+		onart: (art: ChosenArt | null, auto: boolean) => void;
 	}
 	let {
 		albumId,
@@ -79,7 +108,10 @@
 		fields,
 		getField,
 		setField,
-		onaccept
+		onaccept,
+		original,
+		artChosen,
+		onart
 	}: Props = $props();
 
 	let lookup = $state<IdentifyState | null>(null);
@@ -121,9 +153,69 @@
 		if (s.state === 'done') {
 			rows = buildRows(s.result);
 			applyDefaults(s.result);
+			loadCover(s.result, mine);
 		}
 	}
 	identify();
+
+	/** MusicBrainz's cover for the release shown: `art` undefined while it downloads, null if none. */
+	let cover = $state<{ release: string; art?: MbArt | null; error?: string } | null>(null);
+	let artOn = $derived(!!cover?.art && artChosen === cover.release);
+
+	async function loadCover(r: Identification, mine: number) {
+		const release = r.release;
+		cover = null;
+		if (!release || (!release.front_art && !release.release_group)) return;
+		cover = { release: release.id };
+		try {
+			const art = await api.musicbrainzArt(release.id, release.release_group, release.front_art);
+			if (mine !== seq) return;
+			cover = { release: release.id, art };
+			// Like an empty tag: filled in when the release is surely the album.
+			if (art && !original && complete) toggleArt(true, true);
+		} catch (e) {
+			if (mine !== seq) return;
+			cover = {
+				release: release.id,
+				error: e instanceof ApiError ? e.message : "coversyncd couldn't be reached."
+			};
+		}
+	}
+
+	function toggleArt(on: boolean, auto = false) {
+		onart(on && cover?.art ? { release: cover.release, ...cover.art } : null, auto);
+	}
+
+	/** The image the viewer shows first, while it's open. */
+	let viewing = $state<number | null>(null);
+	let artImages = $derived.by(() => {
+		const out: ViewedArt[] = [];
+		if (original) {
+			const { full: url, width, height, source: note } = original;
+			out.push({ label: 'Original', url, width, height, note });
+		}
+		if (cover?.art) {
+			out.push({
+				label: 'MusicBrainz',
+				url: musicbrainzArtUrl(cover.release),
+				width: cover.art.width,
+				height: cover.art.height,
+				note: cover.art.from === 'release' ? "the release's cover" : "the release group's cover"
+			});
+		}
+		return out;
+	});
+	const pixels = (w: number | null, h: number | null) => (w && h ? `${w} × ${h}` : 'size unknown');
+	/** The album art row: downloading, failed, or with an image (not when there's none). */
+	let artRow = $derived(!!cover && cover.art !== null);
+	let offered = $derived(rows.length + (cover?.art ? 1 : 0));
+	/** MusicBrainz's cover has fewer pixels than the album's own. */
+	let artSmaller = $derived(
+		!!cover?.art &&
+			!!original?.width &&
+			!!original.height &&
+			cover.art.width * cover.art.height < original.width * original.height
+	);
 
 	const num = (v: string) => /^\d+/.exec(v.trim())?.[0];
 	/** Whether a value typed before the dialog already says what MusicBrainz does. */
@@ -186,6 +278,7 @@
 					scope: 'album',
 					ids: entries.map((e) => e.id),
 					values: values(entries),
+					suggested: values(entries),
 					value: entries[0].value,
 					current: currents.size === 1 ? entries[0].current : null,
 					mixed: currents.size > 1,
@@ -203,6 +296,7 @@
 						scope: 'track',
 						ids: [e.id],
 						values: values([e]),
+						suggested: values([e]),
 						value: e.value,
 						current: e.current,
 						mixed: false,
@@ -222,6 +316,7 @@
 						scope: 'bundle',
 						ids: part.map((e) => e.id),
 						values: values(part),
+						suggested: values(part),
 						value: part[0].value,
 						current: null,
 						mixed: false,
@@ -237,10 +332,11 @@
 	}
 
 	function isOn(row: Row) {
+		if (row.ids.some((id) => !row.values[id].trim())) return false;
 		if (row.field === 'track') {
-			return row.ids.every((id) => getField(id, row.kind).trim() === row.values[id]);
+			return row.ids.every((id) => getField(id, row.kind).trim() === row.values[id].trim());
 		}
-		if (row.field === 'album') return getField(null, row.kind).trim() === row.value;
+		if (row.field === 'album') return getField(null, row.kind).trim() === row.value.trim();
 		return chosen.has(row.key);
 	}
 
@@ -263,6 +359,32 @@
 			chosen.delete(row.key);
 		}
 	}
+
+	/**
+	 * Put new values in a row. Typing one ticks the row and clearing one
+	 * unticks it; putting MusicBrainz's back (`tick` false) leaves it as it was.
+	 */
+	function update(row: Row, values: Record<number, string>, tick: boolean) {
+		const was = isOn(row);
+		Object.assign(row.values, values);
+		row.value = row.values[row.ids[0]];
+		const want = tick ? row.ids.every((id) => row.values[id].trim()) : was;
+		if (want !== was) {
+			toggle(row, want);
+		} else if (was && row.field) {
+			for (const id of row.field === 'album' ? [null] : row.ids) {
+				setField(id, row.kind, id === null ? row.value : row.values[id]);
+			}
+		}
+	}
+	const typed = (ids: number[], value: string) => Object.fromEntries(ids.map((id) => [id, value]));
+	const suggestedFor = (row: Row, ids: number[]) =>
+		Object.fromEntries(ids.map((id) => [id, row.suggested[id]]));
+	const edited = (row: Row, ids: number[]) =>
+		ids.some((id) => row.values[id] !== row.suggested[id]);
+
+	/** Bundles with a different value per track, opened to edit each one. */
+	const opened = new SvelteSet<string>();
 
 	/**
 	 * A release with exactly the album's tracks, each paired: fill empty tags,
@@ -291,18 +413,26 @@
 		}
 	}
 
-	function setAll(pick: (row: Row) => boolean) {
+	/**
+	 * Tick or untick every row, the album art's included; a cover smaller
+	 * than the album's own is left as it is rather than ticked.
+	 */
+	function setAll(pick: (row: { fill: boolean }) => boolean) {
 		for (const row of rows) {
 			const want = pick(row);
 			if (want !== isOn(row)) toggle(row, want);
 		}
+		const want = pick({ fill: !original });
+		if (cover?.art && want !== artOn && !(want && artSmaller)) toggleArt(want);
 	}
 
 	/** Look again, after taking back what this lookup's suggestions filled in. */
 	function relook() {
 		setAll(() => false);
 		restore.clear();
+		opened.clear();
 		rows = [];
+		cover = null;
 		identify();
 	}
 	function switchRelease(id: string) {
@@ -321,7 +451,7 @@
 		const out: ImportEdits = {};
 		for (const row of on) {
 			if (row.field) continue;
-			for (const id of row.ids) (out[id] ??= {})[row.kind] = row.values[id];
+			for (const id of row.ids) (out[id] ??= {})[row.kind] = row.values[id].trim();
 		}
 		onaccept(out, accepted);
 	});
@@ -409,18 +539,108 @@
 	}
 </script>
 
+{#snippet reset(row: Row, ids: number[], name: string)}
+	{#if edited(row, ids)}
+		<button
+			class="reset"
+			title="Back to MusicBrainz's value"
+			aria-label="Put back MusicBrainz's {name}"
+			onclick={() => update(row, suggestedFor(row, ids), false)}
+			transition:fade={{ duration: 120 }}><Undo2 size={13} /></button
+		>
+	{/if}
+{/snippet}
+
+<!-- The value `ids` get, to edit in place; one input sets it for all of them. -->
+{#snippet editor(row: Row, ids: number[], name: string)}
+	{@const value = row.values[ids[0]]}
+	<span class="now grow" class:mono={ID_KINDS.test(row.kind)} data-value={value}>
+		<input
+			{value}
+			size="1"
+			placeholder={row.suggested[ids[0]]}
+			aria-label={name}
+			title={row.original ? `${value} (${row.original})` : value}
+			spellcheck="false"
+			oninput={(e) => update(row, typed(ids, e.currentTarget.value), true)}
+			onchange={(e) => {
+				if (e.currentTarget.value.trim()) return;
+				update(row, suggestedFor(row, ids), false);
+				// Without an input event first the state never saw it empty, so set the box too.
+				e.currentTarget.value = row.values[ids[0]];
+			}}
+		/>
+	</span>
+	{@render reset(row, ids, name)}
+{/snippet}
+
+<!-- The album's own art beside MusicBrainz's; either opens full size. -->
+{#snippet artSuggestion()}
+	{@const c = cover!}
+	<label class="sugg" class:on={artOn} class:change={!!original}>
+		<input
+			type="checkbox"
+			checked={artOn}
+			disabled={!c.art}
+			onchange={(e) => toggleArt(e.currentTarget.checked)}
+		/>
+		<span class="kind">Album art</span>
+		<span class="diff">
+			{#if original}
+				<button class="thumb" onclick={() => (viewing = 0)} title="Show the album's art full size">
+					<img src={original.thumb} alt="The album's art" />
+				</button>
+				<span class="was tabular">{pixels(original.width, original.height)}</span>
+			{:else}
+				<span class="was empty">none</span>
+			{/if}
+			<ArrowRight size={13} />
+			{#if c.art}
+				<button
+					class="thumb"
+					onclick={() => (viewing = original ? 1 : 0)}
+					title="Show MusicBrainz's cover full size"
+				>
+					<img src={musicbrainzArtUrl(c.release)} alt="MusicBrainz's cover" />
+				</button>
+				<span class="now tabular">{pixels(c.art.width, c.art.height)}</span>
+			{:else if c.error}
+				<span class="art-error">{c.error}</span>
+			{:else}
+				<span class="fetching"
+					><span class="spin"><LoaderCircle size={13} /></span> Fetching from the Cover Art Archive…</span
+				>
+			{/if}
+		</span>
+		{#if c.art?.from === 'release_group'}<span class="scope">the release group's</span>{/if}
+	</label>
+{/snippet}
+
 {#snippet suggestion(row: Row, note?: string)}
 	{@const checked = isOn(row)}
+	{@const others = new Set(Object.values(row.suggested)).size - 1}
+	{@const open = opened.has(row.key)}
 	<label class="sugg" class:on={checked} class:change={!row.fill}>
 		<input type="checkbox" {checked} onchange={(e) => toggle(row, e.currentTarget.checked)} />
 		<span class="kind">{label(row.kind)}</span>
 		<span class="diff">
 			{#if row.scope === 'bundle'}
-				{@const others = new Set(Object.values(row.values)).size - 1}
 				<span class="was" class:empty={row.fill}>{row.fill ? 'empty' : 'differs'}</span>
 				<ArrowRight size={13} />
-				<span class="now" class:mono={ID_KINDS.test(row.kind)} title={row.value}>{row.value}</span>
-				{#if others > 0}<span class="more tabular">+{others} more</span>{/if}
+				{#if others > 0}
+					<span class="now" class:mono={ID_KINDS.test(row.kind)} title={row.value}>{row.value}</span
+					>
+					<button
+						class="others tabular"
+						aria-expanded={open}
+						title={open ? 'Hide the value for each track' : 'Edit the value for each track'}
+						onclick={() => (open ? opened.delete(row.key) : opened.add(row.key))}
+						>+{others} more <span class="chev" class:open><ChevronDown size={11} /></span></button
+					>
+					{@render reset(row, row.ids, `${label(row.kind)} for every track`)}
+				{:else}
+					{@render editor(row, row.ids, label(row.kind))}
+				{/if}
 			{:else}
 				{#if row.fill}
 					<span class="was empty">empty</span>
@@ -431,13 +651,30 @@
 				{#if row.original}<span class="roman" title="Romanized from {row.original}"
 						><Languages size={12} /></span
 					>{/if}
-				<span class="now" title={row.original ? `${row.value} (${row.original})` : row.value}
-					>{row.value}</span
-				>
+				{@render editor(row, row.ids, label(row.kind))}
 			{/if}
 		</span>
 		{#if note}<span class="scope">{note}</span>{/if}
 	</label>
+	{#if others > 0 && open}
+		<div
+			class="per-track"
+			class:on={checked}
+			class:change={!row.fill}
+			transition:slide={{ duration: 220, easing: cubicOut }}
+		>
+			{#each row.ids as id (id)}
+				{@const t = tracks.find((x) => x.id === id)}
+				{@const name = t?.title || t?.file_name || ''}
+				<div class="track-value">
+					<span class="pos tabular">{result?.tracks.find((x) => x.id === id)?.position ?? '–'}</span
+					>
+					<span class="track-title" title={name}>{name}</span>
+					<span class="diff">{@render editor(row, [id], `${label(row.kind)}, ${name}`)}</span>
+				</div>
+			{/each}
+		</div>
+	{/if}
 {/snippet}
 
 <section class="suggest" aria-labelledby="suggest-title" aria-busy={lookup?.state === 'running'}>
@@ -571,20 +808,21 @@
 			</p>
 		{/if}
 
-		{#if rows.length}
+		{#if rows.length || artRow}
 			<div class="toolbar" in:fly={{ y: 6, duration: 240, easing: cubicOut }}>
 				<span class="tabular"
-					><b>{on.length}</b> of {rows.length}
-					{rows.length === 1 ? 'suggestion' : 'suggestions'} ticked</span
+					><b>{on.length + (artOn ? 1 : 0)}</b> of {offered}
+					{offered === 1 ? 'suggestion' : 'suggestions'} ticked</span
 				>
 				<button class="link" onclick={() => setAll(() => true)}>Tick all</button>
 				<button class="link" onclick={() => setAll((r) => r.fill)}>Only empty tags</button>
 				<button class="link" onclick={() => setAll(() => false)}>None</button>
 			</div>
 
-			{#if albumRows.length}
+			{#if albumRows.length || artRow}
 				<div class="group">
 					<h4>Album-wide</h4>
+					{#if artRow}{@render artSuggestion()}{/if}
 					{#each albumRows as row (row.key)}
 						{@render suggestion(row, scopeText(row))}
 					{/each}
@@ -623,11 +861,15 @@
 					</div>
 				</ShowAll>
 			{/if}
-		{:else if result.release}
+		{/if}
+		{#if !rows.length && result.release}
 			<p class="agree" in:fade={{ duration: 200 }}>
 				<CircleCheck size={15} /> Every tag already matches MusicBrainz.
 			</p>
 		{/if}
+	{/if}
+	{#if viewing !== null && artImages.length}
+		<ArtViewer images={artImages} start={viewing} onclose={() => (viewing = null)} />
 	{/if}
 </section>
 
@@ -941,6 +1183,84 @@
 	.on.change .now {
 		color: hsl(40 92% 72%);
 	}
+	/* A hidden copy of the value sizes the input to its text. */
+	.grow {
+		display: inline-grid;
+		min-width: 6ch;
+	}
+	.grow::after,
+	.grow input {
+		grid-area: 1 / 1;
+		min-width: 0;
+		padding: 1px 5px;
+		border: 1px solid transparent;
+	}
+	.grow::after {
+		content: attr(data-value) ' ';
+		overflow: hidden;
+		white-space: pre;
+		visibility: hidden;
+	}
+	.grow input {
+		width: 100%;
+		height: 100%;
+		margin: 0;
+		border-radius: 6px;
+		background: none;
+		outline: none;
+		text-overflow: ellipsis;
+		cursor: text;
+		transition:
+			border-color 140ms,
+			background 140ms;
+	}
+	.grow input:hover {
+		border-color: var(--border-strong);
+	}
+	.grow input:focus {
+		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
+		background: var(--surface);
+	}
+	.grow input::placeholder {
+		color: var(--text-3);
+		font-weight: 400;
+	}
+	.reset {
+		flex: none;
+		display: grid;
+		place-items: center;
+		width: 22px;
+		height: 22px;
+		border-radius: 6px;
+		color: var(--text-3);
+		transition:
+			color 140ms,
+			background 140ms;
+	}
+	.reset:hover {
+		color: var(--text);
+		background: var(--surface-hover);
+	}
+	.per-track {
+		display: grid;
+		gap: 2px;
+		/* Under the tag's name, past the checkbox. */
+		margin: 0 0 4px 33px;
+		padding-left: 10px;
+		border-left: 1px solid var(--border);
+	}
+	.track-value {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) minmax(0, 1.6fr);
+		align-items: center;
+		gap: 8px;
+		padding: 1px 8px 1px 0;
+		font-size: 12.5px;
+	}
+	.track-value .track-title {
+		color: var(--text-2);
+		font-weight: 450;
+	}
 	.mono {
 		font-family: ui-monospace, monospace;
 		font-size: 12px;
@@ -989,13 +1309,73 @@
 		font-size: 12.5px;
 		color: var(--text-3);
 	}
-	.more {
+	.others {
 		flex: none;
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
 		padding: 1px 6px;
 		border-radius: 999px;
 		font-size: 11px;
 		color: var(--text-3);
 		background: var(--surface-hover);
+		transition:
+			color 140ms,
+			background 140ms;
+	}
+	.others:hover,
+	.others[aria-expanded='true'] {
+		color: var(--text);
+		background: color-mix(in oklab, var(--accent) 18%, transparent);
+	}
+	.thumb {
+		flex: none;
+		display: grid;
+		width: 48px;
+		height: 48px;
+		border-radius: 7px;
+		overflow: hidden;
+		background: var(--surface);
+		box-shadow: 0 0 0 1px var(--border);
+		cursor: zoom-in;
+		transition:
+			box-shadow 140ms,
+			transform 140ms var(--ease-out);
+	}
+	.thumb:hover {
+		box-shadow: 0 0 0 1px var(--border-strong);
+		transform: scale(1.04);
+	}
+	.thumb img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+	.fetching {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12.5px;
+	}
+	.art-error {
+		font-size: 12.5px;
+		color: var(--danger);
+	}
+	.spin {
+		display: inline-grid;
+		animation: spin 900ms linear infinite;
+	}
+	@keyframes spin {
+		to {
+			rotate: 360deg;
+		}
+	}
+	.chev {
+		display: grid;
+		transition: transform 220ms var(--ease-out);
+	}
+	.chev.open {
+		transform: rotate(180deg);
 	}
 	.scope {
 		font-size: 11.5px;
@@ -1020,6 +1400,15 @@
 		}
 		.scope {
 			display: none;
+		}
+		.per-track {
+			margin-left: 8px;
+		}
+		.track-value {
+			grid-template-columns: auto minmax(0, 1fr);
+		}
+		.track-value .diff {
+			grid-column: 2;
 		}
 	}
 </style>

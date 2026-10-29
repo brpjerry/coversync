@@ -215,13 +215,34 @@ pub fn present(tag: &Tag) -> Vec<&'static str> {
         .collect()
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rules {
     /// Catalog ids every managed file must have a value for.
     #[serde(default)]
     pub required_tags: Vec<String>,
     #[serde(default)]
     pub art: crate::art::ArtRules,
+    /// Joins the values of a tag that holds several (artists, genres…) in
+    /// what MusicBrainz suggests.
+    #[serde(default = "default_separator")]
+    pub separator: String,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            required_tags: Vec::new(),
+            art: Default::default(),
+            separator: default_separator(),
+        }
+    }
+}
+
+/// The separator for multiple values unless Library setup says otherwise.
+pub const DEFAULT_SEPARATOR: &str = ";";
+
+fn default_separator() -> String {
+    DEFAULT_SEPARATOR.to_string()
 }
 
 /// Kinds that normally hold one value for a whole album; the import editor
@@ -315,6 +336,17 @@ impl LibrarySetup {
         self.structure = self.structure.trim().to_string();
         crate::template::Template::parse(&self.structure)?;
         self.rules.art = self.rules.art.normalize()?;
+        // Kept as typed: "; " and ";" are different separators.
+        let separator = &self.rules.separator;
+        if separator.trim().is_empty()
+            || separator.chars().count() > 8
+            || separator.chars().any(char::is_control)
+        {
+            return Err(Error::Invalid(
+                "The separator for multiple values needs a character other than a space, and at most 8 in all."
+                    .into(),
+            ));
+        }
         if let Some(bad) = self
             .rules
             .required_tags
@@ -383,5 +415,25 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.normalize().is_err());
+    }
+
+    #[test]
+    fn separators_are_kept_as_typed_but_never_blank() {
+        let with = |separator: &str| LibrarySetup {
+            rules: Rules {
+                separator: separator.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(LibrarySetup::default().rules.separator, ";");
+        // Saved before there was a separator: the default.
+        let old: Rules = serde_json::from_str(r#"{"required_tags": []}"#).unwrap();
+        assert_eq!(old.separator, ";");
+        assert_eq!(with("; ").normalize().unwrap().rules.separator, "; ");
+        assert_eq!(with(" / ").normalize().unwrap().rules.separator, " / ");
+        for bad in ["", "  ", "\t", "123456789"] {
+            assert!(with(bad).normalize().is_err(), "{bad:?}");
+        }
     }
 }

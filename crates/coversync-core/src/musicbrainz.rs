@@ -1,10 +1,11 @@
 //! Clients for the AcoustID and MusicBrainz web services, each kept to the
-//! request rate the service asks for (AcoustID 3 a second, MusicBrainz 1).
+//! request rate the service asks for (AcoustID 3 a second, MusicBrainz 1),
+//! and for MusicBrainz's cover images on the Cover Art Archive.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
@@ -246,6 +247,9 @@ pub struct Release {
     /// Links to other releases, e.g. a translated tracklist.
     #[serde(default)]
     pub relations: Vec<Relation>,
+    /// What the Cover Art Archive holds for the release.
+    #[serde(rename = "cover-art-archive")]
+    pub cover_art: Option<CoverArtArchive>,
     /// Search results only: how well the release matched, out of 100.
     pub score: Option<u32>,
     /// Search results only: tracks across every medium.
@@ -317,6 +321,13 @@ pub struct ReleaseGroup {
     pub genres: Vec<Genre>,
     #[serde(default)]
     pub aliases: Vec<Alias>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoverArtArchive {
+    /// There is a front cover image.
+    #[serde(default)]
+    pub front: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -477,6 +488,104 @@ pub fn search_releases(album: &str, artist: Option<&str>) -> Result<Vec<Release>
         &[("query", &query), ("limit", "15"), ("fmt", "json")],
     )?;
     Ok(res.releases)
+}
+
+// ---- Cover Art Archive ----
+
+const COVER_ART_URL: &str = "https://coverartarchive.org";
+
+/// Images come from the Internet Archive, which can take a while over a big one.
+static ART_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .user_agent(USER_AGENT)
+        .timeout_global(Some(Duration::from_secs(120)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+});
+
+/// Where a front cover came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverFrom {
+    Release,
+    /// The release has none; the Cover Art Archive picked one of the group's.
+    ReleaseGroup,
+}
+
+enum Fetched {
+    Image(Vec<u8>),
+    Missing,
+    TooLarge,
+}
+
+fn fetch_image(url: &str, limit: usize) -> Result<Fetched> {
+    let mut res = 'call: {
+        for attempt in 0.. {
+            let res = ART_AGENT
+                .get(url)
+                .call()
+                .map_err(unreachable("the Cover Art Archive"))?;
+            match res.status().as_u16() {
+                200 => break 'call res,
+                404 => return Ok(Fetched::Missing),
+                // The Internet Archive behind it has bad moments.
+                500..=599 if attempt < 2 => std::thread::sleep(Duration::from_secs(1 + attempt)),
+                status => {
+                    return Err(Error::Remote(format!(
+                        "The Cover Art Archive answered with HTTP {status}"
+                    )));
+                }
+            }
+        }
+        unreachable!()
+    };
+    let length = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if length.is_some_and(|n| n > limit as u64) {
+        return Ok(Fetched::TooLarge);
+    }
+    match res
+        .body_mut()
+        .with_config()
+        .limit(limit as u64)
+        .read_to_vec()
+    {
+        Ok(bytes) => Ok(Fetched::Image(bytes)),
+        Err(ureq::Error::BodyExceedsLimit(_)) => Ok(Fetched::TooLarge),
+        Err(e) => Err(unreachable("the Cover Art Archive")(e)),
+    }
+}
+
+/// The release's front cover from the Cover Art Archive, or failing that its
+/// release group's: the original, or the 1200 px version when the original
+/// is over `limit` bytes. None when neither has one. `release` is None when
+/// MusicBrainz already says it has no front cover.
+pub fn front_cover(
+    release: Option<&str>,
+    group: Option<&str>,
+    limit: usize,
+) -> Result<Option<(Vec<u8>, CoverFrom)>> {
+    let places = [
+        ("release", release, CoverFrom::Release),
+        ("release-group", group, CoverFrom::ReleaseGroup),
+    ];
+    for (path, id, from) in places {
+        let Some(id) = id else { continue };
+        if !is_mbid(id) {
+            return Err(Error::Invalid(format!("'{id}' isn't a MusicBrainz id")));
+        }
+        for size in ["front", "front-1200"] {
+            match fetch_image(&format!("{COVER_ART_URL}/{path}/{id}/{size}"), limit)? {
+                Fetched::Image(bytes) => return Ok(Some((bytes, from))),
+                Fetched::Missing => break,
+                Fetched::TooLarge => continue,
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
