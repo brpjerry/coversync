@@ -1,0 +1,52 @@
+name: Release
+
+# Push a tag vX.Y.Z, where X.Y.Z is coversyncd's version, to publish a
+# GitHub release with the pacman package.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check the version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag names coversyncd's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/coversyncd/Cargo.toml)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match coversyncd's version, $version."
+            exit 1
+          fi
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: arch-package
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.pkg.tar.zst > SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "coversync ${GITHUB_REF_NAME#v}" \
+            --generate-notes

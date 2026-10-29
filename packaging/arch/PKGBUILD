@@ -1,0 +1,51 @@
+# Maintainer: brpjerry <https://github.com/brpjerry>
+#
+# Builds from the release tarball. packaging/arch/build.sh puts a tarball of
+# the checkout in its place, so CI packages exactly the commit it tested.
+
+pkgname=coversync
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Music library manager and tag editor that serves its UI to the browser'
+arch=('x86_64')
+url='https://github.com/brpjerry/coversync'
+license=('MIT')
+depends=('glibc' 'libgcc')
+makedepends=('cargo' 'nodejs' 'pnpm')
+optdepends=('chromaprint: audio fingerprints (fpcalc) for Smart suggestions')
+# makepkg's LTO flags turn the C in ring and SQLite into GCC bitcode that
+# rust-lld can't link; the release profile has LTO of its own. And nothing
+# would publish a -debug package.
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  pnpm --dir web install --frozen-lockfile
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  # The daemon embeds web/build, so the UI comes first.
+  pnpm --dir web build
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p coversyncd
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/coversyncd -t "$pkgdir/usr/bin/"
+  install -Dm644 packaging/arch/coversyncd.service -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}
