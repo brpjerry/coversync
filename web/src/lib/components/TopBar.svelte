@@ -499,7 +499,8 @@
 
 	@media (max-width: 900px) {
 		.bar {
-			grid-template-columns: auto 1fr auto;
+			/* The search field gives way first on phones. */
+			grid-template-columns: auto minmax(0, 1fr) auto;
 			grid-template-rows: none;
 			height: auto;
 			padding: 12px 16px;
@@ -518,6 +519,12 @@
 		}
 		.stats,
 		.scan-label {
+			display: none;
+		}
+	}
+	/* Phones have no keyboard shortcut to show, and the search field needs the room. */
+	@media (max-width: 600px) {
+		kbd {
 			display: none;
 		}
 	}
