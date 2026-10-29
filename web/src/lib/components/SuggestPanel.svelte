@@ -6,9 +6,11 @@
 		key: string;
 		kind: string;
 		scope: Scope;
-		/** Tracks it applies to, with the value for each. */
+		/** Tracks it applies to, with the value for each, as edited here. */
 		ids: number[];
 		values: Record<number, string>;
+		/** MusicBrainz's value for each track, before any edits. */
+		suggested: Record<number, string>;
 		/** The value shown: the album-wide one, or an example for a bundle. */
 		value: string;
 		current: string | null;
@@ -40,6 +42,8 @@
 	import CircleCheck from '@lucide/svelte/icons/circle-check';
 	import Info from '@lucide/svelte/icons/info';
 	import Languages from '@lucide/svelte/icons/languages';
+	import Undo2 from '@lucide/svelte/icons/undo-2';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import {
 		api,
 		ApiError,
@@ -186,6 +190,7 @@
 					scope: 'album',
 					ids: entries.map((e) => e.id),
 					values: values(entries),
+					suggested: values(entries),
 					value: entries[0].value,
 					current: currents.size === 1 ? entries[0].current : null,
 					mixed: currents.size > 1,
@@ -203,6 +208,7 @@
 						scope: 'track',
 						ids: [e.id],
 						values: values([e]),
+						suggested: values([e]),
 						value: e.value,
 						current: e.current,
 						mixed: false,
@@ -222,6 +228,7 @@
 						scope: 'bundle',
 						ids: part.map((e) => e.id),
 						values: values(part),
+						suggested: values(part),
 						value: part[0].value,
 						current: null,
 						mixed: false,
@@ -237,10 +244,11 @@
 	}
 
 	function isOn(row: Row) {
+		if (row.ids.some((id) => !row.values[id].trim())) return false;
 		if (row.field === 'track') {
-			return row.ids.every((id) => getField(id, row.kind).trim() === row.values[id]);
+			return row.ids.every((id) => getField(id, row.kind).trim() === row.values[id].trim());
 		}
-		if (row.field === 'album') return getField(null, row.kind).trim() === row.value;
+		if (row.field === 'album') return getField(null, row.kind).trim() === row.value.trim();
 		return chosen.has(row.key);
 	}
 
@@ -263,6 +271,32 @@
 			chosen.delete(row.key);
 		}
 	}
+
+	/**
+	 * Put new values in a row. Typing one ticks the row and clearing one
+	 * unticks it; putting MusicBrainz's back (`tick` false) leaves it as it was.
+	 */
+	function update(row: Row, values: Record<number, string>, tick: boolean) {
+		const was = isOn(row);
+		Object.assign(row.values, values);
+		row.value = row.values[row.ids[0]];
+		const want = tick ? row.ids.every((id) => row.values[id].trim()) : was;
+		if (want !== was) {
+			toggle(row, want);
+		} else if (was && row.field) {
+			for (const id of row.field === 'album' ? [null] : row.ids) {
+				setField(id, row.kind, id === null ? row.value : row.values[id]);
+			}
+		}
+	}
+	const typed = (ids: number[], value: string) => Object.fromEntries(ids.map((id) => [id, value]));
+	const suggestedFor = (row: Row, ids: number[]) =>
+		Object.fromEntries(ids.map((id) => [id, row.suggested[id]]));
+	const edited = (row: Row, ids: number[]) =>
+		ids.some((id) => row.values[id] !== row.suggested[id]);
+
+	/** Bundles with a different value per track, opened to edit each one. */
+	const opened = new SvelteSet<string>();
 
 	/**
 	 * A release with exactly the album's tracks, each paired: fill empty tags,
@@ -302,6 +336,7 @@
 	function relook() {
 		setAll(() => false);
 		restore.clear();
+		opened.clear();
 		rows = [];
 		identify();
 	}
@@ -321,7 +356,7 @@
 		const out: ImportEdits = {};
 		for (const row of on) {
 			if (row.field) continue;
-			for (const id of row.ids) (out[id] ??= {})[row.kind] = row.values[id];
+			for (const id of row.ids) (out[id] ??= {})[row.kind] = row.values[id].trim();
 		}
 		onaccept(out, accepted);
 	});
@@ -409,18 +444,66 @@
 	}
 </script>
 
+{#snippet reset(row: Row, ids: number[], name: string)}
+	{#if edited(row, ids)}
+		<button
+			class="reset"
+			title="Back to MusicBrainz's value"
+			aria-label="Put back MusicBrainz's {name}"
+			onclick={() => update(row, suggestedFor(row, ids), false)}
+			transition:fade={{ duration: 120 }}><Undo2 size={13} /></button
+		>
+	{/if}
+{/snippet}
+
+<!-- The value `ids` get, to edit in place; one input sets it for all of them. -->
+{#snippet editor(row: Row, ids: number[], name: string)}
+	{@const value = row.values[ids[0]]}
+	<span class="now grow" class:mono={ID_KINDS.test(row.kind)} data-value={value}>
+		<input
+			{value}
+			size="1"
+			placeholder={row.suggested[ids[0]]}
+			aria-label={name}
+			title={row.original ? `${value} (${row.original})` : value}
+			spellcheck="false"
+			oninput={(e) => update(row, typed(ids, e.currentTarget.value), true)}
+			onchange={(e) => {
+				if (e.currentTarget.value.trim()) return;
+				update(row, suggestedFor(row, ids), false);
+				// Without an input event first the state never saw it empty, so set the box too.
+				e.currentTarget.value = row.values[ids[0]];
+			}}
+		/>
+	</span>
+	{@render reset(row, ids, name)}
+{/snippet}
+
 {#snippet suggestion(row: Row, note?: string)}
 	{@const checked = isOn(row)}
+	{@const others = new Set(Object.values(row.suggested)).size - 1}
+	{@const open = opened.has(row.key)}
 	<label class="sugg" class:on={checked} class:change={!row.fill}>
 		<input type="checkbox" {checked} onchange={(e) => toggle(row, e.currentTarget.checked)} />
 		<span class="kind">{label(row.kind)}</span>
 		<span class="diff">
 			{#if row.scope === 'bundle'}
-				{@const others = new Set(Object.values(row.values)).size - 1}
 				<span class="was" class:empty={row.fill}>{row.fill ? 'empty' : 'differs'}</span>
 				<ArrowRight size={13} />
-				<span class="now" class:mono={ID_KINDS.test(row.kind)} title={row.value}>{row.value}</span>
-				{#if others > 0}<span class="others tabular">+{others} more</span>{/if}
+				{#if others > 0}
+					<span class="now" class:mono={ID_KINDS.test(row.kind)} title={row.value}>{row.value}</span
+					>
+					<button
+						class="others tabular"
+						aria-expanded={open}
+						title={open ? 'Hide the value for each track' : 'Edit the value for each track'}
+						onclick={() => (open ? opened.delete(row.key) : opened.add(row.key))}
+						>+{others} more <span class="chev" class:open><ChevronDown size={11} /></span></button
+					>
+					{@render reset(row, row.ids, `${label(row.kind)} for every track`)}
+				{:else}
+					{@render editor(row, row.ids, label(row.kind))}
+				{/if}
 			{:else}
 				{#if row.fill}
 					<span class="was empty">empty</span>
@@ -431,13 +514,30 @@
 				{#if row.original}<span class="roman" title="Romanized from {row.original}"
 						><Languages size={12} /></span
 					>{/if}
-				<span class="now" title={row.original ? `${row.value} (${row.original})` : row.value}
-					>{row.value}</span
-				>
+				{@render editor(row, row.ids, label(row.kind))}
 			{/if}
 		</span>
 		{#if note}<span class="scope">{note}</span>{/if}
 	</label>
+	{#if others > 0 && open}
+		<div
+			class="per-track"
+			class:on={checked}
+			class:change={!row.fill}
+			transition:slide={{ duration: 220, easing: cubicOut }}
+		>
+			{#each row.ids as id (id)}
+				{@const t = tracks.find((x) => x.id === id)}
+				{@const name = t?.title || t?.file_name || ''}
+				<div class="track-value">
+					<span class="pos tabular">{result?.tracks.find((x) => x.id === id)?.position ?? '–'}</span
+					>
+					<span class="track-title" title={name}>{name}</span>
+					<span class="diff">{@render editor(row, [id], `${label(row.kind)}, ${name}`)}</span>
+				</div>
+			{/each}
+		</div>
+	{/if}
 {/snippet}
 
 <section class="suggest" aria-labelledby="suggest-title" aria-busy={lookup?.state === 'running'}>
@@ -941,6 +1041,84 @@
 	.on.change .now {
 		color: hsl(40 92% 72%);
 	}
+	/* A hidden copy of the value sizes the input to its text. */
+	.grow {
+		display: inline-grid;
+		min-width: 6ch;
+	}
+	.grow::after,
+	.grow input {
+		grid-area: 1 / 1;
+		min-width: 0;
+		padding: 1px 5px;
+		border: 1px solid transparent;
+	}
+	.grow::after {
+		content: attr(data-value) ' ';
+		overflow: hidden;
+		white-space: pre;
+		visibility: hidden;
+	}
+	.grow input {
+		width: 100%;
+		height: 100%;
+		margin: 0;
+		border-radius: 6px;
+		background: none;
+		outline: none;
+		text-overflow: ellipsis;
+		cursor: text;
+		transition:
+			border-color 140ms,
+			background 140ms;
+	}
+	.grow input:hover {
+		border-color: var(--border-strong);
+	}
+	.grow input:focus {
+		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
+		background: var(--surface);
+	}
+	.grow input::placeholder {
+		color: var(--text-3);
+		font-weight: 400;
+	}
+	.reset {
+		flex: none;
+		display: grid;
+		place-items: center;
+		width: 22px;
+		height: 22px;
+		border-radius: 6px;
+		color: var(--text-3);
+		transition:
+			color 140ms,
+			background 140ms;
+	}
+	.reset:hover {
+		color: var(--text);
+		background: var(--surface-hover);
+	}
+	.per-track {
+		display: grid;
+		gap: 2px;
+		/* Under the tag's name, past the checkbox. */
+		margin: 0 0 4px 33px;
+		padding-left: 10px;
+		border-left: 1px solid var(--border);
+	}
+	.track-value {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) minmax(0, 1.6fr);
+		align-items: center;
+		gap: 8px;
+		padding: 1px 8px 1px 0;
+		font-size: 12.5px;
+	}
+	.track-value .track-title {
+		color: var(--text-2);
+		font-weight: 450;
+	}
 	.mono {
 		font-family: ui-monospace, monospace;
 		font-size: 12px;
@@ -991,11 +1169,29 @@
 	}
 	.others {
 		flex: none;
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
 		padding: 1px 6px;
 		border-radius: 999px;
 		font-size: 11px;
 		color: var(--text-3);
 		background: var(--surface-hover);
+		transition:
+			color 140ms,
+			background 140ms;
+	}
+	.others:hover,
+	.others[aria-expanded='true'] {
+		color: var(--text);
+		background: color-mix(in oklab, var(--accent) 18%, transparent);
+	}
+	.chev {
+		display: grid;
+		transition: transform 220ms var(--ease-out);
+	}
+	.chev.open {
+		transform: rotate(180deg);
 	}
 	.scope {
 		font-size: 11.5px;
@@ -1020,6 +1216,15 @@
 		}
 		.scope {
 			display: none;
+		}
+		.per-track {
+			margin-left: 8px;
+		}
+		.track-value {
+			grid-template-columns: auto minmax(0, 1fr);
+		}
+		.track-value .diff {
+			grid-column: 2;
 		}
 	}
 </style>
