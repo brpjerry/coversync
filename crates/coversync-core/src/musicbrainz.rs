@@ -520,19 +520,26 @@ enum Fetched {
 }
 
 fn fetch_image(url: &str, limit: usize) -> Result<Fetched> {
-    let mut res = ART_AGENT
-        .get(url)
-        .call()
-        .map_err(unreachable("the Cover Art Archive"))?;
-    match res.status().as_u16() {
-        200 => {}
-        404 => return Ok(Fetched::Missing),
-        status => {
-            return Err(Error::Remote(format!(
-                "The Cover Art Archive answered with HTTP {status}"
-            )));
+    let mut res = 'call: {
+        for attempt in 0.. {
+            let res = ART_AGENT
+                .get(url)
+                .call()
+                .map_err(unreachable("the Cover Art Archive"))?;
+            match res.status().as_u16() {
+                200 => break 'call res,
+                404 => return Ok(Fetched::Missing),
+                // The Internet Archive behind it has bad moments.
+                500..=599 if attempt < 2 => std::thread::sleep(Duration::from_secs(1 + attempt)),
+                status => {
+                    return Err(Error::Remote(format!(
+                        "The Cover Art Archive answered with HTTP {status}"
+                    )));
+                }
+            }
         }
-    }
+        unreachable!()
+    };
     let length = res
         .headers()
         .get("content-length")

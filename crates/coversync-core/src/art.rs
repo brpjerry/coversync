@@ -232,6 +232,13 @@ mod tests {
         assert_eq!(png.file_extension(), "png");
         assert_eq!(png.picture().unwrap().mime_type(), Some(&MimeType::Png));
 
+        // GIFs (some covers on the Cover Art Archive) become JPEG.
+        let gif = Art::new(image(ImageFormat::Gif)).unwrap();
+        assert_eq!((gif.width, gif.height), (8, 6));
+        assert_eq!(gif.file_extension(), "jpg");
+        let bytes = gif.file_bytes().unwrap();
+        assert!(image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg).is_ok());
+
         // WebP files stay WebP, but embedded art is JPEG.
         let webp = Art::new(image(ImageFormat::WebP)).unwrap();
         assert_eq!(webp.file_extension(), "webp");

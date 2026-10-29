@@ -172,6 +172,8 @@ export interface ImportPlan {
 	library_folder: string | null;
 	kinds: string[];
 	failing: string[];
+	/** Album-wide kinds the folder structure uses that differ between tracks. */
+	disagree: string[];
 	tracks: ImportTrack[];
 	problems: string[];
 	/** Kinds autofill sets on at least one track. */

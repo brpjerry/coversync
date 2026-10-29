@@ -74,7 +74,9 @@
 	const initial = untrack(() => $state.snapshot(plan)) as ImportPlan;
 	const tracks = initial.tracks;
 	const failing = initial.failing;
-	const albumCols = failing.filter((k) => albumKinds.includes(k));
+	/** Album-wide tags the tracks differ in: one value keeps the album in one folder. */
+	const disagree = initial.disagree.filter((k) => !failing.includes(k));
+	const albumCols = [...failing.filter((k) => albumKinds.includes(k)), ...disagree];
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
 	const original = (id: number, k: string) => tracks.find((t) => t.id === id)?.values[k] ?? '';
 
@@ -115,10 +117,13 @@
 	}
 	const missingOnTracks = (k: string) => tracks.filter((t) => !t.values[k]?.trim()).length;
 
-	// Album fields count once (one input), track fields once per track.
+	// Album fields count once (one input), track fields once per track. A
+	// field for tracks that differ needs a value even though each has one.
 	let missing = $derived(
-		albumCols.filter((k) => tracks.some((t) => !effective(t.id, k))).length +
-			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
+		albumCols.filter(
+			(k) =>
+				(disagree.includes(k) && !albumValues[k].trim()) || tracks.some((t) => !effective(t.id, k))
+		).length + tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
 	);
 	/** The rules require album art and the album has none. */
 	const artNeeded = initial.art.missing;
@@ -212,7 +217,8 @@
 					: null
 			: null;
 		const did = [file && `saved as ${file}`, into].filter(Boolean).join(', and ');
-		const what = chosen ? from : `${from[0].toUpperCase()}${from.slice(1)}`;
+		// "the art embedded in …" starts the sentence; a file name stays as it's spelled.
+		const what = from.startsWith('the ') ? `T${from.slice(1)}` : from;
 		return did ? `${what} is ${did}.` : `${what} is kept as it is.`;
 	});
 
@@ -222,7 +228,7 @@
 		const out: ImportEdits = structuredClone(base);
 		for (const [id, values] of Object.entries(accepted)) Object.assign((out[+id] ??= {}), values);
 		for (const t of tracks) {
-			for (const k of failing) {
+			for (const k of [...failing, ...disagree]) {
 				const v = effective(t.id, k);
 				if (v && v !== original(t.id, k)) (out[t.id] ??= {})[k] = v;
 			}
@@ -509,13 +515,19 @@
 					<h3>Album</h3>
 					<div class="album-fields">
 						{#each albumCols as k (k)}
-							{@const empty = !albumValues[k].trim() && tracks.some((t) => !original(t.id, k))}
+							{@const differs = disagree.includes(k)}
+							{@const empty =
+								!albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
 							<label class="field">
 								<span class="field-label">
 									{label(k)}
 									<span class="note" class:bad={empty}>
-										{#if empty}
+										{#if empty && differs}
+											differs between tracks; one value keeps the album in one folder
+										{:else if empty}
 											missing on {missingOnTracks(k)} of {tracks.length}
+										{:else if differs && albumValues[k] === consensus(k)}
+											differs between tracks; this is what most have
 										{:else if prefilled.has(k) && albumValues[k] === consensus(k)}
 											filled in from the other tracks
 										{/if}

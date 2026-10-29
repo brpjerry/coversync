@@ -391,7 +391,7 @@
 		} finally {
 			dismiss(checking);
 		}
-		if (plan.failing.length || plan.art.missing || plan.suggest) {
+		if (plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest) {
 			// The editor needs the tag catalog (labels, album-wide kinds) up front.
 			await setup.load();
 			importing = { album, plan, edits };

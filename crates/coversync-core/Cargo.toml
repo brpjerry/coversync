@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 libc = "0.2.191"
 lofty = "0.25.5"
 rayon = "1.12.0"
