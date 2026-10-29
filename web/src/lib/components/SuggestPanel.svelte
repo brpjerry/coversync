@@ -420,7 +420,7 @@
 				<span class="was" class:empty={row.fill}>{row.fill ? 'empty' : 'differs'}</span>
 				<ArrowRight size={13} />
 				<span class="now" class:mono={ID_KINDS.test(row.kind)} title={row.value}>{row.value}</span>
-				{#if others > 0}<span class="more tabular">+{others} more</span>{/if}
+				{#if others > 0}<span class="others tabular">+{others} more</span>{/if}
 			{:else}
 				{#if row.fill}
 					<span class="was empty">empty</span>
@@ -989,7 +989,7 @@
 		font-size: 12.5px;
 		color: var(--text-3);
 	}
-	.more {
+	.others {
 		flex: none;
 		padding: 1px 6px;
 		border-radius: 999px;
