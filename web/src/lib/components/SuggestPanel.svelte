@@ -209,6 +209,13 @@
 	/** The album art row: downloading, failed, or with an image (not when there's none). */
 	let artRow = $derived(!!cover && cover.art !== null);
 	let offered = $derived(rows.length + (cover?.art ? 1 : 0));
+	/** MusicBrainz's cover has fewer pixels than the album's own. */
+	let artSmaller = $derived(
+		!!cover?.art &&
+			!!original?.width &&
+			!!original.height &&
+			cover.art.width * cover.art.height < original.width * original.height
+	);
 
 	const num = (v: string) => /^\d+/.exec(v.trim())?.[0];
 	/** Whether a value typed before the dialog already says what MusicBrainz does. */
@@ -406,13 +413,17 @@
 		}
 	}
 
-	/** Tick or untick every row, the album art's included. */
+	/**
+	 * Tick or untick every row, the album art's included; a cover smaller
+	 * than the album's own is left as it is rather than ticked.
+	 */
 	function setAll(pick: (row: { fill: boolean }) => boolean) {
 		for (const row of rows) {
 			const want = pick(row);
 			if (want !== isOn(row)) toggle(row, want);
 		}
-		if (cover?.art && pick({ fill: !original }) !== artOn) toggleArt(!artOn);
+		const want = pick({ fill: !original });
+		if (cover?.art && want !== artOn && !(want && artSmaller)) toggleArt(want);
 	}
 
 	/** Look again, after taking back what this lookup's suggestions filled in. */
