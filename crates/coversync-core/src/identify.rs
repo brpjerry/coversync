@@ -82,6 +82,10 @@ pub struct ReleaseSummary {
     pub format: Option<String>,
     pub track_count: u32,
     pub disambiguation: Option<String>,
+    /// The Cover Art Archive has a front cover for the release.
+    pub front_art: bool,
+    /// Whose front cover stands in when the release has none.
+    pub release_group: Option<String>,
 }
 
 /// A release the album might be.
@@ -783,6 +787,8 @@ fn summary(r: &Release) -> ReleaseSummary {
         format: format_summary(r.media.iter().map(|m| m.format.as_deref())),
         track_count: r.media.iter().map(|m| m.tracks.len() as u32).sum(),
         disambiguation: r.disambiguation.clone().filter(|d| !d.is_empty()),
+        front_art: r.cover_art.as_ref().is_some_and(|c| c.front),
+        release_group: r.release_group.as_ref().map(|g| g.id.clone()),
     }
 }
 

@@ -182,11 +182,14 @@ export interface ArtPlan {
 	placement: ArtPlacement;
 	/** Where the album's art comes from, e.g. "folder.jpg"; null if it has none. */
 	source: string | null;
+	/** The art's size in pixels. */
+	width: number | null;
+	height: number | null;
 	/** The cover file written beside the tracks, e.g. "cover.jpg". */
 	file: string | null;
 	/** The rule's cover file name, without extension. */
 	file_name: string;
-	/** Tracks without embedded art that get the album's. */
+	/** Tracks without embedded art that get the album's (every track for a chosen image). */
 	embed: number;
 	/** Required, and the album has none: the import needs an image. */
 	missing: boolean;
@@ -298,6 +301,10 @@ export interface Identification {
 		format: string | null;
 		track_count: number;
 		disambiguation: string | null;
+		/** The Cover Art Archive has a front cover for the release. */
+		front_art: boolean;
+		/** Whose front cover stands in when the release has none. */
+		release_group: string | null;
 	} | null;
 	candidates: Candidate[];
 	fingerprinted: number;
@@ -325,6 +332,15 @@ export interface Identification {
 		/** Titles and names MusicBrainz has nothing Latin for. */
 		left: number;
 	} | null;
+}
+
+/** MusicBrainz's front cover for a release, downloaded by coversyncd. */
+export interface MbArt {
+	width: number;
+	height: number;
+	extension: 'jpg' | 'png' | 'webp';
+	/** The release's own, or its release group's when it has none. */
+	from: 'release' | 'release_group';
 }
 
 export type IdentifyStage =
@@ -414,6 +430,11 @@ export const api = {
 		}),
 	identifyStatus: (album_id: string) =>
 		request<IdentifyState>(`/api/identify/${encodeURIComponent(album_id)}`),
+	/** Download MusicBrainz's front cover for a release; null when there is none. */
+	musicbrainzArt: (release_id: string, group: string | null, front: boolean) =>
+		request<MbArt | null>(
+			`/api/musicbrainz/art/${release_id}?front=${front}` + (group ? `&group=${group}` : '')
+		),
 	preview: (structure: string) =>
 		request<StructurePreview>(`/api/library/preview?structure=${encodeURIComponent(structure)}`),
 	checkFolder: (path: string) =>
@@ -424,12 +445,15 @@ export const api = {
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ album_id, edits })
 		}),
-	/** `art`: album art chosen for the import, base64-encoded. */
-	importAlbum: (album_id: string, edits: ImportEdits = {}, art?: string) =>
+	/**
+	 * `art`: album art chosen for the import, base64-encoded; or
+	 * `musicbrainzArt`, the release whose MusicBrainz cover to use.
+	 */
+	importAlbum: (album_id: string, edits: ImportEdits = {}, art?: string, musicbrainzArt?: string) =>
 		request<ImportResult>('/api/import', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ album_id, edits, art })
+			body: JSON.stringify({ album_id, edits, art, musicbrainz_art: musicbrainzArt })
 		}),
 	appearance: () => request<AppearanceResponse>('/api/appearance'),
 	saveAppearance: (setup: AppearanceSetup) =>
@@ -449,4 +473,9 @@ export const api = {
 };
 
 export const coverUrl = (id: string, size = 512) => `${BASE}/api/albums/${id}/cover?size=${size}`;
+/** The album's art at full size. */
+export const fullCoverUrl = (id: string) => `${BASE}/api/albums/${id}/cover/full`;
+/** MusicBrainz's cover, once `api.musicbrainzArt` has downloaded it. */
+export const musicbrainzArtUrl = (release_id: string) =>
+	`${BASE}/api/musicbrainz/art/${release_id}/image`;
 export const streamUrl = (trackId: number) => `${BASE}/api/tracks/${trackId}/stream`;

@@ -111,6 +111,11 @@ const FILE_FORMATS: &[ImageFormat] = &[ImageFormat::Jpeg, ImageFormat::Png, Imag
 /// Formats kept as they are when embedded; every tag format and player knows these.
 const EMBED_FORMATS: &[ImageFormat] = &[ImageFormat::Jpeg, ImageFormat::Png];
 
+/// The media type of image data, for serving it.
+pub fn media_type(data: &[u8]) -> &'static str {
+    image::guess_format(data).map_or("application/octet-stream", |f| f.to_mime_type())
+}
+
 fn extension(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Png => "png",

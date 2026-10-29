@@ -409,11 +409,12 @@
 		edits: ImportEdits,
 		autofilled: string[] = [],
 		art?: string,
-		suggested = 0
+		suggested = 0,
+		musicbrainzArt?: string
 	): Promise<string | null> {
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
 		try {
-			const r = await api.importAlbum(album.id, edits, art);
+			const r = await api.importAlbum(album.id, edits, art, musicbrainzArt);
 			importing = null;
 			// The album leaves the Inbox; close its sheet first so history stays tidy.
 			if (openId === album.id) await close();
@@ -424,9 +425,11 @@
 				? ` · filled in ${autofilled.map((k) => setup.label(k)).join(', ')}`
 				: '';
 			const placed = r.art ? ` · ${r.art}` : '';
-			const fromMb = suggested
-				? ` · ${suggested} ${suggested === 1 ? 'tag' : 'tags'} from MusicBrainz`
-				: '';
+			const taken = [
+				suggested && `${suggested} ${suggested === 1 ? 'tag' : 'tags'}`,
+				musicbrainzArt && 'the cover'
+			].filter(Boolean);
+			const fromMb = taken.length ? ` · ${taken.join(' and ')} from MusicBrainz` : '';
 			toast(
 				`Imported “${album.title}”: ${r.files} ${r.files === 1 ? 'file' : 'files'} ${how}${filled}${fromMb}${placed}`,
 				'success',
@@ -666,8 +669,8 @@
 		coreKinds={setup.kinds.filter((k) => k.group === 'core').map((k) => k.id)}
 		kindOrder={setup.kinds.map((k) => k.id)}
 		onclose={() => (importing = null)}
-		onimport={(edits, art, suggested) =>
-			runImport(importing!.album, edits, importing!.plan.autofilled, art, suggested)}
+		onimport={(edits, art, suggested, mbArt) =>
+			runImport(importing!.album, edits, importing!.plan.autofilled, art, suggested, mbArt)}
 	/>
 {/if}
 

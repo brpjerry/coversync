@@ -46,11 +46,15 @@ pub struct ArtPlan {
     pub placement: Placement,
     /// Where the album's art comes from, e.g. "folder.jpg"; None if it has none.
     pub source: Option<String>,
+    /// The art's size in pixels.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     /// The cover file the import writes beside the tracks, e.g. "cover.jpg".
     pub file: Option<String>,
     /// The rule's cover file name, without extension.
     pub file_name: String,
-    /// Tracks without embedded art that get the album's.
+    /// Tracks without embedded art that get the album's; every track for a
+    /// chosen image, which replaces what they have.
     pub embed: u32,
     /// The rules require art and the album has none: the import needs an image.
     pub missing: bool,
@@ -256,7 +260,11 @@ pub fn plan(
         &inbox.autofill,
         art_rules.placement.embedded(),
     )?;
-    let without_art = read.iter().filter(|t| !t.has_art).count() as u32;
+    let gets_art = if upload.is_some() {
+        read.len()
+    } else {
+        read.iter().filter(|t| !t.has_art).count()
+    } as u32;
 
     let mut tracks = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
@@ -375,11 +383,13 @@ pub fn plan(
             .filter(|_| art_rules.placement.file())
             .map(|(a, _)| art_rules.file_for(a)),
         embed: if art.is_some() && art_rules.placement.embedded() {
-            without_art
+            gets_art
         } else {
             0
         },
         missing: art_rules.required && art.is_none(),
+        width: art.as_ref().map(|(a, _)| a.width),
+        height: art.as_ref().map(|(a, _)| a.height),
         source: art.map(|(_, from)| from),
     };
     Ok(ImportPlan {
@@ -396,7 +406,8 @@ pub fn plan(
     })
 }
 
-/// Import `album_id` with `edits`, and `upload` as its art if given. Fails
+/// Import `album_id` with `edits`, and `upload` as its art if given (an
+/// uploaded image or MusicBrainz's, in place of the album's own). Fails
 /// without changing anything if the plan isn't ready; a failure part-way
 /// removes the files already written.
 pub fn execute(
@@ -424,6 +435,8 @@ pub fn execute(
         return Err(Error::Invalid(reasons.join(" ")));
     }
     let art_rules = lib.library_setup()?.rules.art;
+    // An image chosen for the import replaces the art the tracks have.
+    let replace = upload.is_some();
     let art = upload.or_else(|| found_art(lib, album_id).map(|(a, _)| a));
     let picture = match &art {
         Some(a) if plan.art.placement.embedded() => Some(a.picture()?),
@@ -461,7 +474,7 @@ pub fn execute(
                     values.push((kind.id, v.trim().to_string()));
                 }
             }
-            let added = tags::copy_with_tags(&src, &dest, &values, picture.as_ref())?;
+            let added = tags::copy_with_tags(&src, &dest, &values, picture.as_ref(), replace)?;
             embedded += usize::from(added);
             written.push(dest);
             sources.push(src);

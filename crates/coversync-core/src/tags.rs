@@ -423,14 +423,16 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
 }
 
 /// Copy `src` to `dest` (which must not exist), setting `values` on the copy
-/// and embedding `art` if the file has no pictures yet. Returns whether art
-/// was embedded. `src` is only read. The copy is written beside `dest` and
-/// renamed into place, so a failure never leaves a half-written file at `dest`.
+/// and embedding `art` if the file has no pictures yet, or with `replace` in
+/// place of its front cover. Returns whether art was embedded. `src` is only
+/// read. The copy is written beside `dest` and renamed into place, so a
+/// failure never leaves a half-written file at `dest`.
 pub fn copy_with_tags(
     src: &Path,
     dest: &Path,
     values: &[(&str, String)],
     art: Option<&Picture>,
+    replace: bool,
 ) -> Result<bool> {
     if dest.exists() {
         return Err(Error::Invalid(format!("{} already exists", dest.display())));
@@ -444,8 +446,19 @@ pub fn copy_with_tags(
         let mut embedded = false;
         if !values.is_empty() || art.is_some() {
             let mut file = probe(&tmp, true)?;
-            let art = art.filter(|_| !has_pictures(&file));
+            let art = art.filter(|_| replace || !has_pictures(&file));
             if !values.is_empty() || art.is_some() {
+                if art.is_some() && replace {
+                    // Untyped pictures go too: players show them as the cover.
+                    // Back covers, booklets and the like stay.
+                    let types: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
+                    for t in types {
+                        if let Some(tag) = file.tag_mut(t) {
+                            tag.remove_picture_type(PictureType::CoverFront);
+                            tag.remove_picture_type(PictureType::Other);
+                        }
+                    }
+                }
                 let tag = primary_tag_mut(&mut file);
                 apply_kinds(tag, values)?;
                 if let Some(picture) = art {
@@ -550,7 +563,7 @@ mod tests {
             .unwrap();
 
         let values = [("track_number", "1".to_string())];
-        assert!(copy_with_tags(&src, &dest, &values, Some(&art)).unwrap());
+        assert!(copy_with_tags(&src, &dest, &values, Some(&art), false).unwrap());
         let t = read(&dest).unwrap();
         assert_eq!(t.title.as_deref(), Some("Song"));
         assert_eq!(t.album.as_deref(), Some("Record"));
@@ -558,6 +571,63 @@ mod tests {
         assert!(embedded_cover(&dest).unwrap().is_some());
         // The source is only read.
         assert!(embedded_cover(&src).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaced_art_takes_the_front_covers_place() {
+        let dir = std::env::temp_dir().join(format!("coversync-art-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        for name in ["old.wav", "kept.wav", "new.wav"] {
+            let _ = fs::remove_file(path(name));
+        }
+        wav_with_info(&path("in.wav"));
+        let cover = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            crate::art::Art::new(png.into_inner())
+                .unwrap()
+                .picture()
+                .unwrap()
+        };
+        let (old, new) = (cover(4), cover(8));
+        assert!(copy_with_tags(&path("in.wav"), &path("old.wav"), &[], Some(&old), false).unwrap());
+        // A back cover beside the front one.
+        let mut file = probe(&path("old.wav"), true).unwrap();
+        let back = Picture::unchecked(old.data().to_vec())
+            .pic_type(PictureType::CoverBack)
+            .mime_type(lofty::picture::MimeType::Png)
+            .build();
+        primary_tag_mut(&mut file).push_picture(back);
+        file.save_to_path(path("old.wav"), WriteOptions::default())
+            .unwrap();
+
+        // Without `replace`, a file with art keeps it.
+        let kept = copy_with_tags(&path("old.wav"), &path("kept.wav"), &[], Some(&new), false);
+        assert!(!kept.unwrap());
+        assert_eq!(
+            embedded_cover(&path("kept.wav")).unwrap().unwrap(),
+            old.data()
+        );
+
+        assert!(copy_with_tags(&path("old.wav"), &path("new.wav"), &[], Some(&new), true).unwrap());
+        assert_eq!(
+            embedded_cover(&path("new.wav")).unwrap().unwrap(),
+            new.data()
+        );
+        let file = probe(&path("new.wav"), true).unwrap();
+        let types: Vec<PictureType> = file
+            .tags()
+            .iter()
+            .flat_map(|t| t.pictures())
+            .map(|p| p.pic_type())
+            .collect();
+        let fronts = types.iter().filter(|t| **t == PictureType::CoverFront);
+        assert_eq!(fronts.count(), 1);
+        assert!(types.contains(&PictureType::CoverBack));
         let _ = fs::remove_dir_all(&dir);
     }
 

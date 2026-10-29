@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use coversync_core::appearance::{self, AppearanceSetup};
 use coversync_core::art::{self, Art};
-use coversync_core::db::FileStat;
+use coversync_core::db::{CoverSource, FileStat};
 use coversync_core::import::{self, ImportPlan, ImportResult};
 use coversync_core::scan::Progress;
 use coversync_core::scan::{self, album_dir, album_id};
@@ -33,6 +33,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/albums", get(albums))
         .route("/api/albums/{id}", get(album))
         .route("/api/albums/{id}/cover", get(cover))
+        .route("/api/albums/{id}/cover/full", get(full_cover))
         .route("/api/albums/{id}/tags", put(write_tags))
         .route("/api/tracks/{id}/stream", get(stream))
         .route(
@@ -53,6 +54,11 @@ pub fn router() -> Router<Shared> {
         .route("/api/appearance", get(appearance).put(save_appearance))
         .route("/api/identify", post(crate::suggest::start))
         .route("/api/identify/{album_id}", get(crate::suggest::status))
+        .route("/api/musicbrainz/art/{release}", get(crate::suggest::art))
+        .route(
+            "/api/musicbrainz/art/{release}/image",
+            get(crate::suggest::art_image),
+        )
 }
 
 pub struct ApiError(StatusCode, String);
@@ -85,7 +91,7 @@ impl From<tokio::task::JoinError> for ApiError {
 pub type ApiResult<T> = Result<T, ApiError>;
 
 /// Run blocking library work off the async runtime.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     state: &Shared,
     f: impl FnOnce(&crate::AppState) -> coversync_core::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
@@ -567,6 +573,9 @@ struct ImportRequest {
     /// Album art chosen in the import editor, base64-encoded.
     #[serde(default)]
     art: Option<String>,
+    /// Or MusicBrainz's cover for this release, as suggested.
+    #[serde(default)]
+    musicbrainz_art: Option<String>,
 }
 
 async fn import_plan(
@@ -600,6 +609,10 @@ async fn import_album(
                 Art::new(bytes)
             })
             .transpose()?;
+        let art = match (art, &req.musicbrainz_art) {
+            (None, Some(release)) => Some(crate::suggest::chosen_art(s, release)?),
+            (art, _) => art,
+        };
         let imported =
             import::execute(&s.lib, &s.covers, &req.album_id, &req.edits, art, &progress)?;
         s.identify.forget(&req.album_id);
@@ -615,7 +628,7 @@ struct CoverQuery {
     size: Option<u32>,
 }
 
-async fn serve_file(path: PathBuf, req: Request, cache: &'static str) -> Response {
+pub(crate) async fn serve_file(path: PathBuf, req: Request, cache: &'static str) -> Response {
     match ServeFile::new(path).oneshot(req).await {
         Ok(mut res) => {
             res.headers_mut()
@@ -635,6 +648,36 @@ async fn cover(
     let size = q.size.unwrap_or(512);
     let path = blocking(&state, move |s| s.covers.thumbnail(&s.lib, &id, size)).await?;
     Ok(serve_file(path, req, "public, max-age=86400").await)
+}
+
+/// The album's art at full size: the image file beside the tracks, or the
+/// one embedded in them.
+async fn full_cover(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    req: Request,
+) -> ApiResult<Response> {
+    let source = blocking(&state, move |s| {
+        s.lib
+            .cover_source(&id)?
+            .ok_or(coversync_core::Error::NotFound)
+    })
+    .await?;
+    let cache = "private, max-age=300";
+    match source {
+        CoverSource::File(path) => Ok(serve_file(path, req, cache).await),
+        CoverSource::Embedded(path) => {
+            let data = blocking(&state, move |_| {
+                tags::embedded_cover(&path)?.ok_or(coversync_core::Error::NotFound)
+            })
+            .await?;
+            let headers = [
+                (header::CONTENT_TYPE, art::media_type(&data)),
+                (header::CACHE_CONTROL, cache),
+            ];
+            Ok((headers, data).into_response())
+        }
+    }
 }
 
 async fn stream(

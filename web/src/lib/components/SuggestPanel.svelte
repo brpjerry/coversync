@@ -27,6 +27,21 @@
 		/** Every track it covers has `original` now: it only romanizes the tag. */
 		romanizes: boolean;
 	}
+
+	/** The album's own art, to set MusicBrainz's beside. */
+	export interface OriginalArt {
+		thumb: string;
+		full: string;
+		width: number | null;
+		height: number | null;
+		/** e.g. "cover.jpg". */
+		source: string;
+	}
+
+	/** MusicBrainz's cover, ticked for the import. */
+	export interface ChosenArt extends MbArt {
+		release: string;
+	}
 </script>
 
 <script lang="ts">
@@ -44,15 +59,19 @@
 	import Languages from '@lucide/svelte/icons/languages';
 	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import {
 		api,
 		ApiError,
+		musicbrainzArtUrl,
 		type IdentifyState,
 		type Identification,
 		type ImportEdits,
-		type ImportTrack
+		type ImportTrack,
+		type MbArt
 	} from '#lib/api.ts';
 	import ShowAll from './ShowAll.svelte';
+	import ArtViewer, { type ViewedArt } from './ArtViewer.svelte';
 
 	interface Props {
 		albumId: string;
@@ -71,6 +90,12 @@
 		setField: (id: number | null, kind: string, value: string) => void;
 		/** Accepted suggestions for tags without fields, and how many values are accepted in all. */
 		onaccept: (edits: ImportEdits, count: number) => void;
+		/** The album's own art; null if it has none. */
+		original: OriginalArt | null;
+		/** The release whose MusicBrainz cover the import uses, if any. */
+		artChosen: string | null;
+		/** `auto`: ticked by default rather than by hand. */
+		onart: (art: ChosenArt | null, auto: boolean) => void;
 	}
 	let {
 		albumId,
@@ -83,7 +108,10 @@
 		fields,
 		getField,
 		setField,
-		onaccept
+		onaccept,
+		original,
+		artChosen,
+		onart
 	}: Props = $props();
 
 	let lookup = $state<IdentifyState | null>(null);
@@ -125,9 +153,62 @@
 		if (s.state === 'done') {
 			rows = buildRows(s.result);
 			applyDefaults(s.result);
+			loadCover(s.result, mine);
 		}
 	}
 	identify();
+
+	/** MusicBrainz's cover for the release shown: `art` undefined while it downloads, null if none. */
+	let cover = $state<{ release: string; art?: MbArt | null; error?: string } | null>(null);
+	let artOn = $derived(!!cover?.art && artChosen === cover.release);
+
+	async function loadCover(r: Identification, mine: number) {
+		const release = r.release;
+		cover = null;
+		if (!release || (!release.front_art && !release.release_group)) return;
+		cover = { release: release.id };
+		try {
+			const art = await api.musicbrainzArt(release.id, release.release_group, release.front_art);
+			if (mine !== seq) return;
+			cover = { release: release.id, art };
+			// Like an empty tag: filled in when the release is surely the album.
+			if (art && !original && complete) toggleArt(true, true);
+		} catch (e) {
+			if (mine !== seq) return;
+			cover = {
+				release: release.id,
+				error: e instanceof ApiError ? e.message : "coversyncd couldn't be reached."
+			};
+		}
+	}
+
+	function toggleArt(on: boolean, auto = false) {
+		onart(on && cover?.art ? { release: cover.release, ...cover.art } : null, auto);
+	}
+
+	/** The image the viewer shows first, while it's open. */
+	let viewing = $state<number | null>(null);
+	let artImages = $derived.by(() => {
+		const out: ViewedArt[] = [];
+		if (original) {
+			const { full: url, width, height, source: note } = original;
+			out.push({ label: 'Original', url, width, height, note });
+		}
+		if (cover?.art) {
+			out.push({
+				label: 'MusicBrainz',
+				url: musicbrainzArtUrl(cover.release),
+				width: cover.art.width,
+				height: cover.art.height,
+				note: cover.art.from === 'release' ? "the release's cover" : "the release group's cover"
+			});
+		}
+		return out;
+	});
+	const pixels = (w: number | null, h: number | null) => (w && h ? `${w} × ${h}` : 'size unknown');
+	/** The album art row: downloading, failed, or with an image (not when there's none). */
+	let artRow = $derived(!!cover && cover.art !== null);
+	let offered = $derived(rows.length + (cover?.art ? 1 : 0));
 
 	const num = (v: string) => /^\d+/.exec(v.trim())?.[0];
 	/** Whether a value typed before the dialog already says what MusicBrainz does. */
@@ -325,11 +406,13 @@
 		}
 	}
 
-	function setAll(pick: (row: Row) => boolean) {
+	/** Tick or untick every row, the album art's included. */
+	function setAll(pick: (row: { fill: boolean }) => boolean) {
 		for (const row of rows) {
 			const want = pick(row);
 			if (want !== isOn(row)) toggle(row, want);
 		}
+		if (cover?.art && pick({ fill: !original }) !== artOn) toggleArt(!artOn);
 	}
 
 	/** Look again, after taking back what this lookup's suggestions filled in. */
@@ -338,6 +421,7 @@
 		restore.clear();
 		opened.clear();
 		rows = [];
+		cover = null;
 		identify();
 	}
 	function switchRelease(id: string) {
@@ -477,6 +561,48 @@
 		/>
 	</span>
 	{@render reset(row, ids, name)}
+{/snippet}
+
+<!-- The album's own art beside MusicBrainz's; either opens full size. -->
+{#snippet artSuggestion()}
+	{@const c = cover!}
+	<label class="sugg" class:on={artOn} class:change={!!original}>
+		<input
+			type="checkbox"
+			checked={artOn}
+			disabled={!c.art}
+			onchange={(e) => toggleArt(e.currentTarget.checked)}
+		/>
+		<span class="kind">Album art</span>
+		<span class="diff">
+			{#if original}
+				<button class="thumb" onclick={() => (viewing = 0)} title="Show the album's art full size">
+					<img src={original.thumb} alt="The album's art" />
+				</button>
+				<span class="was tabular">{pixels(original.width, original.height)}</span>
+			{:else}
+				<span class="was empty">none</span>
+			{/if}
+			<ArrowRight size={13} />
+			{#if c.art}
+				<button
+					class="thumb"
+					onclick={() => (viewing = original ? 1 : 0)}
+					title="Show MusicBrainz's cover full size"
+				>
+					<img src={musicbrainzArtUrl(c.release)} alt="MusicBrainz's cover" />
+				</button>
+				<span class="now tabular">{pixels(c.art.width, c.art.height)}</span>
+			{:else if c.error}
+				<span class="art-error">{c.error}</span>
+			{:else}
+				<span class="fetching"
+					><span class="spin"><LoaderCircle size={13} /></span> Fetching from the Cover Art Archive…</span
+				>
+			{/if}
+		</span>
+		{#if c.art?.from === 'release_group'}<span class="scope">the release group's</span>{/if}
+	</label>
 {/snippet}
 
 {#snippet suggestion(row: Row, note?: string)}
@@ -671,20 +797,21 @@
 			</p>
 		{/if}
 
-		{#if rows.length}
+		{#if rows.length || artRow}
 			<div class="toolbar" in:fly={{ y: 6, duration: 240, easing: cubicOut }}>
 				<span class="tabular"
-					><b>{on.length}</b> of {rows.length}
-					{rows.length === 1 ? 'suggestion' : 'suggestions'} ticked</span
+					><b>{on.length + (artOn ? 1 : 0)}</b> of {offered}
+					{offered === 1 ? 'suggestion' : 'suggestions'} ticked</span
 				>
 				<button class="link" onclick={() => setAll(() => true)}>Tick all</button>
 				<button class="link" onclick={() => setAll((r) => r.fill)}>Only empty tags</button>
 				<button class="link" onclick={() => setAll(() => false)}>None</button>
 			</div>
 
-			{#if albumRows.length}
+			{#if albumRows.length || artRow}
 				<div class="group">
 					<h4>Album-wide</h4>
+					{#if artRow}{@render artSuggestion()}{/if}
 					{#each albumRows as row (row.key)}
 						{@render suggestion(row, scopeText(row))}
 					{/each}
@@ -723,11 +850,15 @@
 					</div>
 				</ShowAll>
 			{/if}
-		{:else if result.release}
+		{/if}
+		{#if !rows.length && result.release}
 			<p class="agree" in:fade={{ duration: 200 }}>
 				<CircleCheck size={15} /> Every tag already matches MusicBrainz.
 			</p>
 		{/if}
+	{/if}
+	{#if viewing !== null && artImages.length}
+		<ArtViewer images={artImages} start={viewing} onclose={() => (viewing = null)} />
 	{/if}
 </section>
 
@@ -1185,6 +1316,48 @@
 	.others[aria-expanded='true'] {
 		color: var(--text);
 		background: color-mix(in oklab, var(--accent) 18%, transparent);
+	}
+	.thumb {
+		flex: none;
+		display: grid;
+		width: 48px;
+		height: 48px;
+		border-radius: 7px;
+		overflow: hidden;
+		background: var(--surface);
+		box-shadow: 0 0 0 1px var(--border);
+		cursor: zoom-in;
+		transition:
+			box-shadow 140ms,
+			transform 140ms var(--ease-out);
+	}
+	.thumb:hover {
+		box-shadow: 0 0 0 1px var(--border-strong);
+		transform: scale(1.04);
+	}
+	.thumb img {
+		width: 100%;
+		height: 100%;
+		object-fit: cover;
+	}
+	.fetching {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 12.5px;
+	}
+	.art-error {
+		font-size: 12.5px;
+		color: var(--danger);
+	}
+	.spin {
+		display: inline-grid;
+		animation: spin 900ms linear infinite;
+	}
+	@keyframes spin {
+		to {
+			rotate: 360deg;
+		}
 	}
 	.chev {
 		display: grid;
