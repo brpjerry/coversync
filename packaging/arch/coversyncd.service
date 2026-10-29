@@ -1,0 +1,20 @@
+[Unit]
+Description=coversync music library daemon
+Documentation=https://github.com/brpjerry/coversync
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/coversyncd --listen 127.0.0.1:8770
+Restart=on-failure
+StateDirectory=coversync
+CacheDirectory=coversync
+# Optional, with `systemctl --user edit coversyncd`: a folder coversync must
+# never change, such as an Inbox that another program syncs. Imports from it
+# can then only copy.
+#ReadOnlyPaths=/path/to/inbox
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

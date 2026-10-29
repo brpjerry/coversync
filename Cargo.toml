@@ -4,7 +4,7 @@ members = ["crates/coversync-core", "crates/coversyncd"]
 
 [workspace.package]
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Release runs it before publishing, and takes the package it builds.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the UI's dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Lint and type-check the UI
+        working-directory: web
+        run: |
+          pnpm lint
+          pnpm check
+      # The daemon embeds web/build, so the UI is built before the crates.
+      - name: Build the UI
+        working-directory: web
+        run: pnpm build
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  package:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install git
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v7
+      # makepkg refuses to run as root.
+      - name: Build the package
+        run: |
+          useradd --create-home builder
+          echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
+          chown -R builder .
+          runuser -u builder -- packaging/arch/build.sh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error

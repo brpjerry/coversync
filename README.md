@@ -40,7 +40,24 @@ crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, Mu
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 web/                    SvelteKit / Svelte 5 single-page app
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
+packaging/arch/         PKGBUILD and systemd user unit for the pacman package
+packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
+
+## Install on Arch Linux
+
+Each [release](https://github.com/brpjerry/coversync/releases) has a pacman
+package. Install it and start the daemon as a user service:
+
+```sh
+sudo pacman -U coversync-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -S --asdeps chromaprint                # optional: fpcalc for Smart suggestions
+systemctl --user enable --now coversyncd
+```
+
+The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder in
+Inbox setup. To build the package from a checkout instead, run
+`packaging/arch/build.sh` (it packages the current commit into `dist/`).
 
 ## Build and run
 
@@ -75,6 +92,8 @@ prefix: `(cd web && BASE_PATH=/coversync pnpm build)`.
 
 ### As a systemd user service
 
+The Arch package installs this unit, with `/usr/bin/coversyncd`.
+
 ```ini
 [Unit]
 Description=coversync music library daemon
@@ -108,3 +127,31 @@ tools/ui_smoke.py http://127.0.0.1:8770/ shots/     # read-only tour of the UI
 The smoke test's other modes (`--save`, `--import`, `--suggest`, …, listed at
 the top of the script) change settings or import albums: run them only against
 a daemon with a scratch `--state-dir` and Library folder.
+
+For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
+`pnpm lint`, `pnpm check`, rustfmt, Clippy with warnings as errors and the
+tests, and builds the pacman package.
+
+### Release
+
+1. Set the new version in `crates/coversyncd/Cargo.toml` and as `pkgver` in
+   `packaging/arch/PKGBUILD` (with `pkgrel=1`), and merge that to `main`.
+2. Tag that commit on `main` and push the tag:
+   `git tag v0.2.0 && git push origin v0.2.0`.
+
+The Release workflow checks that the tag matches the version, runs CI, and
+publishes a GitHub release with the package and its SHA-256 checksum.
+
+## License
+
+Copyright (C) 2026 Jerry Shen
+
+coversync is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+coversync is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License in
+[LICENSE](LICENSE) for more details.
