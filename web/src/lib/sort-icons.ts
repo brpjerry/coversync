@@ -1,4 +1,4 @@
-// Icons for sidebar sort tabs; anything without its own falls back to a generic one.
+// Icons for sorts and filter tags; anything without its own falls back to a generic one.
 
 import type { Component } from 'svelte';
 import ArrowUpDown from '@lucide/svelte/icons/arrow-up-down';

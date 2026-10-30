@@ -361,7 +361,7 @@ export type IdentifyState =
 	| { state: 'failed'; error: string };
 
 export interface AppearanceSetup {
-	/** Top bar sort tabs, in order: tag kind ids or 'added'. */
+	/** The top bar's sort menu, in order: tag kind ids or 'added'. */
 	sort_tabs: string[];
 	/** Tag kinds the sidebar filters by, in its dropdown's order. */
 	filter_tags: string[];

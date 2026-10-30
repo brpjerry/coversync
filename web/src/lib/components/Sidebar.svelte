@@ -5,9 +5,11 @@
 	import X from '@lucide/svelte/icons/x';
 	import Check from '@lucide/svelte/icons/check';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
+	import FolderCog from '@lucide/svelte/icons/folder-cog';
+	import Settings2 from '@lucide/svelte/icons/settings-2';
 	import Palette from '@lucide/svelte/icons/palette';
 	import type { Album } from '#lib/api.ts';
-	import { readPref, writePref } from '#lib/browse.ts';
+	import { isSetup, readPref, writePref, type View } from '#lib/browse.ts';
 	import {
 		isPicked,
 		matcher,
@@ -19,6 +21,7 @@
 		type TagValue
 	} from '#lib/filters.ts';
 	import { count, fold } from '#lib/format.ts';
+	import { player } from '#lib/player.svelte.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
 
 	interface Props {
@@ -29,11 +32,30 @@
 		albums: Album[];
 		/** Picked values by tag. */
 		filters: Filters;
-		/** Closed, or on a setup screen where filters don't apply. */
 		collapsed: boolean;
-		onappearance: () => void;
+		view: View;
+		/** Setup screens with unsaved changes. */
+		dirty: Partial<Record<View, boolean>>;
+		onview: (view: View) => void;
 	}
-	let { kinds, label, albums, filters = $bindable(), collapsed, onappearance }: Props = $props();
+	let {
+		kinds,
+		label,
+		albums,
+		filters = $bindable(),
+		collapsed,
+		view,
+		dirty,
+		onview
+	}: Props = $props();
+
+	const setups = [
+		{ id: 'inbox-setup', label: 'Inbox', icon: FolderCog },
+		{ id: 'library-setup', label: 'Library', icon: Settings2 },
+		{ id: 'appearance', label: 'Appearance', icon: Palette }
+	] as const;
+	/** Filters only apply to album grids, not the setup screens. */
+	let idle = $derived(isSetup(view));
 
 	const KIND_KEY = 'coversync.filter';
 	/** Values listed at first, and added by each "Show more": long lists are slow to draw. */
@@ -77,112 +99,138 @@
 	const pick = (k: string, value: string) => (filters = toggled(filters, k, value));
 </script>
 
-<aside id="sidebar" class="sidebar" class:collapsed aria-label="Filter albums" inert={collapsed}>
-	<div class="inner">
-		<div class="head">
-			<h2 class="section">Filter</h2>
+<aside
+	id="sidebar"
+	class="sidebar"
+	class:collapsed
+	aria-label="Filters and setup"
+	inert={collapsed}
+>
+	<div class="inner" class:playing={!!player.current}>
+		<div class="filter" class:idle inert={idle}>
+			<div class="head">
+				<h2 class="section">Filter</h2>
+				{#if active.length}
+					<button
+						class="clear-all"
+						onclick={() => (filters = {})}
+						transition:fade={{ duration: 150 }}
+					>
+						Clear all
+					</button>
+				{/if}
+			</div>
+
 			{#if active.length}
-				<button
-					class="clear-all"
-					onclick={() => (filters = {})}
-					transition:fade={{ duration: 150 }}
+				<ul
+					class="picked"
+					aria-label="Filtering by"
+					transition:slide={{ duration: 220, easing: cubicOut }}
 				>
-					Clear all
-				</button>
+					{#each active as p (`${p.kind}\n${p.value}`)}
+						<li transition:fade={{ duration: 150 }}>
+							<button
+								class="chip"
+								title="{label(p.kind)}: {p.value}"
+								aria-label="Remove {label(p.kind)}: {p.value}"
+								onclick={() => pick(p.kind, p.value)}
+							>
+								<span class="chip-text">{p.value}</span>
+								<X size={12} strokeWidth={2.4} />
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+
+			{#if !kind}
+				<div class="none">
+					<p>No tags to filter by.</p>
+					<button class="btn" onclick={() => onview('appearance')}
+						><Palette size={14} /> Choose in Appearance</button
+					>
+				</div>
+			{:else}
+				{@const Icon = sortIcon(kind)}
+				<label class="field kind">
+					<span class="sr-only">Tag to filter by</span>
+					<span class="lead" aria-hidden="true"><Icon size={16} strokeWidth={1.8} /></span>
+					<select value={kind} onchange={(e) => choose(e.currentTarget.value)}>
+						{#each kinds as k (k)}
+							{@const n = filters[k]?.length ?? 0}
+							<option value={k}>{label(k)}{n ? ` (${n})` : ''}</option>
+						{/each}
+					</select>
+					<span class="chev" aria-hidden="true"><ChevronDown size={16} /></span>
+				</label>
+
+				<label class="field find">
+					<span class="lead" aria-hidden="true"><Search size={15} /></span>
+					<span class="sr-only">Search {label(kind)} values</span>
+					<input
+						type="search"
+						bind:value={find}
+						oninput={() => (limit = PAGE)}
+						placeholder="Search {label(kind).toLowerCase()}"
+						spellcheck="false"
+						autocomplete="off"
+					/>
+					{#if find}
+						<button
+							class="clear"
+							onclick={() => (find = '')}
+							aria-label="Clear search"
+							transition:fade={{ duration: 120 }}
+						>
+							<X size={13} />
+						</button>
+					{/if}
+				</label>
+
+				<div class="values" role="group" aria-label="{label(kind)} values">
+					{#each shown as t (t.value)}
+						{@const on = isPicked(filters, kind, t.value)}
+						<button class="value" class:on aria-pressed={on} onclick={() => pick(kind, t.value)}>
+							<span class="box" aria-hidden="true">
+								{#if on}<span class="tick" in:fade={{ duration: 120 }}
+										><Check size={12} strokeWidth={3} /></span
+									>{/if}
+							</span>
+							<span class="name" title={t.value}>{t.value}</span>
+							<span class="n tabular">{count(t.count)}</span>
+						</button>
+					{/each}
+					{#if found.length > shown.length}
+						<button class="more" onclick={() => (limit += PAGE)}>
+							Show {count(Math.min(PAGE, found.length - shown.length))} more
+						</button>
+					{/if}
+					{#if !values.length}
+						<p class="empty">No {label(kind).toLowerCase()} on these albums.</p>
+					{:else if !found.length}
+						<p class="empty">No {label(kind).toLowerCase()} matches “{find}”.</p>
+					{/if}
+				</div>
 			{/if}
 		</div>
 
-		{#if active.length}
-			<ul
-				class="picked"
-				aria-label="Filtering by"
-				transition:slide={{ duration: 220, easing: cubicOut }}
-			>
-				{#each active as p (`${p.kind}\n${p.value}`)}
-					<li transition:fade={{ duration: 150 }}>
-						<button
-							class="chip"
-							title="{label(p.kind)}: {p.value}"
-							aria-label="Remove {label(p.kind)}: {p.value}"
-							onclick={() => pick(p.kind, p.value)}
-						>
-							<span class="chip-text">{p.value}</span>
-							<X size={12} strokeWidth={2.4} />
-						</button>
-					</li>
-				{/each}
-			</ul>
-		{/if}
-
-		{#if !kind}
-			<div class="none">
-				<p>No tags to filter by.</p>
-				<button class="btn" onclick={onappearance}
-					><Palette size={14} /> Choose in Appearance</button
+		<nav class="setup" aria-label="Setup">
+			<h2 class="section">Setup</h2>
+			{#each setups as item (item.id)}
+				<button
+					class="nav-item"
+					class:on={view === item.id}
+					aria-current={view === item.id ? 'page' : undefined}
+					onclick={() => onview(item.id)}
 				>
-			</div>
-		{:else}
-			{@const Icon = sortIcon(kind)}
-			<label class="field kind">
-				<span class="sr-only">Tag to filter by</span>
-				<span class="lead" aria-hidden="true"><Icon size={16} strokeWidth={1.8} /></span>
-				<select value={kind} onchange={(e) => choose(e.currentTarget.value)}>
-					{#each kinds as k (k)}
-						{@const n = filters[k]?.length ?? 0}
-						<option value={k}>{label(k)}{n ? ` (${n})` : ''}</option>
-					{/each}
-				</select>
-				<span class="chev" aria-hidden="true"><ChevronDown size={16} /></span>
-			</label>
-
-			<label class="field find">
-				<span class="lead" aria-hidden="true"><Search size={15} /></span>
-				<span class="sr-only">Search {label(kind)} values</span>
-				<input
-					type="search"
-					bind:value={find}
-					oninput={() => (limit = PAGE)}
-					placeholder="Search {label(kind).toLowerCase()}"
-					spellcheck="false"
-					autocomplete="off"
-				/>
-				{#if find}
-					<button
-						class="clear"
-						onclick={() => (find = '')}
-						aria-label="Clear search"
-						transition:fade={{ duration: 120 }}
-					>
-						<X size={13} />
-					</button>
-				{/if}
-			</label>
-
-			<div class="values" role="group" aria-label="{label(kind)} values">
-				{#each shown as t (t.value)}
-					{@const on = isPicked(filters, kind, t.value)}
-					<button class="value" class:on aria-pressed={on} onclick={() => pick(kind, t.value)}>
-						<span class="box" aria-hidden="true">
-							{#if on}<span class="tick" in:fade={{ duration: 120 }}
-									><Check size={12} strokeWidth={3} /></span
-								>{/if}
-						</span>
-						<span class="name" title={t.value}>{t.value}</span>
-						<span class="n tabular">{count(t.count)}</span>
-					</button>
-				{/each}
-				{#if found.length > shown.length}
-					<button class="more" onclick={() => (limit += PAGE)}>
-						Show {count(Math.min(PAGE, found.length - shown.length))} more
-					</button>
-				{/if}
-				{#if !values.length}
-					<p class="empty">No {label(kind).toLowerCase()} on these albums.</p>
-				{:else if !found.length}
-					<p class="empty">No {label(kind).toLowerCase()} matches “{find}”.</p>
-				{/if}
-			</div>
-		{/if}
+					<span class="icon">
+						<item.icon size={17} strokeWidth={1.8} />
+						{#if dirty[item.id]}<i class="dot" aria-label="Unsaved changes"></i>{/if}
+					</span>
+					{item.label}
+				</button>
+			{/each}
+		</nav>
 	</div>
 </aside>
 
@@ -205,7 +253,6 @@
 	.inner {
 		display: flex;
 		flex-direction: column;
-		gap: 10px;
 		width: var(--sidebar-w);
 		height: 100%;
 		padding: 18px 12px 0;
@@ -213,6 +260,18 @@
 	}
 	.collapsed .inner {
 		opacity: 0;
+	}
+	/* The tag filter takes the room the setup links leave, its value list scrolling. */
+	.filter {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		transition: opacity 240ms;
+	}
+	.filter.idle {
+		opacity: 0.4;
 	}
 
 	.head {
@@ -375,7 +434,7 @@
 		flex-direction: column;
 		gap: 1px;
 		margin: 0 -12px;
-		padding: 2px 12px calc(var(--player-h) + 24px);
+		padding: 2px 12px 12px;
 		overflow: hidden auto;
 		scrollbar-width: thin;
 	}
@@ -467,6 +526,70 @@
 		margin-left: 8px;
 		padding: 0 12px;
 		font-size: 13px;
+	}
+
+	.setup {
+		flex: none;
+		display: grid;
+		gap: 2px;
+		margin: 0 -12px;
+		padding: 14px 12px 16px;
+		border-top: 1px solid var(--border);
+		transition: padding-bottom 380ms var(--ease-out);
+	}
+	/* Clear of the player, which floats over the bottom of the window. */
+	.playing .setup {
+		padding-bottom: calc(var(--player-h) + 24px);
+	}
+	.setup .section {
+		margin-bottom: 6px;
+		padding-left: 12px;
+	}
+	.nav-item {
+		display: grid;
+		grid-template-columns: 16px minmax(0, 1fr);
+		align-items: center;
+		gap: 10px;
+		height: 36px;
+		padding: 0 12px;
+		border-radius: 10px;
+		text-align: left;
+		font-size: 13.5px;
+		font-weight: 520;
+		color: var(--text-2);
+		transition:
+			color 160ms,
+			background 140ms;
+	}
+	.nav-item:hover:not(.on) {
+		background: var(--surface);
+		color: var(--text);
+	}
+	.nav-item.on {
+		color: var(--text);
+		background: color-mix(in oklab, var(--accent) 14%, var(--surface));
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 28%, transparent);
+	}
+	.icon {
+		position: relative;
+		display: grid;
+		place-items: center;
+		transition: transform 300ms var(--ease-spring);
+	}
+	.nav-item.on .icon {
+		color: var(--accent);
+		transform: scale(1.08);
+	}
+	/* Unsaved changes on that screen. */
+	.dot {
+		position: absolute;
+		top: -2px;
+		right: -3px;
+		width: 7px;
+		height: 7px;
+		border-radius: 999px;
+		background: var(--accent);
+		box-shadow: 0 0 0 2px var(--bg);
 	}
 
 	/* Narrow screens: an off-canvas drawer. */
