@@ -43,7 +43,7 @@
 	import { player } from '#lib/player.svelte.ts';
 	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
-	import SortTabs from '#lib/components/SortTabs.svelte';
+	import SortMenu from '#lib/components/SortMenu.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import LibrarySetup from '#lib/components/LibrarySetup.svelte';
 	import InboxSetup from '#lib/components/InboxSetup.svelte';
@@ -79,14 +79,14 @@
 	let view = $derived(parseView(page.url.searchParams.get('view')));
 
 	// On narrow screens the sidebar is a drawer that starts closed; whether
-	// it's open on wider ones is remembered. Setup screens have no use for it.
+	// it's open on wider ones is remembered.
 	let narrow = $state(matchMedia(NARROW).matches);
 	let sidebarClosed = $state(
 		readPref(SIDEBAR_KEY, (v): v is string => v === 'collapsed' || v === 'expanded', 'expanded') ===
 			'collapsed'
 	);
 	let drawerOpen = $state(false);
-	let collapsed = $derived(isSetup(view) || (narrow ? !drawerOpen : sidebarClosed));
+	let collapsed = $derived(narrow ? !drawerOpen : sidebarClosed);
 
 	function toggleSidebar() {
 		if (narrow) drawerOpen = !drawerOpen;
@@ -98,22 +98,22 @@
 
 	$effect(() => writePref(SORT_KEY, sort));
 
-	/**
-	 * The album grid the setup screens' back button returns to: the last one
-	 * shown, or for a setup screen opened directly, its own collection.
-	 */
-	let browsing = $state<'inbox' | 'library'>(
+	/** The album grid last shown, or for a setup screen opened directly, its own collection. */
+	let lastGrid = $state<'inbox' | 'library'>(
 		collection(parseView(page.url.searchParams.get('view'))) ?? 'inbox'
 	);
 	$effect(() => {
-		if (view === 'inbox' || view === 'library') browsing = view;
+		if (view === 'inbox' || view === 'library') lastGrid = view;
 	});
+	/**
+	 * The album grid shown, or the one behind a setup screen: where its back
+	 * button returns to, and what the sidebar's filters list.
+	 */
+	let browsing = $derived(view === 'inbox' || view === 'library' ? view : lastGrid);
 	let setupBack = $derived({
 		label: browsing === 'library' ? 'Back to Library' : 'Back to Inbox',
 		run: () => setView(browsing)
 	});
-	/** On the Appearance screen the top bar previews the tabs being edited. */
-	let sortTabs = $derived(view === 'appearance' ? appearance.sorts.items : appearance.sorts.saved);
 	/** Views slide in from the side of the tab they come after. */
 	let direction = $state(1);
 	async function setView(next: View) {
@@ -128,7 +128,7 @@
 		await goto(url, { replace: true, reset: false });
 		scrollTo({ top: 0 });
 	}
-	let source = $derived(view === 'library' ? library : albums);
+	let source = $derived(browsing === 'library' ? library : albums);
 
 	const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
 	const cmp = (a: string, b: string) => collator.compare(a, b);
@@ -205,7 +205,8 @@
 		const list = attentionView
 			? sorted(source, 'album_artist').filter((a) => a.attention)
 			: sorted(source, activeSort);
-		const terms = fold(query).split(/\s+/).filter(Boolean);
+		// Setup screens use the search field for their own lists.
+		const terms = isSetup(view) ? [] : fold(query).split(/\s+/).filter(Boolean);
 		return terms.length
 			? list.filter((a) => terms.every((t) => haystack.get(a.id)!.includes(t)))
 			: list;
@@ -530,24 +531,18 @@
 	total={source.length}
 	sidebarOpen={!collapsed}
 	{filtered}
-	dirty={{
-		'inbox-setup': inboxSetup.changes > 0,
-		'library-setup': setup.changes > 0,
-		appearance: appearance.changes > 0
-	}}
 	onview={setView}
 	ontogglesidebar={toggleSidebar}
 	onrescan={rescan}
 >
 	{#snippet sorts()}
-		<SortTabs
-			tabs={sortTabs}
+		<SortMenu
+			sorts={appearance.sorts.saved}
 			active={activeSort}
 			label={(id) => appearance.label(id)}
 			counts={{ attention: flagged.length }}
 			onsort={(id) => (sort = id)}
 			disabled={isSetup(view)}
-			previewing={view === 'appearance'}
 		/>
 	{/snippet}
 </TopBar>
@@ -559,7 +554,13 @@
 		albums={searched}
 		bind:filters={filters[browsing]}
 		{collapsed}
-		onappearance={() => setView('appearance')}
+		{view}
+		dirty={{
+			'inbox-setup': inboxSetup.changes > 0,
+			'library-setup': setup.changes > 0,
+			appearance: appearance.changes > 0
+		}}
+		onview={setView}
 	/>
 
 	<main bind:contentRect={mainBox}>

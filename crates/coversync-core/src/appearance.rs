@@ -1,5 +1,5 @@
 //! Appearance settings: how the album browser looks, from which tags the
-//! top bar offers as sort tabs and the sidebar filters by to how big the
+//! top bar's sort menu offers and the sidebar filters by to how big the
 //! album grid's covers are.
 
 use std::collections::HashSet;
@@ -125,7 +125,7 @@ fn default_cover_size() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppearanceSetup {
-    /// Top bar sort tabs, in order.
+    /// The top bar's sort menu, in order.
     #[serde(default = "default_tabs")]
     pub sort_tabs: Vec<String>,
     /// Tag kinds the sidebar filters albums by, in its dropdown's order.
@@ -157,16 +157,16 @@ impl AppearanceSetup {
             .iter()
             .find(|t| !known.iter().any(|s| s.id == *t))
         {
-            return Err(Error::Invalid(format!("'{bad}' can't be a sort tab")));
+            return Err(Error::Invalid(format!("Can't sort by '{bad}'.")));
         }
         let mut seen = HashSet::new();
         self.sort_tabs.retain(|t| seen.insert(t.clone()));
         if self.sort_tabs.is_empty() {
-            return Err(Error::Invalid("Keep at least one sort tab.".into()));
+            return Err(Error::Invalid("Keep at least one sort.".into()));
         }
         if self.sort_tabs.len() > MAX_TABS {
             return Err(Error::Invalid(format!(
-                "Up to {MAX_TABS} sort tabs fit in the top bar."
+                "Up to {MAX_TABS} sorts fit in the sort menu."
             )));
         }
         let filterable = filterable();
@@ -237,7 +237,7 @@ mod tests {
         };
         let s = filters(&["label", "genre", "label"]).normalize().unwrap();
         assert_eq!(s.filter_tags, ["label", "genre"]);
-        // The sidebar can go without filters, unlike the top bar without tabs.
+        // The sidebar can go without filters, unlike the sort menu without sorts.
         assert!(filters(&[]).normalize().unwrap().filter_tags.is_empty());
         for bad in ["added", "attention", "lyrics", "rating", "nope"] {
             assert!(filters(&[bad]).normalize().is_err(), "{bad}");

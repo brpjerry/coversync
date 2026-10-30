@@ -108,11 +108,8 @@
 			<header class="card-head">
 				<span class="card-icon"><ArrowDownUp size={20} /></span>
 				<div>
-					<h2 id="tabs-title">Sort tabs</h2>
-					<p>
-						The tags the top bar can sort albums by, in order. The top bar previews your changes as
-						you make them.
-					</p>
+					<h2 id="tabs-title">Sort menu</h2>
+					<p>The tags the sort menu in the top bar offers to sort albums by, in order.</p>
 				</div>
 			</header>
 			<div class="card-body">
@@ -120,7 +117,7 @@
 					list={appearance.sorts}
 					choices={appearance.sortable}
 					{query}
-					place="the top bar"
+					place="the sort menu"
 				/>
 			</div>
 		</section>
