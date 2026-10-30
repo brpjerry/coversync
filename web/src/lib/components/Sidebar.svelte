@@ -1,289 +1,475 @@
 <script lang="ts">
-	import { flip } from 'svelte/animate';
-	import { fade } from 'svelte/transition';
-	import FolderCog from '@lucide/svelte/icons/folder-cog';
-	import Settings2 from '@lucide/svelte/icons/settings-2';
+	import { fade, slide } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
+	import Search from '@lucide/svelte/icons/search';
+	import X from '@lucide/svelte/icons/x';
+	import Check from '@lucide/svelte/icons/check';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import Palette from '@lucide/svelte/icons/palette';
-	import { isSetup, type Sort, type View } from '#lib/browse.ts';
+	import type { Album } from '#lib/api.ts';
+	import { readPref, writePref } from '#lib/browse.ts';
+	import {
+		isPicked,
+		matcher,
+		order,
+		same,
+		tagValues,
+		toggled,
+		type Filters,
+		type TagValue
+	} from '#lib/filters.ts';
+	import { count, fold } from '#lib/format.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
 
 	interface Props {
-		/** Sort tabs to show, in order (configured in Appearance). */
-		tabs: Sort[];
-		/** The sort in use. */
-		active: Sort;
-		label: (id: Sort) => string;
-		onsort: (id: Sort) => void;
-		/** Counts shown beside tabs, e.g. how many albums need attention. */
-		counts?: Partial<Record<Sort, number>>;
-		view: View;
+		/** Tags to filter by, in the dropdown's order (configured in Appearance). */
+		kinds: string[];
+		label: (id: string) => string;
+		/** Albums the sort tab and search leave, before tag filters. */
+		albums: Album[];
+		/** Picked values by tag. */
+		filters: Filters;
+		/** Closed, or on a setup screen where filters don't apply. */
 		collapsed: boolean;
-		/** Collapsed into an off-canvas drawer (narrow screens): keep it out of the tab order. */
-		offscreen: boolean;
-		/** Setup screens with unsaved changes. */
-		dirty: Partial<Record<View, boolean>>;
-		onview: (view: View) => void;
+		onappearance: () => void;
 	}
-	let {
-		tabs,
-		active,
-		label,
-		onsort,
-		counts = {},
-		view,
-		collapsed,
-		offscreen,
-		dirty,
-		onview
-	}: Props = $props();
+	let { kinds, label, albums, filters = $bindable(), collapsed, onappearance }: Props = $props();
 
-	const setups = [
-		{ id: 'inbox-setup', label: 'Inbox', title: 'Inbox setup', icon: FolderCog },
-		{ id: 'library-setup', label: 'Library', title: 'Library setup', icon: Settings2 },
-		{ id: 'appearance', label: 'Appearance', title: 'Appearance', icon: Palette }
-	] as const;
+	const KIND_KEY = 'coversync.filter';
+	/** Values listed at first, and added by each "Show more": long lists are slow to draw. */
+	const PAGE = 200;
 
-	let index = $derived(Math.max(0, tabs.indexOf(active)));
-	/** On the Appearance screen the tabs are a live preview of the edits. */
-	let previewing = $derived(view === 'appearance');
+	let chosen = $state(readPref(KIND_KEY, (v): v is string => typeof v === 'string', ''));
+	/** The tag the dropdown shows: the one last chosen, or the first if Appearance removed it. */
+	let kind = $derived(kinds.includes(chosen) ? chosen : kinds[0]);
+	let find = $state('');
+	let limit = $state(PAGE);
+
+	function choose(k: string) {
+		chosen = k;
+		writePref(KIND_KEY, k);
+		find = '';
+		limit = PAGE;
+	}
+
+	/**
+	 * Values of the tag on the albums the other tags' filters leave, so the
+	 * counts say what picking one would show; picked values stay listed.
+	 */
+	let values = $derived.by((): TagValue[] => {
+		if (!kind) return [];
+		const list = tagValues(albums.filter(matcher(filters, kinds, kind)), kind);
+		const gone = (filters[kind] ?? []).filter((v) => !list.some((t) => same(t.value, v)));
+		return gone.length
+			? [...list, ...gone.map((value) => ({ value, count: 0 }))].sort(order(kind))
+			: list;
+	});
+	let terms = $derived(fold(find).split(/\s+/).filter(Boolean));
+	let found = $derived(
+		terms.length ? values.filter((t) => terms.every((w) => fold(t.value).includes(w))) : values
+	);
+	let shown = $derived(found.slice(0, limit));
+	/** Every picked value, across tags. */
+	let active = $derived(
+		kinds.flatMap((k) => (filters[k] ?? []).map((value) => ({ kind: k, value })))
+	);
+
+	const pick = (k: string, value: string) => (filters = toggled(filters, k, value));
 </script>
 
-<aside id="sidebar" class="sidebar" class:collapsed aria-label="Browse" inert={offscreen}>
-	<nav>
-		<!-- Sorting only applies to album grids, not the setup screens. -->
-		<div class="block" class:idle={isSetup(view) && !previewing} inert={isSetup(view)}>
-			<h2 class="section">
-				<span
-					>Sort by{#if previewing}<em class="preview" transition:fade>{' · preview'}</em>{/if}</span
+<aside id="sidebar" class="sidebar" class:collapsed aria-label="Filter albums" inert={collapsed}>
+	<div class="inner">
+		<div class="head">
+			<h2 class="section">Filter</h2>
+			{#if active.length}
+				<button
+					class="clear-all"
+					onclick={() => (filters = {})}
+					transition:fade={{ duration: 150 }}
 				>
-			</h2>
-			<div class="list" role="radiogroup" aria-label="Sort albums by" style:--index={index}>
-				<span class="pill" aria-hidden="true"></span>
-				{#each tabs as id (id)}
-					{@const Icon = sortIcon(id)}
-					<button
-						role="radio"
-						aria-checked={active === id}
-						class:on={active === id}
-						title={collapsed ? label(id) : undefined}
-						onclick={() => onsort(id)}
-						animate:flip={{ duration: 300 }}
-						transition:fade={{ duration: 180 }}
-					>
-						<span class="icon">
-							<Icon size={18} strokeWidth={1.8} />
-							{#if counts[id]}<i class="dot warn" aria-hidden="true"></i>{/if}
-						</span>
-						<span class="label">{label(id)}</span>
-						{#if counts[id]}
-							<span
-								class="tab-count tabular"
-								class:warn={id === 'attention'}
-								transition:fade={{ duration: 160 }}>{counts[id]}</span
-							>
-						{/if}
-					</button>
-				{/each}
-			</div>
+					Clear all
+				</button>
+			{/if}
 		</div>
 
-		<div class="block">
-			<h2 class="section"><span>Setup</span></h2>
-			<div class="list">
-				{#each setups as item (item.id)}
+		{#if active.length}
+			<ul
+				class="picked"
+				aria-label="Filtering by"
+				transition:slide={{ duration: 220, easing: cubicOut }}
+			>
+				{#each active as p (`${p.kind}\n${p.value}`)}
+					<li transition:fade={{ duration: 150 }}>
+						<button
+							class="chip"
+							title="{label(p.kind)}: {p.value}"
+							aria-label="Remove {label(p.kind)}: {p.value}"
+							onclick={() => pick(p.kind, p.value)}
+						>
+							<span class="chip-text">{p.value}</span>
+							<X size={12} strokeWidth={2.4} />
+						</button>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+
+		{#if !kind}
+			<div class="none">
+				<p>No tags to filter by.</p>
+				<button class="btn" onclick={onappearance}
+					><Palette size={14} /> Choose in Appearance</button
+				>
+			</div>
+		{:else}
+			{@const Icon = sortIcon(kind)}
+			<label class="field kind">
+				<span class="sr-only">Tag to filter by</span>
+				<span class="lead" aria-hidden="true"><Icon size={16} strokeWidth={1.8} /></span>
+				<select value={kind} onchange={(e) => choose(e.currentTarget.value)}>
+					{#each kinds as k (k)}
+						{@const n = filters[k]?.length ?? 0}
+						<option value={k}>{label(k)}{n ? ` (${n})` : ''}</option>
+					{/each}
+				</select>
+				<span class="chev" aria-hidden="true"><ChevronDown size={16} /></span>
+			</label>
+
+			<label class="field find">
+				<span class="lead" aria-hidden="true"><Search size={15} /></span>
+				<span class="sr-only">Search {label(kind)} values</span>
+				<input
+					type="search"
+					bind:value={find}
+					oninput={() => (limit = PAGE)}
+					placeholder="Search {label(kind).toLowerCase()}"
+					spellcheck="false"
+					autocomplete="off"
+				/>
+				{#if find}
 					<button
-						class="nav-item"
-						class:on={view === item.id}
-						aria-current={view === item.id ? 'page' : undefined}
-						title={collapsed ? item.title : undefined}
-						onclick={() => onview(item.id)}
+						class="clear"
+						onclick={() => (find = '')}
+						aria-label="Clear search"
+						transition:fade={{ duration: 120 }}
 					>
-						<span class="icon">
-							<item.icon size={18} strokeWidth={1.8} />
-							{#if dirty[item.id]}<i class="dot" aria-label="Unsaved changes"></i>{/if}
+						<X size={13} />
+					</button>
+				{/if}
+			</label>
+
+			<div class="values" role="group" aria-label="{label(kind)} values">
+				{#each shown as t (t.value)}
+					{@const on = isPicked(filters, kind, t.value)}
+					<button class="value" class:on aria-pressed={on} onclick={() => pick(kind, t.value)}>
+						<span class="box" aria-hidden="true">
+							{#if on}<span class="tick" in:fade={{ duration: 120 }}
+									><Check size={12} strokeWidth={3} /></span
+								>{/if}
 						</span>
-						<span class="label">{item.label}</span>
+						<span class="name" title={t.value}>{t.value}</span>
+						<span class="n tabular">{count(t.count)}</span>
 					</button>
 				{/each}
+				{#if found.length > shown.length}
+					<button class="more" onclick={() => (limit += PAGE)}>
+						Show {count(Math.min(PAGE, found.length - shown.length))} more
+					</button>
+				{/if}
+				{#if !values.length}
+					<p class="empty">No {label(kind).toLowerCase()} on these albums.</p>
+				{:else if !found.length}
+					<p class="empty">No {label(kind).toLowerCase()} matches “{find}”.</p>
+				{/if}
 			</div>
-		</div>
-	</nav>
+		{/if}
+	</div>
 </aside>
 
 <style>
 	.sidebar {
-		--item-h: 40px;
-		--item-gap: 4px;
 		position: sticky;
 		top: var(--topbar-h);
 		align-self: start;
 		height: calc(100dvh - var(--topbar-h));
 		width: var(--sidebar-w);
-		padding: 20px 12px calc(var(--player-h) + 24px);
 		border-right: 1px solid var(--border);
-		/* Many sort tabs can outgrow the window. */
-		overflow: hidden auto;
-		scrollbar-width: thin;
+		overflow: hidden;
 		transition: width 380ms var(--ease-out);
 	}
 	.sidebar.collapsed {
-		width: var(--rail-w);
+		width: 0;
+		border-right-width: 0;
+	}
+	/* Fixed width, so closing slides the panel away instead of squeezing it. */
+	.inner {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		width: var(--sidebar-w);
+		height: 100%;
+		padding: 18px 12px 0;
+		transition: opacity 260ms;
+	}
+	.collapsed .inner {
+		opacity: 0;
 	}
 
-	nav {
-		display: grid;
-		gap: 26px;
-	}
-	.block {
-		transition: opacity 240ms;
-	}
-	.block.idle {
-		opacity: 0.4;
-	}
-	.nav-item.on {
-		background: color-mix(in oklab, var(--accent) 14%, var(--surface));
-		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 28%, transparent);
-	}
-	.icon {
-		position: relative;
-	}
-	.tab-count {
-		margin-left: auto;
-		padding: 0 7px;
-		border-radius: 999px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--text-3);
-		background: var(--surface-hover);
-		transition: opacity 220ms;
-	}
-	.tab-count.warn {
-		color: hsl(40 95% 70%);
-		background: hsl(40 90% 55% / 0.16);
-	}
-	.collapsed .tab-count {
-		opacity: 0;
-	}
-	/* In the rail the count becomes a dot on the icon. */
-	.dot.warn {
-		background: hsl(40 95% 62%);
-		opacity: 0;
-		transition: opacity 220ms;
-	}
-	.collapsed .dot.warn {
-		opacity: 1;
-	}
-	.dot {
-		position: absolute;
-		top: -2px;
-		right: -3px;
-		width: 7px;
-		height: 7px;
-		border-radius: 999px;
-		background: var(--accent);
-		box-shadow: 0 0 0 2px var(--bg);
+	.head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		height: 22px;
+		padding: 0 4px 0 12px;
 	}
 	.section {
-		position: relative;
-		height: 20px;
-		margin: 0 0 10px;
-		padding: 0 12px;
+		margin: 0;
 		font-size: 11.5px;
 		font-weight: 600;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
 		color: var(--text-3);
-		white-space: nowrap;
 	}
-	.section span {
-		transition: opacity 200ms;
-	}
-	.preview {
-		font-style: normal;
+	.clear-all {
+		padding: 2px 8px;
+		border-radius: 999px;
+		font-size: 12.5px;
+		font-weight: 550;
 		color: var(--accent);
+		transition: background 140ms;
 	}
-	/* In the rail, the heading shrinks into a short rule. */
-	.section::after {
-		content: '';
-		position: absolute;
-		left: 12px;
-		top: 50%;
-		width: 20px;
-		height: 1px;
-		background: var(--border-strong);
-		opacity: 0;
-		transition: opacity 200ms;
-	}
-	.collapsed .section span {
-		opacity: 0;
-	}
-	.collapsed .section::after {
-		opacity: 1;
-		transition-delay: 120ms;
+	.clear-all:hover {
+		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 
-	.list {
-		position: relative;
-		display: grid;
-		gap: var(--item-gap);
+	.picked {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 5px;
+		margin: 0;
+		padding: 0 2px 4px;
+		list-style: none;
 	}
-	.pill {
-		position: absolute;
-		inset: 0 0 auto;
-		height: var(--item-h);
-		border-radius: 12px;
-		background: color-mix(in oklab, var(--accent) 14%, var(--surface));
-		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 28%, transparent);
-		transform: translateY(calc(var(--index) * (var(--item-h) + var(--item-gap))));
-		transition: transform 420ms var(--ease-spring);
-	}
-	button {
-		position: relative;
-		display: grid;
-		grid-template-columns: 20px minmax(0, 1fr) auto;
+	.chip {
+		display: inline-flex;
 		align-items: center;
-		gap: 14px;
-		height: var(--item-h);
-		padding: 0 12px;
-		border-radius: 12px;
-		text-align: left;
-		font-size: 14px;
-		font-weight: 520;
-		color: var(--text-2);
-		white-space: nowrap;
-		transition:
-			color 200ms,
-			background 160ms;
+		gap: 4px;
+		max-width: 100%;
+		height: 26px;
+		padding: 0 8px 0 10px;
+		border-radius: 999px;
+		font-size: 12.5px;
+		font-weight: 540;
+		color: var(--text);
+		background: color-mix(in oklab, var(--accent) 16%, var(--surface));
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 34%, transparent);
+		transition: background 140ms;
 	}
-	button:hover:not(.on) {
+	.chip :global(svg) {
+		flex: none;
+		color: var(--text-2);
+	}
+	.chip:hover {
+		background: color-mix(in oklab, var(--accent) 26%, var(--surface));
+	}
+	.chip:hover :global(svg) {
+		color: var(--text);
+	}
+	.chip-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.picked li {
+		max-width: 100%;
+	}
+
+	.field {
+		position: relative;
+		display: flex;
+		align-items: center;
+		flex: none;
+		height: 38px;
+		border-radius: 11px;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		color: var(--text-3);
+		transition:
+			border-color 160ms,
+			background 160ms,
+			box-shadow 200ms;
+	}
+	.field:hover {
+		border-color: var(--border-strong);
+	}
+	.field:focus-within {
+		border-color: color-mix(in oklab, var(--accent) 60%, transparent);
+		background: var(--bg-raised);
+		box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 16%, transparent);
+	}
+	.lead {
+		position: absolute;
+		left: 12px;
+		display: grid;
+		pointer-events: none;
+	}
+	.kind .lead {
+		color: var(--accent);
+	}
+	select,
+	input {
+		width: 100%;
+		height: 100%;
+		min-width: 0;
+		border: 0;
+		outline: 0;
+		background: none;
+		color: var(--text);
+		font: inherit;
+		font-size: 14px;
+	}
+	select {
+		appearance: none;
+		padding: 0 34px 0 38px;
+		font-weight: 560;
+		text-overflow: ellipsis;
+		cursor: pointer;
+	}
+	/* The native list takes the page's colours. */
+	option {
+		background: var(--bg-raised);
+		color: var(--text);
+	}
+	.chev {
+		position: absolute;
+		right: 10px;
+		display: grid;
+		pointer-events: none;
+	}
+	input {
+		padding: 0 34px 0 36px;
+		font-size: 13.5px;
+	}
+	input::placeholder {
+		color: var(--text-3);
+	}
+	input::-webkit-search-cancel-button {
+		display: none;
+	}
+	.clear {
+		position: absolute;
+		right: 8px;
+		display: grid;
+		place-items: center;
+		width: 20px;
+		height: 20px;
+		border-radius: 999px;
+		background: var(--surface-hover);
+		color: var(--text-2);
+	}
+
+	.values {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		margin: 0 -12px;
+		padding: 2px 12px calc(var(--player-h) + 24px);
+		overflow: hidden auto;
+		scrollbar-width: thin;
+	}
+	.value {
+		display: grid;
+		grid-template-columns: 16px minmax(0, 1fr) auto;
+		align-items: center;
+		gap: 10px;
+		flex: none;
+		height: 34px;
+		padding: 0 10px 0 12px;
+		border-radius: 10px;
+		text-align: left;
+		font-size: 13.5px;
+		color: var(--text-2);
+		transition:
+			background 140ms,
+			color 140ms;
+	}
+	.value:hover {
 		background: var(--surface);
 		color: var(--text);
 	}
-	button.on {
+	.value.on {
 		color: var(--text);
+		background: color-mix(in oklab, var(--accent) 10%, transparent);
 	}
-	.icon {
+	.value.on:hover {
+		background: color-mix(in oklab, var(--accent) 16%, transparent);
+	}
+	.box {
 		display: grid;
 		place-items: center;
-		transition: transform 300ms var(--ease-spring);
+		width: 16px;
+		height: 16px;
+		border-radius: 5px;
+		border: 1.5px solid var(--border-strong);
+		transition:
+			background 160ms,
+			border-color 160ms,
+			transform 220ms var(--ease-spring);
 	}
-	button.on .icon {
-		color: var(--accent);
-		transform: scale(1.08);
+	.value:active .box {
+		transform: scale(0.88);
 	}
-	.label {
+	.on .box {
+		border-color: var(--accent);
+		background: var(--accent);
+		color: var(--accent-ink);
+	}
+	.tick {
+		display: grid;
+	}
+	.name {
 		overflow: hidden;
 		text-overflow: ellipsis;
-		transition:
-			opacity 220ms,
-			transform 300ms var(--ease-out);
+		white-space: nowrap;
 	}
-	.collapsed .label {
-		opacity: 0;
-		transform: translateX(-6px);
+	.n {
+		font-size: 12px;
+		color: var(--text-3);
+	}
+	.more {
+		flex: none;
+		height: 32px;
+		margin-top: 4px;
+		border-radius: 10px;
+		font-size: 13px;
+		font-weight: 550;
+		color: var(--text-2);
+	}
+	.more:hover {
+		background: var(--surface);
+		color: var(--text);
+	}
+	.empty,
+	.none p {
+		margin: 6px 12px;
+		font-size: 13px;
+		color: var(--text-3);
+	}
+	.none {
+		display: grid;
+		justify-items: start;
+		gap: 8px;
+	}
+	.none .btn {
+		height: 32px;
+		margin-left: 8px;
+		padding: 0 12px;
+		font-size: 13px;
 	}
 
-	/* Narrow screens: an off-canvas drawer instead of a rail. */
+	/* Narrow screens: an off-canvas drawer. */
 	@media (max-width: 900px) {
 		.sidebar {
 			position: fixed;
@@ -291,24 +477,22 @@
 			top: 0;
 			left: 0;
 			height: 100dvh;
-			width: 248px;
-			padding-top: 24px;
+			width: 280px;
 			background: var(--bg-raised);
 			box-shadow: var(--shadow);
 			transition: transform 380ms var(--ease-out);
 		}
 		.sidebar.collapsed {
-			width: 248px;
+			width: 280px;
 			transform: translateX(-100%);
 			box-shadow: none;
 		}
-		.collapsed .label,
-		.collapsed .section span {
-			opacity: 1;
-			transform: none;
+		.inner {
+			width: 280px;
+			padding-top: 22px;
 		}
-		.collapsed .section::after {
-			opacity: 0;
+		.collapsed .inner {
+			opacity: 1;
 		}
 	}
 </style>

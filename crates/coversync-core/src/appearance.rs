@@ -1,5 +1,6 @@
 //! Appearance settings: how the album browser looks, from which tags the
-//! sidebar offers as sort tabs to how big the album grid's covers are.
+//! top bar offers as sort tabs and the sidebar filters by to how big the
+//! album grid's covers are.
 
 use std::collections::HashSet;
 
@@ -20,6 +21,15 @@ pub const BUILT_IN: &[&str] = &["album_artist", "album", "date", "genre", ADDED,
 
 const MAX_TABS: usize = 16;
 
+/// Tags the sidebar filters by until Appearance says otherwise; the first is
+/// the one its dropdown starts on.
+pub const DEFAULT_FILTERS: &[&str] = &["genre", "album_artist", "date"];
+
+/// Long free text, of no use for picking albums by.
+const NOT_FILTERABLE: &[&str] = &["lyrics", "acoustid_fingerprint"];
+
+const MAX_FILTERS: usize = 16;
+
 /// The narrowest an album grid cover may be, in CSS pixels.
 pub const MIN_COVER_SIZE: u32 = 120;
 pub const DEFAULT_COVER_SIZE: u32 = 176;
@@ -39,6 +49,7 @@ pub const COVER_SIZES: CoverSizes = CoverSizes {
     default: DEFAULT_COVER_SIZE,
 };
 
+/// A tag the album browser can sort or filter by.
 #[derive(Debug, Serialize)]
 pub struct Sortable {
     pub id: &'static str,
@@ -80,6 +91,14 @@ pub fn sortable() -> Vec<Sortable> {
     out
 }
 
+/// Everything the sidebar can filter by: the text tag kinds, less long free text.
+pub fn filterable() -> Vec<Sortable> {
+    sortable()
+        .into_iter()
+        .filter(|s| s.group != "library" && !NOT_FILTERABLE.contains(&s.id))
+        .collect()
+}
+
 pub fn groups() -> Vec<SortGroup> {
     let mut out = vec![SortGroup {
         id: "library",
@@ -96,15 +115,22 @@ fn default_tabs() -> Vec<String> {
     DEFAULT_TABS.iter().map(|s| s.to_string()).collect()
 }
 
+fn default_filters() -> Vec<String> {
+    DEFAULT_FILTERS.iter().map(|s| s.to_string()).collect()
+}
+
 fn default_cover_size() -> u32 {
     DEFAULT_COVER_SIZE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppearanceSetup {
-    /// Sidebar sort tabs, in order.
+    /// Top bar sort tabs, in order.
     #[serde(default = "default_tabs")]
     pub sort_tabs: Vec<String>,
+    /// Tag kinds the sidebar filters albums by, in its dropdown's order.
+    #[serde(default = "default_filters")]
+    pub filter_tags: Vec<String>,
     /// How wide album grid covers are at least, in CSS pixels; each row's
     /// covers stretch to fill it. Phones show them a fifth smaller.
     #[serde(default = "default_cover_size")]
@@ -115,6 +141,7 @@ impl Default for AppearanceSetup {
     fn default() -> Self {
         Self {
             sort_tabs: default_tabs(),
+            filter_tags: default_filters(),
             cover_size: DEFAULT_COVER_SIZE,
         }
     }
@@ -139,7 +166,22 @@ impl AppearanceSetup {
         }
         if self.sort_tabs.len() > MAX_TABS {
             return Err(Error::Invalid(format!(
-                "Up to {MAX_TABS} sort tabs fit in the sidebar."
+                "Up to {MAX_TABS} sort tabs fit in the top bar."
+            )));
+        }
+        let filterable = filterable();
+        if let Some(bad) = self
+            .filter_tags
+            .iter()
+            .find(|t| !filterable.iter().any(|s| s.id == *t))
+        {
+            return Err(Error::Invalid(format!("'{bad}' can't be a tag filter")));
+        }
+        let mut seen = HashSet::new();
+        self.filter_tags.retain(|t| seen.insert(t.clone()));
+        if self.filter_tags.len() > MAX_FILTERS {
+            return Err(Error::Invalid(format!(
+                "Up to {MAX_FILTERS} tags fit in the sidebar's filter."
             )));
         }
         Ok(self)
@@ -152,6 +194,11 @@ impl AppearanceSetup {
             .map(String::as_str)
             .filter(|t| !BUILT_IN.contains(t))
             .collect()
+    }
+
+    /// Tag kinds whose values the album list must carry for the sidebar's filter.
+    pub fn filter_keys(&self) -> Vec<&str> {
+        self.filter_tags.iter().map(String::as_str).collect()
     }
 }
 
@@ -177,6 +224,32 @@ mod tests {
         assert!(tabs(&["nope"]).normalize().is_err());
         let parsed: AppearanceSetup = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, d);
+    }
+
+    #[test]
+    fn filter_tags_are_validated() {
+        let d = AppearanceSetup::default();
+        assert_eq!(d.filter_tags, DEFAULT_FILTERS);
+        assert_eq!(d.filter_keys(), DEFAULT_FILTERS);
+        let filters = |t: &[&str]| AppearanceSetup {
+            filter_tags: t.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let s = filters(&["label", "genre", "label"]).normalize().unwrap();
+        assert_eq!(s.filter_tags, ["label", "genre"]);
+        // The sidebar can go without filters, unlike the top bar without tabs.
+        assert!(filters(&[]).normalize().unwrap().filter_tags.is_empty());
+        for bad in ["added", "attention", "lyrics", "rating", "nope"] {
+            assert!(filters(&[bad]).normalize().is_err(), "{bad}");
+        }
+        assert!(
+            filterable()
+                .iter()
+                .all(|f| sortable().iter().any(|s| s.id == f.id))
+        );
+        // Settings saved before tag filters existed get the defaults.
+        let old: AppearanceSetup = serde_json::from_str(r#"{"sort_tabs":["genre"]}"#).unwrap();
+        assert_eq!(old.filter_tags, DEFAULT_FILTERS);
     }
 
     #[test]

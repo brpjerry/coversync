@@ -200,8 +200,43 @@ fn summarize(id: &str, tracks: &[&Track], mtime: i64, cover: Option<&CoverRow>) 
             .to_string(),
         collection: tracks.first().map(|t| t.collection).unwrap_or_default(),
         sort_values: HashMap::new(),
+        filter_values: HashMap::new(),
         attention: None,
     }
+}
+
+/// Filter keys whose values come from the album summary, as the grid shows
+/// it: the album artist (or the artist it falls back to) and the year.
+const SUMMARY_FILTERS: &[&str] = &["album_artist", "date"];
+
+/// Every value of `key` an album has, in the order found and without repeats;
+/// a value holding several is split at `separator`. `tracks` are the
+/// album's stored tag values.
+fn filter_values<'a>(
+    key: &str,
+    album: &Album,
+    tracks: impl Iterator<Item = &'a HashMap<String, String>>,
+    separator: &str,
+) -> Vec<String> {
+    let found: Vec<String> = match key {
+        "album_artist" => vec![album.artist.clone()],
+        "date" => album.year.map(|y| y.to_string()).into_iter().collect(),
+        _ => tracks.filter_map(|v| v.get(key).cloned()).collect(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for value in &found {
+        let parts: Vec<&str> = if separator.trim().is_empty() {
+            vec![value]
+        } else {
+            value.split(separator).collect()
+        };
+        for part in parts.into_iter().map(str::trim).filter(|p| !p.is_empty()) {
+            if !out.iter().any(|o| o == part) {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn sort_tracks(tracks: &mut [Track]) {
@@ -483,7 +518,9 @@ impl Library {
     }
 
     /// Albums of a collection. `sort_keys` are tag kinds whose album-wide
-    /// value (what most tracks agree on) each album should carry. Albums with
+    /// value (what most tracks agree on) each album should carry;
+    /// `filter_keys` are kinds whose every value, on any track, it should
+    /// carry, with values that hold several split at `separator`. Albums with
     /// tracks missing any `required` kind are flagged for attention, after
     /// `autofill` fills what it can (as an import would). `art::ART` among
     /// them requires album art.
@@ -491,13 +528,17 @@ impl Library {
         &self,
         collection: Collection,
         sort_keys: &[&str],
+        filter_keys: &[&str],
+        separator: &str,
         required: &[&str],
         autofill: Option<&Autofill>,
     ) -> Result<Vec<Album>> {
         let rows = self.all_tracks(collection)?;
         let covers = self.covers()?;
-        // Only parse the stored values when a sort tab or autofill needs them.
-        let needs_values = !sort_keys.is_empty() || (autofill.is_some() && !required.is_empty());
+        // Only parse the stored values when a sort tab, filter or autofill needs them.
+        let needs_values = !sort_keys.is_empty()
+            || filter_keys.iter().any(|k| !SUMMARY_FILTERS.contains(k))
+            || (autofill.is_some() && !required.is_empty());
         let values: Vec<HashMap<String, String>> = if needs_values {
             rows.iter()
                 .map(|r| serde_json::from_str(&r.values).unwrap_or_default())
@@ -525,6 +566,13 @@ impl Library {
                         .filter_map(|i| values[*i].get(*key).map(String::as_str));
                     if let Some(v) = consensus(found) {
                         album.sort_values.insert(key.to_string(), v.to_string());
+                    }
+                }
+                for key in filter_keys {
+                    let found =
+                        filter_values(key, &album, idx.iter().map(|i| &values[*i]), separator);
+                    if !found.is_empty() {
+                        album.filter_values.insert(key.to_string(), found);
                     }
                 }
                 if !required.is_empty() {
@@ -944,7 +992,7 @@ mod tests {
         let c = file("/m/b/1.flac", "b", &[]);
         lib.upsert(&[a, b, c]).unwrap();
         let albums = lib
-            .albums(Collection::Inbox, &["label"], &[], None)
+            .albums(Collection::Inbox, &["label"], &[], "", &[], None)
             .unwrap();
         let get = |id: &str| albums.iter().find(|x| x.id == id).unwrap();
         assert_eq!(
@@ -953,11 +1001,49 @@ mod tests {
         );
         assert!(get("b").sort_values.is_empty());
         assert!(
-            lib.albums(Collection::Inbox, &[], &[], None)
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
                 .unwrap()
                 .iter()
                 .all(|x| x.sort_values.is_empty())
         );
+    }
+
+    #[test]
+    fn albums_carry_every_filter_value() {
+        let lib = Library::open(&temp_db("filtervalues")).unwrap();
+        let mut a = file("/m/a/1.flac", "a", &["genre", "artist"]);
+        a.3.values.insert("genre", "Rock; Pop".into());
+        a.3.values.insert("artist", "Kano".into());
+        a.3.artist = Some("Kano".into());
+        a.3.year = Some(2003);
+        let mut b = file("/m/a/2.flac", "a", &["genre", "artist"]);
+        b.3.values.insert("genre", "Pop;Jazz;".into());
+        b.3.values.insert("artist", "Guest".into());
+        b.3.artist = Some("Kano".into());
+        b.3.year = Some(2005);
+        let c = file("/m/b/1.flac", "b", &[]);
+        lib.upsert(&[a, b, c]).unwrap();
+        let keys = ["genre", "artist", "album_artist", "date"];
+        let albums = lib
+            .albums(Collection::Inbox, &[], &keys, ";", &[], None)
+            .unwrap();
+        let get = |id: &str| &albums.iter().find(|x| x.id == id).unwrap().filter_values;
+        let values = |id: &str, key: &str| get(id).get(key).cloned().unwrap_or_default();
+        // Every track's values, split at the separator, without repeats.
+        assert_eq!(values("a", "genre"), ["Rock", "Pop", "Jazz"]);
+        assert_eq!(values("a", "artist"), ["Kano", "Guest"]);
+        // Album artist and year are the ones the grid shows.
+        assert_eq!(values("a", "album_artist"), ["Kano"]);
+        assert_eq!(values("a", "date"), ["2003"]);
+        // An untagged album only has the artist the grid shows for it.
+        assert_eq!(values("b", "album_artist"), ["Unknown Artist"]);
+        assert_eq!(get("b").len(), 1);
+        // Another separator leaves the values whole.
+        let whole = lib
+            .albums(Collection::Inbox, &[], &["genre"], " / ", &[], None)
+            .unwrap();
+        let a = whole.iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(a.filter_values["genre"], ["Rock; Pop", "Pop;Jazz;"]);
     }
 
     #[test]
@@ -970,7 +1056,7 @@ mod tests {
         ])
         .unwrap();
         let albums = lib
-            .albums(Collection::Inbox, &[], &["title", "genre"], None)
+            .albums(Collection::Inbox, &[], &[], "", &["title", "genre"], None)
             .unwrap();
         let get = |id: &str| {
             albums
@@ -994,15 +1080,26 @@ mod tests {
         c.3.values.insert("title", "Song".into());
         lib.upsert(&[c]).unwrap();
         let req = ["title", "album_artist"];
-        let plain = lib.albums(Collection::Inbox, &[], &req, None).unwrap();
+        let plain = lib
+            .albums(Collection::Inbox, &[], &[], "", &req, None)
+            .unwrap();
         let filled = lib
-            .albums(Collection::Inbox, &[], &req, Some(&Autofill::default()))
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                "",
+                &req,
+                Some(&Autofill::default()),
+            )
             .unwrap();
         let flag =
             |list: &[Album], id: &str| list.iter().find(|x| x.id == id).unwrap().attention.clone();
         assert!(flag(&plain, "c").is_some());
         assert_eq!(flag(&filled, "c"), None);
-        let none = lib.albums(Collection::Inbox, &[], &[], None).unwrap();
+        let none = lib
+            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .unwrap();
         assert!(none.iter().all(|x| x.attention.is_none()));
     }
 
@@ -1019,7 +1116,14 @@ mod tests {
             .unwrap();
         lib.set_cover("b", None, None, "sig").unwrap();
         let albums = lib
-            .albums(Collection::Inbox, &[], &["title", crate::art::ART], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                "",
+                &["title", crate::art::ART],
+                None,
+            )
             .unwrap();
         let get = |id: &str| {
             albums
@@ -1112,7 +1216,9 @@ mod tests {
             }
         );
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], None).unwrap().len(),
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+                .unwrap()
+                .len(),
             1
         );
         assert!(lib.album("a").unwrap().is_none());
@@ -1120,12 +1226,16 @@ mod tests {
         // Hiding is by path, so it survives the file being re-indexed.
         lib.upsert(&[file("/m/a/1.flac", "a", &["title"])]).unwrap();
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], None).unwrap().len(),
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(lib.unhide_all().unwrap(), 3);
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], None).unwrap().len(),
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(lib.hidden_stats().unwrap(), HiddenStats::default());

@@ -147,6 +147,8 @@ async fn albums(State(state): State<Shared>, Query(q): Query<AlbumsQuery>) -> Ap
         s.lib.albums(
             collection,
             &appearance.extra_sort_keys(),
+            &appearance.filter_keys(),
+            &setup.rules.separator,
             &required,
             autofill.as_ref(),
         )
@@ -409,7 +411,9 @@ async fn unhide_all(State(state): State<Shared>) -> ApiResult<Json<UnhideResult>
 struct AppearanceResponse {
     setup: AppearanceSetup,
     defaults: &'static [&'static str],
+    filter_defaults: &'static [&'static str],
     sortable: Vec<appearance::Sortable>,
+    filterable: Vec<appearance::Sortable>,
     groups: Vec<appearance::SortGroup>,
     cover_sizes: appearance::CoverSizes,
 }
@@ -418,7 +422,9 @@ fn appearance_response(setup: AppearanceSetup) -> Json<AppearanceResponse> {
     Json(AppearanceResponse {
         setup,
         defaults: appearance::DEFAULT_TABS,
+        filter_defaults: appearance::DEFAULT_FILTERS,
         sortable: appearance::sortable(),
+        filterable: appearance::filterable(),
         groups: appearance::groups(),
         cover_sizes: appearance::COVER_SIZES,
     })
@@ -515,7 +521,7 @@ async fn structure_preview(
         }
         for album in s
             .lib
-            .albums(Collection::Inbox, &[], &[], None)?
+            .albums(Collection::Inbox, &[], &[], "", &[], None)?
             .iter()
             .take(24)
         {

@@ -12,6 +12,7 @@
 	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import PanelTopOpen from '@lucide/svelte/icons/panel-top-open';
 	import Play from '@lucide/svelte/icons/play';
+	import FilterX from '@lucide/svelte/icons/funnel-x';
 	import {
 		api,
 		ApiError,
@@ -36,11 +37,13 @@
 	import { setup } from '#lib/setup.svelte.ts';
 	import { appearance } from '#lib/appearance.svelte.ts';
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
+	import { matcher, picked, type Filters } from '#lib/filters.ts';
 	import { fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
+	import SortTabs from '#lib/components/SortTabs.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import LibrarySetup from '#lib/components/LibrarySetup.svelte';
 	import InboxSetup from '#lib/components/InboxSetup.svelte';
@@ -67,31 +70,33 @@
 		migrateSort(readPref(SORT_KEY, (v): v is string => typeof v === 'string', 'album_artist'))
 	);
 	/** The sort in use: the chosen one, or the first tab if it was removed in Appearance. */
-	let activeSort = $derived(appearance.saved.includes(sort) ? sort : appearance.saved[0]);
+	let activeSort = $derived(
+		appearance.sorts.saved.includes(sort) ? sort : appearance.sorts.saved[0]
+	);
 	let search = $state<HTMLInputElement>();
 	let detail = $state<Detail | null>(null);
 
-	// On narrow screens the sidebar is a drawer that starts closed; the
-	// desktop rail/expanded choice is remembered separately.
+	let view = $derived(parseView(page.url.searchParams.get('view')));
+
+	// On narrow screens the sidebar is a drawer that starts closed; whether
+	// it's open on wider ones is remembered. Setup screens have no use for it.
 	let narrow = $state(matchMedia(NARROW).matches);
-	let railCollapsed = $state(
+	let sidebarClosed = $state(
 		readPref(SIDEBAR_KEY, (v): v is string => v === 'collapsed' || v === 'expanded', 'expanded') ===
 			'collapsed'
 	);
 	let drawerOpen = $state(false);
-	let collapsed = $derived(narrow ? !drawerOpen : railCollapsed);
+	let collapsed = $derived(isSetup(view) || (narrow ? !drawerOpen : sidebarClosed));
 
 	function toggleSidebar() {
 		if (narrow) drawerOpen = !drawerOpen;
 		else {
-			railCollapsed = !railCollapsed;
-			writePref(SIDEBAR_KEY, railCollapsed ? 'collapsed' : 'expanded');
+			sidebarClosed = !sidebarClosed;
+			writePref(SIDEBAR_KEY, sidebarClosed ? 'collapsed' : 'expanded');
 		}
 	}
 
 	$effect(() => writePref(SORT_KEY, sort));
-
-	let view = $derived(parseView(page.url.searchParams.get('view')));
 
 	/**
 	 * The album grid the setup screens' back button returns to: the last one
@@ -107,8 +112,8 @@
 		label: browsing === 'library' ? 'Back to Library' : 'Back to Inbox',
 		run: () => setView(browsing)
 	});
-	/** On the Appearance screen the sidebar previews the tabs being edited. */
-	let sortTabs = $derived(view === 'appearance' ? appearance.tabs : appearance.saved);
+	/** On the Appearance screen the top bar previews the tabs being edited. */
+	let sortTabs = $derived(view === 'appearance' ? appearance.sorts.items : appearance.sorts.saved);
 	/** Views slide in from the side of the tab they come after. */
 	let direction = $state(1);
 	async function setView(next: View) {
@@ -195,7 +200,8 @@
 	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
 	let attentionView = $derived(activeSort === 'attention');
 	let flagged = $derived(source.filter((a) => a.attention));
-	let visible = $derived.by(() => {
+	/** Albums the sort tab and search leave, in order; the sidebar's tag filters narrow them. */
+	let searched = $derived.by(() => {
 		const list = attentionView
 			? sorted(source, 'album_artist').filter((a) => a.attention)
 			: sorted(source, activeSort);
@@ -204,6 +210,13 @@
 			? list.filter((a) => terms.every((t) => haystack.get(a.id)!.includes(t)))
 			: list;
 	});
+	/** Tag values picked in the sidebar, kept per collection as their tags differ. */
+	let filters = $state<Record<'inbox' | 'library', Filters>>({ inbox: {}, library: {} });
+	let filterKinds = $derived(appearance.filters.saved);
+	let filtered = $derived(picked(filters[browsing], filterKinds));
+	let visible = $derived(
+		filtered ? searched.filter(matcher(filters[browsing], filterKinds)) : searched
+	);
 
 	/** The album grid's width, for the Appearance screen's cover size preview. */
 	let mainBox = $state<DOMRectReadOnly>();
@@ -482,6 +495,10 @@
 		}
 	}
 
+	function clearFilters() {
+		filters[browsing] = {};
+	}
+
 	onMount(() => {
 		appearance.load();
 		// Tag labels for attention badges.
@@ -512,31 +529,37 @@
 	shown={visible.length}
 	total={source.length}
 	sidebarOpen={!collapsed}
+	{filtered}
+	dirty={{
+		'inbox-setup': inboxSetup.changes > 0,
+		'library-setup': setup.changes > 0,
+		appearance: appearance.changes > 0
+	}}
 	onview={setView}
 	ontogglesidebar={toggleSidebar}
 	onrescan={rescan}
-/>
+>
+	{#snippet sorts()}
+		<SortTabs
+			tabs={sortTabs}
+			active={activeSort}
+			label={(id) => appearance.label(id)}
+			counts={{ attention: flagged.length }}
+			onsort={(id) => (sort = id)}
+			disabled={isSetup(view)}
+			previewing={view === 'appearance'}
+		/>
+	{/snippet}
+</TopBar>
 
 <div class="shell" inert={!!openAlbum}>
 	<Sidebar
-		tabs={sortTabs}
-		active={activeSort}
+		kinds={filterKinds}
 		label={(id) => appearance.label(id)}
-		counts={{ attention: flagged.length }}
-		onsort={(id) => {
-			sort = id;
-			// Picking a sort in the drawer closes it, even the one already in use.
-			drawerOpen = false;
-		}}
-		{view}
+		albums={searched}
+		bind:filters={filters[browsing]}
 		{collapsed}
-		offscreen={narrow && collapsed}
-		dirty={{
-			'inbox-setup': inboxSetup.changes > 0,
-			'library-setup': setup.changes > 0,
-			appearance: appearance.changes > 0
-		}}
-		onview={setView}
+		onappearance={() => setView('appearance')}
 	/>
 
 	<main bind:contentRect={mainBox}>
@@ -596,11 +619,23 @@
 							<p>coversyncd didn't find any audio files in its library folders.</p>
 						{/if}
 					</div>
-				{:else if visible.length === 0 && attentionView && !query.trim()}
+				{:else if visible.length === 0 && attentionView && !query.trim() && !filtered}
 					<div class="empty">
 						<span class="empty-ok"><CircleCheck size={44} strokeWidth={1.4} /></span>
 						<h2>Nothing needs attention</h2>
 						<p>Every album here has the tags the library rules and folder structure need.</p>
+					</div>
+				{:else if visible.length === 0 && filtered}
+					<div class="empty">
+						<h2>No albums match these filters</h2>
+						<p>
+							{query.trim() ? `Nothing with these tags matches “${query}”.` : 'Try fewer tags.'}
+						</p>
+						<div class="empty-actions">
+							<button class="btn" onclick={clearFilters}>
+								<FilterX size={16} /> Clear filters
+							</button>
+						</div>
 					</div>
 				{:else if visible.length === 0}
 					<div class="empty">
@@ -625,7 +660,7 @@
 {#if narrow && drawerOpen}
 	<button
 		class="scrim"
-		aria-label="Close sidebar"
+		aria-label="Close filters"
 		onclick={() => (drawerOpen = false)}
 		transition:fade={{ duration: 260 }}
 	></button>

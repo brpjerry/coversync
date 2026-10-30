@@ -10,9 +10,13 @@ Early days: single user, no authentication, used on a home server.
 
 ## Features
 
-- **Browse**: Inbox and Library album grids with cover art, sidebar sort tabs,
-  search, a player, and a tag editor. "Needs attention" lists albums missing
-  tags or art the rules require.
+- **Browse**: Inbox and Library album grids with cover art, sort tabs in the
+  top bar, search, a player, and a tag editor. "Needs attention" lists albums
+  missing tags or art the rules require. The sidebar filters albums by tag:
+  pick a tag such as Genre from its dropdown, search its values, and tick the
+  ones to show. Ticked values of one tag widen the choice, values of several
+  tags narrow it, and tags holding several values (split by Library setup's
+  separator) offer each.
 - **Library setup**: required tags; album art rules (a cover file, embedded
   art or both, required or not, and the cover file's name); and the folder
   structure, a template such as
@@ -33,7 +37,8 @@ Early days: single user, no authentication, used on a home server.
   suggests romanized or English titles and artist names for releases in other
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first.
-- **Appearance**: which sort tabs the sidebar shows, and the cover size.
+- **Appearance**: which sort tabs the top bar shows, which tags the sidebar
+  filters by, and the cover size.
 
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
@@ -56,7 +61,8 @@ systemctl --user enable --now coversyncd
 ```
 
 The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder in
-Inbox setup. To build the package from a checkout instead, run
+Inbox setup (under the gear in the top bar). To build the package from a
+checkout instead, run
 `packaging/arch/build.sh` (it packages the current commit into `dist/`).
 
 ## Build and run

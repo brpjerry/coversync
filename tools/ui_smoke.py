@@ -129,6 +129,16 @@ class Driver:
         el = self.s("POST", "/element", {"using": "xpath", "value": xpath})
         self.s("POST", f"/element/{el[ELEMENT]}/click", {})
 
+    def click_sort(self, label):
+        """Pick a sort tab in the top bar."""
+        self.click_xpath(f"//div[@role='radiogroup'][@aria-label='Sort albums by']//button[normalize-space(.)='{label}']")
+
+    def open_setup(self, label):
+        """Open a setup screen (Inbox setup, Library setup, Appearance) from the top bar's menu."""
+        self.click(".settings")
+        self.wait("return !!document.querySelector('[role=menu]')")
+        self.click_text("div[@role='menu']", label)
+
     def right_click(self, css):
         el = self.s("POST", "/element", {"using": "css selector", "value": css})
         origin = {ELEMENT: el[ELEMENT]}
@@ -170,8 +180,8 @@ class Driver:
 
 def appearance_flow(d, out, tag):
     """Add Label and Genre sort tabs, move Label up; save only with --save."""
-    tabs = "return [...document.querySelectorAll('aside [role=radio]')].map(b => b.textContent.trim())"
-    d.click_text("aside", "Appearance")
+    tabs = "return [...document.querySelectorAll('.sort [role=radio]')].map(b => b.textContent.trim())"
+    d.open_setup("Appearance")
     d.wait("return !!document.querySelector('.chips')")
     # The tabs card sits below Cover art size; keep it clear of the save bar.
     d.js("document.querySelector('#tabs-title').scrollIntoView({block: 'start'})")
@@ -186,7 +196,7 @@ def appearance_flow(d, out, tag):
     time.sleep(0.4)
     d.click_xpath("//li[.//span[contains(@class,'tab-label')][normalize-space(.)='Label']]//button[contains(@aria-label,'up')]")
     time.sleep(0.6)
-    print("sidebar preview:", d.js(tabs), "| changes:", d.js("return document.querySelector('.savebar .summary')?.textContent.trim()"))
+    print("top bar preview:", d.js(tabs), "| changes:", d.js("return document.querySelector('.savebar .summary')?.textContent.trim()"))
     d.shot(out / f"9a-appearance-{tag}.png")
     if "--save" in sys.argv:
         d.click_text("main", "Save")
@@ -194,12 +204,12 @@ def appearance_flow(d, out, tag):
         d.click_text("header", "Inbox")
         d.wait("return document.querySelectorAll('.card').length > 0")
         time.sleep(0.6)
-        d.click_text("aside", "Label")
+        d.click_sort("Label")
         time.sleep(0.8)
         print("sorted by label, first albums:", d.js("return [...document.querySelectorAll('.card .title')].slice(0, 4).map(t => t.textContent)"))
         d.shot(out / f"9b-sorted-by-label-{tag}.png")
         # Put the defaults back for later steps and runs.
-        d.click_text("aside", "Appearance")
+        d.open_setup("Appearance")
         d.wait("return !!document.querySelector('.chips')")
         d.click_text("main", "Reset to defaults")
         d.click_text("main", "Save")
@@ -213,6 +223,41 @@ def appearance_flow(d, out, tag):
     d.click(".setup .back")
     d.wait("return document.querySelectorAll('.card').length > 0")
     print("after back:", repr(d.js("return location.search")))
+
+
+def filter_flow(d, out, tag):
+    """The sidebar's tag filters: pick values of two tags, search a list, then clear them."""
+    cards = "return document.querySelectorAll('.card').length"
+    stats = "return document.querySelector('.stats')?.textContent.trim()"
+    values = ("return [...document.querySelectorAll('aside .value')]"
+              ".map(v => v.querySelector('.name').textContent + ' ' + v.querySelector('.n').textContent)")
+    print("filter tags:", d.js("return [...document.querySelectorAll('aside option')].map(o => o.textContent)"),
+          "| values:", d.js(values)[:8])
+    d.click("aside .value")
+    time.sleep(0.6)
+    print("picked:", d.js(cards), "cards |", d.js(stats), "| chips:",
+          d.js("return [...document.querySelectorAll('aside .chip')].map(c => c.textContent.trim())"))
+    # Another tag's counts only cover the albums the first one leaves.
+    d.js("const s = document.querySelector('aside select'); s.value = s.options[s.options.length - 1].value;"
+         "s.dispatchEvent(new Event('change', {bubbles: true}))")
+    time.sleep(0.4)
+    print("other tag:", d.js("return document.querySelector('aside select').value"), "| values:", d.js(values)[:8])
+    d.shot(out / f"1b-filter-{tag}.png")
+    d.click(".toggle")
+    time.sleep(0.7)
+    print("closed sidebar width:", d.js("return document.querySelector('.sidebar').getBoundingClientRect().width"),
+          "| toggle badge:", d.js("return document.querySelector('.toggle .filtered')?.textContent"))
+    d.shot(out / f"1b-filter-closed-{tag}.png")
+    d.click(".toggle")
+    time.sleep(0.7)
+    first = d.js("return document.querySelector('aside .value .name')?.textContent ?? ''")
+    d.type("aside input[type=search]", first[:2])
+    time.sleep(0.4)
+    print("searched values:", d.js(values)[:8])
+    d.click("aside .field .clear")
+    d.click("aside .clear-all")
+    time.sleep(0.4)
+    print("cleared:", d.js(cards), "cards |", d.js(stats))
 
 
 def cover_size_flow(d, out, tag, save):
@@ -244,7 +289,7 @@ def cover_size_flow(d, out, tag, save):
         print(f"grid {label}:", d.js(grid), "| cover sizes fetched:", d.js(srcs))
 
     measure_grid("before")
-    d.click_text("aside", "Appearance")
+    d.open_setup("Appearance")
     d.wait("return !!document.querySelector('.slider')")
     time.sleep(0.8)
     print("default:", d.js("return +document.querySelector('.slider').value"), "|", d.js(readout),
@@ -294,7 +339,7 @@ def cover_size_flow(d, out, tag, save):
     d.go(d.js("return location.href"))
     measure_grid("after reload")
 
-    d.click_text("aside", "Appearance")
+    d.open_setup("Appearance")
     d.wait("return !!document.querySelector('.slider')")
     time.sleep(0.6)
     d.click_text("main", "Default")
@@ -314,7 +359,7 @@ def requests_json(d, path):
 
 def autofill_flow(d, out, tag, save):
     """Inbox setup's autofill card, and its effect on the Needs attention count."""
-    count = "return document.querySelector('aside .tab-count.warn')?.textContent.trim() ?? '0'"
+    count = "return document.querySelector('.sort .count.warn')?.textContent.trim() ?? '0'"
     switch = "//button[@role='switch'][.//span[contains(@class, 'label')][normalize-space(.)='{}']]"
     summary = "return document.querySelector('.savebar .summary')?.textContent.trim()"
     d.js("document.getElementById('autofill-title').scrollIntoView({block: 'start'})")
@@ -335,19 +380,19 @@ def autofill_flow(d, out, tag, save):
     saved = "return [...document.querySelectorAll('.toast')].filter(t => t.textContent.includes('Inbox setup saved')).length"
     d.click_text("main", "Save")
     d.wait(saved + " > 0")
-    d.wait(f"return document.querySelector('aside .tab-count.warn')?.textContent.trim() !== '{before}'")
+    d.wait(f"return document.querySelector('.sort .count.warn')?.textContent.trim() !== '{before}'")
     off = d.js(count)
     d.click_xpath(switch.format("Track number from the file name"))
     d.click_xpath(switch.format("Album artist from artist"))
     d.click_text("main", "Save")
-    d.wait(f"return document.querySelector('aside .tab-count.warn')?.textContent.trim() === '{before}'")
+    d.wait(f"return document.querySelector('.sort .count.warn')?.textContent.trim() === '{before}'")
     print("needs attention: autofill on", before, "| off", off, "| on again", d.js(count))
 
 
 def import_flow(d, out, tag, library_folder):
     """Scratch libraries only: set up a library folder and import two albums."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
-    d.click_text("aside", "Library")
+    d.open_setup("Library setup")
     d.wait("return !!document.querySelector('#library-folder')")
     d.clear_and_type("#library-folder", library_folder)
     d.wait("return /created on the first import|Ready for imports/.test(document.querySelector('.folder-field').textContent)")
@@ -398,7 +443,7 @@ def import_flow(d, out, tag, library_folder):
 def art_flow(d, out, tag, library_folder):
     """Scratch libraries only: require album art, then import an album without any."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
-    d.click_text("aside", "Library")
+    d.open_setup("Library setup")
     d.wait("return !!document.querySelector('#library-folder')")
     d.clear_and_type("#library-folder", library_folder)
     d.wait("return /created on the first import|Ready for imports/.test(document.querySelector('.folder-field').textContent)")
@@ -429,7 +474,7 @@ def art_flow(d, out, tag, library_folder):
 
     d.click_text("header", "Inbox")
     d.wait("return document.querySelectorAll('.card').length > 0")
-    d.click_text("aside", "Needs attention")
+    d.click_sort("Needs attention")
     d.wait("return !!document.querySelector('.card .flag')")
     time.sleep(0.8)
     print("needs attention:", d.js("return [...document.querySelectorAll('.card')].map(c => c.querySelector('.title').textContent + ' [' + c.querySelector('.flag')?.textContent.trim() + ']')"))
@@ -506,7 +551,7 @@ def option(name):
 
 def romanize_flow(d, out, tag, album):
     """Scratch daemons with Prefer English on: romanized suggestions, the script switch, and an import."""
-    d.click_text("aside", "Inbox")
+    d.open_setup("Inbox setup")
     d.wait("return !!document.querySelector('#suggest-title')")
     d.js("document.querySelector('#suggest-title').scrollIntoView({block: 'start'})")
     time.sleep(0.6)
@@ -535,7 +580,7 @@ def suggest_flow(d, out, tag, album, superset=None):
     """Scratch daemons only: Smart suggestions in Inbox setup, then importing with them."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
     summary = "return document.querySelector('.savebar .summary')?.textContent.trim() ?? null"
-    d.click_text("aside", "Inbox")
+    d.open_setup("Inbox setup")
     d.wait("return !!document.querySelector('#suggest-title')")
     d.js("document.querySelector('#suggest-title').scrollIntoView({block: 'start'})")
     time.sleep(0.6)
@@ -626,15 +671,11 @@ def main():
             cover_size_flow(d, out, tag, "--save" in sys.argv)
             return
 
-        d.click_text("aside", "Year")
+        d.click_sort("Year")
         time.sleep(0.8)
         print("first by year:", d.js("return document.querySelector('.card .artist').textContent.trim()"))
-        d.click(".toggle")
-        time.sleep(0.7)
-        print("rail width:", d.js("return document.querySelector('.sidebar').getBoundingClientRect().width"))
-        d.shot(out / f"1b-rail-year-{tag}.png")
-        d.click(".toggle")
-        d.click_text("aside", "Album artist")
+        filter_flow(d, out, tag)
+        d.click_sort("Album artist")
         time.sleep(0.6)
 
         d.click_text("header", "Library")
@@ -680,7 +721,7 @@ def main():
         d.click_text("main", "Browse the Inbox")
         d.wait("return document.querySelectorAll('.card').length > 0")
 
-        d.click_text("aside", "Inbox")
+        d.open_setup("Inbox setup")
         d.wait("return !!document.querySelector('.modes')")
         time.sleep(0.8)
         text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
@@ -694,7 +735,7 @@ def main():
         time.sleep(0.7)
         print("selected:", d.js("return document.querySelector('.mode input:checked').value"),
               "| warning:", d.js("return !!document.querySelector('.warn')"),
-              "| dirty dot:", d.js("return !!document.querySelector('aside .dot')"))
+              "| dirty dot:", d.js("return !!document.querySelector('.settings .dot')"))
         d.shot(out / f"1h-inbox-move-{tag}.png")
         if "--save" in sys.argv:
             d.click_text("main", "Save")
@@ -767,9 +808,14 @@ def main():
         d.click(".toggle")
         time.sleep(0.6)
         d.shot(out / f"7-drawer-{tag}.png")
-        d.click_xpath("//aside//button[normalize-space(.)='Album']")
+        # Picking a tag keeps the drawer open for more; Escape closes it.
+        d.click("aside .value")
         time.sleep(0.6)
-        print("drawer closed after pick:", d.js("return !document.querySelector('.scrim')"))
+        print("drawer open after pick:", d.js("return !!document.querySelector('.scrim')"),
+              "| cards:", d.js("return document.querySelectorAll('.card').length"))
+        d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        time.sleep(0.6)
+        print("drawer closed by Escape:", d.js("return !document.querySelector('.scrim')"))
     finally:
         errors = [l for l in d.logs if l.startswith(("[error]", "[warn]"))]
         print(f"console: {len(d.logs)} entries, {len(errors)} warnings/errors")
