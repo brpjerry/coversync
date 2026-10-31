@@ -39,6 +39,9 @@ Early days: single user, no authentication, used on a home server.
   Korean names family name first.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
+- **Sync** (planned): the sidebar's Sync section will list the devices the
+  Library syncs to, each with its own settings. For now it's a placeholder,
+  which Sync setup can turn off.
 
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
