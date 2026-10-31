@@ -37,6 +37,7 @@
 	import { setup } from '#lib/setup.svelte.ts';
 	import { appearance } from '#lib/appearance.svelte.ts';
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
+	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
 	import { fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
@@ -48,6 +49,7 @@
 	import LibrarySetup from '#lib/components/LibrarySetup.svelte';
 	import InboxSetup from '#lib/components/InboxSetup.svelte';
 	import AppearanceSetup from '#lib/components/AppearanceSetup.svelte';
+	import SyncSetup from '#lib/components/SyncSetup.svelte';
 	import AlbumGrid from '#lib/components/AlbumGrid.svelte';
 	import AlbumDetail from '#lib/components/AlbumDetail.svelte';
 	import PlayerBar from '#lib/components/PlayerBar.svelte';
@@ -502,6 +504,8 @@
 
 	onMount(() => {
 		appearance.load();
+		// Whether the sidebar shows its Sync section.
+		syncSetup.load();
 		// Tag labels for attention badges.
 		setup.load();
 		loadAlbums();
@@ -555,10 +559,12 @@
 		bind:filters={filters[browsing]}
 		{collapsed}
 		{view}
+		sync={syncSetup.loaded && syncSetup.savedEnabled}
 		dirty={{
 			'inbox-setup': inboxSetup.changes > 0,
 			'library-setup': setup.changes > 0,
-			appearance: appearance.changes > 0
+			appearance: appearance.changes > 0,
+			'sync-setup': syncSetup.changes > 0
 		}}
 		onview={setView}
 	/>
@@ -587,6 +593,8 @@
 						onchanged={inboxChanged}
 						onrescan={() => setTimeout(poll, 300)}
 					/>
+				{:else if view === 'sync-setup'}
+					<SyncSetup back={setupBack} />
 				{:else if !loaded || !appearance.settled}
 					<div class="grid" aria-busy="true" style:--cover-min="{ghostWidth}px">
 						{#each { length: 18 } as _, i (i)}

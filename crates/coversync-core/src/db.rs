@@ -12,6 +12,7 @@ use crate::autofill::{self, Autofill, TrackInfo};
 use crate::inbox::{HiddenStats, InboxSetup};
 use crate::model::{Album, AlbumDetail, Attention, Collection, KindCoverage, TagCoverage, Track};
 use crate::rules::{self, LibrarySetup};
+use crate::sync::SyncSetup;
 use crate::tags::TrackTags;
 
 const SCHEMA: &str = r#"
@@ -776,6 +777,15 @@ impl Library {
         Ok(setup)
     }
 
+    pub fn sync_setup(&self) -> Result<SyncSetup> {
+        Ok(self.setting("sync_setup")?.unwrap_or_default())
+    }
+
+    pub fn set_sync_setup(&self, setup: SyncSetup) -> Result<SyncSetup> {
+        self.put_setting("sync_setup", &setup)?;
+        Ok(setup)
+    }
+
     /// Hide Inbox files, e.g. once they have been copied into the Library.
     pub fn hide_paths(&self, paths: &[PathBuf], now: i64) -> Result<()> {
         let mut conn = self.conn();
@@ -1252,6 +1262,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(lib.inbox_setup().unwrap().ingest, IngestMode::Move);
+    }
+
+    #[test]
+    fn sync_setup_defaults_to_on_and_round_trips() {
+        let lib = Library::open(&temp_db("sync")).unwrap();
+        assert!(lib.sync_setup().unwrap().enabled);
+        lib.set_sync_setup(SyncSetup { enabled: false }).unwrap();
+        assert!(!lib.sync_setup().unwrap().enabled);
     }
 
     #[test]

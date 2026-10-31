@@ -57,8 +57,8 @@
 	let setup = $derived(isSetup(view));
 	/** Library setup and Appearance reuse the search field to filter tags. */
 	let filtering = $derived(view === 'library-setup' || view === 'appearance');
-	/** Inbox setup has nothing to search. */
-	let searchable = $derived(view !== 'inbox-setup');
+	/** Inbox setup and sync setup have nothing to search. */
+	let searchable = $derived(view !== 'inbox-setup' && view !== 'sync-setup');
 
 	let pct = $derived.by(() => {
 		if (!scan?.running) return 0;

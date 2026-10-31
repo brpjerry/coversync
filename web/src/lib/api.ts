@@ -392,6 +392,15 @@ export interface AppearanceResponse {
 	cover_sizes: CoverSizes;
 }
 
+export interface SyncSetup {
+	/** Sync is on: the sidebar shows its Sync section. */
+	enabled: boolean;
+}
+
+export interface SyncSetupResponse {
+	setup: SyncSetup;
+}
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
@@ -472,6 +481,13 @@ export const api = {
 	appearance: () => request<AppearanceResponse>('/api/appearance'),
 	saveAppearance: (setup: AppearanceSetup) =>
 		request<AppearanceResponse>('/api/appearance', {
+			method: 'PUT',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(setup)
+		}),
+	syncSetup: () => request<SyncSetupResponse>('/api/sync/setup'),
+	saveSyncSetup: (setup: SyncSetup) =>
+		request<SyncSetupResponse>('/api/sync/setup', {
 			method: 'PUT',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(setup)

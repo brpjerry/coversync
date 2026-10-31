@@ -15,6 +15,7 @@ use coversync_core::db::{CoverSource, FileStat};
 use coversync_core::import::{self, ImportPlan, ImportResult};
 use coversync_core::scan::Progress;
 use coversync_core::scan::{self, album_dir, album_id};
+use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
     AlbumDetail, Collection, HiddenStats, InboxSetup, LibrarySetup, TagCoverage, TagEdit, inbox,
@@ -52,6 +53,7 @@ pub fn router() -> Router<Shared> {
             post(import_album).layer(DefaultBodyLimit::max(art::MAX_BYTES / 3 * 4 + (1 << 20))),
         )
         .route("/api/appearance", get(appearance).put(save_appearance))
+        .route("/api/sync/setup", get(sync_setup).put(save_sync_setup))
         .route("/api/identify", post(crate::suggest::start))
         .route("/api/identify/{album_id}", get(crate::suggest::status))
         .route("/api/musicbrainz/art/{release}", get(crate::suggest::art))
@@ -443,6 +445,26 @@ async fn save_appearance(
     blocking(&state, move |s| s.lib.set_appearance(setup))
         .await
         .map(appearance_response)
+}
+
+#[derive(Serialize)]
+struct SyncSetupResponse {
+    setup: SyncSetup,
+}
+
+async fn sync_setup(State(state): State<Shared>) -> ApiResult<Json<SyncSetupResponse>> {
+    blocking(&state, |s| s.lib.sync_setup())
+        .await
+        .map(|setup| Json(SyncSetupResponse { setup }))
+}
+
+async fn save_sync_setup(
+    State(state): State<Shared>,
+    Json(setup): Json<SyncSetup>,
+) -> ApiResult<Json<SyncSetupResponse>> {
+    blocking(&state, move |s| s.lib.set_sync_setup(setup))
+        .await
+        .map(|setup| Json(SyncSetupResponse { setup }))
 }
 
 #[derive(Deserialize)]

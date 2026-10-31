@@ -8,6 +8,8 @@
 	import FolderCog from '@lucide/svelte/icons/folder-cog';
 	import Settings2 from '@lucide/svelte/icons/settings-2';
 	import Palette from '@lucide/svelte/icons/palette';
+	import FolderSync from '@lucide/svelte/icons/folder-sync';
+	import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
 	import type { Album } from '#lib/api.ts';
 	import { isSetup, readPref, writePref, type View } from '#lib/browse.ts';
 	import {
@@ -34,6 +36,8 @@
 		filters: Filters;
 		collapsed: boolean;
 		view: View;
+		/** Sync is on: show the Sync section. */
+		sync: boolean;
 		/** Setup screens with unsaved changes. */
 		dirty: Partial<Record<View, boolean>>;
 		onview: (view: View) => void;
@@ -45,6 +49,7 @@
 		filters = $bindable(),
 		collapsed,
 		view,
+		sync,
 		dirty,
 		onview
 	}: Props = $props();
@@ -52,7 +57,8 @@
 	const setups = [
 		{ id: 'inbox-setup', label: 'Inbox', icon: FolderCog },
 		{ id: 'library-setup', label: 'Library', icon: Settings2 },
-		{ id: 'appearance', label: 'Appearance', icon: Palette }
+		{ id: 'appearance', label: 'Appearance', icon: Palette },
+		{ id: 'sync-setup', label: 'Sync', icon: FolderSync }
 	] as const;
 	/** Filters only apply to album grids, not the setup screens. */
 	let idle = $derived(isSetup(view));
@@ -214,6 +220,26 @@
 			{/if}
 		</div>
 
+		{#if sync}
+			<!-- A placeholder: the devices the Library syncs to will be listed here, each with its own settings. -->
+			<section
+				class="sync"
+				aria-labelledby="sidebar-sync-title"
+				transition:slide={{ duration: 220, easing: cubicOut }}
+			>
+				<h2 class="section" id="sidebar-sync-title">Sync</h2>
+				<div class="devices">
+					<span class="icon" aria-hidden="true"
+						><MonitorSmartphone size={17} strokeWidth={1.8} /></span
+					>
+					<p>
+						<b>No devices yet</b>
+						Devices the Library syncs to will show up here, each with its own settings.
+					</p>
+				</div>
+			</section>
+		{/if}
+
 		<nav class="setup" aria-label="Setup">
 			<h2 class="section">Setup</h2>
 			{#each setups as item (item.id)}
@@ -256,17 +282,21 @@
 		width: var(--sidebar-w);
 		height: 100%;
 		padding: 18px 12px 0;
+		/* Too short for everything, the whole sidebar scrolls. */
+		overflow: hidden auto;
+		scrollbar-width: thin;
 		transition: opacity 260ms;
 	}
 	.collapsed .inner {
 		opacity: 0;
 	}
-	/* The tag filter takes the room the setup links leave, its value list scrolling;
-	   in a window too short for that, the whole filter scrolls. It reaches the
+	/* The tag filter takes the room the Sync section and setup links leave, its
+	   value list scrolling. It keeps room for its fields and about three values,
+	   and scrolls as a whole when picked values crowd them. It reaches the
 	   sidebar's edges, so its scrollbar and the value list's sit there. */
 	.filter {
 		flex: 1;
-		min-height: 0;
+		min-height: 248px;
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
@@ -535,6 +565,34 @@
 		font-size: 13px;
 	}
 
+	.sync {
+		flex: none;
+		margin: 0 -12px;
+		padding: 14px 12px;
+		border-top: 1px solid var(--border);
+	}
+	.devices {
+		display: grid;
+		grid-template-columns: 16px minmax(0, 1fr);
+		gap: 10px;
+		padding: 0 12px;
+		color: var(--text-3);
+	}
+	.devices .icon {
+		height: 19px;
+	}
+	.devices p {
+		margin: 0;
+		font-size: 12.5px;
+		line-height: 1.45;
+	}
+	.devices b {
+		display: block;
+		font-size: 13.5px;
+		font-weight: 520;
+		color: var(--text-2);
+	}
+
 	.setup {
 		flex: none;
 		display: grid;
@@ -548,9 +606,13 @@
 	.playing .setup {
 		padding-bottom: calc(var(--player-h) + 24px);
 	}
+	.sync .section,
 	.setup .section {
 		margin-bottom: 6px;
 		padding-left: 12px;
+	}
+	.sync .section {
+		margin-bottom: 10px;
 	}
 	.nav-item {
 		display: grid;

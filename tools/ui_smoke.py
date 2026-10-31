@@ -136,11 +136,11 @@ class Driver:
         self.click_xpath(f"//div[@role='menu']//button[@role='menuitemradio'][.//span[contains(concat(' ', normalize-space(@class), ' '), ' label ')][normalize-space(.)='{label}']]")
 
     def open_setup(self, label):
-        """Open a setup screen (Inbox setup, Library setup, Appearance) from the sidebar."""
+        """Open a setup screen (Inbox setup, Library setup, Appearance, Sync setup) from the sidebar."""
         if self.js("return document.querySelector('.sidebar').classList.contains('collapsed')"):
             self.click(".toggle")
             time.sleep(0.5)
-        short = {"Inbox setup": "Inbox", "Library setup": "Library"}.get(label, label)
+        short = {"Inbox setup": "Inbox", "Library setup": "Library", "Sync setup": "Sync"}.get(label, label)
         self.click_xpath(f"//nav[@aria-label='Setup']//button[normalize-space(.)='{short}']")
 
     def right_click(self, css):
@@ -227,6 +227,39 @@ def appearance_flow(d, out, tag):
     d.click(".setup .back")
     d.wait("return document.querySelectorAll('.card').length > 0")
     print("after back:", repr(d.js("return location.search")))
+
+
+def sync_flow(d, out, tag):
+    """Flip the Sync switch; with --save, check the sidebar's Sync section follows, then flip it back."""
+    section = "return !!document.querySelector('#sidebar-sync-title')"
+    switch = "return document.querySelector('main [role=switch]').getAttribute('aria-checked')"
+    d.open_setup("Sync setup")
+    d.wait("return !!document.querySelector('#sync-title')")
+    time.sleep(0.6)
+    initially = d.js(switch) == "true"
+    print("sync section:", d.js(section), "| switch:", d.js(switch))
+    d.click("main [role=switch]")
+    time.sleep(0.4)
+    print("switch:", d.js(switch), "| dirty dot:", d.js("return !!document.querySelector('nav .dot')"),
+          "| changes:", d.js("return document.querySelector('.savebar .summary')?.textContent.trim()"))
+    d.shot(out / f"9c-sync-setup-{tag}.png")
+    if "--save" in sys.argv:
+        d.click_text("main", "Save")
+        d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Sync setup saved'))")
+        d.wait(f"{section} === {str(not initially).lower()}")
+        print("sync section after saving:", d.js(section))
+        d.shot(out / f"9d-sync-saved-{tag}.png")
+        # Put the setting back for later steps and runs.
+        d.click("main [role=switch]")
+        d.click_text("main", "Save")
+        d.wait(f"{section} === {str(initially).lower()}")
+        print("sync section after restoring:", d.js(section))
+    else:
+        d.click_text("main", "Revert")
+        d.wait(f"{switch} === '{str(initially).lower()}'")
+        print("after revert:", d.js(switch))
+    d.click(".setup .back")
+    d.wait("return document.querySelectorAll('.card').length > 0")
 
 
 def filter_flow(d, out, tag):
@@ -763,6 +796,7 @@ def main():
 
         appearance_flow(d, out, tag)
         print("back to inbox url:", repr(d.js("return location.search")))
+        sync_flow(d, out, tag)
         time.sleep(0.8)
 
         d.click(".cell:first-child .cover")
