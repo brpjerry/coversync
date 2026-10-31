@@ -130,14 +130,18 @@ class Driver:
         self.s("POST", f"/element/{el[ELEMENT]}/click", {})
 
     def click_sort(self, label):
-        """Pick a sort tab in the top bar."""
-        self.click_xpath(f"//div[@role='radiogroup'][@aria-label='Sort albums by']//button[normalize-space(.)='{label}']")
+        """Pick a sort from the top bar's sort menu."""
+        self.click(".sort-btn")
+        self.wait("return !!document.querySelector('[role=menu]')")
+        self.click_xpath(f"//div[@role='menu']//button[@role='menuitemradio'][.//span[contains(concat(' ', normalize-space(@class), ' '), ' label ')][normalize-space(.)='{label}']]")
 
     def open_setup(self, label):
-        """Open a setup screen (Inbox setup, Library setup, Appearance) from the top bar's menu."""
-        self.click(".settings")
-        self.wait("return !!document.querySelector('[role=menu]')")
-        self.click_text("div[@role='menu']", label)
+        """Open a setup screen (Inbox setup, Library setup, Appearance) from the sidebar."""
+        if self.js("return document.querySelector('.sidebar').classList.contains('collapsed')"):
+            self.click(".toggle")
+            time.sleep(0.5)
+        short = {"Inbox setup": "Inbox", "Library setup": "Library"}.get(label, label)
+        self.click_xpath(f"//nav[@aria-label='Setup']//button[normalize-space(.)='{short}']")
 
     def right_click(self, css):
         el = self.s("POST", "/element", {"using": "css selector", "value": css})
@@ -179,8 +183,8 @@ class Driver:
 
 
 def appearance_flow(d, out, tag):
-    """Add Label and Genre sort tabs, move Label up; save only with --save."""
-    tabs = "return [...document.querySelectorAll('.sort [role=radio]')].map(b => b.textContent.trim())"
+    """Add Label and Genre to the sort menu, move Label up; save only with --save."""
+    tabs = "return [...document.querySelectorAll('[aria-labelledby=tabs-title] .tab-label')].map(b => b.textContent.trim())"
     d.open_setup("Appearance")
     d.wait("return !!document.querySelector('.chips')")
     # The tabs card sits below Cover art size; keep it clear of the save bar.
@@ -196,7 +200,7 @@ def appearance_flow(d, out, tag):
     time.sleep(0.4)
     d.click_xpath("//li[.//span[contains(@class,'tab-label')][normalize-space(.)='Label']]//button[contains(@aria-label,'up')]")
     time.sleep(0.6)
-    print("top bar preview:", d.js(tabs), "| changes:", d.js("return document.querySelector('.savebar .summary')?.textContent.trim()"))
+    print("sort menu edits:", d.js(tabs), "| changes:", d.js("return document.querySelector('.savebar .summary')?.textContent.trim()"))
     d.shot(out / f"9a-appearance-{tag}.png")
     if "--save" in sys.argv:
         d.click_text("main", "Save")
@@ -359,7 +363,10 @@ def requests_json(d, path):
 
 def autofill_flow(d, out, tag, save):
     """Inbox setup's autofill card, and its effect on the Needs attention count."""
-    count = "return document.querySelector('.sort .count.warn')?.textContent.trim() ?? '0'"
+    # The sort menu shows the count, but it's out of reach on setup screens: ask the daemon.
+    attention = ("const r = new XMLHttpRequest(); r.open('GET', new URL('api/albums?collection=inbox', document.baseURI), false);"
+                 "r.send(); const n = String(JSON.parse(r.responseText).filter(a => a.attention).length);")
+    count = attention + " return n"
     switch = "//button[@role='switch'][.//span[contains(@class, 'label')][normalize-space(.)='{}']]"
     summary = "return document.querySelector('.savebar .summary')?.textContent.trim()"
     d.js("document.getElementById('autofill-title').scrollIntoView({block: 'start'})")
@@ -380,12 +387,12 @@ def autofill_flow(d, out, tag, save):
     saved = "return [...document.querySelectorAll('.toast')].filter(t => t.textContent.includes('Inbox setup saved')).length"
     d.click_text("main", "Save")
     d.wait(saved + " > 0")
-    d.wait(f"return document.querySelector('.sort .count.warn')?.textContent.trim() !== '{before}'")
+    d.wait(attention + f" return n !== '{before}'")
     off = d.js(count)
     d.click_xpath(switch.format("Track number from the file name"))
     d.click_xpath(switch.format("Album artist from artist"))
     d.click_text("main", "Save")
-    d.wait(f"return document.querySelector('.sort .count.warn')?.textContent.trim() === '{before}'")
+    d.wait(attention + f" return n === '{before}'")
     print("needs attention: autofill on", before, "| off", off, "| on again", d.js(count))
 
 
@@ -735,7 +742,7 @@ def main():
         time.sleep(0.7)
         print("selected:", d.js("return document.querySelector('.mode input:checked').value"),
               "| warning:", d.js("return !!document.querySelector('.warn')"),
-              "| dirty dot:", d.js("return !!document.querySelector('.settings .dot')"))
+              "| dirty dot:", d.js("return !!document.querySelector('nav .dot')"))
         d.shot(out / f"1h-inbox-move-{tag}.png")
         if "--save" in sys.argv:
             d.click_text("main", "Save")

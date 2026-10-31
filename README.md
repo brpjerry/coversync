@@ -10,7 +10,7 @@ Early days: single user, no authentication, used on a home server.
 
 ## Features
 
-- **Browse**: Inbox and Library album grids with cover art, sort tabs in the
+- **Browse**: Inbox and Library album grids with cover art, a sort menu in the
   top bar, search, a player, and a tag editor. "Needs attention" lists albums
   missing tags or art the rules require. The sidebar filters albums by tag:
   pick a tag such as Genre from its dropdown, search its values, and tick the
@@ -37,7 +37,7 @@ Early days: single user, no authentication, used on a home server.
   suggests romanized or English titles and artist names for releases in other
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first.
-- **Appearance**: which sort tabs the top bar shows, which tags the sidebar
+- **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
 
 ```text
@@ -60,10 +60,10 @@ sudo pacman -S --asdeps chromaprint                # optional: fpcalc for Smart 
 systemctl --user enable --now coversyncd
 ```
 
-The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder in
-Inbox setup (under the gear in the top bar). To build the package from a
-checkout instead, run
-`packaging/arch/build.sh` (it packages the current commit into `dist/`).
+The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder
+under Setup > Inbox (in the sidebar, under the tag filter). To build the
+package from a checkout instead, run `packaging/arch/build.sh` (it packages
+the current commit into `dist/`).
 
 ## Build and run
 

@@ -1,7 +1,6 @@
-// Appearance: the top bar's sort tabs, the sidebar's tag filters and the album
+// Appearance: the top bar's sort menu, the sidebar's tag filters and the album
 // grid's cover size. Loaded at start-up because the top bar, sidebar and grid
-// need them; the Appearance screen edits `sorts`, `filters` (the top bar
-// previews the sort tabs) and `coverSize`.
+// need them; the Appearance screen edits `sorts`, `filters` and `coverSize`.
 
 import { api, ApiError, type AppearanceResponse, type CoverSizes, type Sortable } from './api';
 import { toast } from './toast.svelte';
@@ -88,7 +87,7 @@ class AppearanceStore {
 	sortable = $state<Sortable[]>([]);
 	filterable = $state<Sortable[]>([]);
 	groups = $state<{ id: string; label: string }[]>([]);
-	/** The top bar's sort tabs; it keeps at least one. */
+	/** The top bar's sort menu; it keeps at least one. */
 	sorts = new TagList(DEFAULT_SORTS, 1);
 	/** Tags the sidebar filters by. */
 	filters = new TagList(DEFAULT_FILTERS, 0);
@@ -133,7 +132,7 @@ class AppearanceStore {
 		this.coverSize = this.savedCoverSize;
 	}
 
-	/** Returns whether it saved; new tabs and filters need fresh album data for their values. */
+	/** Returns whether it saved; new sorts and filters need fresh album data for their values. */
 	async save(): Promise<boolean> {
 		this.saving = true;
 		try {

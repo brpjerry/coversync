@@ -366,7 +366,6 @@
 	@media (max-width: 800px) {
 		.player {
 			grid-template-columns: minmax(0, 1fr) auto;
-			height: auto;
 			padding: 8px 12px;
 			gap: 8px;
 		}

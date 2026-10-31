@@ -18,7 +18,7 @@ export interface Album {
 	added_at: number;
 	format: string;
 	collection: Collection;
-	/** Album-wide values for sort tabs beyond the built-in fields. */
+	/** Album-wide values for sorts beyond the built-in fields. */
 	sort_values?: Record<string, string>;
 	/** Every value of each sidebar filter tag on any track, several in one tag split apart. */
 	filter_values?: Record<string, string[]>;
@@ -361,7 +361,7 @@ export type IdentifyState =
 	| { state: 'failed'; error: string };
 
 export interface AppearanceSetup {
-	/** Top bar sort tabs, in order: tag kind ids or 'added'. */
+	/** The top bar's sort menu, in order: tag kind ids or 'added'. */
 	sort_tabs: string[];
 	/** Tag kinds the sidebar filters by, in its dropdown's order. */
 	filter_tags: string[];

@@ -7,15 +7,10 @@
 	import LibraryBig from '@lucide/svelte/icons/library-big';
 	import PanelLeftClose from '@lucide/svelte/icons/panel-left-close';
 	import PanelLeftOpen from '@lucide/svelte/icons/panel-left-open';
-	import Settings from '@lucide/svelte/icons/settings';
-	import FolderCog from '@lucide/svelte/icons/folder-cog';
-	import Settings2 from '@lucide/svelte/icons/settings-2';
-	import Palette from '@lucide/svelte/icons/palette';
 	import { fade, fly } from 'svelte/transition';
 	import type { ScanProgress } from '#lib/api.ts';
 	import { collection, isSetup, type View } from '#lib/browse.ts';
 	import { count } from '#lib/format.ts';
-	import ContextMenu, { type MenuEntry } from './ContextMenu.svelte';
 
 	interface Props {
 		query: string;
@@ -28,13 +23,11 @@
 		sidebarOpen: boolean;
 		/** How many tag values filter the grid, flagged on the sidebar toggle while it's closed. */
 		filtered: number;
-		/** Setup screens with unsaved changes. */
-		dirty: Partial<Record<View, boolean>>;
 		onview: (view: View) => void;
 		ontogglesidebar: () => void;
 		onrescan: () => void;
 		search?: HTMLInputElement;
-		/** The sort tabs, on the bar's second row. */
+		/** The sort menu, at the bar's right end. */
 		sorts: Snippet;
 	}
 	let {
@@ -46,7 +39,6 @@
 		total,
 		sidebarOpen,
 		filtered,
-		dirty,
 		onview,
 		ontogglesidebar,
 		onrescan,
@@ -59,34 +51,9 @@
 		{ id: 'library', label: 'Library', icon: LibraryBig }
 	] as const;
 
-	const setups = [
-		{ id: 'inbox-setup', label: 'Inbox setup', icon: FolderCog },
-		{ id: 'library-setup', label: 'Library setup', icon: Settings2 },
-		{ id: 'appearance', label: 'Appearance', icon: Palette }
-	] as const;
-	let settings = $state<HTMLButtonElement>();
-	/** Where the setup menu opens, while it's open. */
-	let menu = $state<{ x: number; y: number } | null>(null);
-	let unsaved = $derived(setups.some((s) => dirty[s.id]));
-	let menuItems = $derived(
-		setups.map((s): MenuEntry => ({
-			label: s.label,
-			icon: s.icon,
-			run: () => onview(s.id),
-			current: view === s.id,
-			note: dirty[s.id] ? 'Unsaved' : undefined
-		}))
-	);
-	function toggleMenu() {
-		if (menu || !settings) return (menu = null);
-		// Below the button, its right edge lined up with the button's.
-		const r = settings.getBoundingClientRect();
-		menu = { x: r.right, y: r.bottom + 8 };
-	}
-
 	// Each setup screen sits under its collection's tab.
 	let tab = $derived(collection(view));
-	/** Filters only apply to album grids, so setup screens leave the sidebar closed. */
+	/** Filters only apply to album grids, not setup screens. */
 	let setup = $derived(isSetup(view));
 	/** Library setup and Appearance reuse the search field to filter tags. */
 	let filtering = $derived(view === 'library-setup' || view === 'appearance');
@@ -114,13 +81,12 @@
 			class="icon-btn toggle"
 			onclick={ontogglesidebar}
 			aria-label={sidebarOpen
-				? 'Hide filters'
+				? 'Hide sidebar'
 				: filtered && !setup
-					? `Show filters, ${filtered} applied`
-					: 'Show filters'}
+					? `Show sidebar, ${filtered} ${filtered === 1 ? 'filter' : 'filters'} applied`
+					: 'Show sidebar'}
 			aria-expanded={sidebarOpen}
 			aria-controls="sidebar"
-			disabled={setup}
 		>
 			{#if sidebarOpen}<PanelLeftClose size={19} />{:else}<PanelLeftOpen size={19} />{/if}
 			{#if filtered && !sidebarOpen && !setup}
@@ -191,6 +157,10 @@
 				<span class="ring" style:--p={pct}></span>
 				<span class="scan-label tabular">{label}</span>
 			</div>
+		{:else if !setup}
+			<span class="stats tabular" in:fade>
+				{shown !== total ? `${count(shown)} of ${count(total)}` : count(total)} albums
+			</span>
 		{/if}
 		<button
 			class="icon-btn"
@@ -200,39 +170,9 @@
 		>
 			<span class:spin={scan?.running}><RefreshCw size={17} /></span>
 		</button>
-		<button
-			bind:this={settings}
-			class="icon-btn settings"
-			class:on={setup}
-			onclick={toggleMenu}
-			aria-label="Setup"
-			aria-haspopup="menu"
-			aria-expanded={!!menu}
-		>
-			<Settings size={18} />
-			{#if unsaved}<i class="dot" aria-label="Unsaved changes"></i>{/if}
-		</button>
-	</div>
-
-	<div class="second">
 		{@render sorts()}
-		{#if !setup}
-			<span class="stats tabular" in:fade>
-				{shown !== total ? `${count(shown)} of ${count(total)}` : count(total)} albums
-			</span>
-		{/if}
 	</div>
 </header>
-
-{#if menu}
-	<ContextMenu
-		x={menu.x}
-		y={menu.y}
-		items={menuItems}
-		anchor={settings}
-		onclose={() => (menu = null)}
-	/>
-{/if}
 
 <style>
 	.bar {
@@ -240,8 +180,8 @@
 		top: 0;
 		z-index: 20;
 		display: grid;
-		grid-template-columns: auto minmax(180px, 440px) auto 1fr;
-		grid-template-rows: var(--bar-h) var(--sortbar-h);
+		/* The search field gives way before the buttons on the right do. */
+		grid-template-columns: auto minmax(180px, 440px) auto minmax(max-content, 1fr);
 		align-items: center;
 		column-gap: 20px;
 		height: var(--topbar-h);
@@ -258,12 +198,6 @@
 	.toggle {
 		position: relative;
 		flex: none;
-	}
-	.toggle:disabled {
-		opacity: 0.45;
-		cursor: default;
-		background: none;
-		color: var(--text-2);
 	}
 	/* How many filters apply while the sidebar is closed. */
 	.filtered {
@@ -427,35 +361,7 @@
 		gap: 12px;
 		min-width: 0;
 	}
-	.settings {
-		position: relative;
-	}
-	.settings.on {
-		color: var(--accent);
-		background: color-mix(in oklab, var(--accent) 14%, transparent);
-	}
-	.dot {
-		position: absolute;
-		top: 6px;
-		right: 6px;
-		width: 7px;
-		height: 7px;
-		border-radius: 999px;
-		background: var(--accent);
-		box-shadow: 0 0 0 2px var(--bg);
-	}
-	.second {
-		grid-column: 1 / -1;
-		display: flex;
-		align-items: center;
-		gap: 16px;
-		min-width: 0;
-		/* Close under the first row, as far from it as from the bar's bottom edge. */
-		align-self: start;
-		padding-top: 2px;
-	}
 	.stats {
-		margin-left: auto;
 		color: var(--text-3);
 		font-size: 13px;
 		white-space: nowrap;
@@ -472,6 +378,7 @@
 		font-size: 12.5px;
 		color: var(--text-2);
 		min-width: 0;
+		max-width: 220px;
 	}
 	.scan-label {
 		white-space: nowrap;
@@ -497,11 +404,16 @@
 		}
 	}
 
+	@media (max-width: 1040px) {
+		.stats,
+		.scan-label {
+			display: none;
+		}
+	}
 	@media (max-width: 900px) {
 		.bar {
 			/* The search field gives way first on phones. */
 			grid-template-columns: auto minmax(0, 1fr) auto;
-			grid-template-rows: none;
 			height: auto;
 			padding: 12px 16px;
 			row-gap: 12px;
@@ -510,15 +422,7 @@
 			grid-row: 2;
 			grid-column: 1 / -1;
 		}
-		.second {
-			grid-row: 3;
-			padding-top: 0;
-		}
 		.brand .name {
-			display: none;
-		}
-		.stats,
-		.scan-label {
 			display: none;
 		}
 	}

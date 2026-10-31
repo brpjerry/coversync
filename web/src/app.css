@@ -20,13 +20,17 @@
 	--ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 	--ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 	--player-h: 84px;
-	/* The top bar's two rows: search and collections, then sort tabs. */
-	--bar-h: 62px;
-	--sortbar-h: 46px;
-	--topbar-h: calc(var(--bar-h) + var(--sortbar-h));
+	--topbar-h: 68px;
 	--sidebar-w: 248px;
 	--font:
 		'Inter Variable', system-ui, 'Noto Sans CJK JP', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
+}
+
+/* The player's two rows on narrow screens (PlayerBar's breakpoint). */
+@media (max-width: 800px) {
+	:root {
+		--player-h: 156px;
+	}
 }
 
 @media (prefers-color-scheme: light) {
