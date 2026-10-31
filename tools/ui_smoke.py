@@ -230,12 +230,13 @@ def appearance_flow(d, out, tag):
 
 
 def sync_flow(d, out, tag):
-    """Turn sync off: the sidebar's Sync section hides once saved (only with --save)."""
+    """Flip the Sync switch; with --save, check the sidebar's Sync section follows, then flip it back."""
     section = "return !!document.querySelector('#sidebar-sync-title')"
     switch = "return document.querySelector('main [role=switch]').getAttribute('aria-checked')"
     d.open_setup("Sync setup")
     d.wait("return !!document.querySelector('#sync-title')")
     time.sleep(0.6)
+    initially = d.js(switch) == "true"
     print("sync section:", d.js(section), "| switch:", d.js(switch))
     d.click("main [role=switch]")
     time.sleep(0.4)
@@ -245,17 +246,17 @@ def sync_flow(d, out, tag):
     if "--save" in sys.argv:
         d.click_text("main", "Save")
         d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Sync setup saved'))")
-        d.wait("return !document.querySelector('#sidebar-sync-title')")
-        print("sync section after saving off:", d.js(section))
-        d.shot(out / f"9d-sync-off-{tag}.png")
-        # Turn it back on for later steps and runs.
+        d.wait(f"{section} === {str(not initially).lower()}")
+        print("sync section after saving:", d.js(section))
+        d.shot(out / f"9d-sync-saved-{tag}.png")
+        # Put the setting back for later steps and runs.
         d.click("main [role=switch]")
         d.click_text("main", "Save")
-        d.wait("return !!document.querySelector('#sidebar-sync-title')")
-        print("sync section after saving on:", d.js(section))
+        d.wait(f"{section} === {str(initially).lower()}")
+        print("sync section after restoring:", d.js(section))
     else:
         d.click_text("main", "Revert")
-        time.sleep(0.4)
+        d.wait(f"{switch} === '{str(initially).lower()}'")
         print("after revert:", d.js(switch))
     d.click(".setup .back")
     d.wait("return document.querySelectorAll('.card').length > 0")

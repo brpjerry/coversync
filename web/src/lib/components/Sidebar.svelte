@@ -282,17 +282,21 @@
 		width: var(--sidebar-w);
 		height: 100%;
 		padding: 18px 12px 0;
+		/* Too short for everything, the whole sidebar scrolls. */
+		overflow: hidden auto;
+		scrollbar-width: thin;
 		transition: opacity 260ms;
 	}
 	.collapsed .inner {
 		opacity: 0;
 	}
-	/* The tag filter takes the room the setup links leave, its value list scrolling;
-	   in a window too short for that, the whole filter scrolls. It reaches the
+	/* The tag filter takes the room the Sync section and setup links leave, its
+	   value list scrolling. It keeps room for its fields and about three values,
+	   and scrolls as a whole when picked values crowd them. It reaches the
 	   sidebar's edges, so its scrollbar and the value list's sit there. */
 	.filter {
 		flex: 1;
-		min-height: 0;
+		min-height: 248px;
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
