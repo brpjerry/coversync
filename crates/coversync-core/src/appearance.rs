@@ -63,7 +63,7 @@ pub struct SortGroup {
     pub label: &'static str,
 }
 
-/// Everything that can be a sort tab: text tag kinds plus "Recently added".
+/// Everything the sort menu can offer: text tag kinds plus "Recently added".
 pub fn sortable() -> Vec<Sortable> {
     let mut out = vec![
         Sortable {
@@ -83,7 +83,7 @@ pub fn sortable() -> Vec<Sortable> {
             .filter(|k| !rules::NOT_EDITABLE.contains(&k.id))
             .map(|k| Sortable {
                 id: k.id,
-                // "Year" reads better than the catalog's "Date / year" as a tab.
+                // "Year" reads better than the catalog's "Date / year" as a sort.
                 label: if k.id == "date" { "Year" } else { k.label },
                 group: k.group,
             }),

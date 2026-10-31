@@ -83,7 +83,7 @@
 			aria-label={sidebarOpen
 				? 'Hide sidebar'
 				: filtered && !setup
-					? `Show sidebar, ${filtered} filters applied`
+					? `Show sidebar, ${filtered} ${filtered === 1 ? 'filter' : 'filters'} applied`
 					: 'Show sidebar'}
 			aria-expanded={sidebarOpen}
 			aria-controls="sidebar"

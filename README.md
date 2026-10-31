@@ -60,10 +60,10 @@ sudo pacman -S --asdeps chromaprint                # optional: fpcalc for Smart 
 systemctl --user enable --now coversyncd
 ```
 
-The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder in
-Inbox setup (in the sidebar, under the tag filter). To build the package from
-a checkout instead, run `packaging/arch/build.sh` (it packages the current
-commit into `dist/`).
+The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder
+under Setup > Inbox (in the sidebar, under the tag filter). To build the
+package from a checkout instead, run `packaging/arch/build.sh` (it packages
+the current commit into `dist/`).
 
 ## Build and run
 

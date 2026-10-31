@@ -18,7 +18,7 @@ export interface Album {
 	added_at: number;
 	format: string;
 	collection: Collection;
-	/** Album-wide values for sort tabs beyond the built-in fields. */
+	/** Album-wide values for sorts beyond the built-in fields. */
 	sort_values?: Record<string, string>;
 	/** Every value of each sidebar filter tag on any track, several in one tag split apart. */
 	filter_values?: Record<string, string[]>;

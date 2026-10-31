@@ -18,7 +18,7 @@
 </script>
 
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import Check from '@lucide/svelte/icons/check';
@@ -28,7 +28,7 @@
 		y: number;
 		title?: string;
 		items: MenuEntry[];
-		/** The button that opened the menu: clicking it again isn't clicking away, and keyboard dismissal returns to it. */
+		/** The button that opened the menu: clicking it again isn't clicking away, and picking an item or dismissing with the keyboard returns to it. */
 		anchor?: HTMLElement;
 		onclose: () => void;
 	}
@@ -59,9 +59,13 @@
 		top = flipY ? y - height : y;
 		origin = `${flipY ? 'bottom' : 'top'} ${flipX ? 'right' : 'left'}`;
 		const list = buttons();
-		(list.find((b) => b.getAttribute('aria-checked') === 'true') ?? list[0])?.focus({
-			preventScroll: true
-		});
+		const start = list.find((b) => b.getAttribute('aria-checked') === 'true') ?? list[0];
+		start?.focus({ preventScroll: true });
+		// Once its height applies, a long menu scrolls to centre that item.
+		if (long && start)
+			tick().then(() => {
+				if (menu) menu.scrollTop = start.offsetTop - (menu.clientHeight - start.offsetHeight) / 2;
+			});
 
 		const away = (e: Event) => {
 			const target = e.target as Node;
@@ -114,6 +118,11 @@
 	tabindex="-1"
 	aria-label={title}
 	bind:this={menu}
+	{@attach (node) => {
+		// From the body, so no ancestor's stacking context (the top bar's) puts the player over it.
+		document.body.append(node);
+		return () => node.remove();
+	}}
 	style:left="{left}px"
 	style:top="{top}px"
 	style:max-height={height && `${height}px`}
@@ -134,6 +143,7 @@
 				aria-checked={item.checked}
 				onclick={() => {
 					onclose();
+					anchor?.focus({ preventScroll: true });
 					item.run();
 				}}
 			>

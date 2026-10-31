@@ -28,7 +28,7 @@
 		/** Tags to filter by, in the dropdown's order (configured in Appearance). */
 		kinds: string[];
 		label: (id: string) => string;
-		/** Albums the sort tab and search leave, before tag filters. */
+		/** Albums the sort and search leave, before tag filters. */
 		albums: Album[];
 		/** Picked values by tag. */
 		filters: Filters;
@@ -261,13 +261,19 @@
 	.collapsed .inner {
 		opacity: 0;
 	}
-	/* The tag filter takes the room the setup links leave, its value list scrolling. */
+	/* The tag filter takes the room the setup links leave, its value list scrolling;
+	   in a window too short for that, the whole filter scrolls. It reaches the
+	   sidebar's edges, so its scrollbar and the value list's sit there. */
 	.filter {
 		flex: 1;
 		min-height: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 10px;
+		margin: 0 -12px;
+		padding: 0 12px;
+		overflow: hidden auto;
+		scrollbar-width: thin;
 		transition: opacity 240ms;
 	}
 	.filter.idle {
@@ -429,7 +435,8 @@
 
 	.values {
 		flex: 1;
-		min-height: 0;
+		/* About three values. */
+		min-height: 120px;
 		display: flex;
 		flex-direction: column;
 		gap: 1px;

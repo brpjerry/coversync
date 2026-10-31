@@ -20,7 +20,7 @@ export function collection(v: View): 'inbox' | 'library' | null {
 }
 export const isSetup = (v: View) => v.endsWith('-setup') || v === 'appearance';
 
-/** A sort tab: a tag kind id, or 'added'. Which ones exist is set in Appearance. */
+/** A sort: a tag kind id, or 'added'. Which ones the sort menu offers is set in Appearance. */
 export type Sort = string;
 
 /** Earlier builds stored these names for the original four tabs. */

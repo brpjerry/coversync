@@ -133,7 +133,7 @@ class Driver:
         """Pick a sort from the top bar's sort menu."""
         self.click(".sort-btn")
         self.wait("return !!document.querySelector('[role=menu]')")
-        self.click_xpath(f"//div[@role='menu']//button[@role='menuitemradio'][normalize-space(.)='{label}' or starts-with(normalize-space(.), '{label} ')]")
+        self.click_xpath(f"//div[@role='menu']//button[@role='menuitemradio'][.//span[contains(concat(' ', normalize-space(@class), ' '), ' label ')][normalize-space(.)='{label}']]")
 
     def open_setup(self, label):
         """Open a setup screen (Inbox setup, Library setup, Appearance) from the sidebar."""

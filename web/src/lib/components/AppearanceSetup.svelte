@@ -17,7 +17,7 @@
 	interface Props {
 		/** Filter text from the top bar's search field. */
 		query: string;
-		/** Saved: album data needs refreshing for any new sort tabs or filters. */
+		/** Saved: album data needs refreshing for any new sorts or filters. */
 		onsaved: () => void;
 		back: Back;
 		/** The album grid's width, so the preview shows cards at the size they'll be. */

@@ -69,7 +69,7 @@
 	let sort = $state<Sort>(
 		migrateSort(readPref(SORT_KEY, (v): v is string => typeof v === 'string', 'album_artist'))
 	);
-	/** The sort in use: the chosen one, or the first tab if it was removed in Appearance. */
+	/** The sort in use: the chosen one, or the menu's first if it was removed in Appearance. */
 	let activeSort = $derived(
 		appearance.sorts.saved.includes(sort) ? sort : appearance.sorts.saved[0]
 	);
@@ -142,7 +142,7 @@
 		'tagging_time'
 	]);
 
-	/** An album's value for a sort tab: built-in fields, else the daemon's sort values. */
+	/** An album's value for a sort: built-in fields, else the daemon's sort values. */
 	function sortValue(a: Album, key: Sort): string | number | null {
 		switch (key) {
 			case 'added':
@@ -200,7 +200,7 @@
 	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
 	let attentionView = $derived(activeSort === 'attention');
 	let flagged = $derived(source.filter((a) => a.attention));
-	/** Albums the sort tab and search leave, in order; the sidebar's tag filters narrow them. */
+	/** Albums the sort and search leave, in order; the sidebar's tag filters narrow them. */
 	let searched = $derived.by(() => {
 		const list = attentionView
 			? sorted(source, 'album_artist').filter((a) => a.attention)
@@ -661,7 +661,7 @@
 {#if narrow && drawerOpen}
 	<button
 		class="scrim"
-		aria-label="Close filters"
+		aria-label="Close sidebar"
 		onclick={() => (drawerOpen = false)}
 		transition:fade={{ duration: 260 }}
 	></button>

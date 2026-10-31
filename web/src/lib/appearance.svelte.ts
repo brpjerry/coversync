@@ -132,7 +132,7 @@ class AppearanceStore {
 		this.coverSize = this.savedCoverSize;
 	}
 
-	/** Returns whether it saved; new tabs and filters need fresh album data for their values. */
+	/** Returns whether it saved; new sorts and filters need fresh album data for their values. */
 	async save(): Promise<boolean> {
 		this.saving = true;
 		try {

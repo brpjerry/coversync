@@ -26,6 +26,13 @@
 		'Inter Variable', system-ui, 'Noto Sans CJK JP', 'Hiragino Sans', 'Yu Gothic UI', sans-serif;
 }
 
+/* The player's two rows on narrow screens (PlayerBar's breakpoint). */
+@media (max-width: 800px) {
+	:root {
+		--player-h: 156px;
+	}
+}
+
 @media (prefers-color-scheme: light) {
 	:root:not([data-theme='dark']) {
 		color-scheme: light;
