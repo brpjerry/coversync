@@ -235,8 +235,8 @@
 		background: var(--surface-hover);
 	}
 	.count.warn {
-		color: color-mix(in oklab, hsl(40 90% 62%) 75%, var(--text));
-		background: color-mix(in oklab, hsl(40 90% 55%) 18%, transparent);
+		color: var(--warn-text);
+		background: var(--warn-surface);
 	}
 	/* Radio items keep the tick at the far end. */
 	.check {

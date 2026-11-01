@@ -197,7 +197,7 @@
 		z-index: 20;
 		display: grid;
 		/* The search field gives way before the buttons on the right do. */
-		grid-template-columns: auto minmax(180px, 440px) auto minmax(max-content, 1fr);
+		grid-template-columns: auto minmax(140px, 440px) auto minmax(max-content, 1fr);
 		align-items: center;
 		column-gap: 20px;
 		height: var(--topbar-h);

@@ -414,13 +414,17 @@
 			display: none;
 		}
 	}
-	/* Phones: the summary and the buttons on their own rows. */
+	/* Phones: a sheet along the bottom edge, summary and buttons on their own rows. */
 	@media (max-width: 600px) {
 		.savebar {
+			bottom: 0;
 			flex-wrap: wrap;
 			justify-content: flex-end;
-			padding: 10px 12px;
-			border-radius: 22px;
+			margin: 0 -20px;
+			padding: 10px 16px;
+			border-radius: 0;
+			border-width: 1px 0 0;
+			box-shadow: 0 -12px 32px -16px rgb(0 0 0 / 0.5);
 		}
 		.summary {
 			flex: 1 1 100%;

@@ -870,9 +870,9 @@
 		display: grid;
 		gap: 6px;
 		border-radius: 12px;
-		background: color-mix(in oklab, hsl(40 90% 60%) 10%, transparent);
-		border: 1px solid color-mix(in oklab, hsl(40 90% 60%) 30%, transparent);
-		color: color-mix(in oklab, hsl(40 90% 70%) 85%, var(--text));
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+		color: var(--warn-text);
 		font-size: 13.5px;
 	}
 	.problems li {
@@ -883,6 +883,7 @@
 	.problems :global(svg) {
 		flex: none;
 		margin-top: 2px;
+		color: var(--warn);
 	}
 
 	.album-fields {

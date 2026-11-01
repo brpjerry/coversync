@@ -2,7 +2,7 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
 	import { fade, fly, slide } from 'svelte/transition';
-	import { goto, pushState, replaceState } from '$app/navigation';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
@@ -301,7 +301,8 @@
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
 		await morph(cover, async () => {
-			await pushState('', { album: album.id });
+			// Shallow: a history entry with the album in page.state, no navigation.
+			await goto(page.url.href, { state: { album: album.id }, shallow: true });
 			await tick();
 		});
 	}
@@ -341,7 +342,12 @@
 	async function onsaved(result: TagWriteResult) {
 		await loadAlbums();
 		if (result.album) detail = result.album;
-		if (result.album_id !== openId) await replaceState('', { album: result.album_id });
+		if (result.album_id !== openId)
+			await goto(page.url.href, {
+				state: { album: result.album_id },
+				shallow: true,
+				replace: true
+			});
 	}
 
 	let lastAlbums = 0;
@@ -790,7 +796,8 @@
 		   intrinsic width. */
 		grid-column: 2;
 		min-width: 0;
-		padding: 28px 28px calc(var(--player-h) + 56px);
+		/* Clear of the player while it's showing (--dock). */
+		padding: 28px 28px calc(var(--dock, 0px) + 56px);
 	}
 	/* The attention view is a filter: say so above the grid, with the way out. */
 	.attention-note {
@@ -803,12 +810,12 @@
 		border-radius: 12px;
 		font-size: 13.5px;
 		color: var(--text-2);
-		background: color-mix(in oklab, hsl(40 90% 60%) 9%, transparent);
-		border: 1px solid color-mix(in oklab, hsl(40 90% 60%) 28%, transparent);
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
 	}
 	.attention-note :global(svg) {
 		flex: none;
-		color: hsl(40 85% 58%);
+		color: var(--warn);
 	}
 	.attention-note span {
 		min-width: 0;
@@ -980,7 +987,7 @@
 	}
 	@media (max-width: 600px) {
 		main {
-			padding: 18px 16px calc(var(--player-h) + 64px);
+			padding: 18px 16px calc(var(--dock, 0px) + 64px);
 		}
 		.grid {
 			gap: 22px 14px;

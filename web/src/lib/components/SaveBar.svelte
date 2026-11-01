@@ -34,6 +34,8 @@
 			</button>
 		</div>
 	</div>
+	<!-- Phones: the bar docks to the window's bottom edge; this keeps the form's end clear of it. -->
+	<div class="dock-space" aria-hidden="true"></div>
 {/if}
 
 <style>
@@ -73,6 +75,27 @@
 	@keyframes spin {
 		to {
 			rotate: 360deg;
+		}
+	}
+	.dock-space {
+		display: none;
+	}
+	/* Phones: a sheet along the bottom edge, above the player, rather than a pill over the form. */
+	@media (max-width: 600px) {
+		.savebar {
+			position: fixed;
+			left: 0;
+			right: 0;
+			bottom: var(--dock, 0px);
+			z-index: 24;
+			padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+			border-radius: 0;
+			border-width: 1px 0 0;
+			box-shadow: 0 -12px 32px -16px rgb(0 0 0 / 0.5);
+		}
+		.dock-space {
+			display: block;
+			height: 72px;
 		}
 	}
 </style>

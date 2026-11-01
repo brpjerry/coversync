@@ -1,5 +1,6 @@
 <script lang="ts">
 	import ArrowDownWideNarrow from '@lucide/svelte/icons/arrow-down-wide-narrow';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import type { Sort } from '#lib/browse.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
 	import ContextMenu, { type MenuEntry } from './ContextMenu.svelte';
@@ -38,19 +39,24 @@
 		const r = button.getBoundingClientRect();
 		menu = { x: r.right, y: r.bottom + 8 };
 	}
+	let Icon = $derived(sortIcon(active));
 </script>
 
+<!-- Names the sort in use; phones get the sort glyph alone, the menu says the rest. -->
 <button
 	bind:this={button}
-	class="icon-btn sort-btn"
+	class="sort-btn"
+	class:warn={active === 'attention'}
 	onclick={toggle}
 	aria-label="Sort by {label(active)}"
-	title="Sort by {label(active)}"
 	aria-haspopup="menu"
 	aria-expanded={!!menu}
 	{disabled}
 >
-	<ArrowDownWideNarrow size={18} />
+	<span class="glyph" aria-hidden="true"><ArrowDownWideNarrow size={17} /></span>
+	<span class="active" aria-hidden="true"><Icon size={15} strokeWidth={2} /></span>
+	<span class="label">{label(active)}</span>
+	<span class="chev" aria-hidden="true"><ChevronDown size={14} /></span>
 </button>
 
 {#if menu}
@@ -65,14 +71,63 @@
 {/if}
 
 <style>
+	.sort-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		height: 36px;
+		padding: 0 9px 0 11px;
+		border-radius: 999px;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		font-size: 13.5px;
+		font-weight: 560;
+		color: var(--text-2);
+		white-space: nowrap;
+		transition:
+			background 160ms,
+			border-color 160ms,
+			color 160ms,
+			opacity 160ms;
+	}
+	.sort-btn:hover:not(:disabled),
 	.sort-btn[aria-expanded='true'] {
-		color: var(--text);
 		background: var(--surface-hover);
+		border-color: var(--border-strong);
+		color: var(--text);
 	}
 	.sort-btn:disabled {
 		opacity: 0.45;
 		cursor: default;
-		background: none;
-		color: var(--text-2);
+	}
+	.active {
+		display: grid;
+		color: var(--accent);
+	}
+	.warn .active {
+		color: var(--warn);
+	}
+	.chev {
+		display: grid;
+		color: var(--text-3);
+	}
+	/* The sort glyph stands in for the label on phones. */
+	.glyph {
+		display: none;
+	}
+	@media (max-width: 600px) {
+		.sort-btn {
+			width: 36px;
+			padding: 0;
+			justify-content: center;
+		}
+		.glyph {
+			display: grid;
+		}
+		.active,
+		.label,
+		.chev {
+			display: none;
+		}
 	}
 </style>

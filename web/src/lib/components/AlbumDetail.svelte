@@ -203,7 +203,8 @@
 		z-index: 30;
 		overflow-y: auto;
 		overscroll-behavior: contain;
-		padding: 48px 24px calc(var(--player-h) + 40px);
+		/* Room for the player while it's showing (--dock). */
+		padding: 48px 24px calc(var(--dock, 0px) + 40px);
 		background: color-mix(in oklab, var(--bg) 55%, transparent);
 		backdrop-filter: blur(18px) saturate(1.2);
 	}
@@ -543,7 +544,7 @@
 
 	@media (max-width: 760px) {
 		.sheet-wrap {
-			padding: 0;
+			padding: 0 0 var(--dock, 0px);
 		}
 		.sheet {
 			border-radius: 0;
