@@ -260,7 +260,7 @@
 
 	.album-grid {
 		display: grid;
-		grid-template-columns: repeat(4, 1fr);
+		grid-template-columns: repeat(4, minmax(0, 1fr));
 		gap: 14px;
 	}
 	.field {
@@ -327,7 +327,7 @@
 	.thead,
 	.tr {
 		display: grid;
-		grid-template-columns: 64px 64px 1.4fr 1fr;
+		grid-template-columns: 64px 64px minmax(0, 1.4fr) minmax(0, 1fr);
 		gap: 8px;
 	}
 	.thead span {
@@ -404,13 +404,29 @@
 
 	@media (max-width: 760px) {
 		.album-grid {
-			grid-template-columns: 1fr 1fr;
+			grid-template-columns: repeat(2, minmax(0, 1fr));
 		}
 		.thead,
 		.tr {
-			grid-template-columns: 44px 44px 1fr;
+			grid-template-columns: 44px 44px minmax(0, 1fr);
 		}
 		.col-artist {
+			display: none;
+		}
+	}
+	/* Phones: the summary and the buttons on their own rows. */
+	@media (max-width: 600px) {
+		.savebar {
+			flex-wrap: wrap;
+			justify-content: flex-end;
+			padding: 10px 12px;
+			border-radius: 22px;
+		}
+		.summary {
+			flex: 1 1 100%;
+			padding-left: 4px;
+		}
+		.hint {
 			display: none;
 		}
 	}

@@ -850,6 +850,19 @@
 		padding: 0 12px;
 		font-size: 13px;
 	}
+	/* Phones: the buttons go under the text instead of squeezing it. */
+	@media (max-width: 600px) {
+		.art-drop {
+			flex-wrap: wrap;
+		}
+		.art-text {
+			flex-basis: calc(100% - 70px);
+		}
+		.art-actions {
+			flex-basis: 100%;
+			justify-content: flex-end;
+		}
+	}
 	.problems {
 		list-style: none;
 		margin: 0;

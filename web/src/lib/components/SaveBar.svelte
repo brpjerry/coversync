@@ -39,7 +39,8 @@
 <style>
 	.savebar {
 		position: sticky;
-		bottom: calc(var(--player-h) + 28px);
+		/* Just above the player while it's showing (--dock), else near the bottom. */
+		bottom: calc(var(--dock, 0px) + 24px);
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
