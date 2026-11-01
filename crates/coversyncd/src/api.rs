@@ -226,7 +226,13 @@ fn setup_response(setup: LibrarySetup) -> SetupResponse {
     }];
     variables.extend(rules::CATALOG.iter().map(|k| Variable {
         id: k.id,
-        label: k.label,
+        // The date tag is "Year" everywhere else; here {year} is the four digits and
+        // {date} the tag as written, which may be a full date.
+        label: if k.id == "date" {
+            "Date, as tagged"
+        } else {
+            k.label
+        },
         group: k.group,
     }));
     SetupResponse {

@@ -83,7 +83,7 @@ pub const CATALOG: &[TagKind] = kinds! {
         "track_total", "Track total", [TrackTotal];
         "disc_number", "Disc number", [DiscNumber];
         "disc_total", "Disc total", [DiscTotal];
-        "date", "Date / year", [RecordingDate, Year];
+        "date", "Year", [RecordingDate, Year];
         "genre", "Genre", [Genre];
     ]
     "release" => [

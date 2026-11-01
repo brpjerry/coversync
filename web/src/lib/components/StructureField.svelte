@@ -233,12 +233,16 @@
 		gap: 6px;
 	}
 	.suggestion {
+		max-width: 100%;
 		padding: 5px 10px;
 		border-radius: 8px;
 		border: 1px solid var(--border);
 		background: var(--surface);
 		font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', monospace;
 		font-size: 12px;
+		text-align: left;
+		/* A structure with no spaces would otherwise widen the whole screen on phones. */
+		overflow-wrap: anywhere;
 		color: var(--text-2);
 		transition:
 			border-color 160ms,

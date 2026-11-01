@@ -29,6 +29,8 @@
 		search?: HTMLInputElement;
 		/** The sort menu, at the bar's right end. */
 		sorts: Snippet;
+		/** A dialog is open over the page: the bar takes no focus or clicks. */
+		inert?: boolean;
 	}
 	let {
 		query = $bindable(),
@@ -43,7 +45,8 @@
 		ontogglesidebar,
 		onrescan,
 		search = $bindable(),
-		sorts
+		sorts,
+		inert = false
 	}: Props = $props();
 
 	const views = [
@@ -59,6 +62,17 @@
 	let filtering = $derived(view === 'library-setup' || view === 'appearance');
 	/** Inbox setup and sync setup have nothing to search. */
 	let searchable = $derived(view !== 'inbox-setup' && view !== 'sync-setup');
+	/** Phones: the field is too short for the long placeholder. */
+	let phone = $state(matchMedia('(max-width: 600px)').matches);
+	$effect(() => {
+		const mq = matchMedia('(max-width: 600px)');
+		const onchange = () => (phone = mq.matches);
+		mq.addEventListener('change', onchange);
+		return () => mq.removeEventListener('change', onchange);
+	});
+	let placeholder = $derived(
+		filtering ? 'Filter tags' : phone ? 'Search' : 'Search albums, artists, genres'
+	);
 
 	let pct = $derived.by(() => {
 		if (!scan?.running) return 0;
@@ -75,7 +89,7 @@
 	});
 </script>
 
-<header class="bar">
+<header class="bar" {inert}>
 	<div class="lead">
 		<button
 			class="icon-btn toggle"
@@ -85,6 +99,7 @@
 				: filtered && !setup
 					? `Show sidebar, ${filtered} ${filtered === 1 ? 'filter' : 'filters'} applied`
 					: 'Show sidebar'}
+			title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
 			aria-expanded={sidebarOpen}
 			aria-controls="sidebar"
 		>
@@ -108,7 +123,7 @@
 			bind:this={search}
 			bind:value={query}
 			type="search"
-			placeholder={filtering ? 'Filter tags' : 'Search albums, artists, genres'}
+			{placeholder}
 			disabled={!searchable}
 			spellcheck="false"
 			autocomplete="off"
@@ -165,7 +180,8 @@
 		<button
 			class="icon-btn"
 			onclick={onrescan}
-			aria-label="Rescan library"
+			aria-label={scan?.running ? 'Scanning' : 'Rescan the Inbox and Library'}
+			title={scan?.running ? 'Scanning…' : 'Rescan the Inbox and Library'}
 			disabled={scan?.running}
 		>
 			<span class:spin={scan?.running}><RefreshCw size={17} /></span>
@@ -181,7 +197,7 @@
 		z-index: 20;
 		display: grid;
 		/* The search field gives way before the buttons on the right do. */
-		grid-template-columns: auto minmax(180px, 440px) auto minmax(max-content, 1fr);
+		grid-template-columns: auto minmax(140px, 440px) auto minmax(max-content, 1fr);
 		align-items: center;
 		column-gap: 20px;
 		height: var(--topbar-h);
