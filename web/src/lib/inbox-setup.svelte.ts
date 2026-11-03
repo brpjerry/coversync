@@ -86,8 +86,11 @@ class InboxSetupStore {
 	}
 
 	async load() {
+		// Background reads (after a scan) can be overtaken by a save; its response is fresher.
+		const version = this.version;
 		try {
 			const r = await api.inboxSetup();
+			if (this.saving || this.version !== version) return;
 			if (this.loaded && this.changes) {
 				// Keep unsaved choices; refresh only what the daemon owns.
 				this.#status(r);

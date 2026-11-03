@@ -83,8 +83,7 @@ pub fn sortable() -> Vec<Sortable> {
             .filter(|k| !rules::NOT_EDITABLE.contains(&k.id))
             .map(|k| Sortable {
                 id: k.id,
-                // "Year" reads better than the catalog's "Date / year" as a sort.
-                label: if k.id == "date" { "Year" } else { k.label },
+                label: k.label,
                 group: k.group,
             }),
     );

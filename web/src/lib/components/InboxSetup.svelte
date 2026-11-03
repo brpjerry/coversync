@@ -596,14 +596,15 @@
 		margin-top: 14px;
 		padding: 12px 16px;
 		border-radius: 12px;
-		background: color-mix(in oklab, hsl(40 90% 60%) 10%, transparent);
-		border: 1px solid color-mix(in oklab, hsl(40 90% 60%) 30%, transparent);
-		color: color-mix(in oklab, hsl(40 90% 70%) 85%, var(--text));
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+		color: var(--warn-text);
 		font-size: 13.5px;
 	}
 	.warn :global(svg) {
 		flex: none;
 		margin-top: 1px;
+		color: var(--warn);
 	}
 	.warn p {
 		margin: 0;
@@ -704,7 +705,7 @@
 		gap: 6px;
 	}
 	.fpcalc.missing {
-		color: hsl(40 90% 65%);
+		color: var(--warn);
 	}
 	.sr-only {
 		position: absolute;

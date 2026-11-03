@@ -1038,10 +1038,10 @@
 		color: var(--text-3);
 	}
 	.note.warn {
-		color: color-mix(in oklab, hsl(40 90% 70%) 85%, var(--text));
+		color: var(--warn-text);
 	}
 	.note.warn :global(svg) {
-		color: hsl(40 90% 62%);
+		color: var(--warn);
 	}
 	.toolbar {
 		display: flex;
@@ -1178,10 +1178,10 @@
 		font-weight: 560;
 	}
 	.change .now {
-		color: color-mix(in oklab, hsl(40 90% 70%) 70%, var(--text-2));
+		color: color-mix(in oklab, var(--warn) 70%, var(--text-2));
 	}
 	.on.change .now {
-		color: hsl(40 92% 72%);
+		color: var(--warn);
 	}
 	/* A hidden copy of the value sizes the input to its text. */
 	.grow {

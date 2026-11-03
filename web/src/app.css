@@ -14,6 +14,11 @@
 	--accent-ink: #0a0b0e;
 	--danger: hsl(358 80% 68%);
 	--success: hsl(150 55% 58%);
+	/* Warnings: amber icons and short lines, with a tinted surface for boxed notices. */
+	--warn: hsl(40 90% 66%);
+	--warn-text: color-mix(in oklab, hsl(40 90% 70%) 85%, var(--text));
+	--warn-surface: hsl(40 90% 60% / 0.1);
+	--warn-border: hsl(40 90% 60% / 0.3);
 	--radius: 14px;
 	--radius-sm: 9px;
 	--shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -8px rgb(0 0 0 / 0.55);
@@ -46,7 +51,13 @@
 		--text: #14161b;
 		--text-2: #4d5361;
 		--text-3: #858b98;
+		/* Deeper than the dark theme's, so white ink and accent text read on light surfaces. */
+		--accent: hsl(252 70% 56%);
 		--accent-ink: #ffffff;
+		--warn: hsl(36 90% 36%);
+		--warn-text: hsl(30 60% 24%);
+		--warn-surface: hsl(42 95% 55% / 0.16);
+		--warn-border: hsl(38 85% 45% / 0.4);
 		--shadow: 0 1px 2px rgb(0 0 0 / 0.08), 0 12px 32px -10px rgb(0 0 0 / 0.22);
 	}
 }

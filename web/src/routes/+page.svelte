@@ -1,11 +1,14 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
-	import { fade, fly } from 'svelte/transition';
-	import { goto, pushState, replaceState } from '$app/navigation';
+	import { fade, fly, slide } from 'svelte/transition';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
+	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import CircleCheck from '@lucide/svelte/icons/circle-check';
+	import FolderCog from '@lucide/svelte/icons/folder-cog';
+	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Inbox from '@lucide/svelte/icons/inbox';
 	import LibraryBig from '@lucide/svelte/icons/library-big';
 	import Settings2 from '@lucide/svelte/icons/settings-2';
@@ -39,7 +42,7 @@
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
-	import { fold } from '#lib/format.ts';
+	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
@@ -202,6 +205,20 @@
 	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
 	let attentionView = $derived(activeSort === 'attention');
 	let flagged = $derived(source.filter((a) => a.attention));
+	/** The sort in use before Needs attention, to go back to. */
+	let lastPlain = $state<Sort>();
+	$effect(() => {
+		if (sort !== 'attention') lastPlain = sort;
+	});
+	/** Where "Show all albums" leads: the sort before, else the menu's first plain one; none if there isn't one. */
+	let plainSort = $derived(
+		lastPlain && appearance.sorts.saved.includes(lastPlain)
+			? lastPlain
+			: appearance.sorts.saved.find((s) => s !== 'attention')
+	);
+	function showAll() {
+		if (plainSort) sort = plainSort;
+	}
 	/** Albums the sort and search leave, in order; the sidebar's tag filters narrow them. */
 	let searched = $derived.by(() => {
 		const list = attentionView
@@ -262,6 +279,14 @@
 		document.documentElement.style.overflow = openAlbum || importing ? 'hidden' : '';
 	});
 
+	// Room the player takes at the bottom of the window, for bars that float above it.
+	$effect(() => {
+		document.documentElement.style.setProperty(
+			'--dock',
+			player.current ? 'calc(var(--player-h) + 12px)' : '0px'
+		);
+	});
+
 	const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 	/** Run a DOM update as a view transition morphing `from` into the other cover. */
@@ -285,7 +310,8 @@
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
 		await morph(cover, async () => {
-			await pushState('', { album: album.id });
+			// Shallow: a history entry with the album in page.state, no navigation.
+			await goto(page.url.href, { state: { album: album.id }, shallow: true });
 			await tick();
 		});
 	}
@@ -325,7 +351,12 @@
 	async function onsaved(result: TagWriteResult) {
 		await loadAlbums();
 		if (result.album) detail = result.album;
-		if (result.album_id !== openId) await replaceState('', { album: result.album_id });
+		if (result.album_id !== openId)
+			await goto(page.url.href, {
+				state: { album: result.album_id },
+				shallow: true,
+				replace: true
+			});
 	}
 
 	let lastAlbums = 0;
@@ -357,7 +388,11 @@
 		try {
 			const wasRunning = status?.scan.running ?? false;
 			status = await api.status();
-			if (wasRunning && !status.scan.running) dataGeneration++;
+			if (wasRunning && !status.scan.running) {
+				dataGeneration++;
+				// The Inbox folder may have come or gone; the empty Inbox's message says which.
+				inboxSetup.load();
+			}
 			if (status.scan.running ? Date.now() - lastAlbums > 4000 : wasRunning) await loadAlbums();
 		} catch {}
 		pollTimer = setTimeout(poll, status?.scan.running ? 1500 : 10000);
@@ -471,6 +506,8 @@
 
 	async function rescan() {
 		await api.rescan().catch(() => toast('Rescan failed to start', 'error'));
+		// The folder may have been mounted (or unmounted) since the page loaded.
+		inboxSetup.load();
 		setTimeout(poll, 300);
 	}
 
@@ -506,6 +543,8 @@
 		appearance.load();
 		// Whether the sidebar shows its Sync section.
 		syncSetup.load();
+		// Whether an Inbox folder is set, for the empty Inbox's message.
+		inboxSetup.load();
 		// Tag labels for attention badges.
 		setup.load();
 		loadAlbums();
@@ -528,6 +567,7 @@
 <TopBar
 	bind:query
 	bind:search
+	inert={!!openAlbum}
 	{view}
 	counts={{ inbox: loaded ? albums.length : null, library: loaded ? library.length : null }}
 	scan={status?.scan ?? null}
@@ -572,6 +612,19 @@
 	<main bind:contentRect={mainBox}>
 		{#key view}
 			<div class="view" in:fly={{ x: 28 * direction, duration: 420, easing: cubicOut }}>
+				{#if attentionView && !isSetup(view) && loaded && appearance.settled && source.length}
+					<!-- A filter kept across visits, so it's always on show while it applies. -->
+					<div class="attention-note" transition:slide={{ duration: 220 }}>
+						<CircleAlert size={15} strokeWidth={2.2} />
+						<span>
+							Only albums that need attention: <b class="tabular">{count(flagged.length)}</b> of
+							{count(source.length)}
+						</span>
+						{#if plainSort}
+							<button class="link" onclick={showAll}>Show all albums</button>
+						{/if}
+					</div>
+				{/if}
 				{#if view === 'library-setup'}
 					<LibrarySetup
 						{query}
@@ -623,9 +676,39 @@
 						{#if status?.scan.running}
 							<h2>Scanning for music…</h2>
 							<p>Albums appear in the Inbox as their tags are read.</p>
+						{:else if inboxSetup.loaded && !inboxSetup.saved.folder}
+							<h2>No Inbox folder yet</h2>
+							<p>Choose the folder coversync scans for music to bring into the Library.</p>
+							<div class="empty-actions">
+								<button class="btn primary" onclick={() => setView('inbox-setup')}>
+									<FolderCog size={16} /> Choose a folder
+								</button>
+							</div>
+						{:else if inboxSetup.folderStatus && !inboxSetup.folderStatus.exists}
+							<h2>The Inbox folder can't be found</h2>
+							<p>
+								<code>{inboxSetup.saved.folder}</code> isn't there right now. Mount it and rescan, or
+								choose another folder.
+							</p>
+							<div class="empty-actions">
+								<button class="btn primary" onclick={rescan}>
+									<RefreshCw size={16} /> Rescan
+								</button>
+								<button class="btn" onclick={() => setView('inbox-setup')}>
+									<FolderCog size={16} /> Inbox setup
+								</button>
+							</div>
 						{:else}
 							<h2>The Inbox is empty</h2>
-							<p>coversyncd didn't find any audio files in its library folders.</p>
+							<p>No audio files were found in the Inbox folder.</p>
+							<div class="empty-actions">
+								<button class="btn primary" onclick={() => setView('inbox-setup')}>
+									<FolderCog size={16} /> Inbox setup
+								</button>
+								<button class="btn" onclick={rescan}>
+									<RefreshCw size={16} /> Rescan
+								</button>
+							</div>
 						{/if}
 					</div>
 				{:else if visible.length === 0 && attentionView && !query.trim() && !filtered}
@@ -636,7 +719,11 @@
 					</div>
 				{:else if visible.length === 0 && filtered}
 					<div class="empty">
-						<h2>No albums match these filters</h2>
+						<h2>
+							{attentionView
+								? 'No albums needing attention match these filters'
+								: 'No albums match these filters'}
+						</h2>
 						<p>
 							{query.trim() ? `Nothing with these tags matches “${query}”.` : 'Try fewer tags.'}
 						</p>
@@ -648,7 +735,11 @@
 					</div>
 				{:else if visible.length === 0}
 					<div class="empty">
-						<h2>Nothing matches “{query}”</h2>
+						<h2>
+							{attentionView
+								? `Nothing that needs attention matches “${query}”`
+								: `Nothing matches “${query}”`}
+						</h2>
 						<p>Try an artist, album title, genre or year.</p>
 					</div>
 				{:else}
@@ -731,7 +822,46 @@
 		   intrinsic width. */
 		grid-column: 2;
 		min-width: 0;
-		padding: 28px 28px calc(var(--player-h) + 56px);
+		/* Clear of the player while it's showing (--dock). */
+		padding: 28px 28px calc(var(--dock, 0px) + 56px);
+	}
+	/* The attention view is a filter: say so above the grid, with the way out. */
+	.attention-note {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		max-width: 1800px;
+		margin: 0 auto 22px;
+		padding: 8px 8px 8px 14px;
+		border-radius: 12px;
+		font-size: 13.5px;
+		color: var(--text-2);
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+	}
+	.attention-note :global(svg) {
+		flex: none;
+		color: var(--warn);
+	}
+	.attention-note span {
+		min-width: 0;
+	}
+	.attention-note b {
+		color: var(--text);
+		font-weight: 600;
+	}
+	.attention-note .link {
+		margin-left: auto;
+		padding: 4px 10px;
+		border-radius: 999px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--accent);
+		white-space: nowrap;
+		transition: background 140ms;
+	}
+	.attention-note .link:hover {
+		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.scrim {
 		position: fixed;
@@ -801,7 +931,13 @@
 	}
 	.empty p {
 		margin: 0;
+		max-width: 560px;
 		color: var(--text-2);
+	}
+	.empty code {
+		font-size: 13px;
+		color: var(--text);
+		overflow-wrap: anywhere;
 	}
 	.empty-actions {
 		display: flex;
@@ -883,10 +1019,13 @@
 	}
 	@media (max-width: 600px) {
 		main {
-			padding: 18px 16px calc(var(--player-h) + 64px);
+			padding: 18px 16px calc(var(--dock, 0px) + 64px);
 		}
 		.grid {
 			gap: 22px 14px;
+		}
+		.attention-note {
+			margin-bottom: 16px;
 		}
 	}
 </style>

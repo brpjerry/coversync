@@ -375,7 +375,7 @@ pub fn validate_kind(id: &str, value: &str) -> Result<()> {
         "date" => {
             v.parse::<Timestamp>().map_err(|_| {
                 Error::Tags(format!(
-                    "{label}: '{v}' is not a date like 2003 or 2003-04-01"
+                    "{label}: '{v}' should be a year like 2003, or a date like 2003-04-01"
                 ))
             })?;
         }

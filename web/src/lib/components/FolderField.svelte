@@ -162,7 +162,7 @@
 		color: var(--accent);
 	}
 	.warn {
-		color: color-mix(in oklab, hsl(40 90% 65%) 85%, var(--text));
+		color: var(--warn);
 	}
 	.error {
 		color: var(--danger);

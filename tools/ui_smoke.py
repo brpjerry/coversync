@@ -116,18 +116,21 @@ class Driver:
             time.sleep(0.2)
         raise TimeoutError(script)
 
-    def click(self, css):
-        el = self.s("POST", "/element", {"using": "css selector", "value": css})
+    def _click(self, el):
+        # WebDriver scrolls the element just into view, which can leave it under
+        # the sticky save bar at the bottom edge; centre it first.
+        self.js("arguments[0].scrollIntoView({block: 'center'})", el)
         self.s("POST", f"/element/{el[ELEMENT]}/click", {})
+
+    def click(self, css):
+        self._click(self.s("POST", "/element", {"using": "css selector", "value": css}))
 
     def click_text(self, scope, text):
         xpath = f"//{scope}//button[normalize-space(.)='{text}' or starts-with(normalize-space(.), '{text} ')]"
-        el = self.s("POST", "/element", {"using": "xpath", "value": xpath})
-        self.s("POST", f"/element/{el[ELEMENT]}/click", {})
+        self._click(self.s("POST", "/element", {"using": "xpath", "value": xpath}))
 
     def click_xpath(self, xpath):
-        el = self.s("POST", "/element", {"using": "xpath", "value": xpath})
-        self.s("POST", f"/element/{el[ELEMENT]}/click", {})
+        self._click(self.s("POST", "/element", {"using": "xpath", "value": xpath}))
 
     def click_sort(self, label):
         """Pick a sort from the top bar's sort menu."""
@@ -386,6 +389,51 @@ def cover_size_flow(d, out, tag, save):
     print("restored:", requests_json(d, "/api/appearance")["setup"])
     d.click(".setup .back")
     measure_grid("after restoring")
+
+
+def attention_flow(d, out, tag):
+    """The Needs attention view: its banner, and "Show all albums" going back to the sort before."""
+    before = d.js("return document.querySelector('.sort-btn .label').textContent.trim()")
+    d.click_sort("Needs attention")
+    d.wait("return !!document.querySelector('.attention-note')")
+    time.sleep(0.8)
+    print("attention banner:", d.js("return document.querySelector('.attention-note').textContent.replace(/\\s+/g, ' ').trim()"),
+          "| cards:", d.js("return document.querySelectorAll('.card').length"),
+          "| sort button:", d.js("return document.querySelector('.sort-btn').textContent.replace(/\\s+/g, ' ').trim()"))
+    d.shot(out / f"1g-attention-{tag}.png")
+    d.click_text("main", "Show all albums")
+    d.wait("return !document.querySelector('.attention-note')")
+    time.sleep(0.6)
+    after = d.js("return document.querySelector('.sort-btn .label').textContent.trim()")
+    print("show all albums:", d.js("return document.querySelectorAll('.card').length"), "cards | sort back to:", after,
+          "" if after == before else f"(expected {before})")
+
+
+def phone_flow(d, out, tag):
+    """Phone width: the compact sort button, the sidebar drawer, and the save bar docked at the bottom."""
+    d.resize(390, 844)
+    time.sleep(0.8)
+    print("phone width:", d.js("return innerWidth"),
+          "| sort label hidden:", d.js("return getComputedStyle(document.querySelector('.sort-btn .label')).display === 'none'"),
+          "| page overflows:", d.js("return document.documentElement.scrollWidth > document.documentElement.clientWidth"))
+    d.shot(out / f"1h-phone-grid-{tag}.png")
+    d.open_setup("Appearance")
+    d.wait("return !!document.querySelector('.cover-preview')")
+    time.sleep(0.8)
+    # An unsaved change docks the save bar along the bottom edge.
+    d.js("document.querySelector('.chips .chip:not(.on)').click()")
+    d.wait("return !!document.querySelector('.savebar')")
+    time.sleep(0.6)
+    print("phone save bar:", d.js("const el = document.querySelector('.savebar'); const r = el.getBoundingClientRect();"
+                                  "return `${getComputedStyle(el).position}, ${Math.round(innerHeight - r.bottom)}px from the bottom, ${Math.round(r.width)}px wide`"),
+          "| overflows:", d.js("return document.documentElement.scrollWidth > document.documentElement.clientWidth"))
+    d.shot(out / f"1i-phone-savebar-{tag}.png")
+    d.click_text("main", "Revert")
+    time.sleep(0.4)
+    d.resize(1440, 1000)
+    d.click_text("header", "Inbox")
+    d.wait("return document.querySelectorAll('.card').length > 0")
+    time.sleep(0.6)
 
 
 def requests_json(d, path):
@@ -715,6 +763,8 @@ def main():
         time.sleep(0.8)
         print("first by year:", d.js("return document.querySelector('.card .artist').textContent.trim()"))
         filter_flow(d, out, tag)
+        attention_flow(d, out, tag)
+        phone_flow(d, out, tag)
         d.click_sort("Album artist")
         time.sleep(0.6)
 
@@ -803,6 +853,10 @@ def main():
         d.wait("return !!document.querySelector('.tracks li')")
         time.sleep(1.2)
         d.shot(out / f"2-album-{tag}.png")
+        # The top bar is inert behind the sheet: "/" mustn't focus the search field.
+        d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: '/', bubbles: true}))")
+        print("top bar inert:", d.js("return document.querySelector('.bar').inert"),
+              "| '/' focused search:", d.js("return document.activeElement === document.querySelector('.search input')"))
 
         d.click(".actions .btn.primary")
         d.wait("return !!document.querySelector('.player')")
