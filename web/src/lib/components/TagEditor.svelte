@@ -420,6 +420,7 @@
 			bottom: 0;
 			flex-wrap: wrap;
 			justify-content: flex-end;
+			/* Bleed past .editor's 16px and AlbumDetail's phone .body 4px to the sheet's edges. */
 			margin: 0 -20px;
 			padding: 10px 16px;
 			border-radius: 0;
@@ -429,9 +430,6 @@
 		.summary {
 			flex: 1 1 100%;
 			padding-left: 4px;
-		}
-		.hint {
-			display: none;
 		}
 	}
 </style>

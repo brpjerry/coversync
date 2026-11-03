@@ -183,7 +183,7 @@
 		place-items: center;
 		padding-left: 2px;
 		border-radius: 999px;
-		/* Dark ink on the light theme's pale glow, white on the dark glow of the light theme. */
+		/* Dark ink on the dark theme's pale glow, white on the light theme's deep glow. */
 		color: var(--accent-ink);
 		background: var(--glow);
 		box-shadow: 0 8px 20px -6px rgb(0 0 0 / 0.6);

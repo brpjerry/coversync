@@ -104,6 +104,12 @@
 		display: grid;
 		color: var(--accent);
 	}
+	/* Long tag names ("MusicBrainz release group ID") end in an ellipsis rather than widening the bar. */
+	.label {
+		max-width: 180px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
 	.warn .active {
 		color: var(--warn);
 	}
@@ -111,11 +117,12 @@
 		display: grid;
 		color: var(--text-3);
 	}
-	/* The sort glyph stands in for the label on phones. */
+	/* The sort glyph stands in for the label on phones, and where the single-row
+	   top bar is tightest (its two-row layout below 900px has room again). */
 	.glyph {
 		display: none;
 	}
-	@media (max-width: 600px) {
+	@media (max-width: 600px), (min-width: 901px) and (max-width: 1040px) {
 		.sort-btn {
 			width: 36px;
 			padding: 0;

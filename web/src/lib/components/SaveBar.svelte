@@ -88,7 +88,7 @@
 			right: 0;
 			bottom: var(--dock, 0px);
 			z-index: 24;
-			padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+			padding: 10px 16px;
 			border-radius: 0;
 			border-width: 1px 0 0;
 			box-shadow: 0 -12px 32px -16px rgb(0 0 0 / 0.5);

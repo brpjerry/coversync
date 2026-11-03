@@ -205,8 +205,17 @@
 	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
 	let attentionView = $derived(activeSort === 'attention');
 	let flagged = $derived(source.filter((a) => a.attention));
-	/** The sort to fall back to from the attention view; none if it's the only one. */
-	let plainSort = $derived(appearance.sorts.saved.find((s) => s !== 'attention'));
+	/** The sort in use before Needs attention, to go back to. */
+	let lastPlain = $state<Sort>();
+	$effect(() => {
+		if (sort !== 'attention') lastPlain = sort;
+	});
+	/** Where "Show all albums" leads: the sort before, else the menu's first plain one; none if there isn't one. */
+	let plainSort = $derived(
+		lastPlain && appearance.sorts.saved.includes(lastPlain)
+			? lastPlain
+			: appearance.sorts.saved.find((s) => s !== 'attention')
+	);
 	function showAll() {
 		if (plainSort) sort = plainSort;
 	}
@@ -528,6 +537,8 @@
 		appearance.load();
 		// Whether the sidebar shows its Sync section.
 		syncSetup.load();
+		// Whether an Inbox folder is set, for the empty Inbox's message.
+		inboxSetup.load();
 		// Tag labels for attention badges.
 		setup.load();
 		loadAlbums();
@@ -597,7 +608,7 @@
 			<div class="view" in:fly={{ x: 28 * direction, duration: 420, easing: cubicOut }}>
 				{#if attentionView && !isSetup(view) && loaded && appearance.settled && source.length}
 					<!-- A filter kept across visits, so it's always on show while it applies. -->
-					<div class="attention-note" role="status" transition:slide={{ duration: 220 }}>
+					<div class="attention-note" transition:slide={{ duration: 220 }}>
 						<CircleAlert size={15} strokeWidth={2.2} />
 						<span>
 							Only albums that need attention: <b class="tabular">{count(flagged.length)}</b> of
@@ -659,6 +670,28 @@
 						{#if status?.scan.running}
 							<h2>Scanning for music…</h2>
 							<p>Albums appear in the Inbox as their tags are read.</p>
+						{:else if inboxSetup.loaded && !inboxSetup.saved.folder}
+							<h2>No Inbox folder yet</h2>
+							<p>Choose the folder coversync scans for music to bring into the Library.</p>
+							<div class="empty-actions">
+								<button class="btn primary" onclick={() => setView('inbox-setup')}>
+									<FolderCog size={16} /> Choose a folder
+								</button>
+							</div>
+						{:else if inboxSetup.folderStatus && !inboxSetup.folderStatus.exists}
+							<h2>The Inbox folder can't be found</h2>
+							<p>
+								<code>{inboxSetup.saved.folder}</code> isn't there right now. Mount it and rescan, or
+								choose another folder.
+							</p>
+							<div class="empty-actions">
+								<button class="btn primary" onclick={rescan}>
+									<RefreshCw size={16} /> Rescan
+								</button>
+								<button class="btn" onclick={() => setView('inbox-setup')}>
+									<FolderCog size={16} /> Inbox setup
+								</button>
+							</div>
 						{:else}
 							<h2>The Inbox is empty</h2>
 							<p>No audio files were found in the Inbox folder.</p>
@@ -677,11 +710,6 @@
 						<span class="empty-ok"><CircleCheck size={44} strokeWidth={1.4} /></span>
 						<h2>Nothing needs attention</h2>
 						<p>Every album here has the tags the library rules and folder structure need.</p>
-						{#if plainSort}
-							<div class="empty-actions">
-								<button class="btn" onclick={showAll}>Show all albums</button>
-							</div>
-						{/if}
 					</div>
 				{:else if visible.length === 0 && filtered}
 					<div class="empty">
@@ -697,9 +725,6 @@
 							<button class="btn" onclick={clearFilters}>
 								<FilterX size={16} /> Clear filters
 							</button>
-							{#if attentionView && plainSort}
-								<button class="btn" onclick={showAll}>Show all albums</button>
-							{/if}
 						</div>
 					</div>
 				{:else if visible.length === 0}
@@ -710,11 +735,6 @@
 								: `Nothing matches “${query}”`}
 						</h2>
 						<p>Try an artist, album title, genre or year.</p>
-						{#if attentionView && plainSort}
-							<div class="empty-actions">
-								<button class="btn" onclick={showAll}>Search all albums</button>
-							</div>
-						{/if}
 					</div>
 				{:else}
 					<AlbumGrid
@@ -905,7 +925,13 @@
 	}
 	.empty p {
 		margin: 0;
+		max-width: 560px;
 		color: var(--text-2);
+	}
+	.empty code {
+		font-size: 13px;
+		color: var(--text);
+		overflow-wrap: anywhere;
 	}
 	.empty-actions {
 		display: flex;

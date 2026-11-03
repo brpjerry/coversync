@@ -8,6 +8,7 @@
 	import PanelLeftClose from '@lucide/svelte/icons/panel-left-close';
 	import PanelLeftOpen from '@lucide/svelte/icons/panel-left-open';
 	import { fade, fly } from 'svelte/transition';
+	import { MediaQuery } from 'svelte/reactivity';
 	import type { ScanProgress } from '#lib/api.ts';
 	import { collection, isSetup, type View } from '#lib/browse.ts';
 	import { count } from '#lib/format.ts';
@@ -63,15 +64,9 @@
 	/** Inbox setup and sync setup have nothing to search. */
 	let searchable = $derived(view !== 'inbox-setup' && view !== 'sync-setup');
 	/** Phones: the field is too short for the long placeholder. */
-	let phone = $state(matchMedia('(max-width: 600px)').matches);
-	$effect(() => {
-		const mq = matchMedia('(max-width: 600px)');
-		const onchange = () => (phone = mq.matches);
-		mq.addEventListener('change', onchange);
-		return () => mq.removeEventListener('change', onchange);
-	});
+	const phone = new MediaQuery('max-width: 600px');
 	let placeholder = $derived(
-		filtering ? 'Filter tags' : phone ? 'Search' : 'Search albums, artists, genres'
+		filtering ? 'Filter tags' : phone.current ? 'Search' : 'Search albums, artists, genres'
 	);
 
 	let pct = $derived.by(() => {
