@@ -373,6 +373,10 @@
 		min-width: 0;
 	}
 	.stats {
+		/* Bounded, so a long "1,234 of 5,678 albums" can't widen the bar. */
+		max-width: 170px;
+		overflow: hidden;
+		text-overflow: ellipsis;
 		color: var(--text-3);
 		font-size: 13px;
 		white-space: nowrap;

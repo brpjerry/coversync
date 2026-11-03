@@ -118,11 +118,12 @@
 		color: var(--text-3);
 	}
 	/* The sort glyph stands in for the label on phones, and where the single-row
-	   top bar is tightest (its two-row layout below 900px has room again). */
+	   top bar is tight: with the album count or scan progress beside it, a long
+	   label needs about 1200px (the two-row layout below 900px has room again). */
 	.glyph {
 		display: none;
 	}
-	@media (max-width: 600px), (min-width: 901px) and (max-width: 1100px) {
+	@media (max-width: 600px), (min-width: 901px) and (max-width: 1200px) {
 		.sort-btn {
 			width: 36px;
 			padding: 0;
