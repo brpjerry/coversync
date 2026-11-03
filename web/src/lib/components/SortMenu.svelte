@@ -106,7 +106,7 @@
 	}
 	/* Long tag names ("MusicBrainz release group ID") end in an ellipsis rather than widening the bar. */
 	.label {
-		max-width: 180px;
+		max-width: 150px;
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
@@ -122,7 +122,7 @@
 	.glyph {
 		display: none;
 	}
-	@media (max-width: 600px), (min-width: 901px) and (max-width: 1040px) {
+	@media (max-width: 600px), (min-width: 901px) and (max-width: 1100px) {
 		.sort-btn {
 			width: 36px;
 			padding: 0;

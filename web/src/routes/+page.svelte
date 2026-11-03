@@ -388,7 +388,11 @@
 		try {
 			const wasRunning = status?.scan.running ?? false;
 			status = await api.status();
-			if (wasRunning && !status.scan.running) dataGeneration++;
+			if (wasRunning && !status.scan.running) {
+				dataGeneration++;
+				// The Inbox folder may have come or gone; the empty Inbox's message says which.
+				inboxSetup.load();
+			}
 			if (status.scan.running ? Date.now() - lastAlbums > 4000 : wasRunning) await loadAlbums();
 		} catch {}
 		pollTimer = setTimeout(poll, status?.scan.running ? 1500 : 10000);
@@ -502,6 +506,8 @@
 
 	async function rescan() {
 		await api.rescan().catch(() => toast('Rescan failed to start', 'error'));
+		// The folder may have been mounted (or unmounted) since the page loaded.
+		inboxSetup.load();
 		setTimeout(poll, 300);
 	}
 

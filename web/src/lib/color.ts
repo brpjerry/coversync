@@ -39,9 +39,12 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
 	return [r + m, g + m, b + m];
 }
 
-/** WCAG relative luminance. */
+/** WCAG relative luminance of the 8-bit colour the browser will actually paint. */
 function luminance([r, g, b]: [number, number, number]): number {
-	const lin = (v: number) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+	const lin = (v: number) => {
+		const q = Math.round(v * 255) / 255;
+		return q <= 0.04045 ? q / 12.92 : ((q + 0.055) / 1.055) ** 2.4;
+	};
 	return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
 }
 
@@ -49,13 +52,14 @@ function luminance([r, g, b]: [number, number, number]): number {
 const whiteOn = (h: number, s: number, l: number) => 1.05 / (luminance(hslToRgb(h, s, l)) + 0.05);
 
 /**
- * The lightest tone at or below `start` that gives white ink WCAG AA contrast
- * (4.5:1). A fixed lightness isn't enough: at 46% a yellow is still bright
- * while a blue is already deep.
+ * The lightest whole-number lightness at or below `start` that gives white
+ * ink WCAG AA contrast (4.5:1). A fixed lightness isn't enough: at 46% a
+ * yellow is still bright while a blue is already deep. `h` and `s` are the
+ * rounded values that end up in the CSS, so the check sees the emitted colour.
  */
 function readable(h: number, s: number, start: number): number {
-	let l = start;
-	while (l > 18 && whiteOn(h, s, l) < 4.5) l -= 2;
+	let l = Math.round(start);
+	while (l > 18 && whiteOn(h, s, l) < 4.5) l -= 1;
 	return l;
 }
 
@@ -74,12 +78,12 @@ const lightDark = (light: string, dark: string) =>
 export function accent(hex: string | null): string {
 	const [h, s, l] = hexToHsl(hex ?? FALLBACK);
 	if (s < 8) return lightDark(`hsl(${h} 10% 42%)`, `hsl(${h} 10% 72%)`);
-	const hue = h.toFixed(0);
-	const sat = clamp(s, 45, 85);
-	const deep = readable(h, sat, clamp(l, 38, 46));
+	const hue = Math.round(h);
+	const sat = Math.round(clamp(s, 45, 85));
+	const deep = readable(hue, sat, clamp(l, 38, 46));
 	return lightDark(
-		`hsl(${hue} ${sat.toFixed(0)}% ${deep.toFixed(0)}%)`,
-		`hsl(${hue} ${sat.toFixed(0)}% ${clamp(l, 62, 72).toFixed(0)}%)`
+		`hsl(${hue} ${sat}% ${deep}%)`,
+		`hsl(${hue} ${sat}% ${clamp(l, 62, 72).toFixed(0)}%)`
 	);
 }
 
