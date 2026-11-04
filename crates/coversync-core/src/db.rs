@@ -139,7 +139,10 @@ CREATE TABLE IF NOT EXISTS {schema}.tracks (
     bitrate      INTEGER,
     format       TEXT NOT NULL,
     tag_keys     TEXT NOT NULL DEFAULT '',
-    tag_values   TEXT NOT NULL DEFAULT '{{}}'
+    tag_values   TEXT NOT NULL DEFAULT '{{}}',
+    -- When the file joined the Library (Unix seconds): the import that
+    -- wrote it, or for a file found there by a scan, its modification time.
+    added_at     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS {schema}.tracks_album ON tracks (album_id);
 CREATE TABLE IF NOT EXISTS {schema}.settings (
@@ -178,19 +181,23 @@ fn temp_schema() -> String {
                 r.root AS root,
                 CASE t.album_dir WHEN '' THEN r.root ELSE r.root || '/' || t.album_dir END
                     AS album_dir,
-                'library' AS collection, {lib_data}
+                'library' AS collection, {lib_data}, t.added_at
             FROM lib.tracks t JOIN temp.lib_root r;
+         -- An Inbox file counts as added when it was last modified.
+         CREATE TEMP VIEW inbox_tracks AS SELECT *, mtime AS added_at FROM main.tracks;
          CREATE TEMP VIEW indexed_tracks AS
-            SELECT id, path, root, album_dir, collection, {data} FROM main.tracks
+            SELECT id, path, root, album_dir, collection, {data}, added_at
+                FROM temp.inbox_tracks
             UNION ALL
-            SELECT id, path, root, album_dir, collection, {data} FROM temp.library_tracks;"
+            SELECT id, path, root, album_dir, collection, {data}, added_at
+                FROM temp.library_tracks;"
     )
 }
 
 /// The tracks of `collection`, as a table or view with the local schema.
 fn source(collection: Collection) -> &'static str {
     match collection {
-        Collection::Inbox => "main.tracks",
+        Collection::Inbox => "temp.inbox_tracks",
         Collection::Library => "temp.library_tracks",
     }
 }
@@ -313,6 +320,22 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     if version < 1 {
         conn.execute_batch(&format!("PRAGMA {schema}.user_version = 1"))?;
     }
+    if version < 2 {
+        // v2 records when each file joined the Library. Earlier imports
+        // wrote their files then, so their modification time stands in.
+        let has_column = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('tracks', '{schema}') WHERE name = 'added_at'"
+            ))?
+            .exists([])?;
+        if !has_column {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {schema}.tracks ADD COLUMN added_at INTEGER NOT NULL DEFAULT 0;
+                 UPDATE {schema}.tracks SET added_at = mtime;"
+            ))?;
+        }
+        conn.execute_batch(&format!("PRAGMA {schema}.user_version = 2"))?;
+    }
     Ok(())
 }
 
@@ -370,6 +393,10 @@ pub struct FileStat {
     pub mtime: i64,
     pub size: u64,
     pub collection: Collection,
+    /// When a Library file was imported, for files an import just wrote.
+    /// Others keep the time they were first indexed with (their
+    /// modification time then).
+    pub added: Option<i64>,
 }
 
 /// SQL condition selecting tracks the Inbox shows (not hidden).
@@ -468,7 +495,17 @@ fn consensus<'a>(values: impl Iterator<Item = &'a str>) -> Option<&'a str> {
         .map(|(_, (k, _))| *k)
 }
 
-fn summarize(id: &str, tracks: &[&Track], mtime: i64, cover: Option<&CoverRow>) -> Album {
+/// When an album counts as added, from its tracks' times: in the Inbox, its
+/// newest file; in the Library, its first import.
+fn album_added(collection: Collection, times: impl Iterator<Item = i64>) -> i64 {
+    match collection {
+        Collection::Inbox => times.max(),
+        Collection::Library => times.min(),
+    }
+    .unwrap_or(0)
+}
+
+fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) -> Album {
     let title = consensus(tracks.iter().map(|t| t.album.as_str())).unwrap_or_default();
     let album_artist = consensus(tracks.iter().filter_map(|t| t.album_artist.as_deref()));
     let artist = album_artist.map(str::to_string).unwrap_or_else(|| {
@@ -493,7 +530,7 @@ fn summarize(id: &str, tracks: &[&Track], mtime: i64, cover: Option<&CoverRow>) 
         duration_ms: tracks.iter().map(|t| t.duration_ms).sum(),
         color: cover.and_then(|c| c.1.clone()),
         has_cover: cover.is_some_and(|c| c.0.is_some()),
-        added_at: mtime,
+        added_at: added,
         format: consensus(tracks.iter().map(|t| t.format.as_str()))
             .unwrap_or_default()
             .to_string(),
@@ -557,7 +594,8 @@ fn sort_tracks(tracks: &mut [Track]) {
 struct TrackRow {
     track: Track,
     dir: String,
-    mtime: i64,
+    /// When the file was added, as its collection counts it.
+    added: i64,
     /// Tag values as stored (JSON object).
     values: String,
     /// Comma-separated kinds the file has.
@@ -711,14 +749,25 @@ fn adopt_or_store_setup(conn: &Connection, mirror: &LibrarySetup) -> Result<()> 
 /// database wasn't open, so the local copy wins when it is.
 const PENDING: &str = "library_setup_pending";
 
-/// An upsert into `table` of the `head` columns, then the data columns.
-fn upsert_sql(table: &str, head: &[&str]) -> String {
-    let cols: Vec<&str> = head.iter().chain(DATA_COLUMNS).copied().collect();
+/// An upsert into `table` of the `head` columns, the data columns, then the
+/// `kept` columns, which an existing row only takes when the parameter after
+/// all of them is true.
+fn upsert_sql(table: &str, head: &[&str], kept: &[&str]) -> String {
+    let cols: Vec<&str> = head
+        .iter()
+        .chain(DATA_COLUMNS)
+        .chain(kept)
+        .copied()
+        .collect();
     let marks: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+    let replace = cols.len() + 1;
     let set: Vec<String> = cols
         .iter()
         .filter(|c| **c != "path")
-        .map(|c| format!("{c} = excluded.{c}"))
+        .map(|c| match kept.contains(c) {
+            true => format!("{c} = CASE WHEN ?{replace} THEN excluded.{c} ELSE {c} END"),
+            false => format!("{c} = excluded.{c}"),
+        })
         .collect();
     format!(
         "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT (path) DO UPDATE SET {}",
@@ -919,8 +968,13 @@ impl Library {
             let mut inbox = tx.prepare_cached(&upsert_sql(
                 "main.tracks",
                 &["path", "root", "album_dir", "collection"],
+                &[],
             ))?;
-            let mut lib = tx.prepare_cached(&upsert_sql("lib.tracks", &["path", "album_dir"]))?;
+            let mut lib = tx.prepare_cached(&upsert_sql(
+                "lib.tracks",
+                &["path", "album_dir"],
+                &["added_at"],
+            ))?;
             for (stat, album_id, album_dir, t) in batch {
                 let title = t.title.clone().unwrap_or_else(|| {
                     stat.path
@@ -986,7 +1040,11 @@ impl Library {
                         let path = rel.to_string_lossy();
                         let dir = rel_dir.to_string_lossy();
                         let head: [&dyn ToSql; 2] = [&path, &dir];
-                        lib.execute(params_from_iter(head.iter().chain(&data)))?;
+                        // An import's time replaces what a scan may have
+                        // recorded; otherwise the first time recorded stays.
+                        let added = stat.added.unwrap_or(stat.mtime);
+                        let tail: [&dyn ToSql; 2] = [&added, &stat.added.is_some()];
+                        lib.execute(params_from_iter(head.iter().chain(&data).chain(&tail)))?;
                     }
                 }
             }
@@ -1030,7 +1088,7 @@ impl Library {
             Ok(TrackRow {
                 track,
                 dir,
-                mtime: r.get("mtime")?,
+                added: r.get("added_at")?,
                 values: r.get("tag_values")?,
                 keys: r.get("tag_keys")?,
             })
@@ -1076,18 +1134,17 @@ impl Library {
         };
         let present: Vec<HashSet<&str>> =
             rows.iter().map(|r| r.keys.split(',').collect()).collect();
-        let mut groups: HashMap<&str, (Vec<usize>, i64)> = HashMap::new();
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, r) in rows.iter().enumerate() {
-            let g = groups.entry(r.track.album_id.as_str()).or_default();
-            g.0.push(i);
-            g.1 = g.1.max(r.mtime);
+            groups.entry(r.track.album_id.as_str()).or_default().push(i);
         }
         let mut albums: Vec<Album> = groups
             .into_iter()
-            .map(|(id, (idx, mtime))| {
+            .map(|(id, idx)| {
                 let mut ts: Vec<&Track> = idx.iter().map(|i| &rows[*i].track).collect();
                 ts.sort_by_key(|t| (t.disc_no.unwrap_or(1), t.track_no.unwrap_or(u32::MAX)));
-                let mut album = summarize(id, &ts, mtime, covers.get(id));
+                let added = album_added(collection, idx.iter().map(|i| rows[*i].added));
+                let mut album = summarize(id, &ts, added, covers.get(id));
                 for key in sort_keys {
                     let found = idx
                         .iter()
@@ -1126,30 +1183,31 @@ impl Library {
     }
 
     pub fn album(&self, id: &str) -> Result<Option<AlbumDetail>> {
-        let (mut tracks, dir, mtime) = {
+        let (mut tracks, dir, added) = {
             let conn = self.conn();
             let mut stmt = conn.prepare(&format!(
                 "SELECT * FROM temp.indexed_tracks WHERE album_id = ?1 AND {VISIBLE}"
             ))?;
             let mut dir = String::new();
-            let mut mtime = 0;
+            let mut added = Vec::new();
             let mut tracks = Vec::new();
             let mut rows = stmt.query([id])?;
             while let Some(r) = rows.next()? {
                 let (t, d) = track_from_row(r)?;
                 dir = d;
-                mtime = mtime.max(r.get::<_, i64>("mtime")?);
+                added.push(r.get::<_, i64>("added_at")?);
                 tracks.push(t);
             }
-            (tracks, dir, mtime)
+            (tracks, dir, added)
         };
-        if tracks.is_empty() {
+        let Some(collection) = tracks.first().map(|t| t.collection) else {
             return Ok(None);
-        }
+        };
         sort_tracks(&mut tracks);
         let covers = self.covers()?;
         let refs: Vec<&Track> = tracks.iter().collect();
-        let album = summarize(id, &refs, mtime, covers.get(id));
+        let added = album_added(collection, added.into_iter());
+        let album = summarize(id, &refs, added, covers.get(id));
         Ok(Some(AlbumDetail { album, dir, tracks }))
     }
 
@@ -1518,6 +1576,7 @@ mod tests {
             mtime: 1,
             size: 1,
             collection: Collection::Inbox,
+            added: None,
         };
         let tags = TrackTags {
             tag_keys: keys.to_vec(),
@@ -1864,6 +1923,7 @@ mod tests {
             mtime,
             size: 1,
             collection: Collection::Library,
+            added: None,
         };
         let tags = TrackTags {
             album: Some(album.into()),
@@ -1949,6 +2009,87 @@ mod tests {
         assert_eq!(setup.rules.required_tags, ["title", "genre"]);
         assert_eq!(Library::library_in(&root), Some(1));
         assert_eq!(Library::library_in(&dir.join("state")), None);
+    }
+
+    #[test]
+    fn library_albums_count_as_added_when_imported() {
+        let dir = temp_dir("libadded", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        let imported = |rel: &str, album: &str, mtime: i64, at: i64| {
+            let mut f = library_file(&root, rel, album, mtime);
+            f.0.added = Some(at);
+            f
+        };
+        let added = |title: &str| {
+            let albums = lib
+                .albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap();
+            let album = albums.iter().find(|a| a.title == title).unwrap();
+            let detail = lib.album(&album.id).unwrap().unwrap();
+            assert_eq!(detail.album.added_at, album.added_at);
+            album.added_at
+        };
+
+        lib.upsert(&[imported("A/1.flac", "A", 100, 500)]).unwrap();
+        assert_eq!(added("A"), 500);
+        // A tag edit rewrites the file; the album was still added at the import.
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 900)])
+            .unwrap();
+        assert_eq!(added("A"), 500);
+        // A track imported into the album later doesn't make it new.
+        lib.upsert(&[imported("A/2.flac", "A", 800, 800)]).unwrap();
+        assert_eq!(added("A"), 500);
+        // Files found in the folder by a scan count from their modification time.
+        lib.upsert(&[library_file(&root, "B/1.flac", "B", 300)])
+            .unwrap();
+        assert_eq!(added("B"), 300);
+
+        // The Inbox goes by its newest file.
+        lib.upsert(&[file("/m/a/1.flac", "a", &[]), {
+            let mut f = file("/m/a/2.flac", "a", &[]);
+            f.0.mtime = 40;
+            f
+        }])
+        .unwrap();
+        let inbox = lib
+            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(inbox[0].added_at, 40);
+    }
+
+    #[test]
+    fn an_older_library_database_gets_added_times_from_its_files() {
+        let dir = temp_dir("libv1", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 70)])
+            .unwrap();
+        drop(lib);
+        // As the first version of the Library database left it.
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        own.execute_batch(
+            "ALTER TABLE tracks DROP COLUMN added_at;
+             UPDATE tracks SET mtime = 70;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(own);
+
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums[0].added_at, 70);
+        let version: i64 = lib
+            .conn()
+            .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -2069,6 +2210,7 @@ mod tests {
             .albums(Collection::Library, &[], &[], "", &[], None)
             .unwrap();
         assert_eq!(lib.album_track_ids(&albums[0].id).unwrap(), before);
+        assert_eq!(albums[0].added_at, 1);
     }
 
     #[test]

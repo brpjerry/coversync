@@ -41,7 +41,8 @@ pub struct Album {
     /// Dominant cover colour as `#rrggbb`, once the cover pass has run.
     pub color: Option<String>,
     pub has_cover: bool,
-    /// Newest file modification time in the album (Unix seconds).
+    /// When the album was added (Unix seconds): for the Inbox, its newest
+    /// file's modification time; for the Library, when it was first imported.
     pub added_at: i64,
     pub format: String,
     pub collection: Collection,

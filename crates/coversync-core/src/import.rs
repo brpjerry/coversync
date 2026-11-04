@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::art::{Art, Placement};
 use crate::cover::CoverCache;
-use crate::db::CoverSource;
+use crate::db::{CoverSource, FileStat};
 use crate::inbox::IngestMode;
 use crate::model::Collection;
 use crate::scan::{self, Progress};
@@ -616,6 +616,10 @@ pub fn execute(
     let stats = written
         .iter()
         .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
+        .map(|s| FileStat {
+            added: Some(now),
+            ..s
+        })
         .collect();
     if let Err(e) = scan::index_files(lib, stats, progress) {
         // Rows are kept by the resolved Library folder plus each file's path

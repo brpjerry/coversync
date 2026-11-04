@@ -11,8 +11,11 @@ Early days: single user, no authentication, used on a home server.
 ## Features
 
 - **Browse**: Inbox and Library album grids with cover art, a sort menu in the
-  top bar, search, a player, and a tag editor. "Needs attention" lists albums
-  missing tags or art the rules require. The sidebar filters albums by tag:
+  top bar, search, a player, and a tag editor. "Recently added" means newest
+  files first in the Inbox, and most recently imported first in the Library
+  (the import time is kept in the Library's database, so tag edits and moves
+  don't change it). "Needs attention" lists albums missing tags or art the
+  rules require. The sidebar filters albums by tag:
   pick a tag such as Genre from its dropdown, search its values, and tick the
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
