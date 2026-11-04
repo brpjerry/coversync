@@ -618,11 +618,15 @@ pub fn execute(
         .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
         .collect();
     if let Err(e) = scan::index_files(lib, stats, progress) {
-        // Rows are kept by the Library folder's resolved path.
-        let indexed: Vec<PathBuf> = written
-            .iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .collect();
+        // Rows are kept by the resolved Library folder plus each file's path
+        // under it as written (folders below it aren't resolved).
+        let indexed: Vec<PathBuf> = match folder.canonicalize() {
+            Ok(root) => written
+                .iter()
+                .filter_map(|p| p.strip_prefix(&folder).ok().map(|rel| root.join(rel)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         let _ = lib.remove_paths(&indexed);
         for f in written.iter().chain(&art_files) {
             let _ = fs::remove_file(f);
