@@ -613,14 +613,7 @@ pub fn execute(
         .unwrap_or(0);
     // Index the copies before the originals leave the Inbox, so a failure
     // here leaves them where they were, and takes the copies back out.
-    let stats = written
-        .iter()
-        .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
-        .map(|s| FileStat {
-            added: Some(now),
-            ..s
-        })
-        .collect();
+    let stats = imported_stats(&written, &folder, now);
     if let Err(e) = scan::index_files(lib, stats, progress) {
         // Rows are kept by the resolved Library folder plus each file's path
         // under it as written (folders below it aren't resolved).
@@ -666,6 +659,18 @@ pub fn execute(
     })
 }
 
+/// The files an import wrote into `folder`, ready to index as added `now`.
+fn imported_stats(written: &[PathBuf], folder: &Path, now: i64) -> Vec<FileStat> {
+    written
+        .iter()
+        .filter_map(|p| scan::stat(p.clone(), folder, Collection::Library))
+        .map(|s| FileStat {
+            added: Some(now),
+            ..s
+        })
+        .collect()
+}
+
 fn art_summary(file: Option<&PathBuf>, embedded: usize) -> Option<String> {
     let file = file.map(|f| file_name(f));
     let embedded = (embedded > 0).then(|| {
@@ -683,6 +688,20 @@ fn art_summary(file: Option<&PathBuf>, embedded: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_files_are_indexed_as_added_at_the_import() {
+        let dir = std::env::temp_dir().join(format!("coversync-imported-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("A")).unwrap();
+        let file = dir.join("A/1.flac");
+        fs::write(&file, b"").unwrap();
+        let stats = imported_stats(std::slice::from_ref(&file), &dir, 1234);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].added, Some(1234));
+        assert_eq!(stats[0].collection, Collection::Library);
+        assert_eq!(stats[0].root, dir);
+    }
 
     #[test]
     fn album_wide_values_that_differ_would_split_the_album() {

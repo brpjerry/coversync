@@ -281,6 +281,12 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
     let prepared = (|| -> Result<(i64, bool)> {
         conn.execute_batch(&library_schema("lib_new"))?;
         migrate_library(conn, "lib_new")?;
+        // An older coversyncd, opening the folder elsewhere, adds files
+        // without a time; date them by their modification time now.
+        conn.execute(
+            "UPDATE lib_new.tracks SET added_at = mtime WHERE added_at = 0",
+            [],
+        )?;
         // SQLite opens a file it can't write read-only without saying so;
         // writing the prefix (again) checks the file and its folder, which
         // holds the journal, take writes.
@@ -322,19 +328,28 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     }
     if version < 2 {
         // v2 records when each file joined the Library. Earlier imports
-        // wrote their files then, so their modification time stands in.
+        // wrote their files then, so their modification time stands in. One
+        // transaction, so an interrupted upgrade is redone in full.
         let has_column = conn
             .prepare(&format!(
                 "SELECT 1 FROM pragma_table_info('tracks', '{schema}') WHERE name = 'added_at'"
             ))?
             .exists([])?;
-        if !has_column {
-            conn.execute_batch(&format!(
-                "ALTER TABLE {schema}.tracks ADD COLUMN added_at INTEGER NOT NULL DEFAULT 0;
-                 UPDATE {schema}.tracks SET added_at = mtime;"
-            ))?;
-        }
-        conn.execute_batch(&format!("PRAGMA {schema}.user_version = 2"))?;
+        let add = if has_column {
+            String::new()
+        } else {
+            format!("ALTER TABLE {schema}.tracks ADD COLUMN added_at INTEGER NOT NULL DEFAULT 0;")
+        };
+        conn.execute_batch(&format!(
+            "BEGIN;
+             {add}
+             UPDATE {schema}.tracks SET added_at = mtime WHERE added_at = 0;
+             PRAGMA {schema}.user_version = 2;
+             COMMIT;"
+        ))
+        .inspect_err(|_| {
+            let _ = conn.execute_batch("ROLLBACK");
+        })?;
     }
     Ok(())
 }
@@ -393,9 +408,9 @@ pub struct FileStat {
     pub mtime: i64,
     pub size: u64,
     pub collection: Collection,
-    /// When a Library file was imported, for files an import just wrote.
-    /// Others keep the time they were first indexed with (their
-    /// modification time then).
+    /// For Library files an import just wrote: the import time, which
+    /// replaces any stored `added_at`. `None` keeps the stored value, or for
+    /// a file not indexed yet, starts it at `mtime`.
     pub added: Option<i64>,
 }
 
@@ -2090,6 +2105,69 @@ mod tests {
             .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn missing_added_times_are_filled_from_the_files() {
+        let dir = temp_dir("libzero", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[
+            library_file(&root, "A/1.flac", "A", 70),
+            library_file(&root, "B/1.flac", "B", 80),
+        ])
+        .unwrap();
+        drop(lib);
+        let added = |lib: &Library, title: &str| {
+            lib.albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap()
+                .into_iter()
+                .find(|a| a.title == title)
+                .unwrap()
+                .added_at
+        };
+
+        // An upgrade cut short after adding the column, and a row an older
+        // coversyncd added without a time.
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        own.execute_batch(
+            "UPDATE tracks SET added_at = 0 WHERE path = 'A/1.flac';
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(own);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert_eq!(added(&lib, "A"), 70);
+        drop(lib);
+
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        own.execute("UPDATE tracks SET added_at = 0 WHERE path = 'B/1.flac'", [])
+            .unwrap();
+        drop(own);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert_eq!(added(&lib, "B"), 80);
+    }
+
+    #[test]
+    fn an_import_over_a_stale_row_takes_the_import_time() {
+        let dir = temp_dir("libstale", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 70)])
+            .unwrap();
+        // The file was deleted by hand and the album imported again before
+        // a scan noticed: the row is still there.
+        let mut again = library_file(&root, "A/1.flac", "A", 900);
+        again.0.added = Some(900);
+        lib.upsert(&[again]).unwrap();
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums[0].added_at, 900);
     }
 
     #[test]

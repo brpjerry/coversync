@@ -100,12 +100,12 @@ pub fn stat(path: PathBuf, root: &Path, collection: Collection) -> Option<FileSt
         .ok()?
         .as_secs() as i64;
     Some(FileStat {
-        added: None,
         path,
         root: root.to_path_buf(),
         mtime,
         size: meta.len(),
         collection,
+        added: None,
     })
 }
 
