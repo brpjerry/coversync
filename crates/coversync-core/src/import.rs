@@ -612,12 +612,23 @@ pub fn execute(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     // Index the copies before the originals leave the Inbox, so a failure
-    // here leaves them where they were.
+    // here leaves them where they were, and takes the copies back out.
     let stats = written
         .iter()
         .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
         .collect();
-    scan::index_files(lib, stats, progress)?;
+    if let Err(e) = scan::index_files(lib, stats, progress) {
+        // Rows are kept by the Library folder's resolved path.
+        let indexed: Vec<PathBuf> = written
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+        let _ = lib.remove_paths(&indexed);
+        for f in written.iter().chain(&art_files) {
+            let _ = fs::remove_file(f);
+        }
+        return Err(e);
+    }
     match plan.mode {
         IngestMode::Copy => lib.hide_paths(&sources, now)?,
         IngestMode::Move => {

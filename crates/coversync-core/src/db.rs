@@ -231,17 +231,9 @@ fn existing_dir(folder: Option<&str>) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// The track id prefix of a folder indexed in memory: taken from its path,
-/// so ids stay the same across restarts (and into the database its first
-/// import creates).
-fn path_prefix(dir: &Path) -> i64 {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(dir.as_os_str().as_encoded_bytes());
-    let n = u64::from_le_bytes(hash[..8].try_into().expect("8 bytes"));
-    1 + (n % ((1 << 20) - 1)) as i64
-}
-
-/// A random track id prefix for a new Library database (see [`ID_SPAN`]).
+/// A random track id prefix for a new Library index (see [`ID_SPAN`]). An
+/// index rebuilt in memory gets a new one too: its rows are numbered afresh,
+/// so ids from before must not name its tracks.
 fn new_prefix() -> i64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -263,7 +255,7 @@ fn attach_memory(conn: &Connection, dir: Option<&Path>, problem: Option<&str>) -
     if let Some(dir) = dir {
         conn.execute(
             "INSERT INTO temp.lib_root (root, prefix, stored, problem) VALUES (?1, ?2, 0, ?3)",
-            params![dir.to_string_lossy(), path_prefix(dir), problem],
+            params![dir.to_string_lossy(), new_prefix(), problem],
         )?;
     }
     Ok(())
@@ -2196,20 +2188,25 @@ mod tests {
     }
 
     #[test]
-    fn ids_of_a_folder_indexed_in_memory_survive_a_restart() {
+    fn rebuilding_an_in_memory_index_does_not_retarget_old_ids() {
         let dir = temp_dir("libmemids", &["state", "Lib"]);
         let root = dir.join("Lib");
-        let id = || {
+        let open = |rel: &str| {
             let lib = Library::open_in(&dir.join("state")).unwrap();
             lib.set_library_setup(with_folder(&root, &[])).unwrap();
-            lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
-                .unwrap();
-            let album = &lib
-                .albums(Collection::Library, &[], &[], "", &[], None)
-                .unwrap()[0];
-            lib.album_track_ids(&album.id).unwrap()[0]
+            lib.upsert(&[library_file(&root, rel, "A", 1)]).unwrap();
+            lib
         };
-        assert_eq!(id(), id());
+        let lib = open("A/1.flac");
+        let album = &lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap()[0];
+        let id = lib.album_track_ids(&album.id).unwrap()[0];
+        drop(lib);
+
+        // A different file is row 1 once the index is rebuilt.
+        let lib = open("A/2.flac");
+        assert_eq!(lib.track_path(id).unwrap(), None);
         assert!(!root.join(".coversync").exists());
     }
 
