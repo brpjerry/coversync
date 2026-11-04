@@ -304,13 +304,9 @@ pub fn plan(
         Some(f) if !creatable(Path::new(f)) => {
             problems.push(format!("coversyncd can't write to the library folder {f}."))
         }
-        Some(f) => {
-            if let Some(p) = lib.library_problem()? {
-                problems.push(format!(
-                    "coversync can't keep the Library's database in {f}: {p}"
-                ));
-            }
-        }
+        // A Library database that couldn't be opened is tried again by the
+        // import itself (`prepare_library`), before anything is copied.
+        _ => {}
     }
 
     let art_rules = &setup.rules.art;
@@ -615,6 +611,13 @@ pub fn execute(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Index the copies before the originals leave the Inbox, so a failure
+    // here leaves them where they were.
+    let stats = written
+        .iter()
+        .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
+        .collect();
+    scan::index_files(lib, stats, progress)?;
     match plan.mode {
         IngestMode::Copy => lib.hide_paths(&sources, now)?,
         IngestMode::Move => {
@@ -626,11 +629,6 @@ pub fn execute(
             lib.remove_paths(&sources)?;
         }
     }
-    let stats = written
-        .iter()
-        .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
-        .collect();
-    scan::index_files(lib, stats, progress)?;
     scan::refresh_covers(lib, covers, progress)?;
 
     let first = &written[0];

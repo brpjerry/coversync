@@ -231,7 +231,17 @@ fn existing_dir(folder: Option<&str>) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// A random track id prefix for a Library (see [`ID_SPAN`]).
+/// The track id prefix of a folder indexed in memory: taken from its path,
+/// so ids stay the same across restarts (and into the database its first
+/// import creates).
+fn path_prefix(dir: &Path) -> i64 {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(dir.as_os_str().as_encoded_bytes());
+    let n = u64::from_le_bytes(hash[..8].try_into().expect("8 bytes"));
+    1 + (n % ((1 << 20) - 1)) as i64
+}
+
+/// A random track id prefix for a new Library database (see [`ID_SPAN`]).
 fn new_prefix() -> i64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -253,7 +263,7 @@ fn attach_memory(conn: &Connection, dir: Option<&Path>, problem: Option<&str>) -
     if let Some(dir) = dir {
         conn.execute(
             "INSERT INTO temp.lib_root (root, prefix, stored, problem) VALUES (?1, ?2, 0, ?3)",
-            params![dir.to_string_lossy(), new_prefix(), problem],
+            params![dir.to_string_lossy(), path_prefix(dir), problem],
         )?;
     }
     Ok(())
@@ -272,7 +282,11 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
     let prepared = (|| -> Result<(i64, bool)> {
         conn.execute_batch(&library_schema("lib_new"))?;
         migrate_library(conn, "lib_new")?;
+        // SQLite opens a file it can't write read-only without saying so;
+        // writing the prefix (again) checks the file and its folder, which
+        // holds the journal, take writes.
         if let Some(prefix) = get_setting::<i64>(conn, "lib_new", "track_id_prefix")? {
+            put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
             return Ok((prefix, false));
         }
         let prefix = carry.unwrap_or_else(new_prefix);
@@ -728,7 +742,8 @@ impl Library {
     pub fn open_in(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join(LOCAL_DB);
         let legacy = state_dir.join(LEGACY_DB);
-        if !path.exists() && legacy.exists() {
+        let migrated = !path.exists() && legacy.exists();
+        if migrated {
             // Fold the write-ahead log into the file first, so a single rename
             // moves everything and can't leave committed changes behind.
             let conn = Connection::open(&legacy)?;
@@ -745,6 +760,16 @@ impl Library {
         }
         let lib = Self::open(&path)?;
         lib.refresh_library()?;
+        if migrated
+            && let Some(folder) = lib.library_setup()?.folder
+            && Path::new(&folder).is_dir()
+        {
+            // That folder already was this installation's Library: keep its
+            // index in its own database rather than re-reading it every start.
+            if let Err(e) = lib.prepare_library(Path::new(&folder)) {
+                tracing::warn!(folder = %folder, "couldn't create the Library database: {e}");
+            }
+        }
         Ok(lib)
     }
 
@@ -821,9 +846,9 @@ impl Library {
         let carry = match current {
             Some(a) if a.root == dir => {
                 // Indexed in memory: move to the folder's database once there
-                // is one to open, or one is wanted. One that failed is only
-                // retried by an import.
-                if a.stored || !(create || has_db && a.problem.is_none()) {
+                // is one to open, or one is wanted. One that failed is tried
+                // again, in case it has been fixed.
+                if a.stored || !(create || has_db) {
                     return Ok(());
                 }
                 Some(a.prefix)
@@ -2128,7 +2153,64 @@ mod tests {
                 .len(),
             1
         );
+        // Once the folder is fixed, the next import gets its database.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lib.prepare_library(&root).unwrap();
+        assert_eq!(lib.library_problem().unwrap(), None);
+        assert_eq!(Library::library_in(&root), Some(1));
+    }
+
+    #[test]
+    fn a_database_that_cant_be_written_is_retried_once_fixed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("libdbro", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        drop(lib);
+
+        let own = root.join(".coversync");
+        let mode = |m| std::fs::set_permissions(&own, std::fs::Permissions::from_mode(m));
+        let db_mode =
+            |m| std::fs::set_permissions(root.join(LIBRARY_DB), std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        db_mode(0o444).unwrap();
+        if std::fs::create_dir(own.join("probe")).is_ok() {
+            return; // Running as root: permissions don't stop writes.
+        }
+        // SQLite would open it read-only; it is indexed in memory instead.
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert!(lib.library_problem().unwrap().is_some());
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        assert_eq!(lib.file_stats().unwrap().len(), 1);
+
+        mode(0o755).unwrap();
+        db_mode(0o644).unwrap();
+        lib.refresh_library().unwrap();
+        assert_eq!(lib.library_problem().unwrap(), None);
+        assert_eq!(lib.file_stats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ids_of_a_folder_indexed_in_memory_survive_a_restart() {
+        let dir = temp_dir("libmemids", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let id = || {
+            let lib = Library::open_in(&dir.join("state")).unwrap();
+            lib.set_library_setup(with_folder(&root, &[])).unwrap();
+            lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+                .unwrap();
+            let album = &lib
+                .albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap()[0];
+            lib.album_track_ids(&album.id).unwrap()[0]
+        };
+        assert_eq!(id(), id());
+        assert!(!root.join(".coversync").exists());
     }
 
     #[test]
@@ -2175,5 +2257,25 @@ mod tests {
         assert!(!lib.sync_setup().unwrap().enabled);
         // The next scan reads the Library's files into its own database.
         assert!(lib.file_stats().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_existing_library_gets_its_database_on_takeover() {
+        let dir = temp_dir("legacylib", &["state", "Lib"]);
+        let state = dir.join("state");
+        let root = dir.join("Lib");
+        let old = Library::open(&state.join(LEGACY_DB)).unwrap();
+        old.put_setting("library_setup", &with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        old.conn().execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(old);
+
+        let lib = Library::open_in(&state).unwrap();
+        assert!(root.join(LIBRARY_DB).is_file());
+        assert_eq!(lib.library_problem().unwrap(), None);
+        drop(lib);
+        let other = Library::open_in(&dir.join("other")).unwrap();
+        let opened = other.set_library_setup(with_folder(&root, &[])).unwrap();
+        assert_eq!(opened.rules.required_tags, ["title", "genre"]);
     }
 }
