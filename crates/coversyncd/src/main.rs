@@ -27,7 +27,9 @@ struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8770")]
     listen: SocketAddr,
-    /// Where the index database lives (default: $XDG_STATE_HOME/coversync).
+    /// Where the Inbox's database and this installation's settings live
+    /// (default: $XDG_STATE_HOME/coversync). The Library keeps its own
+    /// database in its folder.
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Where cover thumbnails are cached (default: $XDG_CACHE_HOME/coversync).
@@ -98,6 +100,8 @@ pub fn spawn_scan(state: Shared) {
         state.rescan.store(false, Ordering::SeqCst);
         let s = state.clone();
         let result = tokio::task::spawn_blocking(move || {
+            // The Library folder may have appeared (or gone) since the last scan.
+            s.lib.refresh_library()?;
             scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress)
         })
         .await;
@@ -159,7 +163,7 @@ async fn run() -> anyhow::Result<()> {
     let cache_dir = args
         .cache_dir
         .unwrap_or_else(|| xdg("XDG_CACHE_HOME", ".cache"));
-    let lib = Library::open(&state_dir.join("library.sqlite3"))?;
+    let lib = Library::open_in(&state_dir)?;
     // The command-line folder only seeds the setting; Inbox setup owns it after.
     if let Some(inbox) = &args.inbox {
         let mut setup = lib.inbox_setup()?;

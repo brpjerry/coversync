@@ -46,6 +46,8 @@ class SetupStore {
 	separator = $state(';');
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
+	/** Why the saved folder can't hold the library's database, if it can't. */
+	libraryProblem = $state<string | null>(null);
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
@@ -91,7 +93,10 @@ class SetupStore {
 		try {
 			const r = await api.setup();
 			if (this.changes === 0) this.#apply(r);
-			else this.folderStatus = r.folder;
+			else {
+				this.folderStatus = r.folder;
+				this.libraryProblem = r.library_problem;
+			}
 		} catch {}
 	}
 
@@ -119,6 +124,7 @@ class SetupStore {
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
 		this.folderStatus = r.folder;
+		this.libraryProblem = r.library_problem;
 	}
 
 	label(id: string) {
@@ -160,7 +166,9 @@ class SetupStore {
 			});
 			this.#apply(r);
 			this.version++;
-			toast('Library setup saved', 'success');
+			if (r.adopted)
+				toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
+			else toast('Library setup saved', 'success');
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
 		} finally {

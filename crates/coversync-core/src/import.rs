@@ -304,6 +304,8 @@ pub fn plan(
         Some(f) if !creatable(Path::new(f)) => {
             problems.push(format!("coversyncd can't write to the library folder {f}."))
         }
+        // A Library database that couldn't be opened is tried again by the
+        // import itself (`prepare_library`), before anything is copied.
         _ => {}
     }
 
@@ -493,6 +495,9 @@ pub fn execute(
     upload: Option<Art>,
     progress: &Progress,
 ) -> Result<ImportResult> {
+    // The Library folder may hold its own database (with its own rules) that
+    // isn't open yet.
+    lib.refresh_library()?;
     let plan = plan(lib, album_id, edits, upload.as_ref())?;
     if !plan.ready() {
         let mut reasons = plan.problems.clone();
@@ -533,6 +538,9 @@ pub fn execute(
             .as_deref()
             .expect("ready plans have a folder"),
     );
+    // The first import creates the Library folder and its database; nothing
+    // is copied, hidden or deleted unless the database is there to index it.
+    lib.prepare_library(&folder)?;
 
     let mut sources = Vec::new();
     let mut written: Vec<PathBuf> = Vec::new();
@@ -603,6 +611,28 @@ pub fn execute(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Index the copies before the originals leave the Inbox, so a failure
+    // here leaves them where they were, and takes the copies back out.
+    let stats = written
+        .iter()
+        .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
+        .collect();
+    if let Err(e) = scan::index_files(lib, stats, progress) {
+        // Rows are kept by the resolved Library folder plus each file's path
+        // under it as written (folders below it aren't resolved).
+        let indexed: Vec<PathBuf> = match folder.canonicalize() {
+            Ok(root) => written
+                .iter()
+                .filter_map(|p| p.strip_prefix(&folder).ok().map(|rel| root.join(rel)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let _ = lib.remove_paths(&indexed);
+        for f in written.iter().chain(&art_files) {
+            let _ = fs::remove_file(f);
+        }
+        return Err(e);
+    }
     match plan.mode {
         IngestMode::Copy => lib.hide_paths(&sources, now)?,
         IngestMode::Move => {
@@ -614,17 +644,17 @@ pub fn execute(
             lib.remove_paths(&sources)?;
         }
     }
-    let stats = written
-        .iter()
-        .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
-        .collect();
-    scan::index_files(lib, stats, progress)?;
     scan::refresh_covers(lib, covers, progress)?;
 
     let first = &written[0];
     let album = tags::read(first)?.album;
     Ok(ImportResult {
-        album_id: scan::album_id(&scan::album_dir(first), album.as_deref()),
+        album_id: scan::album_id_in(
+            Collection::Library,
+            &folder,
+            &scan::album_dir_in(Collection::Library, &folder, first),
+            album.as_deref(),
+        ),
         files: written.len(),
         dest_dir: dest_dir.display().to_string(),
         mode: plan.mode,

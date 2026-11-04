@@ -1,6 +1,7 @@
 //! Sync settings. Syncing the Library to devices is planned; for now the
 //! setting only shows or hides the sidebar's Sync section, where those
-//! devices will be listed with their own settings.
+//! devices will be listed with their own settings. Syncing should leave out
+//! the Library's own database folder (`db::LIBRARY_DB`).
 
 use serde::{Deserialize, Serialize};
 

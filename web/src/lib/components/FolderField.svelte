@@ -4,6 +4,7 @@
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import CircleX from '@lucide/svelte/icons/circle-x';
 	import FolderPlus from '@lucide/svelte/icons/folder-plus';
+	import LibraryBig from '@lucide/svelte/icons/library-big';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import { fade } from 'svelte/transition';
 	import { api, ApiError, type FolderStatus } from '#lib/api.ts';
@@ -15,8 +16,10 @@
 		placeholder: string;
 		/** Inbox folders must exist; a Library folder can be created on first import. */
 		purpose: 'inbox' | 'library';
+		/** The folder as saved, to tell switching to another library from keeping this one. */
+		saved?: string;
 	}
-	let { value = $bindable(), id, label, placeholder, purpose }: Props = $props();
+	let { value = $bindable(), id, label, placeholder, purpose, saved }: Props = $props();
 
 	let status = $state<FolderStatus | null>(null);
 	let error = $state<string | null>(null);
@@ -50,7 +53,7 @@
 		return () => clearTimeout(timer);
 	});
 
-	type Tone = 'ok' | 'info' | 'warn' | 'error';
+	type Tone = 'ok' | 'info' | 'library' | 'warn' | 'error';
 	let verdict = $derived.by((): { tone: Tone; text: string } | null => {
 		if (error) return { tone: 'error', text: error };
 		if (!value.trim())
@@ -70,6 +73,14 @@
 			return purpose === 'inbox'
 				? { tone: 'warn', text: 'Found. Read-only to coversyncd, so only Copy works.' }
 				: { tone: 'error', text: 'Read-only to coversyncd; imports would fail.' };
+		if (purpose === 'library' && status.library !== null && value.trim() !== saved) {
+			const n = status.library;
+			const holds =
+				n === 0
+					? 'Holds a coversync library, with no tracks yet.'
+					: `Holds a coversync library of ${n} ${n === 1 ? 'track' : 'tracks'}.`;
+			return { tone: 'library', text: `${holds} Saving opens it with its own rules.` };
+		}
 		return { tone: 'ok', text: purpose === 'inbox' ? 'Found and writable.' : 'Ready for imports.' };
 	});
 </script>
@@ -94,6 +105,7 @@
 			<p class="verdict {verdict.tone}" in:fade={{ duration: 160 }}>
 				{#if verdict.tone === 'ok'}<CircleCheck size={14} />
 				{:else if verdict.tone === 'info'}<FolderPlus size={14} />
+				{:else if verdict.tone === 'library'}<LibraryBig size={14} />
 				{:else if verdict.tone === 'warn'}<CircleAlert size={14} />
 				{:else}<CircleX size={14} />{/if}
 				{verdict.text}
@@ -158,7 +170,8 @@
 	.ok {
 		color: var(--success);
 	}
-	.info {
+	.info,
+	.library {
 		color: var(--accent);
 	}
 	.warn {

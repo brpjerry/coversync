@@ -1,12 +1,19 @@
-//! SQLite index of tracks and cover metadata.
+//! SQLite index of tracks and cover metadata, in two databases.
+//!
+//! The local one, in coversyncd's state directory, holds the Inbox: its
+//! index, the files hidden from it, its setup, plus cover data and the
+//! settings that belong to this installation. The Library's own one lives in
+//! the Library folder (see [`LIBRARY_DB`]) and travels with it: the Library's
+//! rules and its index, with paths relative to the folder. It is attached to
+//! the same connection as `lib`, and temporary views give both collections'
+//! tracks the same shape.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, ToSql, params, params_from_iter};
 
-use crate::Result;
 use crate::appearance::AppearanceSetup;
 use crate::autofill::{self, Autofill, TrackInfo};
 use crate::inbox::{HiddenStats, InboxSetup};
@@ -14,6 +21,7 @@ use crate::model::{Album, AlbumDetail, Attention, Collection, KindCoverage, TagC
 use crate::rules::{self, LibrarySetup};
 use crate::sync::SyncSetup;
 use crate::tags::TrackTags;
+use crate::{Error, Result};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -63,6 +71,296 @@ CREATE TABLE IF NOT EXISTS covers (
     signature TEXT NOT NULL
 );
 "#;
+
+/// The local database's file name, in the state directory.
+pub const LOCAL_DB: &str = "inbox.sqlite3";
+
+/// What the local database was called before the Library got its own.
+const LEGACY_DB: &str = "library.sqlite3";
+
+/// The Library's own database, relative to the Library folder.
+pub const LIBRARY_DB: &str = ".coversync/library.sqlite3";
+
+/// Track columns both databases store the same way. The Library's leaves
+/// out `root` and `collection`, and its `path` and `album_dir` are relative
+/// to the Library folder.
+const DATA_COLUMNS: &[&str] = &[
+    "mtime",
+    "size",
+    "album_id",
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "track_no",
+    "track_total",
+    "disc_no",
+    "disc_total",
+    "year",
+    "genre",
+    "duration_ms",
+    "sample_rate",
+    "bit_depth",
+    "channels",
+    "bitrate",
+    "format",
+    "tag_keys",
+    "tag_values",
+];
+
+/// The Library database's tables, in the database attached as `schema`.
+/// It keeps a rollback journal rather than a write-ahead log, so a copy of
+/// the folder taken while coversyncd is stopped holds every change.
+fn library_schema(schema: &str) -> String {
+    format!(
+        r#"
+PRAGMA {schema}.journal_mode = DELETE;
+CREATE TABLE IF NOT EXISTS {schema}.tracks (
+    id           INTEGER PRIMARY KEY,
+    path         TEXT NOT NULL UNIQUE,
+    mtime        INTEGER NOT NULL,
+    size         INTEGER NOT NULL,
+    album_id     TEXT NOT NULL,
+    album_dir    TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    artist       TEXT NOT NULL,
+    album        TEXT NOT NULL,
+    album_artist TEXT,
+    track_no     INTEGER,
+    track_total  INTEGER,
+    disc_no      INTEGER,
+    disc_total   INTEGER,
+    year         INTEGER,
+    genre        TEXT,
+    duration_ms  INTEGER NOT NULL,
+    sample_rate  INTEGER,
+    bit_depth    INTEGER,
+    channels     INTEGER,
+    bitrate      INTEGER,
+    format       TEXT NOT NULL,
+    tag_keys     TEXT NOT NULL DEFAULT '',
+    tag_values   TEXT NOT NULL DEFAULT '{{}}'
+);
+CREATE INDEX IF NOT EXISTS {schema}.tracks_album ON tracks (album_id);
+CREATE TABLE IF NOT EXISTS {schema}.settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#
+    )
+}
+
+/// Library track ids are public as -(prefix * 2^32 + row id), with a prefix
+/// chosen at random per Library (below 2^20, so ids stay exact in
+/// JavaScript). An id from another Library then names no track here rather
+/// than a different one, and never clashes with an Inbox id.
+const ID_SPAN: i64 = 1 << 32;
+
+/// The connection's temporary objects: the Library folder attached (no row
+/// while there is none), and views that give Library tracks absolute paths
+/// and public ids, alongside the Inbox's.
+fn temp_schema() -> String {
+    let data = DATA_COLUMNS.join(", ");
+    let lib_data: Vec<String> = DATA_COLUMNS.iter().map(|c| format!("t.{c}")).collect();
+    let lib_data = lib_data.join(", ");
+    format!(
+        "CREATE TEMP TABLE lib_root (
+            root    TEXT NOT NULL,
+            prefix  INTEGER NOT NULL,
+            -- 1 when the Library's own database is attached; 0 while its
+            -- folder is indexed in memory (no database yet, or none possible).
+            stored  INTEGER NOT NULL,
+            -- Why the folder can't hold its database, if it can't.
+            problem TEXT
+         );
+         CREATE TEMP VIEW library_tracks AS
+            SELECT -(r.prefix * {ID_SPAN} + t.id) AS id, r.root || '/' || t.path AS path,
+                r.root AS root,
+                CASE t.album_dir WHEN '' THEN r.root ELSE r.root || '/' || t.album_dir END
+                    AS album_dir,
+                'library' AS collection, {lib_data}
+            FROM lib.tracks t JOIN temp.lib_root r;
+         CREATE TEMP VIEW indexed_tracks AS
+            SELECT id, path, root, album_dir, collection, {data} FROM main.tracks
+            UNION ALL
+            SELECT id, path, root, album_dir, collection, {data} FROM temp.library_tracks;"
+    )
+}
+
+/// The tracks of `collection`, as a table or view with the local schema.
+fn source(collection: Collection) -> &'static str {
+    match collection {
+        Collection::Inbox => "main.tracks",
+        Collection::Library => "temp.library_tracks",
+    }
+}
+
+/// The Library folder attached, and how.
+struct Attached {
+    root: PathBuf,
+    prefix: i64,
+    stored: bool,
+    problem: Option<String>,
+}
+
+fn attached(conn: &Connection) -> Result<Option<Attached>> {
+    Ok(conn
+        .query_row(
+            "SELECT root, prefix, stored, problem FROM temp.lib_root",
+            [],
+            |r| {
+                Ok(Attached {
+                    root: PathBuf::from(r.get::<_, String>(0)?),
+                    prefix: r.get(1)?,
+                    stored: r.get(2)?,
+                    problem: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The Library folder whose tracks are indexed, if one is.
+fn library_root(conn: &Connection) -> Result<Option<PathBuf>> {
+    Ok(attached(conn)?.map(|a| a.root))
+}
+
+/// `folder` as the existing directory it names, symlinks resolved.
+fn existing_dir(folder: Option<&str>) -> Option<PathBuf> {
+    let dir = Path::new(folder?).canonicalize().ok()?;
+    dir.is_dir().then_some(dir)
+}
+
+/// A random track id prefix for a new Library index (see [`ID_SPAN`]). An
+/// index rebuilt in memory gets a new one too: its rows are numbered afresh,
+/// so ids from before must not name its tracks.
+fn new_prefix() -> i64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    1 + (h.finish() % ((1 << 20) - 1)) as i64
+}
+
+/// Index `dir` (or nothing, with no `dir`) in an empty in-memory database.
+fn attach_memory(conn: &Connection, dir: Option<&Path>, problem: Option<&str>) -> Result<()> {
+    let _ = conn.execute("DETACH DATABASE lib", []);
+    conn.execute("ATTACH DATABASE ':memory:' AS lib", [])?;
+    conn.execute_batch(&library_schema("lib"))?;
+    conn.execute("DELETE FROM temp.lib_root", [])?;
+    if let Some(dir) = dir {
+        conn.execute(
+            "INSERT INTO temp.lib_root (root, prefix, stored, problem) VALUES (?1, ?2, 0, ?3)",
+            params![dir.to_string_lossy(), new_prefix(), problem],
+        )?;
+    }
+    Ok(())
+}
+
+/// Attach `dir`'s own database as `lib`, creating it if the folder has none.
+/// Tracks of `carry`, the same folder indexed in memory, move into a
+/// database created now. Returns whether the database is new. On failure the
+/// database attached before stays attached.
+fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool> {
+    let db = dir.join(LIBRARY_DB);
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    conn.execute("ATTACH DATABASE ?1 AS lib_new", [db.to_string_lossy()])?;
+    let prepared = (|| -> Result<(i64, bool)> {
+        conn.execute_batch(&library_schema("lib_new"))?;
+        migrate_library(conn, "lib_new")?;
+        // SQLite opens a file it can't write read-only without saying so;
+        // writing the prefix (again) checks the file and its folder, which
+        // holds the journal, take writes.
+        if let Some(prefix) = get_setting::<i64>(conn, "lib_new", "track_id_prefix")? {
+            put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
+            return Ok((prefix, false));
+        }
+        let prefix = carry.unwrap_or_else(new_prefix);
+        put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
+        if carry.is_some() {
+            conn.execute(
+                "INSERT OR IGNORE INTO lib_new.tracks SELECT * FROM lib.tracks",
+                [],
+            )?;
+        }
+        Ok((prefix, true))
+    })();
+    let _ = conn.execute("DETACH DATABASE lib_new", []);
+    let (prefix, created) = prepared?;
+    conn.execute("DETACH DATABASE lib", [])?;
+    if let Err(e) = conn.execute("ATTACH DATABASE ?1 AS lib", [db.to_string_lossy()]) {
+        attach_memory(conn, Some(dir), Some(&e.to_string()))?;
+        return Err(e.into());
+    }
+    conn.execute("DELETE FROM temp.lib_root", [])?;
+    conn.execute(
+        "INSERT INTO temp.lib_root (root, prefix, stored) VALUES (?1, ?2, 1)",
+        params![dir.to_string_lossy(), prefix],
+    )?;
+    Ok(created)
+}
+
+/// Bring a Library database up to the current schema (its own `user_version`).
+fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
+    let version: i64 =
+        conn.query_row(&format!("PRAGMA {schema}.user_version"), [], |r| r.get(0))?;
+    if version < 1 {
+        conn.execute_batch(&format!("PRAGMA {schema}.user_version = 1"))?;
+    }
+    Ok(())
+}
+
+/// A setting stored in `schema` ("main" or "lib"). A value this build can't
+/// parse (say, from a newer one) reads as unset.
+fn get_setting<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    schema: &str,
+    key: &str,
+) -> Result<Option<T>> {
+    Ok(raw_setting(conn, schema, key)?.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+fn raw_setting(conn: &Connection, schema: &str, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT value FROM {schema}.settings WHERE key = ?1"),
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn put_setting<T: serde::Serialize>(
+    conn: &Connection,
+    schema: &str,
+    key: &str,
+    value: &T,
+) -> Result<()> {
+    let json = serde_json::to_string(value).expect("settings serialize");
+    conn.execute(
+        &format!(
+            "INSERT INTO {schema}.settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value"
+        ),
+        params![key, json],
+    )?;
+    Ok(())
+}
+
+/// Library setup as the Library's own database stores it: everything but
+/// the folder, which is where the database itself is.
+fn own_setup(setup: &LibrarySetup) -> LibrarySetup {
+    LibrarySetup {
+        folder: None,
+        ..setup.clone()
+    }
+}
 
 /// A file found on disk, with the stat data used to skip unchanged files.
 #[derive(Debug, Clone)]
@@ -370,10 +668,105 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch("PRAGMA user_version = 3")?;
     }
+    if version < 4 {
+        // v4 moves the Library's index into the Library folder's own
+        // database; the next scan reads its files into that one.
+        conn.execute_batch(
+            "DELETE FROM tracks WHERE collection = 'library';
+             DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM tracks);
+             PRAGMA user_version = 4;",
+        )?;
+    }
     Ok(())
 }
 
+/// Once a Library's own database is attached: take its setup over the copy
+/// kept locally, unless that copy holds edits saved while the database
+/// wasn't open; a new database starts from the local copy.
+fn adopt_or_store_setup(conn: &Connection, mirror: &LibrarySetup) -> Result<()> {
+    let pending = get_setting::<bool>(conn, "main", PENDING)?.unwrap_or(false);
+    let own = get_setting::<LibrarySetup>(conn, "lib", "library_setup")?;
+    match own {
+        Some(own) if !pending => {
+            let setup = LibrarySetup {
+                folder: mirror.folder.clone(),
+                ..own
+            };
+            if setup != *mirror {
+                tracing::info!("using the Library's own setup");
+                put_setting(conn, "main", "library_setup", &setup)?;
+            }
+        }
+        // One a newer build wrote is kept, even though this one can't read it.
+        None if !pending && raw_setting(conn, "lib", "library_setup")?.is_some() => {}
+        _ => put_setting(conn, "lib", "library_setup", &own_setup(mirror))?,
+    }
+    if pending {
+        conn.execute("DELETE FROM main.settings WHERE key = ?1", [PENDING])?;
+    }
+    Ok(())
+}
+
+/// Local setting: Library setup was saved for the same folder while its
+/// database wasn't open, so the local copy wins when it is.
+const PENDING: &str = "library_setup_pending";
+
+/// An upsert into `table` of the `head` columns, then the data columns.
+fn upsert_sql(table: &str, head: &[&str]) -> String {
+    let cols: Vec<&str> = head.iter().chain(DATA_COLUMNS).copied().collect();
+    let marks: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+    let set: Vec<String> = cols
+        .iter()
+        .filter(|c| **c != "path")
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect();
+    format!(
+        "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT (path) DO UPDATE SET {}",
+        cols.join(", "),
+        marks.join(", "),
+        set.join(", ")
+    )
+}
+
 impl Library {
+    /// Open the local database in `state_dir`, taking over the one from
+    /// before the Library had its own, then attach the Library folder's.
+    pub fn open_in(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join(LOCAL_DB);
+        let legacy = state_dir.join(LEGACY_DB);
+        let migrated = !path.exists() && legacy.exists();
+        if migrated {
+            // Fold the write-ahead log into the file first, so a single rename
+            // moves everything and can't leave committed changes behind.
+            let conn = Connection::open(&legacy)?;
+            let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+            drop(conn);
+            if !mode.eq_ignore_ascii_case("delete") {
+                return Err(Error::Invalid(format!(
+                    "Couldn't checkpoint {} before renaming it (journal mode {mode}).",
+                    legacy.display()
+                )));
+            }
+            std::fs::rename(&legacy, &path)?;
+            tracing::info!(from = %legacy.display(), to = %path.display(), "renamed the local database");
+        }
+        let lib = Self::open(&path)?;
+        lib.refresh_library()?;
+        if migrated
+            && let Some(folder) = lib.library_setup()?.folder
+            && Path::new(&folder).is_dir()
+        {
+            // That folder already was this installation's Library: keep its
+            // index in its own database rather than re-reading it every start.
+            if let Err(e) = lib.prepare_library(Path::new(&folder)) {
+                tracing::warn!(folder = %folder, "couldn't create the Library database: {e}");
+            }
+        }
+        Ok(lib)
+    }
+
+    /// Open a local database, with no Library folder attached yet (see
+    /// [`Library::refresh_library`]).
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -381,6 +774,8 @@ impl Library {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        conn.execute_batch(&temp_schema())?;
+        attach_memory(&conn, None, None)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -390,11 +785,114 @@ impl Library {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Path -> (mtime, size) for every indexed file.
+    /// Follow Library setup's folder: attach its own database if it has one,
+    /// or else index it in memory. The database is only created by an import
+    /// (see [`Library::prepare_library`]), so choosing a folder by mistake
+    /// leaves nothing behind in it. Run this exclusively with scans, imports
+    /// and tag writes, since it can switch the Library they work on.
+    pub fn refresh_library(&self) -> Result<()> {
+        self.follow_library(false)
+    }
+
+    /// Before an import: create the Library folder and its database if need
+    /// be, and fail, before anything is copied, if the database can't be kept
+    /// there.
+    pub fn prepare_library(&self, folder: &Path) -> Result<()> {
+        std::fs::create_dir_all(folder)?;
+        self.follow_library(true)?;
+        let conn = self.conn();
+        let here = folder.canonicalize()?;
+        match attached(&conn)? {
+            Some(a) if a.stored && a.root == here => Ok(()),
+            Some(Attached {
+                problem: Some(p), ..
+            }) => Err(Error::Invalid(format!(
+                "coversync can't keep the Library's database in {}: {p}",
+                folder.display()
+            ))),
+            _ => Err(Error::Invalid(format!(
+                "{} isn't the Library folder Library setup names.",
+                folder.display()
+            ))),
+        }
+    }
+
+    /// Why the Library folder can't hold its database, if it can't: it is
+    /// then indexed for this session only, and imports are refused.
+    pub fn library_problem(&self) -> Result<Option<String>> {
+        Ok(attached(&self.conn())?.and_then(|a| a.problem))
+    }
+
+    fn follow_library(&self, create: bool) -> Result<()> {
+        let conn = self.conn();
+        let mirror: LibrarySetup = get_setting(&conn, "main", "library_setup")?.unwrap_or_default();
+        let target = existing_dir(mirror.folder.as_deref());
+        let current = attached(&conn)?;
+        let Some(dir) = target else {
+            if current.is_some() {
+                attach_memory(&conn, None, None)?;
+            }
+            return Ok(());
+        };
+        let has_db = dir.join(LIBRARY_DB).is_file();
+        let carry = match current {
+            Some(a) if a.root == dir => {
+                // Indexed in memory: move to the folder's database once there
+                // is one to open, or one is wanted. One that failed is tried
+                // again, in case it has been fixed.
+                if a.stored || !(create || has_db) {
+                    return Ok(());
+                }
+                Some(a.prefix)
+            }
+            _ => None,
+        };
+        if create || has_db {
+            match attach_file(&conn, &dir, carry) {
+                Ok(created) => {
+                    adopt_or_store_setup(&conn, &mirror)?;
+                    tracing::info!(folder = %dir.display(), created, "Library database attached");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(folder = %dir.display(), "Library database unavailable: {e}");
+                    let problem = e.to_string();
+                    if carry.is_some() {
+                        conn.execute("UPDATE temp.lib_root SET problem = ?1", [&problem])?;
+                    } else {
+                        attach_memory(&conn, Some(&dir), Some(&problem))?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        attach_memory(&conn, Some(&dir), None)?;
+        Ok(())
+    }
+
+    /// Tracks in a coversync Library database in `folder`, if it holds one.
+    /// Reads it without attaching it, so any folder can be checked.
+    pub fn library_in(folder: &Path) -> Option<u64> {
+        let db = folder.join(LIBRARY_DB);
+        if !db.is_file() {
+            return None;
+        }
+        let count = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get::<_, i64>(0)));
+        match count {
+            Ok(n) => Some(n as u64),
+            Err(e) => {
+                tracing::debug!(db = %db.display(), "can't read Library database: {e}");
+                None
+            }
+        }
+    }
+
     /// Path -> (mtime, size, collection) for every indexed file.
     pub fn file_stats(&self) -> Result<HashMap<PathBuf, (i64, u64, Collection)>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT path, mtime, size, collection FROM tracks")?;
+        let mut stmt =
+            conn.prepare("SELECT path, mtime, size, collection FROM temp.indexed_tracks")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 PathBuf::from(r.get::<_, String>(0)?),
@@ -408,84 +906,112 @@ impl Library {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Store indexed files, each in its collection's database. Library files
+    /// are stored relative to the folder they were found in, which must be
+    /// the attached one: a scan of a folder Library setup has since moved
+    /// away from leaves its files out.
     pub fn upsert(&self, batch: &[IndexedFile]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let library = library_root(&tx)?;
+        let mut attached: HashMap<&Path, bool> = HashMap::new();
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO tracks (path, root, mtime, size, album_id, album_dir, title, artist,
-                    album, album_artist, track_no, track_total, disc_no, disc_total, year, genre,
-                    duration_ms, sample_rate, bit_depth, channels, bitrate, format, tag_keys,
-                    collection, tag_values)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
-                 ON CONFLICT (path) DO UPDATE SET root = excluded.root, mtime = excluded.mtime,
-                    size = excluded.size, album_id = excluded.album_id,
-                    album_dir = excluded.album_dir, title = excluded.title,
-                    artist = excluded.artist, album = excluded.album,
-                    album_artist = excluded.album_artist, track_no = excluded.track_no,
-                    track_total = excluded.track_total, disc_no = excluded.disc_no,
-                    disc_total = excluded.disc_total, year = excluded.year,
-                    genre = excluded.genre, duration_ms = excluded.duration_ms,
-                    sample_rate = excluded.sample_rate, bit_depth = excluded.bit_depth,
-                    channels = excluded.channels, bitrate = excluded.bitrate,
-                    format = excluded.format, tag_keys = excluded.tag_keys,
-                    collection = excluded.collection, tag_values = excluded.tag_values",
-            )?;
+            let mut inbox = tx.prepare_cached(&upsert_sql(
+                "main.tracks",
+                &["path", "root", "album_dir", "collection"],
+            ))?;
+            let mut lib = tx.prepare_cached(&upsert_sql("lib.tracks", &["path", "album_dir"]))?;
             for (stat, album_id, album_dir, t) in batch {
-                let fallback_title = stat
-                    .path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let fallback_album = album_dir
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                stmt.execute(params![
-                    stat.path.to_string_lossy(),
-                    stat.root.to_string_lossy(),
-                    stat.mtime,
-                    stat.size as i64,
+                let title = t.title.clone().unwrap_or_else(|| {
+                    stat.path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                let artist = t.artist.clone().unwrap_or_else(|| "Unknown Artist".into());
+                let album = t.album.clone().unwrap_or_else(|| {
+                    album_dir
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                let size = stat.size as i64;
+                let duration = t.duration_ms as i64;
+                let keys = t.tag_keys.join(",");
+                let values = serde_json::to_string(&t.values).expect("tag values serialize");
+                let data: [&dyn ToSql; 21] = [
+                    &stat.mtime,
+                    &size,
                     album_id,
-                    album_dir.to_string_lossy(),
-                    t.title.clone().unwrap_or(fallback_title),
-                    t.artist.clone().unwrap_or_else(|| "Unknown Artist".into()),
-                    t.album.clone().unwrap_or(fallback_album),
-                    t.album_artist,
-                    t.track_no,
-                    t.track_total,
-                    t.disc_no,
-                    t.disc_total,
-                    t.year,
-                    t.genre,
-                    t.duration_ms as i64,
-                    t.sample_rate,
-                    t.bit_depth,
-                    t.channels,
-                    t.bitrate,
-                    t.format,
-                    t.tag_keys.join(","),
-                    stat.collection.as_str(),
-                    serde_json::to_string(&t.values).expect("tag values serialize"),
-                ])?;
+                    &title,
+                    &artist,
+                    &album,
+                    &t.album_artist,
+                    &t.track_no,
+                    &t.track_total,
+                    &t.disc_no,
+                    &t.disc_total,
+                    &t.year,
+                    &t.genre,
+                    &duration,
+                    &t.sample_rate,
+                    &t.bit_depth,
+                    &t.channels,
+                    &t.bitrate,
+                    &t.format,
+                    &keys,
+                    &values,
+                ];
+                debug_assert_eq!(data.len(), DATA_COLUMNS.len());
+                match stat.collection {
+                    Collection::Inbox => {
+                        let path = stat.path.to_string_lossy();
+                        let root = stat.root.to_string_lossy();
+                        let dir = album_dir.to_string_lossy();
+                        let head: [&dyn ToSql; 4] = [&path, &root, &dir, &"inbox"];
+                        inbox.execute(params_from_iter(head.iter().chain(&data)))?;
+                    }
+                    Collection::Library => {
+                        let here = *attached.entry(stat.root.as_path()).or_insert_with(|| {
+                            library.is_some() && stat.root.canonicalize().ok() == library
+                        });
+                        let (true, Ok(rel), Ok(rel_dir)) = (
+                            here,
+                            stat.path.strip_prefix(&stat.root),
+                            album_dir.strip_prefix(&stat.root),
+                        ) else {
+                            tracing::debug!(path = %stat.path.display(), "not in the attached Library folder");
+                            continue;
+                        };
+                        let path = rel.to_string_lossy();
+                        let dir = rel_dir.to_string_lossy();
+                        let head: [&dyn ToSql; 2] = [&path, &dir];
+                        lib.execute(params_from_iter(head.iter().chain(&data)))?;
+                    }
+                }
             }
         }
         tx.commit()?;
         Ok(())
     }
 
+    /// Forget files, from whichever database holds them.
     pub fn remove_paths(&self, paths: &[PathBuf]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let library = library_root(&tx)?;
         {
-            let mut stmt = tx.prepare_cached("DELETE FROM tracks WHERE path = ?1")?;
+            let mut inbox = tx.prepare_cached("DELETE FROM main.tracks WHERE path = ?1")?;
+            let mut lib = tx.prepare_cached("DELETE FROM lib.tracks WHERE path = ?1")?;
             for p in paths {
-                stmt.execute([p.to_string_lossy()])?;
+                inbox.execute([p.to_string_lossy()])?;
+                if let Some(rel) = library.as_deref().and_then(|r| p.strip_prefix(r).ok()) {
+                    lib.execute([rel.to_string_lossy()])?;
+                }
             }
         }
         tx.execute(
-            "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM tracks)",
+            "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM temp.indexed_tracks)",
             [],
         )?;
         tx.commit()?;
@@ -496,9 +1022,10 @@ impl Library {
     fn all_tracks(&self, collection: Collection) -> Result<Vec<TrackRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT * FROM tracks WHERE collection = ?1 AND {VISIBLE}"
+            "SELECT * FROM {} WHERE {VISIBLE}",
+            source(collection)
         ))?;
-        let rows = stmt.query_map([collection.as_str()], |r| {
+        let rows = stmt.query_map([], |r| {
             let (track, dir) = track_from_row(r)?;
             Ok(TrackRow {
                 track,
@@ -602,7 +1129,7 @@ impl Library {
         let (mut tracks, dir, mtime) = {
             let conn = self.conn();
             let mut stmt = conn.prepare(&format!(
-                "SELECT * FROM tracks WHERE album_id = ?1 AND {VISIBLE}"
+                "SELECT * FROM temp.indexed_tracks WHERE album_id = ?1 AND {VISIBLE}"
             ))?;
             let mut dir = String::new();
             let mut mtime = 0;
@@ -627,31 +1154,44 @@ impl Library {
     }
 
     pub fn track_path(&self, id: i64) -> Result<Option<PathBuf>> {
-        let conn = self.conn();
-        Ok(conn
-            .query_row("SELECT path FROM tracks WHERE id = ?1", [id], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .map(PathBuf::from))
+        Ok(self.track_root(id)?.map(|(path, _)| path))
     }
 
+    /// A track's file and the folder it was found in.
     pub fn track_root(&self, id: i64) -> Result<Option<(PathBuf, PathBuf)>> {
         let conn = self.conn();
+        let row = |r: &Row<'_>| {
+            Ok((
+                PathBuf::from(r.get::<_, String>(0)?),
+                PathBuf::from(r.get::<_, String>(1)?),
+            ))
+        };
+        if id >= 0 {
+            return Ok(conn
+                .query_row(
+                    "SELECT path, root FROM main.tracks WHERE id = ?1",
+                    [id],
+                    row,
+                )
+                .optional()?);
+        }
+        // A Library id names its Library's prefix and the stored row (see
+        // ID_SPAN); one from another Library names nothing here.
+        let (prefix, row_id) = (-id / ID_SPAN, -id % ID_SPAN);
         Ok(conn
-            .query_row("SELECT path, root FROM tracks WHERE id = ?1", [id], |r| {
-                Ok((
-                    PathBuf::from(r.get::<_, String>(0)?),
-                    PathBuf::from(r.get::<_, String>(1)?),
-                ))
-            })
+            .query_row(
+                "SELECT r.root || '/' || t.path, r.root FROM lib.tracks t JOIN temp.lib_root r
+                 WHERE r.prefix = ?1 AND t.id = ?2",
+                [prefix, row_id],
+                row,
+            )
             .optional()?)
     }
 
     pub fn album_track_ids(&self, album_id: &str) -> Result<Vec<i64>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM tracks WHERE album_id = ?1 AND {VISIBLE}"
+            "SELECT id FROM temp.indexed_tracks WHERE album_id = ?1 AND {VISIBLE}"
         ))?;
         let rows = stmt.query_map([album_id], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -662,8 +1202,11 @@ impl Library {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT t.album_id, t.album_dir, MIN(t.path),
-                    MAX(t.mtime) || ':' || COUNT(*) AS sig, c.signature
-             FROM tracks t LEFT JOIN covers c ON c.album_id = t.album_id
+                    MAX(t.mtime) || ':' || COUNT(*)
+                        -- Library album ids survive a move; their cover paths don't.
+                        || CASE t.collection WHEN 'library' THEN ':' || t.root ELSE '' END AS sig,
+                    c.signature
+             FROM temp.indexed_tracks t LEFT JOIN covers c ON c.album_id = t.album_id
              GROUP BY t.album_id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -703,30 +1246,31 @@ impl Library {
         Ok(())
     }
 
+    /// A setting of this installation, kept in the local database.
     fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        let value: Option<String> = self
-            .conn()
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        // A value this build can't parse (say, from a newer one) reads as unset.
-        Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
+        get_setting(&self.conn(), "main", key)
     }
 
     fn put_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        let json = serde_json::to_string(value).expect("settings serialize");
-        self.conn().execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![key, json],
-        )?;
-        Ok(())
+        put_setting(&self.conn(), "main", key, value)
     }
 
+    /// Library setup: the folder from the local database, everything else
+    /// from the Library's own database once one is attached (the local
+    /// database keeps a copy for while none is).
     pub fn library_setup(&self) -> Result<LibrarySetup> {
+        let conn = self.conn();
+        let mut setup: LibrarySetup =
+            get_setting(&conn, "main", "library_setup")?.unwrap_or_default();
+        if attached(&conn)?.is_some_and(|a| a.stored)
+            && let Some(own) = get_setting::<LibrarySetup>(&conn, "lib", "library_setup")?
+        {
+            setup = LibrarySetup {
+                folder: setup.folder,
+                ..own
+            };
+        }
         // A setup saved by a newer build may name kinds this one doesn't know.
-        let mut setup: LibrarySetup = self.setting("library_setup")?.unwrap_or_default();
         setup
             .rules
             .required_tags
@@ -734,10 +1278,32 @@ impl Library {
         Ok(setup)
     }
 
+    /// Save Library setup. Pointing it at another folder that already holds
+    /// a coversync Library opens that Library with its own rules, which
+    /// replace the ones given; the saved setup is returned. Like
+    /// [`Library::refresh_library`], run it exclusively with scans, imports
+    /// and tag writes.
     pub fn set_library_setup(&self, setup: LibrarySetup) -> Result<LibrarySetup> {
         let setup = setup.normalize()?;
-        self.put_setting("library_setup", &setup)?;
-        Ok(setup)
+        {
+            let conn = self.conn();
+            let before: Option<LibrarySetup> = get_setting(&conn, "main", "library_setup")?;
+            put_setting(&conn, "main", "library_setup", &setup)?;
+            let target = existing_dir(setup.folder.as_deref());
+            let open = attached(&conn)?.filter(|a| a.stored).map(|a| a.root);
+            if target.is_some() && open == target {
+                put_setting(&conn, "lib", "library_setup", &own_setup(&setup))?;
+            } else if before.is_some_and(|b| b.folder == setup.folder) {
+                // The same folder, with its database not open (the disk is
+                // away, say): these edits win over its rules once it is.
+                put_setting(&conn, "main", PENDING, &true)?;
+            } else {
+                // Another folder: a Library already there keeps its own rules.
+                conn.execute("DELETE FROM main.settings WHERE key = ?1", [PENDING])?;
+            }
+        }
+        self.refresh_library()?;
+        self.library_setup()
     }
 
     pub fn appearance(&self) -> Result<AppearanceSetup> {
@@ -806,7 +1372,7 @@ impl Library {
         let conn = self.conn();
         Ok(conn.query_row(
             "SELECT (SELECT COUNT(*) FROM hidden),
-                    (SELECT COUNT(DISTINCT t.album_id) FROM tracks t JOIN hidden h ON h.path = t.path)",
+                    (SELECT COUNT(DISTINCT t.album_id) FROM main.tracks t JOIN hidden h ON h.path = t.path)",
             [],
             |r| Ok(HiddenStats { files: r.get(0)?, albums: r.get(1)? }),
         )?)
@@ -989,7 +1555,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -1277,5 +1843,436 @@ mod tests {
         assert_eq!(consensus(["a", "b", "b"].into_iter()), Some("b"));
         assert_eq!(consensus(["a", "b"].into_iter()), Some("a"));
         assert_eq!(consensus(std::iter::empty()), None);
+    }
+
+    /// A fresh folder for a test, holding `parts` as empty folders.
+    fn temp_dir(name: &str, parts: &[&str]) -> PathBuf {
+        let dir = temp_db(name).parent().unwrap().canonicalize().unwrap();
+        for p in parts {
+            std::fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        dir
+    }
+
+    /// A Library file at `rel` under `root`.
+    fn library_file(root: &Path, rel: &str, album: &str, mtime: i64) -> IndexedFile {
+        let path = root.join(rel);
+        let dir = path.parent().unwrap().to_path_buf();
+        let stat = FileStat {
+            path,
+            root: root.to_path_buf(),
+            mtime,
+            size: 1,
+            collection: Collection::Library,
+        };
+        let tags = TrackTags {
+            album: Some(album.into()),
+            format: "FLAC".into(),
+            ..Default::default()
+        };
+        let id = crate::scan::album_id_in(Collection::Library, root, &dir, Some(album));
+        (stat, id, dir, tags)
+    }
+
+    fn with_folder(folder: &Path, required: &[&str]) -> LibrarySetup {
+        LibrarySetup {
+            folder: Some(folder.display().to_string()),
+            rules: Rules {
+                required_tags: required.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn library_tracks_live_in_the_library_folder() {
+        let dir = temp_dir("libdb", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[
+            library_file(&root, "A/1.flac", "A", 7),
+            file("/m/a/1.flac", "a", &["title"]),
+        ])
+        .unwrap();
+
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        let detail = lib.album(&albums[0].id).unwrap().unwrap();
+        assert_eq!(detail.dir, root.join("A").display().to_string());
+        let id = detail.tracks[0].id;
+        assert!(id < -ID_SPAN, "Library ids carry a prefix: {id}");
+        assert!(id > -(1 << 53), "and stay exact in JavaScript: {id}");
+        assert_eq!(detail.tracks[0].rel_path, "A/1.flac");
+        assert_eq!(lib.track_path(id).unwrap(), Some(root.join("A/1.flac")));
+        assert_eq!(lib.album_track_ids(&albums[0].id).unwrap(), [id]);
+        assert_eq!(
+            lib.file_stats().unwrap()[&root.join("A/1.flac")],
+            (7, 1, Collection::Library)
+        );
+        assert_eq!(
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The local database holds only the Inbox; the Library's stores
+        // paths relative to its folder, and its own setup.
+        let local: i64 = lib
+            .conn()
+            .query_row("SELECT COUNT(*) FROM main.tracks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(local, 1);
+        drop(lib);
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        let row: (String, String) = own
+            .query_row("SELECT path, album_dir FROM tracks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("A/1.flac".into(), "A".into()));
+        let setup: String = own
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'library_setup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let setup: LibrarySetup = serde_json::from_str(&setup).unwrap();
+        assert_eq!(setup.folder, None);
+        assert_eq!(setup.rules.required_tags, ["title", "genre"]);
+        assert_eq!(Library::library_in(&root), Some(1));
+        assert_eq!(Library::library_in(&dir.join("state")), None);
+    }
+
+    #[test]
+    fn a_moved_library_keeps_its_index_and_rules() {
+        let dir = temp_dir("libmove", &["old", "new", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("old")).unwrap();
+        lib.set_library_setup(with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        let id = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap()[0]
+            .id
+            .clone();
+        drop(lib);
+
+        // Another machine, where the folder has another path.
+        let moved = dir.join("Moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let lib = Library::open_in(&dir.join("new")).unwrap();
+        let saved = lib
+            .set_library_setup(with_folder(&moved, &["title"]))
+            .unwrap();
+        assert_eq!(saved.rules.required_tags, ["title", "genre"]);
+        assert_eq!(saved.folder, Some(moved.display().to_string()));
+        assert_eq!(lib.library_setup().unwrap(), saved);
+        // Unchanged files keep their index rows, so a scan has nothing to re-read.
+        assert_eq!(
+            lib.file_stats().unwrap()[&moved.join("A/1.flac")],
+            (7, 1, Collection::Library)
+        );
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums[0].id, id);
+        // A file added after the move joins the same album.
+        lib.upsert(&[library_file(&moved, "A/2.flac", "A", 8)])
+            .unwrap();
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!((albums.len(), albums[0].track_count), (1, 2));
+
+        // Later edits go to the Library's own setup.
+        lib.set_library_setup(with_folder(&moved, &["artist"]))
+            .unwrap();
+        drop(lib);
+        let lib = Library::open_in(&dir.join("old")).unwrap();
+        let saved = lib
+            .set_library_setup(with_folder(&moved, &["title"]))
+            .unwrap();
+        assert_eq!(saved.rules.required_tags, ["artist"]);
+    }
+
+    #[test]
+    fn covers_are_found_again_after_the_library_moves() {
+        let dir = temp_dir("libcovers", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        let jobs = lib.cover_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let source = CoverSource::File(root.join("A/cover.jpg"));
+        lib.set_cover(&jobs[0].album_id, Some(&source), None, &jobs[0].signature)
+            .unwrap();
+        assert!(lib.cover_jobs().unwrap().is_empty());
+        drop(lib);
+
+        // Same installation, new path: same album id, so the cover row stays,
+        // but it names the old folder and has to be looked at again.
+        let moved = dir.join("Moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&moved, &[])).unwrap();
+        let jobs = lib.cover_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].first_track, moved.join("A/1.flac"));
+    }
+
+    #[test]
+    fn the_database_is_created_by_the_first_import() {
+        let dir = temp_dir("libwait", &["state"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let saved = lib
+            .set_library_setup(with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        assert_eq!(lib.library_setup().unwrap(), saved);
+        assert!(!root.exists(), "the folder is created on the first import");
+
+        // A folder that exists is indexed in memory until then.
+        std::fs::create_dir_all(root.join("A")).unwrap();
+        lib.refresh_library().unwrap();
+        assert!(!root.join(".coversync").exists());
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        let before = lib
+            .album_track_ids(
+                &lib.albums(Collection::Library, &[], &[], "", &[], None)
+                    .unwrap()[0]
+                    .id,
+            )
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        // The import creates the database and keeps what was indexed.
+        lib.prepare_library(&root).unwrap();
+        assert!(root.join(LIBRARY_DB).is_file());
+        assert_eq!(Library::library_in(&root), Some(1));
+        assert_eq!(lib.library_setup().unwrap(), saved);
+        let albums = lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(lib.album_track_ids(&albums[0].id).unwrap(), before);
+    }
+
+    #[test]
+    fn edits_saved_while_the_folder_is_away_win() {
+        let dir = temp_dir("libaway", &["state", "other", "Lib"]);
+        let root = dir.join("Lib");
+        let away = dir.join("Lib.away");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        lib.prepare_library(&root).unwrap();
+        drop(lib);
+
+        // The disk is unplugged; setup is edited and saved meanwhile.
+        std::fs::rename(&root, &away).unwrap();
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &["artist"]))
+            .unwrap();
+        std::fs::rename(&away, &root).unwrap();
+        lib.refresh_library().unwrap();
+        assert_eq!(lib.library_setup().unwrap().rules.required_tags, ["artist"]);
+        drop(lib);
+        // The Library's own database has them too.
+        let other = Library::open_in(&dir.join("other")).unwrap();
+        let opened = other.set_library_setup(with_folder(&root, &[])).unwrap();
+        assert_eq!(opened.rules.required_tags, ["artist"]);
+    }
+
+    #[test]
+    fn track_ids_of_another_library_name_nothing() {
+        let dir = temp_dir("libids", &["state", "A", "B"]);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let mut ids = Vec::new();
+        for name in ["A", "B"] {
+            let root = dir.join(name);
+            lib.set_library_setup(with_folder(&root, &[])).unwrap();
+            lib.prepare_library(&root).unwrap();
+            lib.upsert(&[library_file(&root, "x/1.flac", "x", 1)])
+                .unwrap();
+            let album = &lib
+                .albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap()[0];
+            ids.push(lib.album_track_ids(&album.id).unwrap()[0]);
+        }
+        // Both are row 1 of their own database.
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(lib.track_path(ids[0]).unwrap(), None);
+        assert_eq!(
+            lib.track_path(ids[1]).unwrap(),
+            Some(dir.join("B/x/1.flac"))
+        );
+        assert_eq!(lib.track_path(-1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_folder_that_cant_hold_the_database_is_indexed_in_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("libro", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::create_dir(root.join("probe")).is_ok() {
+            return; // Running as root: permissions don't stop writes.
+        }
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        assert!(lib.prepare_library(&root).is_err());
+        assert!(lib.library_problem().unwrap().is_some());
+        // Still browsable this session.
+        assert_eq!(
+            lib.albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Once the folder is fixed, the next import gets its database.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lib.prepare_library(&root).unwrap();
+        assert_eq!(lib.library_problem().unwrap(), None);
+        assert_eq!(Library::library_in(&root), Some(1));
+    }
+
+    #[test]
+    fn a_database_that_cant_be_written_is_retried_once_fixed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("libdbro", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        drop(lib);
+
+        let own = root.join(".coversync");
+        let mode = |m| std::fs::set_permissions(&own, std::fs::Permissions::from_mode(m));
+        let db_mode =
+            |m| std::fs::set_permissions(root.join(LIBRARY_DB), std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        db_mode(0o444).unwrap();
+        if std::fs::create_dir(own.join("probe")).is_ok() {
+            return; // Running as root: permissions don't stop writes.
+        }
+        // SQLite would open it read-only; it is indexed in memory instead.
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert!(lib.library_problem().unwrap().is_some());
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        assert_eq!(lib.file_stats().unwrap().len(), 1);
+
+        mode(0o755).unwrap();
+        db_mode(0o644).unwrap();
+        lib.refresh_library().unwrap();
+        assert_eq!(lib.library_problem().unwrap(), None);
+        assert_eq!(lib.file_stats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rebuilding_an_in_memory_index_does_not_retarget_old_ids() {
+        let dir = temp_dir("libmemids", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let open = |rel: &str| {
+            let lib = Library::open_in(&dir.join("state")).unwrap();
+            lib.set_library_setup(with_folder(&root, &[])).unwrap();
+            lib.upsert(&[library_file(&root, rel, "A", 1)]).unwrap();
+            lib
+        };
+        let lib = open("A/1.flac");
+        let album = &lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap()[0];
+        let id = lib.album_track_ids(&album.id).unwrap()[0];
+        drop(lib);
+
+        // A different file is row 1 once the index is rebuilt.
+        let lib = open("A/2.flac");
+        assert_eq!(lib.track_path(id).unwrap(), None);
+        assert!(!root.join(".coversync").exists());
+    }
+
+    #[test]
+    fn files_of_another_library_folder_are_left_out() {
+        let dir = temp_dir("libother", &["state", "Lib", "Other"]);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&dir.join("Lib"), &[]))
+            .unwrap();
+        lib.upsert(&[library_file(&dir.join("Other"), "A/1.flac", "A", 1)])
+            .unwrap();
+        assert!(lib.file_stats().unwrap().is_empty());
+        // Removing paths only touches the attached folder's rows.
+        lib.upsert(&[library_file(&dir.join("Lib"), "A/1.flac", "A", 1)])
+            .unwrap();
+        lib.remove_paths(&[dir.join("Other/A/1.flac")]).unwrap();
+        assert_eq!(lib.file_stats().unwrap().len(), 1);
+        lib.remove_paths(&[dir.join("Lib/A/1.flac")]).unwrap();
+        assert!(lib.file_stats().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_old_local_database_is_taken_over() {
+        let dir = temp_dir("legacy", &["state"]);
+        let state = dir.join("state");
+        let old = Library::open(&state.join(LEGACY_DB)).unwrap();
+        old.set_sync_setup(SyncSetup { enabled: false }).unwrap();
+        // A Library track indexed before the split.
+        old.conn()
+            .execute(
+                "INSERT INTO main.tracks (path, root, mtime, size, album_id, album_dir, title,
+                    artist, album, duration_ms, format, collection)
+                 VALUES ('/l/a/1.flac', '/l', 5, 1, 'x', '/l/a', 't', 'a', 'b', 0, 'FLAC', 'library')",
+                [],
+            )
+            .unwrap();
+        old.conn().execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(old);
+
+        let lib = Library::open_in(&state).unwrap();
+        assert!(state.join(LOCAL_DB).is_file());
+        for name in [LEGACY_DB, "library.sqlite3-wal"] {
+            assert!(!state.join(name).exists(), "{name} is left behind");
+        }
+        assert!(!lib.sync_setup().unwrap().enabled);
+        // The next scan reads the Library's files into its own database.
+        assert!(lib.file_stats().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_existing_library_gets_its_database_on_takeover() {
+        let dir = temp_dir("legacylib", &["state", "Lib"]);
+        let state = dir.join("state");
+        let root = dir.join("Lib");
+        let old = Library::open(&state.join(LEGACY_DB)).unwrap();
+        old.put_setting("library_setup", &with_folder(&root, &["title", "genre"]))
+            .unwrap();
+        old.conn().execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(old);
+
+        let lib = Library::open_in(&state).unwrap();
+        assert!(root.join(LIBRARY_DB).is_file());
+        assert_eq!(lib.library_problem().unwrap(), None);
+        drop(lib);
+        let other = Library::open_in(&dir.join("other")).unwrap();
+        let opened = other.set_library_setup(with_folder(&root, &[])).unwrap();
+        assert_eq!(opened.rules.required_tags, ["title", "genre"]);
     }
 }

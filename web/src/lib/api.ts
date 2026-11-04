@@ -133,11 +133,17 @@ export interface FolderStatus {
 	writable: boolean;
 	/** A missing folder can be created (on first import). */
 	creatable: boolean;
+	/** Tracks in the coversync library this folder already holds, if it holds one. */
+	library: number | null;
 }
 
 export interface SetupResponse {
 	setup: LibrarySetup;
 	folder: FolderStatus | null;
+	/** Saving opened a library that has its own rules, which replaced the ones sent. */
+	adopted: boolean;
+	/** Why the library folder can't hold its database, if it can't. */
+	library_problem: string | null;
 	groups: TagGroup[];
 	kinds: TagKind[];
 	essentials: string[];

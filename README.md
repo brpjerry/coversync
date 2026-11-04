@@ -23,7 +23,9 @@ Early days: single user, no authentication, used on a home server.
   `{album_artist}/{year} - {album}/{track_number} - {title}`.
   `{track_number}` is zero-padded and the extension is added. `{album:40}`
   keeps at most 40 characters of a value, cut at a word break when one is
-  close. Tags a template uses count as required on import.
+  close. Tags a template uses count as required on import. The rules and the
+  Library's index live in the Library folder itself (see
+  [Moving the Library](#moving-the-library)).
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never
@@ -87,10 +89,15 @@ Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
   afterwards.
 - `--listen` (default `127.0.0.1:8770`). There is no authentication, so keep
   it on localhost or behind a reverse proxy that adds some.
-- `--state-dir` and `--cache-dir`: the index database (default
-  `$XDG_STATE_HOME/coversync`) and cover thumbnails (`$XDG_CACHE_HOME/coversync`).
-  The AcoustID key is stored in the index database and never sent to the
-  browser.
+- `--state-dir` and `--cache-dir`: the local database, `inbox.sqlite3`
+  (default `$XDG_STATE_HOME/coversync`), and cover thumbnails
+  (`$XDG_CACHE_HOME/coversync`). The local database holds the Inbox's index,
+  the Inbox files already imported, and this installation's settings: Inbox
+  setup, Appearance, Sync setup, the Library folder's location and the
+  AcoustID key, which is never sent to the browser. A database from before
+  the Library had its own, `library.sqlite3`, is renamed on first start;
+  rename it back before going back to an older release.
+  Everything in the cache directory is rebuilt when missing.
 - `--allow-writes` lets the tag editor change Inbox files in place; it is off
   by default. Library files can always be edited. Writes go to a copy beside
   the file that is renamed into place, and every edit is validated before any
@@ -98,6 +105,33 @@ Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
 
 To serve the UI under a path prefix behind a reverse proxy, build it with that
 prefix: `(cd web && BASE_PATH=/coversync pnpm build)`.
+
+### Moving the Library
+
+The Library keeps its own database in its folder,
+`.coversync/library.sqlite3`: Library setup's rules, folder structure and
+separator, and the index of its files, with paths relative to the folder. So
+the folder moves as a whole, to another path or another machine, without the
+Inbox:
+
+1. Stop coversyncd, then copy the Library folder, keeping modification times
+   (`rsync -a`), so its files don't need reading again.
+2. On the other side, choose that folder in Library setup. coversync sees the
+   Library it holds, and saving opens it with its own rules in place of the
+   ones on screen.
+
+The database is created by the first import, along with the folder if
+needed. Until then the rules wait in the local database, and a folder that
+already exists is indexed in memory, so choosing one by mistake leaves
+nothing in it. A folder coversyncd can't write to is indexed the same way,
+and Library setup says imports are off. Rules saved while the folder is away
+(an unmounted disk, say) replace the Library's own when it comes back.
+
+Stopping coversyncd before copying makes sure no import or scan is writing
+to the database; it keeps a rollback journal rather than a write-ahead log,
+so the folder alone holds every change. One coversyncd at a time should use
+a Library folder, and anything that syncs the folder elsewhere (a backup, a
+sync tool) can copy `.coversync` along with it.
 
 ### As a systemd user service
 
