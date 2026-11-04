@@ -14,7 +14,7 @@ use coversync_core::art::{self, Art};
 use coversync_core::db::{CoverSource, FileStat};
 use coversync_core::import::{self, ImportPlan, ImportResult};
 use coversync_core::scan::Progress;
-use coversync_core::scan::{self, album_dir, album_id_in};
+use coversync_core::scan::{self, album_dir_in, album_id_in};
 use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
@@ -214,6 +214,8 @@ struct SetupResponse {
     /// Saving opened a Library that has its own setup, which replaced the
     /// one sent.
     adopted: bool,
+    /// Why the Library folder can't hold its database, if it can't.
+    library_problem: Option<String>,
     groups: &'static [rules::TagGroup],
     kinds: &'static [rules::TagKind],
     essentials: &'static [&'static str],
@@ -224,7 +226,11 @@ struct SetupResponse {
     art_file_names: &'static [&'static str],
 }
 
-fn setup_response(setup: LibrarySetup, adopted: bool) -> SetupResponse {
+fn setup_response(
+    setup: LibrarySetup,
+    adopted: bool,
+    library_problem: Option<String>,
+) -> SetupResponse {
     let mut variables = vec![Variable {
         id: template::YEAR,
         label: "Year (from date)",
@@ -245,6 +251,7 @@ fn setup_response(setup: LibrarySetup, adopted: bool) -> SetupResponse {
         folder: setup.folder.as_deref().map(folder_status),
         setup,
         adopted,
+        library_problem,
         groups: rules::GROUPS,
         kinds: rules::CATALOG,
         essentials: rules::ESSENTIALS,
@@ -258,7 +265,11 @@ fn setup_response(setup: LibrarySetup, adopted: bool) -> SetupResponse {
 
 async fn library_setup(State(state): State<Shared>) -> ApiResult<Json<SetupResponse>> {
     blocking(&state, |s| {
-        Ok(setup_response(s.lib.library_setup()?, false))
+        Ok(setup_response(
+            s.lib.library_setup()?,
+            false,
+            s.lib.library_problem()?,
+        ))
     })
     .await
     .map(Json)
@@ -282,7 +293,9 @@ async fn save_library_setup(
     State(state): State<Shared>,
     Json(setup): Json<LibrarySetup>,
 ) -> ApiResult<Json<SetupResponse>> {
-    let (response, moved) = blocking(&state, move |s| {
+    // Switching the Library mustn't happen under a scan, import or tag write.
+    let guard = state.jobs.lock().await;
+    let result = blocking(&state, move |s| {
         let before = s.lib.library_setup()?;
         let setup = setup.normalize()?;
         must_be_folder(setup.folder.as_deref(), "library folder")?;
@@ -297,12 +310,22 @@ async fn save_library_setup(
         }
         let moved = before.folder != saved.folder;
         let adopted = saved != setup;
-        Ok((setup_response(saved, adopted), moved))
+        Ok((
+            setup_response(saved, adopted, s.lib.library_problem()?),
+            moved,
+        ))
     })
-    .await?;
-    if moved {
+    .await;
+    drop(guard);
+    // A scan asked for while this held the lock runs now too.
+    if result.as_ref().is_ok_and(|(_, moved)| *moved)
+        || state
+            .rescan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
         spawn_scan(state.clone());
     }
+    let (response, _) = result?;
     Ok(Json(response))
 }
 
@@ -779,6 +802,8 @@ async fn write_tags(
     Path(id): Path<String>,
     Json(body): Json<TagWrite>,
 ) -> ApiResult<Json<TagWriteResult>> {
+    // Before resolving the album: saving Library setup can switch the Library.
+    let _guard = state.jobs.lock().await;
     // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
     let lookup = id.clone();
     let in_library = blocking(&state, move |s| {
@@ -793,7 +818,6 @@ async fn write_tags(
             "Editing Inbox files in place is disabled on this server (start coversyncd with --allow-writes). Import the album to edit its Library copy.".into(),
         ));
     }
-    let _guard = state.jobs.lock().await;
     let result = blocking(&state, move |s| {
         let ids = s.lib.album_track_ids(&id)?;
         if ids.is_empty() {
@@ -841,7 +865,7 @@ async fn write_tags(
             Some((p, root)) => album_id_in(
                 collection,
                 &root,
-                &album_dir(&p),
+                &album_dir_in(collection, &root, &p),
                 tags::read(&p)?.album.as_deref(),
             ),
             None => id.clone(),

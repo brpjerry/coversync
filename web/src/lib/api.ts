@@ -142,6 +142,8 @@ export interface SetupResponse {
 	folder: FolderStatus | null;
 	/** Saving opened a library that has its own rules, which replaced the ones sent. */
 	adopted: boolean;
+	/** Why the library folder can't hold its database, if it can't. */
+	library_problem: string | null;
 	groups: TagGroup[];
 	kinds: TagKind[];
 	essentials: string[];

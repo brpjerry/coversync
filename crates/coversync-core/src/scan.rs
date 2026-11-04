@@ -43,6 +43,17 @@ pub fn album_dir(file: &Path) -> PathBuf {
     }
 }
 
+/// [`album_dir`] for a file of `collection` found under `root`, never above
+/// the Library folder (which may itself be called `CD1`).
+pub fn album_dir_in(collection: Collection, root: &Path, file: &Path) -> PathBuf {
+    let dir = album_dir(file);
+    if collection == Collection::Library && !dir.starts_with(root) {
+        root.to_path_buf()
+    } else {
+        dir
+    }
+}
+
 /// The disc number of a `CD1` / `Disc 2` / `disk_3` style folder name.
 pub fn disc_folder_number(name: &str) -> Option<u32> {
     let name = name.to_lowercase();
@@ -131,7 +142,7 @@ pub fn index_files(lib: &Library, files: Vec<FileStat>, progress: &Progress) -> 
             .par_iter()
             .filter_map(|stat| match tags::read(&stat.path) {
                 Ok(t) => {
-                    let dir = album_dir(&stat.path);
+                    let dir = album_dir_in(stat.collection, &stat.root, &stat.path);
                     let id = album_id_in(stat.collection, &stat.root, &dir, t.album.as_deref());
                     Some((stat.clone(), id, dir, t))
                 }
@@ -261,6 +272,19 @@ mod tests {
         assert_eq!(
             album_dir(Path::new("/m/A/CDs/01.flac")),
             Path::new("/m/A/CDs")
+        );
+    }
+
+    #[test]
+    fn library_albums_stay_inside_the_library_folder() {
+        let root = Path::new("/m/CD1");
+        let file = Path::new("/m/CD1/a.flac");
+        assert_eq!(album_dir_in(Collection::Library, root, file), root);
+        assert_eq!(album_dir_in(Collection::Inbox, root, file), Path::new("/m"));
+        let disc = Path::new("/m/CD1/Album/CD2/a.flac");
+        assert_eq!(
+            album_dir_in(Collection::Library, root, disc),
+            Path::new("/m/CD1/Album")
         );
     }
 

@@ -304,7 +304,13 @@ pub fn plan(
         Some(f) if !creatable(Path::new(f)) => {
             problems.push(format!("coversyncd can't write to the library folder {f}."))
         }
-        _ => {}
+        Some(f) => {
+            if let Some(p) = lib.library_problem()? {
+                problems.push(format!(
+                    "coversync can't keep the Library's database in {f}: {p}"
+                ));
+            }
+        }
     }
 
     let art_rules = &setup.rules.art;
@@ -493,6 +499,9 @@ pub fn execute(
     upload: Option<Art>,
     progress: &Progress,
 ) -> Result<ImportResult> {
+    // The Library folder may hold its own database (with its own rules) that
+    // isn't open yet.
+    lib.refresh_library()?;
     let plan = plan(lib, album_id, edits, upload.as_ref())?;
     if !plan.ready() {
         let mut reasons = plan.problems.clone();
@@ -533,6 +542,9 @@ pub fn execute(
             .as_deref()
             .expect("ready plans have a folder"),
     );
+    // The first import creates the Library folder and its database; nothing
+    // is copied, hidden or deleted unless the database is there to index it.
+    lib.prepare_library(&folder)?;
 
     let mut sources = Vec::new();
     let mut written: Vec<PathBuf> = Vec::new();
@@ -614,8 +626,6 @@ pub fn execute(
             lib.remove_paths(&sources)?;
         }
     }
-    // The first import creates the Library folder, and with it its database.
-    lib.refresh_library()?;
     let stats = written
         .iter()
         .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
@@ -629,7 +639,7 @@ pub fn execute(
         album_id: scan::album_id_in(
             Collection::Library,
             &folder,
-            &scan::album_dir(first),
+            &scan::album_dir_in(Collection::Library, &folder, first),
             album.as_deref(),
         ),
         files: written.len(),

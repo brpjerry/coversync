@@ -171,6 +171,15 @@
 					saved={setup.saved.folder}
 					bind:value={setup.folder}
 				/>
+				{#if setup.libraryProblem && setup.folder.trim() === setup.saved.folder}
+					<p class="db-problem" role="alert">
+						<TriangleAlert size={15} />
+						<span>
+							coversync can't keep the library's database in this folder ({setup.libraryProblem}),
+							so it's indexed for this session only and imports are off.
+						</span>
+					</p>
+				{/if}
 			</div>
 		</section>
 
@@ -687,6 +696,18 @@
 		border-color: color-mix(in oklab, var(--accent) 55%, transparent);
 		background: color-mix(in oklab, var(--accent) 10%, var(--surface));
 		color: var(--text);
+	}
+	.db-problem {
+		display: flex;
+		align-items: flex-start;
+		gap: 6px;
+		margin: 8px 0 0;
+		font-size: 13px;
+		color: var(--warn);
+	}
+	.db-problem :global(svg) {
+		flex: none;
+		margin-top: 2px;
 	}
 	.name-hint {
 		margin: 0;

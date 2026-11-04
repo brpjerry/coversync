@@ -75,10 +75,11 @@
 				: { tone: 'error', text: 'Read-only to coversyncd; imports would fail.' };
 		if (purpose === 'library' && status.library !== null && value.trim() !== saved) {
 			const n = status.library;
-			return {
-				tone: 'library',
-				text: `Holds a coversync library (${n} ${n === 1 ? 'track' : 'tracks'}). Saving opens it with its own rules.`
-			};
+			const holds =
+				n === 0
+					? 'Holds a coversync library, with no tracks yet.'
+					: `Holds a coversync library of ${n} ${n === 1 ? 'track' : 'tracks'}.`;
+			return { tone: 'library', text: `${holds} Saving opens it with its own rules.` };
 		}
 		return { tone: 'ok', text: purpose === 'inbox' ? 'Found and writable.' : 'Ready for imports.' };
 	});

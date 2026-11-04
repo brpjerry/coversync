@@ -46,6 +46,8 @@ class SetupStore {
 	separator = $state(';');
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
+	/** Why the saved folder can't hold the library's database, if it can't. */
+	libraryProblem = $state<string | null>(null);
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
@@ -91,7 +93,10 @@ class SetupStore {
 		try {
 			const r = await api.setup();
 			if (this.changes === 0) this.#apply(r);
-			else this.folderStatus = r.folder;
+			else {
+				this.folderStatus = r.folder;
+				this.libraryProblem = r.library_problem;
+			}
 		} catch {}
 	}
 
@@ -119,6 +124,7 @@ class SetupStore {
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
 		this.folderStatus = r.folder;
+		this.libraryProblem = r.library_problem;
 	}
 
 	label(id: string) {

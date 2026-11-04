@@ -95,7 +95,8 @@ Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
   the Inbox files already imported, and this installation's settings: Inbox
   setup, Appearance, Sync setup, the Library folder's location and the
   AcoustID key, which is never sent to the browser. A database from before
-  the Library had its own, `library.sqlite3`, is renamed on first start.
+  the Library had its own, `library.sqlite3`, is renamed on first start;
+  rename it back before going back to an older release.
   Everything in the cache directory is rebuilt when missing.
 - `--allow-writes` lets the tag editor change Inbox files in place; it is off
   by default. Library files can always be edited. Writes go to a copy beside
@@ -119,11 +120,17 @@ Inbox:
    Library it holds, and saving opens it with its own rules in place of the
    ones on screen.
 
-Until the folder exists (it is created on the first import), the rules wait
-in the local database, and the first import writes them into the new
-Library's. The Library database uses a rollback journal, so a copy taken
-while coversyncd is idle is complete. One coversyncd at a time should use a
-Library folder, and anything that syncs the folder elsewhere (a backup, a
+The database is created by the first import, along with the folder if
+needed. Until then the rules wait in the local database, and a folder that
+already exists is indexed in memory, so choosing one by mistake leaves
+nothing in it. A folder coversyncd can't write to is indexed the same way,
+and Library setup says imports are off. Rules saved while the folder is away
+(an unmounted disk, say) replace the Library's own when it comes back.
+
+Stopping coversyncd before copying makes sure no import or scan is writing
+to the database; it keeps a rollback journal rather than a write-ahead log,
+so the folder alone holds every change. One coversyncd at a time should use
+a Library folder, and anything that syncs the folder elsewhere (a backup, a
 sync tool) can copy `.coversync` along with it.
 
 ### As a systemd user service
