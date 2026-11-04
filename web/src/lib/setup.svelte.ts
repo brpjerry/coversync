@@ -160,7 +160,9 @@ class SetupStore {
 			});
 			this.#apply(r);
 			this.version++;
-			toast('Library setup saved', 'success');
+			if (r.adopted)
+				toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
+			else toast('Library setup saved', 'success');
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
 		} finally {

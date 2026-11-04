@@ -14,7 +14,7 @@ use coversync_core::art::{self, Art};
 use coversync_core::db::{CoverSource, FileStat};
 use coversync_core::import::{self, ImportPlan, ImportResult};
 use coversync_core::scan::Progress;
-use coversync_core::scan::{self, album_dir, album_id};
+use coversync_core::scan::{self, album_dir, album_id_in};
 use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
@@ -190,6 +190,8 @@ struct FolderStatus {
     writable: bool,
     /// Missing folders are created on first import if this is true.
     creatable: bool,
+    /// Tracks in the coversync Library this folder holds, if it holds one.
+    library: Option<u64>,
 }
 
 fn folder_status(path: &str) -> FolderStatus {
@@ -201,6 +203,7 @@ fn folder_status(path: &str) -> FolderStatus {
         dir: meta.as_ref().is_some_and(|m| m.is_dir()),
         writable: import::writable(p),
         creatable: import::creatable(p),
+        library: coversync_core::Library::library_in(p),
     }
 }
 
@@ -208,6 +211,9 @@ fn folder_status(path: &str) -> FolderStatus {
 struct SetupResponse {
     setup: LibrarySetup,
     folder: Option<FolderStatus>,
+    /// Saving opened a Library that has its own setup, which replaced the
+    /// one sent.
+    adopted: bool,
     groups: &'static [rules::TagGroup],
     kinds: &'static [rules::TagKind],
     essentials: &'static [&'static str],
@@ -218,7 +224,7 @@ struct SetupResponse {
     art_file_names: &'static [&'static str],
 }
 
-fn setup_response(setup: LibrarySetup) -> SetupResponse {
+fn setup_response(setup: LibrarySetup, adopted: bool) -> SetupResponse {
     let mut variables = vec![Variable {
         id: template::YEAR,
         label: "Year (from date)",
@@ -238,6 +244,7 @@ fn setup_response(setup: LibrarySetup) -> SetupResponse {
     SetupResponse {
         folder: setup.folder.as_deref().map(folder_status),
         setup,
+        adopted,
         groups: rules::GROUPS,
         kinds: rules::CATALOG,
         essentials: rules::ESSENTIALS,
@@ -250,9 +257,11 @@ fn setup_response(setup: LibrarySetup) -> SetupResponse {
 }
 
 async fn library_setup(State(state): State<Shared>) -> ApiResult<Json<SetupResponse>> {
-    blocking(&state, |s| Ok(setup_response(s.lib.library_setup()?)))
-        .await
-        .map(Json)
+    blocking(&state, |s| {
+        Ok(setup_response(s.lib.library_setup()?, false))
+    })
+    .await
+    .map(Json)
 }
 
 fn must_be_folder(path: Option<&str>, what: &str) -> coversync_core::Result<()> {
@@ -281,13 +290,14 @@ async fn save_library_setup(
             s.lib.inbox_setup()?.folder.as_deref(),
             setup.folder.as_deref(),
         )?;
-        let saved = s.lib.set_library_setup(setup)?;
+        let saved = s.lib.set_library_setup(setup.clone())?;
         // Suggestions joined with the old separator shouldn't linger.
         if before.rules.separator != saved.rules.separator {
             s.identify.clear();
         }
         let moved = before.folder != saved.folder;
-        Ok((setup_response(saved), moved))
+        let adopted = saved != setup;
+        Ok((setup_response(saved, adopted), moved))
     })
     .await?;
     if moved {
@@ -823,12 +833,17 @@ async fn write_tags(
             .filter_map(|(path, root)| scan::stat(path, &root, collection))
             .collect();
         let count = stats.len();
-        let first = stats.first().map(|f| f.path.clone());
+        let first = stats.first().map(|f| (f.path.clone(), f.root.clone()));
         scan::index_files(&s.lib, stats, &s.progress)?;
         s.lib.remove_paths(&[])?;
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
         let new_id = match first {
-            Some(p) => album_id(&album_dir(&p), tags::read(&p)?.album.as_deref()),
+            Some((p, root)) => album_id_in(
+                collection,
+                &root,
+                &album_dir(&p),
+                tags::read(&p)?.album.as_deref(),
+            ),
             None => id.clone(),
         };
         let album = s.lib.album(&new_id)?;

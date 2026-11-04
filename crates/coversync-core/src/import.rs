@@ -614,6 +614,8 @@ pub fn execute(
             lib.remove_paths(&sources)?;
         }
     }
+    // The first import creates the Library folder, and with it its database.
+    lib.refresh_library()?;
     let stats = written
         .iter()
         .filter_map(|p| scan::stat(p.clone(), &folder, Collection::Library))
@@ -624,7 +626,12 @@ pub fn execute(
     let first = &written[0];
     let album = tags::read(first)?.album;
     Ok(ImportResult {
-        album_id: scan::album_id(&scan::album_dir(first), album.as_deref()),
+        album_id: scan::album_id_in(
+            Collection::Library,
+            &folder,
+            &scan::album_dir(first),
+            album.as_deref(),
+        ),
         files: written.len(),
         dest_dir: dest_dir.display().to_string(),
         mode: plan.mode,

@@ -57,6 +57,16 @@ pub fn disc_folder_number(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The id of an album of `collection` found under `root`. A Library album's
+/// is taken from its folder relative to the Library folder, so it stays the
+/// same when the Library moves.
+pub fn album_id_in(collection: Collection, root: &Path, dir: &Path, album: Option<&str>) -> String {
+    match collection {
+        Collection::Library => album_id(dir.strip_prefix(root).unwrap_or(dir), album),
+        Collection::Inbox => album_id(dir, album),
+    }
+}
+
 /// Stable album id from its directory and album title.
 pub fn album_id(dir: &Path, album: Option<&str>) -> String {
     let mut h = Sha256::new();
@@ -122,7 +132,7 @@ pub fn index_files(lib: &Library, files: Vec<FileStat>, progress: &Progress) -> 
             .filter_map(|stat| match tags::read(&stat.path) {
                 Ok(t) => {
                     let dir = album_dir(&stat.path);
-                    let id = album_id(&dir, t.album.as_deref());
+                    let id = album_id_in(stat.collection, &stat.root, &dir, t.album.as_deref());
                     Some((stat.clone(), id, dir, t))
                 }
                 Err(e) => {

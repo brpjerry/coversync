@@ -155,7 +155,11 @@
 				<span class="card-icon"><HardDrive size={20} /></span>
 				<div>
 					<h2 id="location-title">Library folder</h2>
-					<p>Imported albums are written here. It can't be inside the Inbox folder.</p>
+					<p>
+						Imported albums are written here, and the library's rules and index are kept with them
+						in <code>.coversync</code>, so the folder can move as a whole. It can't be inside the
+						Inbox folder.
+					</p>
 				</div>
 			</header>
 			<div class="card-body">
@@ -164,6 +168,7 @@
 					label="Folder"
 					placeholder="/data/Library"
 					purpose="library"
+					saved={setup.saved.folder}
 					bind:value={setup.folder}
 				/>
 			</div>
