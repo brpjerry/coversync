@@ -337,7 +337,10 @@ impl<'a> Client<'a> {
     ) -> Result<Answer<Vec<Release>>> {
         let mut query = format!("release:{}", phrase(album));
         if let Some(artist) = artist {
-            query += &format!(" AND artist:{}", phrase(artist));
+            // As credited ("X feat. Y"), or by an artist's own name when the
+            // release credits them under another.
+            let artist = phrase(artist);
+            query += &format!(" AND (artist:{artist} OR artistname:{artist})");
         }
         self.release_search(&query)
     }
@@ -349,6 +352,12 @@ impl<'a> Client<'a> {
             .filter(|id| is_mbid(id))
             .map(|id| format!("\"{id}\""))
             .collect();
+        if ids.is_empty() {
+            return Ok(Answer {
+                value: Vec::new(),
+                saved: None,
+            });
+        }
         let query = format!("release:{} AND arid:({})", phrase(album), ids.join(" OR "));
         self.release_search(&query)
     }
@@ -386,8 +395,8 @@ impl<'a> Client<'a> {
     }
 
     /// Artists with `name` as their name, sort name or an alias, best first.
-    /// A release search only matches the name a release credits, so this
-    /// finds 汐れいら for "Ushio Reira".
+    /// A release search matches artists by name, so this finds 汐れいら,
+    /// whose sort name is "Ushio Reira".
     pub fn search_artists(&self, name: &str) -> Result<Answer<Vec<FoundArtist>>> {
         let name = phrase(name);
         let query = format!("artist:{name} OR sortname:{name} OR alias:{name}");
@@ -692,8 +701,10 @@ struct RecordingSearch {
 pub struct FoundArtist {
     pub id: String,
     pub name: String,
-    /// How well the artist matched, out of 100.
-    pub score: Option<u32>,
+    #[serde(rename = "sort-name")]
+    pub sort_name: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
 }
 
 #[derive(Debug, Deserialize)]

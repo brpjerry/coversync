@@ -511,7 +511,7 @@
 		reading: 'Reading the tags',
 		fingerprinting: 'Fingerprinting the audio',
 		acoustid: 'Asking AcoustID',
-		searching: 'Searching MusicBrainz by title',
+		searching: 'Searching MusicBrainz',
 		release: 'Fetching the release from MusicBrainz',
 		romanizing: 'Looking for romanized titles and names'
 	};

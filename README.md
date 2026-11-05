@@ -86,7 +86,7 @@ the current commit into `dist/`).
 You need stable Rust and Node with pnpm. Smart suggestions also use `fpcalc`
 (Chromaprint) for fingerprints and a free AcoustID application key from
 <https://acoustid.org/new-application>; without them, albums are matched by
-title and artist.
+barcode, ISRCs, or title and artist.
 
 ```sh
 (cd web && pnpm install && pnpm build)   # the daemon embeds web/build

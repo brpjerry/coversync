@@ -329,7 +329,10 @@ pub fn upc(path: &Path) -> Option<String> {
     let found = match file_type {
         FileType::Flac => {
             let file = FlacFile::read_from(&mut f, options).ok()?;
-            let vorbis = file.vorbis_comments().and_then(|t| t.get("UPC"));
+            let vorbis = file
+                .vorbis_comments()
+                .and_then(|t| t.get("UPC"))
+                .filter(|v| !v.trim().is_empty());
             vorbis
                 .or_else(|| file.id3v2().and_then(|t| t.get_user_text("UPC")))
                 .map(str::to_string)
@@ -674,6 +677,54 @@ mod tests {
         let fronts = types.iter().filter(|t| **t == PictureType::CoverFront);
         assert_eq!(fronts.count(), 1);
         assert!(types.contains(&PictureType::CoverBack));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FLAC file with no audio, only these Vorbis comments.
+    fn flac_with_comments(path: &Path, comments: &[&str]) {
+        let mut b = b"fLaC".to_vec();
+        // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+        b.extend([
+            0x00, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+        ]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        let mut block = Vec::new();
+        let vendor = b"coversync";
+        block.extend((vendor.len() as u32).to_le_bytes());
+        block.extend(vendor);
+        block.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            block.extend((c.len() as u32).to_le_bytes());
+            block.extend(c.as_bytes());
+        }
+        // The last block: VORBIS_COMMENT.
+        b.push(0x80 | 4);
+        b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+        b.extend(block);
+        fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn a_upc_comment_is_read_though_lofty_leaves_it_out() {
+        let dir = std::env::temp_dir().join(format!("coversync-upc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(&path, &["TITLE=もし、", "upc= 4547366860535 "]);
+        assert_eq!(upc(&path).as_deref(), Some("4547366860535"));
+        // Not a barcode lofty knows, so not one read_kinds sees.
+        assert!(
+            !read_kinds(&path, false)
+                .unwrap()
+                .values
+                .contains_key("barcode")
+        );
+        flac_with_comments(&path, &["TITLE=もし、", "UPC= "]);
+        assert_eq!(upc(&path), None);
+        flac_with_comments(&path, &["TITLE=もし、"]);
+        assert_eq!(upc(&path), None);
+        assert_eq!(upc(&dir.join("missing.flac")), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
