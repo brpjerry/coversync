@@ -1,7 +1,9 @@
 //! Smart suggestions as background jobs. Identifying an album takes a few
 //! seconds (fingerprinting, rate-limited web lookups), so the import dialog
-//! starts a job and polls it for progress and the result. MusicBrainz's
-//! cover art is downloaded when the dialog asks for it, and cached.
+//! starts a job and polls it for progress and the result. The lookups'
+//! answers are saved, so identifying the album again only fingerprints it.
+//! MusicBrainz's cover art is downloaded when the dialog asks for it, and
+//! cached.
 
 use std::collections::HashMap;
 use std::fs;
@@ -97,6 +99,10 @@ pub struct IdentifyRequest {
     /// Start over even if a recent result exists.
     #[serde(default)]
     refresh: bool,
+    /// Ask AcoustID and MusicBrainz again rather than use their saved
+    /// answers, and save the new ones; implies `refresh`.
+    #[serde(default)]
+    fresh: bool,
 }
 
 /// Start identifying an album, or report on the job already under way.
@@ -111,10 +117,11 @@ pub async fn start(
     {
         return Err(coversync_core::Error::Invalid(format!("'{r}' isn't a MusicBrainz id")).into());
     }
+    let refresh = req.refresh || req.fresh;
     let mut jobs = state.identify.lock();
     let previous = jobs.get(&req.album_id);
-    if let Some(job) = previous
-        .filter(|j| !req.refresh && j.release == req.release_id && j.romanize == req.romanize)
+    if let Some(job) =
+        previous.filter(|j| !refresh && j.release == req.release_id && j.romanize == req.romanize)
     {
         let fresh = match job.state {
             JobState::Running(_) => true,
@@ -126,7 +133,7 @@ pub async fn start(
         }
     }
     let evidence = previous
-        .filter(|_| !req.refresh)
+        .filter(|_| !refresh)
         .and_then(|j| j.evidence.clone());
     let generation = previous.map_or(0, |j| j.generation + 1);
     let job = Job {
@@ -148,6 +155,7 @@ pub async fn start(
     let album_id = req.album_id;
     let release = req.release_id;
     let asked = req.romanize;
+    let fresh = req.fresh;
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let progress = |step: Step| {
@@ -168,15 +176,29 @@ pub async fn start(
             let best = evidence
                 .as_ref()
                 .and_then(|ev| ev.candidates.first().map(|c| c.id.clone()));
+            let lookups = &state.lookups;
             match (release.as_deref().or(best.as_deref()), evidence) {
                 (Some(r), Some(ev)) => Ok((
                     None,
-                    identify::suggest(&ev, r, release.is_some(), romanize, &separator, &progress)?,
+                    identify::suggest(
+                        &ev,
+                        lookups,
+                        r,
+                        release.is_some(),
+                        romanize,
+                        &separator,
+                        &progress,
+                    )?,
                 )),
                 _ => {
                     let key = state.lib.acoustid_key()?;
+                    let client = musicbrainz::Client {
+                        cache: lookups,
+                        fresh,
+                    };
                     let (ev, best) = identify::identify(
                         &state.lib,
+                        client,
                         &album_id,
                         key.as_deref(),
                         romanize,
@@ -184,9 +206,9 @@ pub async fn start(
                         &progress,
                     )?;
                     let result = match release.as_deref() {
-                        Some(r) => {
-                            identify::suggest(&ev, r, true, romanize, &separator, &progress)?
-                        }
+                        Some(r) => identify::suggest(
+                            &ev, lookups, r, true, romanize, &separator, &progress,
+                        )?,
                         None => best,
                     };
                     Ok((Some(ev), result))
@@ -198,6 +220,7 @@ pub async fn start(
                 album = album_id,
                 release = r.release.as_ref().map(|r| r.id.as_str()),
                 method = ?r.method,
+                saved = r.saved.is_some(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "identified"
             ),

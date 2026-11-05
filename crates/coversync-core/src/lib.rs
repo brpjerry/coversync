@@ -8,6 +8,7 @@ pub mod db;
 pub mod identify;
 pub mod import;
 pub mod inbox;
+pub mod lookups;
 pub mod model;
 pub mod musicbrainz;
 pub mod romanize;
@@ -19,6 +20,7 @@ pub mod template;
 
 pub use db::Library;
 pub use inbox::{HiddenStats, InboxSetup, IngestMode};
+pub use lookups::LookupCache;
 pub use model::{Album, AlbumDetail, Collection, ScanProgress, TagCoverage, TagEdit, Track};
 pub use rules::LibrarySetup;
 

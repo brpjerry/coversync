@@ -130,7 +130,8 @@
 	/** Romanized or original script, picked here; undefined for Inbox setup's choice. */
 	let romanize = $state<boolean>();
 
-	async function identify(refresh = false) {
+	/** `fresh`: ask AcoustID and MusicBrainz again rather than use saved lookups. */
+	async function identify(refresh = false, fresh = false) {
 		const mine = ++seq;
 		const failed = (e: unknown): IdentifyState => ({
 			state: 'failed',
@@ -138,7 +139,7 @@
 		});
 		let s: IdentifyState;
 		try {
-			s = await api.identify(albumId, picked, refresh, romanize);
+			s = await api.identify(albumId, picked, refresh, romanize, fresh);
 			while (s.state === 'running') {
 				if (mine !== seq) return;
 				lookup = s;
@@ -525,6 +526,19 @@
 		return `Identified by audio: AcoustID recognized ${result.recognized} of ${tracks.length} ${tracks.length === 1 ? 'track' : 'tracks'}`;
 	});
 
+	/** When the saved lookups shown were made, if they weren't made just now. */
+	let lookedUp = $derived.by(() => {
+		if (!result?.saved) return '';
+		const at = new Date(result.saved * 1000);
+		const now = new Date();
+		if (at.toDateString() === now.toDateString()) return 'today';
+		return at.toLocaleDateString(undefined, {
+			month: 'short',
+			day: 'numeric',
+			year: at.getFullYear() === now.getFullYear() ? undefined : 'numeric'
+		});
+	});
+
 	function candidateText(c: Identification['candidates'][number]) {
 		const bits = [
 			c.title,
@@ -717,7 +731,13 @@
 					]
 						.filter(Boolean)
 						.join(' · ')}
-					<span class="how">{how}</span>
+					<span class="how"
+						>{how}{#if lookedUp}<span
+								class="saved"
+								title="Saved answers from AcoustID and MusicBrainz. Look up again to ask them now."
+								>{` · looked up ${lookedUp}`}</span
+							>{/if}</span
+					>
 				</p>
 			{:else}
 				<p class="stage">MusicBrainz has nothing for this album.</p>
@@ -736,6 +756,22 @@
 					rel="noreferrer"
 					title="Open the release on MusicBrainz">MusicBrainz <ExternalLink size={13} /></a
 				>
+				<button
+					class="btn sm square"
+					onclick={() => identify(true, true)}
+					title="Look up again on AcoustID and MusicBrainz, instead of using what was saved"
+					aria-label="Look up again"
+				>
+					<RefreshCw size={14} />
+				</button>
+			{:else if result}
+				<button
+					class="btn sm"
+					onclick={() => identify(true, true)}
+					title="Ask AcoustID and MusicBrainz again, instead of using what was saved"
+				>
+					<RefreshCw size={14} /> Look up again
+				</button>
 			{/if}
 		</div>
 	</header>
@@ -958,6 +994,9 @@
 		display: block;
 		color: var(--accent);
 	}
+	.how .saved {
+		color: var(--text-3);
+	}
 	.progress {
 		display: block;
 		height: 3px;
@@ -1001,6 +1040,11 @@
 		padding: 0 11px;
 		font-size: 12.5px;
 		text-decoration: none;
+	}
+	.head-actions .btn.square {
+		justify-content: center;
+		width: 30px;
+		padding: 0;
 	}
 	.pick {
 		display: flex;

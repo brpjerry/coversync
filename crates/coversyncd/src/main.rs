@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context;
 use clap::Parser;
 use coversync_core::cover::CoverCache;
+use coversync_core::lookups::{self, LookupCache};
 use coversync_core::scan::{self, Progress};
 use coversync_core::{Collection, Library, ScanProgress};
 use tokio::sync::Mutex;
@@ -32,7 +33,8 @@ struct Args {
     /// database in its folder.
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    /// Where cover thumbnails are cached (default: $XDG_CACHE_HOME/coversync).
+    /// Where cover thumbnails, MusicBrainz's covers and saved AcoustID and
+    /// MusicBrainz lookups are kept (default: $XDG_CACHE_HOME/coversync).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// Allow the tag editor to modify files. Off by default.
@@ -45,6 +47,8 @@ pub struct AppState {
     pub covers: CoverCache,
     /// MusicBrainz's cover images, downloaded for suggestions.
     pub mb_art: PathBuf,
+    /// AcoustID's and MusicBrainz's answers, so lookups aren't made twice.
+    pub lookups: LookupCache,
     pub progress: Progress,
     pub allow_writes: bool,
     /// Serializes scans, tag writes and imports.
@@ -181,6 +185,7 @@ async fn run() -> anyhow::Result<()> {
         lib,
         covers,
         mb_art: cache_dir.join("musicbrainz"),
+        lookups: LookupCache::open_or_memory(&cache_dir.join(lookups::FILE)),
         progress: Arc::new(RwLock::new(ScanProgress::default())),
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
