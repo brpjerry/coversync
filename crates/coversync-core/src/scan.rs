@@ -105,6 +105,7 @@ pub fn stat(path: PathBuf, root: &Path, collection: Collection) -> Option<FileSt
         mtime,
         size: meta.len(),
         collection,
+        added: None,
     })
 }
 
