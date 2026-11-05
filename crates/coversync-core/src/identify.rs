@@ -32,6 +32,8 @@ const MIN_SCORE: f64 = 0.5;
 /// MusicBrainz search results scoring below this (out of 100) are ignored.
 const MIN_SEARCH_SCORE: u32 = 70;
 const MAX_CANDIDATES: usize = 8;
+/// ISRCs sent in one search, enough to place any album.
+const MAX_ISRCS: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,10 +61,25 @@ pub struct Step {
 pub enum Method {
     /// Fingerprints matched recordings on it.
     Acoustid,
+    /// It has the barcode (or UPC) the album's files are tagged with.
+    Barcode,
+    /// It has the recordings the album's ISRCs name.
+    Isrc,
     /// A MusicBrainz search by the album's title and artist.
     Tags,
     /// Picked from the candidates by hand.
     Chosen,
+}
+
+impl Method {
+    /// What the album was matched by, for notes: "matched by its …".
+    fn by(self) -> &'static str {
+        match self {
+            Method::Barcode => "barcode",
+            Method::Isrc => "ISRCs",
+            _ => "title and artist",
+        }
+    }
 }
 
 /// How a track was paired with the release's tracks.
@@ -70,6 +87,8 @@ pub enum Method {
 #[serde(rename_all = "snake_case")]
 pub enum Via {
     Acoustid,
+    /// The local track's ISRC is the release track's recording's.
+    Isrc,
     Position,
     Title,
 }
@@ -497,28 +516,74 @@ fn audio_candidates(tracks: &[Local], results: &[Vec<AcoustResult>]) -> (Vec<Can
     (candidates, trusted)
 }
 
-/// Releases found by searching for the album's title and artist, best
-/// first, with MusicBrainz's score for each (100: title and artist exact).
-fn tag_candidates(
-    client: mb::Client,
+/// A barcode as MusicBrainz holds it: digits only, 8 (EAN-8) to 14 long.
+fn as_barcode(v: &str) -> Option<String> {
+    let digits: String = v.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+    let valid = (8..=14).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit());
+    valid.then_some(digits)
+}
+
+/// An ISRC as MusicBrainz holds it, e.g. "JP-U90-26-04206" -> "JPU902604206".
+fn as_isrc(v: &str) -> Option<String> {
+    let code: String = v
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-'))
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let b = code.as_bytes();
+    let valid = b.len() == 12
+        && b[..2].iter().all(u8::is_ascii_uppercase)
+        && b[2..5].iter().all(u8::is_ascii_alphanumeric)
+        && b[5..].iter().all(u8::is_ascii_digit);
+    valid.then_some(code)
+}
+
+/// The album's ISRCs, each with the tracks tagged with it.
+fn isrcs(tracks: &[Local]) -> BTreeMap<String, Vec<usize>> {
+    let mut out: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, t) in tracks.iter().enumerate() {
+        if let Some(code) = t.values.get("isrc").and_then(|v| as_isrc(v)) {
+            out.entry(code).or_default().push(i);
+        }
+    }
+    out
+}
+
+/// What searching MusicBrainz by the album's tags found, and how.
+struct Searched {
+    /// Barcode, Isrc or Tags.
+    method: Method,
+    /// Best first, each with a score out of 100 (100: an exact match).
+    found: Vec<(u32, Candidate)>,
+    /// What the album was searched by, for the note when nothing was found.
+    by: Vec<&'static str>,
+}
+
+fn search_candidate(r: Release) -> Candidate {
+    Candidate {
+        artist: Some(mb::credit_name(&r.artist_credit)).filter(|a| !a.is_empty()),
+        format: format_summary(r.media.iter().map(|m| m.format.as_deref())),
+        date: r.date.filter(|d| !d.is_empty()),
+        country: r.country,
+        track_count: r.track_count,
+        matched: 0,
+        title: r.title,
+        id: r.id,
+    }
+}
+
+/// Releases found with a score each, best first for `tracks`: by the score
+/// plus a bonus for the album's number of tracks and one for its year.
+/// Ties keep their order.
+fn rank_found(
     tracks: &[Local],
-) -> Result<mb::Answer<Vec<(u32, Candidate)>>> {
-    let Some(album) = consensus(tracks, "album") else {
-        return Ok(mb::Answer {
-            value: Vec::new(),
-            saved: None,
-        });
-    };
-    let artist = consensus(tracks, "album_artist").or_else(|| consensus(tracks, "artist"));
+    found: impl IntoIterator<Item = (u32, Release)>,
+) -> Vec<(u32, Candidate)> {
     let n = tracks.len() as u32;
     let year_now = consensus(tracks, "date").and_then(year);
-    let search = client.search_releases(album, artist)?;
-    let mut found: Vec<(i64, (u32, Candidate))> = search
-        .value
+    let mut ranked: Vec<(i64, (u32, Candidate))> = found
         .into_iter()
-        .filter(|r| r.score.unwrap_or(0) >= MIN_SEARCH_SCORE)
-        .map(|r| {
-            let score = r.score.unwrap_or(0);
+        .map(|(score, r)| {
             let mut rank = i64::from(score);
             if r.track_count == Some(n) {
                 rank += 50;
@@ -526,28 +591,207 @@ fn tag_candidates(
             if year_now.is_some() && r.date.as_deref().and_then(year) == year_now {
                 rank += 10;
             }
-            let candidate = Candidate {
-                artist: Some(mb::credit_name(&r.artist_credit)).filter(|a| !a.is_empty()),
-                format: format_summary(r.media.iter().map(|m| m.format.as_deref())),
-                date: r.date.filter(|d| !d.is_empty()),
-                country: r.country,
-                track_count: r.track_count,
-                matched: 0,
-                title: r.title,
-                id: r.id,
-            };
-            (rank, (score, candidate))
+            (rank, (score, search_candidate(r)))
         })
         .collect();
-    found.sort_by_key(|a| std::cmp::Reverse(a.0));
-    Ok(mb::Answer {
-        value: found
-            .into_iter()
-            .map(|(_, c)| c)
-            .take(MAX_CANDIDATES)
-            .collect(),
-        saved: search.saved,
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.0));
+    ranked.into_iter().map(|(_, c)| c).collect()
+}
+
+/// Search results MusicBrainz scored well enough, ranked.
+fn well_matched(tracks: &[Local], found: Vec<Release>) -> Vec<(u32, Candidate)> {
+    let scored = found
+        .into_iter()
+        .map(|r| (r.score.unwrap_or(0), r))
+        .filter(|(score, _)| *score >= MIN_SEARCH_SCORE);
+    rank_found(tracks, scored)
+}
+
+/// The releases `found` recordings are on, scored by the share of the
+/// album's ISRCs each holds (100: all of them).
+fn isrc_candidates(
+    tracks: &[Local],
+    isrcs: &BTreeMap<String, Vec<usize>>,
+    found: Vec<mb::FoundRecording>,
+) -> Vec<(u32, Candidate)> {
+    let tagged: HashSet<usize> = isrcs.values().flatten().copied().collect();
+    let mut on: BTreeMap<String, (Release, HashSet<usize>)> = BTreeMap::new();
+    for recording in found {
+        let held: Vec<usize> = recording
+            .isrcs
+            .iter()
+            .filter_map(|code| isrcs.get(&code.to_ascii_uppercase()))
+            .flatten()
+            .copied()
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        for release in recording.releases {
+            let (_, held_by) = on
+                .entry(release.id.clone())
+                .or_insert_with(|| (release, HashSet::new()));
+            held_by.extend(&held);
+        }
+    }
+    let mut scored: Vec<(u32, Release)> = on
+        .into_values()
+        .map(|(r, held)| ((held.len() * 100 / tagged.len().max(1)) as u32, r))
+        .collect();
+    // Equal ones: the album's title first, then the earliest dated, as
+    // originals come before reissues.
+    let album = consensus(tracks, "album")
+        .map(title_key)
+        .filter(|t| !t.is_empty());
+    scored.sort_by_cached_key(|(_, r)| {
+        let titled = album.as_ref().is_some_and(|a| *a == title_key(&r.title));
+        let date = r.date.clone().filter(|d| !d.is_empty());
+        (!titled, date.is_none(), date)
+    });
+    let mut ranked = rank_found(tracks, scored);
+    // How many of the recordings it holds comes before how it's laid out: a
+    // compilation of the album's length holding a few of them isn't it.
+    ranked.sort_by_key(|(share, _)| std::cmp::Reverse(*share));
+    ranked
+}
+
+/// An extra search that failed finds nothing; the title search still runs.
+fn or_nothing<T>(what: &str, res: Result<mb::Answer<Vec<T>>>) -> mb::Answer<Vec<T>> {
+    res.unwrap_or_else(|e| {
+        tracing::warn!("{what}: {e}");
+        mb::Answer {
+            value: Vec::new(),
+            saved: None,
+        }
     })
+}
+
+/// Whether MusicBrainz knows `artist` as `name`: by its name, sort name
+/// ("Ushio, Reira") or an alias, ignoring case and punctuation.
+fn known_as(artist: &mb::FoundArtist, name: &str) -> bool {
+    let key = title_key(name);
+    !key.is_empty()
+        && std::iter::once(artist.name.as_str())
+            .chain(artist.sort_name.as_deref())
+            .chain(artist.aliases.iter().map(|a| a.name.as_str()))
+            .any(|n| title_key(n) == key)
+}
+
+/// Releases found by searching MusicBrainz with the album's tags, best
+/// first. A barcode names the release and ISRCs its recordings, so either
+/// can settle it; otherwise it's searched for by title and artist.
+fn tag_candidates(
+    client: mb::Client,
+    tracks: &[Local],
+    barcode: Option<&str>,
+) -> Result<mb::Answer<Searched>> {
+    let n = tracks.len() as u32;
+    let laid_out = |found: &[(u32, Candidate)]| found.iter().any(|(_, c)| c.track_count == Some(n));
+    let mut saved = None;
+    let mut by = Vec::new();
+    let done = |method, found, by, saved| {
+        Ok(mb::Answer {
+            value: Searched { method, found, by },
+            saved,
+        })
+    };
+    // The barcode's releases with fewer tracks than the album: perhaps
+    // another edition sharing it, so the title search has a say.
+    let mut by_barcode = Vec::new();
+    if let Some(code) = barcode {
+        by.push("barcode");
+        let res = or_nothing("barcode search", client.search_barcode(code));
+        saved = oldest(saved, res.saved);
+        let mut found = well_matched(tracks, res.value);
+        // The product the files came from, even with tracks missing here
+        // (one disc of two, say).
+        let holds_all = |c: &Candidate| c.track_count.is_none_or(|t| t >= n);
+        if found.iter().any(|(_, c)| holds_all(c)) {
+            // Ahead of an edition sharing the barcode with fewer tracks.
+            found.sort_by_key(|(_, c)| !holds_all(c));
+            return done(Method::Barcode, found, by, saved);
+        }
+        by_barcode = found;
+    }
+    // Releases holding under half of the ISRCs: kept, behind the rest.
+    let mut few_isrcs = Vec::new();
+    // The first few place an album; releases are scored by those sent.
+    let isrcs: BTreeMap<String, Vec<usize>> = isrcs(tracks).into_iter().take(MAX_ISRCS).collect();
+    if !isrcs.is_empty() {
+        by.push("ISRC");
+        let codes: Vec<&str> = isrcs.keys().map(String::as_str).collect();
+        let res = or_nothing("ISRC search", client.search_isrcs(&codes));
+        saved = oldest(saved, res.saved);
+        let mut found = isrc_candidates(tracks, &isrcs, res.value);
+        // At least half of them on one release: that's the album.
+        if found.first().is_some_and(|(share, _)| *share >= 50) {
+            found.append(&mut by_barcode);
+            return done(Method::Isrc, found, by, saved);
+        }
+        few_isrcs = found;
+    }
+    let mut found = Vec::new();
+    if let Some(album) = consensus(tracks, "album") {
+        by.push("title and artist");
+        let artist = consensus(tracks, "album_artist").or_else(|| consensus(tracks, "artist"));
+        let search = match client.search_releases(album, artist) {
+            Ok(search) => search,
+            // With something found already, a failed search finds nothing.
+            Err(e) if !by_barcode.is_empty() || !few_isrcs.is_empty() => {
+                or_nothing("title search", Err(e))
+            }
+            Err(e) => return Err(e),
+        };
+        saved = oldest(saved, search.saved);
+        found = well_matched(tracks, search.value);
+        if let (true, Some(artist)) = (found.is_empty(), artist) {
+            // That matched artists by name, so "Ushio Reira" missed 汐れいら,
+            // whose sort name it is. Look the artist up by sort name and
+            // alias too, and search by the ones known by another name.
+            let artists = or_nothing("artist search", client.search_artists(artist));
+            saved = oldest(saved, artists.saved);
+            let ids: Vec<&str> = artists
+                .value
+                .iter()
+                .filter(|a| known_as(a, artist) && title_key(&a.name) != title_key(artist))
+                .filter(|a| mb::is_mbid(&a.id))
+                .take(3)
+                .map(|a| a.id.as_str())
+                .collect();
+            if !ids.is_empty() {
+                let search = client.search_releases_by(album, &ids);
+                let search = or_nothing("release search by artist", search);
+                saved = oldest(saved, search.saved);
+                found = well_matched(tracks, search.value);
+            }
+        }
+    }
+    // The title search's releases first if one is laid out like the album,
+    // else the barcode's; releases with a few of the ISRCs come last.
+    let method = if !by_barcode.is_empty() && !laid_out(&found) {
+        by_barcode.append(&mut found);
+        found = by_barcode;
+        Method::Barcode
+    } else {
+        found.append(&mut by_barcode);
+        if found.is_empty() && !few_isrcs.is_empty() {
+            Method::Isrc
+        } else {
+            Method::Tags
+        }
+    };
+    found.append(&mut few_isrcs);
+    done(method, found, by, saved)
+}
+
+/// "a", "a and b", "a, b, and c".
+fn listed(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// Read, fingerprint and look up `album_id`, then suggest tags from the
@@ -658,6 +902,7 @@ pub fn identify(
     }
     let recognized = tracks.iter().filter(|t| !t.recordings.is_empty()).count() as u32;
 
+    let mut searched = Vec::new();
     let (audio, trusted) = audio_candidates(&tracks, &results);
     let complete = |c: &Candidate| c.track_count == Some(n);
     let mut method = Method::Acoustid;
@@ -670,21 +915,36 @@ pub fn identify(
             done: 0,
             total: 1,
         });
-        let search = tag_candidates(client, &tracks)?;
+        // The barcode, or the UPC some stores tag files with instead.
+        let barcode = consensus(&tracks, "barcode")
+            .and_then(as_barcode)
+            .or_else(|| {
+                read.first()
+                    .and_then(|t| tags::upc(&t.path))
+                    .as_deref()
+                    .and_then(as_barcode)
+            });
+        let search = tag_candidates(client, &tracks, barcode.as_deref())?;
         saved = oldest(saved, search.saved);
-        let tagged = search.value;
+        let Searched {
+            method: found_by,
+            found: tagged,
+            by,
+        } = search.value;
+        searched = by;
         let exact = tagged
             .iter()
             .position(|(score, c)| *score == 100 && complete(c));
         if !trusted && !tagged.is_empty() {
+            let how = found_by.by();
             if fingerprinted > 0 {
                 notes.push(if recognized == 0 {
-                    "AcoustID doesn't know these recordings, so the album was matched by its title and artist.".into()
+                    format!("AcoustID doesn't know these recordings, so the album was matched by its {how}.")
                 } else {
-                    format!("AcoustID recognized only {recognized} of {n} tracks, and they don't agree on a release, so the album was matched by its title and artist.")
+                    format!("AcoustID recognized only {recognized} of {n} tracks, and they don't agree on a release, so the album was matched by its {how}.")
                 });
             }
-            method = Method::Tags;
+            method = found_by;
             let audio = std::mem::take(&mut candidates);
             candidates = tagged.into_iter().map(|(_, c)| c).chain(audio).collect();
         } else if let (true, Some(i)) = (trusted, exact) {
@@ -692,8 +952,15 @@ pub fn identify(
                 .first()
                 .map(|c| c.title.clone())
                 .unwrap_or_default();
-            notes.push(format!("The recordings are also on “{bigger}”, a release with more tracks; this one matches the album's title, artist and track count."));
-            method = Method::Tags;
+            let why = match found_by {
+                Method::Barcode => "has the album's barcode and track count",
+                Method::Isrc => "has the album's ISRCs and track count",
+                _ => "matches the album's title, artist and track count",
+            };
+            notes.push(format!(
+                "The recordings are also on “{bigger}”, a release with more tracks; this one {why}."
+            ));
+            method = found_by;
             let mut tagged: Vec<Candidate> = tagged.into_iter().map(|(_, c)| c).collect();
             let picked = tagged.remove(i);
             let audio = std::mem::take(&mut candidates);
@@ -703,12 +970,15 @@ pub fn identify(
         }
     }
     if candidates.is_empty() {
+        let by = listed(&searched);
         notes.push(if recognized > 0 {
             "AcoustID knows these recordings, but not on any release.".into()
+        } else if searched.is_empty() {
+            "The album has no title, barcode or ISRCs to search MusicBrainz by.".into()
         } else if fingerprinted > 0 {
-            "Neither AcoustID nor a MusicBrainz search by title found this album.".into()
+            format!("Neither AcoustID nor a MusicBrainz search by {by} found this album.")
         } else {
-            "A MusicBrainz search by title found nothing.".into()
+            format!("A MusicBrainz search by {by} found nothing.")
         });
     }
     let mut seen = HashSet::new();
@@ -870,8 +1140,8 @@ fn summary_candidate(r: &Release) -> Candidate {
 }
 
 /// Pair each local track with a release track: by fingerprint, then by
-/// disc and track number (when the release has as many tracks as the
-/// album), then by title. Returns (medium, track, how).
+/// ISRC, then by disc and track number (when the release has as many tracks
+/// as the album), then by title. Returns (medium, track, how).
 fn map_tracks(
     tracks: &[Local],
     release: &Release,
@@ -914,6 +1184,33 @@ fn map_tracks(
         if let Some(&(m, t, _, _)) = hit {
             taken.insert((m, t));
             out[i] = Some((m, t, Via::Acoustid));
+        }
+    }
+    for (i, local) in tracks.iter().enumerate() {
+        let Some(code) = local
+            .values
+            .get("isrc")
+            .filter(|_| out[i].is_none())
+            .and_then(|v| as_isrc(v))
+        else {
+            continue;
+        };
+        let same_place = |disc: u32, pos: u32| {
+            local.track == Some(pos) && (local.disc.unwrap_or(1) == disc || single)
+        };
+        let hit = positions
+            .iter()
+            .filter(|(m, t, _, _)| {
+                !taken.contains(&(*m, *t))
+                    && track_at(*m, *t)
+                        .recording
+                        .as_ref()
+                        .is_some_and(|r| r.isrcs.iter().any(|c| c.eq_ignore_ascii_case(&code)))
+            })
+            .min_by_key(|(_, _, disc, pos)| !same_place(*disc, *pos));
+        if let Some(&(m, t, _, _)) = hit {
+            taken.insert((m, t));
+            out[i] = Some((m, t, Via::Isrc));
         }
     }
     // Numbers only mean the same thing when the release is laid out like the
@@ -1280,6 +1577,381 @@ mod tests {
             tag_type: TagType::VorbisComments,
             recordings: Vec::new(),
         }
+    }
+
+    /// Searches answered from saved lookups; one that isn't saved fails.
+    fn searching(cache: &LookupCache) -> mb::Client<'_> {
+        mb::Client {
+            cache: Some(cache),
+            fresh: false,
+        }
+    }
+
+    fn found(id: &str, title: &str, score: u32, tracks: u32, date: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "title": title, "score": score, "track-count": tracks,
+            "date": date, "artist-credit": [{"name": "汐れいら",
+                "artist": {"id": "c9c4b066-7ac7-455a-aff5-b4684f769876", "sort-name": "Ushio Reira"}}]})
+    }
+
+    #[test]
+    fn barcodes_and_isrcs_are_read_as_musicbrainz_holds_them() {
+        assert_eq!(
+            as_barcode(" 4547-3668-60535 ").as_deref(),
+            Some("4547366860535")
+        );
+        assert_eq!(as_barcode("1234567"), None);
+        assert_eq!(as_barcode("45473668605x5"), None);
+        assert_eq!(as_isrc("jp-u90-26-04206").as_deref(), Some("JPU902604206"));
+        assert_eq!(as_isrc("JPU90260420"), None);
+        assert_eq!(as_isrc("1PU902604206"), None);
+        assert_eq!(listed(&["barcode"]), "barcode");
+        assert_eq!(
+            listed(&["barcode", "ISRC", "title and artist"]),
+            "barcode, ISRC, and title and artist"
+        );
+    }
+
+    #[test]
+    fn a_barcode_settles_it_without_searching_by_title() {
+        let cache = LookupCache::in_memory();
+        let body = serde_json::json!({"releases": [
+            found("a1111111-1111-4111-8111-111111111111", "Clover (CD)", 100, 3, "2026-09-02"),
+            found("b2222222-2222-4222-8222-222222222222", "Clover", 100, 2, "2026-08-29"),
+        ]});
+        // A 12-digit UPC is asked for as the EAN too.
+        mb::save_search(
+            &cache,
+            "release",
+            "barcode:(454736682783 OR 0454736682783)",
+            &body.to_string(),
+        );
+        let tracks = [
+            local(1, &[("album", "Clover"), ("artist", "Ushio Reira")]),
+            local(2, &[("album", "Clover"), ("artist", "Ushio Reira")]),
+        ];
+        // Searching by title would fail: nothing is saved for it.
+        let s = tag_candidates(searching(&cache), &tracks, Some("454736682783")).unwrap();
+        assert_eq!(s.value.method, Method::Barcode);
+        assert_eq!(s.value.by, ["barcode"]);
+        let titles: Vec<&str> = s
+            .value
+            .found
+            .iter()
+            .map(|(_, c)| c.title.as_str())
+            .collect();
+        // The one with the album's two tracks first.
+        assert_eq!(titles, ["Clover", "Clover (CD)"]);
+        assert!(s.saved.is_some());
+
+        // Only on a release with more tracks: the product the files came
+        // from, with tracks missing here. It settles it all the same.
+        let cd = serde_json::json!({"releases": [
+            found("a1111111-1111-4111-8111-111111111111", "Clover (CD)", 100, 3, "2026-09-02"),
+        ]});
+        mb::save_search(
+            &cache,
+            "release",
+            "barcode:(454736682784 OR 0454736682784)",
+            &cd.to_string(),
+        );
+        let s = tag_candidates(searching(&cache), &tracks, Some("454736682784")).unwrap();
+        assert_eq!(s.value.method, Method::Barcode);
+        // Shared with an edition with fewer tracks, listed first: that one
+        // goes after.
+        let both = serde_json::json!({"releases": [
+            found("c3333333-3333-4333-8333-333333333333", "Clover (Single)", 100, 1, "2026-07-11"),
+            found("a1111111-1111-4111-8111-111111111111", "Clover (CD)", 100, 3, "2026-09-02"),
+        ]});
+        mb::save_search(
+            &cache,
+            "release",
+            "barcode:(454736682785 OR 0454736682785)",
+            &both.to_string(),
+        );
+        let s = tag_candidates(searching(&cache), &tracks, Some("454736682785")).unwrap();
+        assert_eq!(s.value.method, Method::Barcode);
+        let titles: Vec<&str> = s
+            .value
+            .found
+            .iter()
+            .map(|(_, c)| c.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Clover (CD)", "Clover (Single)"]);
+
+        // A 13-digit EAN with a leading 0 is asked for as the UPC too. Found
+        // only on a release with fewer tracks, perhaps another edition with
+        // the same barcode, it doesn't settle it: the title search's release
+        // laid out like the album comes first.
+        let single = serde_json::json!({"releases": [
+            found("c3333333-3333-4333-8333-333333333333", "Clover (Single)", 100, 1, "2026-07-11"),
+        ]});
+        mb::save_search(
+            &cache,
+            "release",
+            "barcode:(0454736682783 OR 454736682783)",
+            &single.to_string(),
+        );
+        let title = r#"release:"Clover" AND (artist:"Ushio Reira" OR artistname:"Ushio Reira")"#;
+        let titled = serde_json::json!({"releases": [
+            found("b2222222-2222-4222-8222-222222222222", "Clover", 100, 2, "2026-08-29"),
+        ]});
+        mb::save_search(&cache, "release", title, &titled.to_string());
+        let s = tag_candidates(searching(&cache), &tracks, Some("0454736682783")).unwrap();
+        assert_eq!(s.value.method, Method::Tags);
+        assert_eq!(s.value.by, ["barcode", "title and artist"]);
+        let titles: Vec<&str> = s
+            .value
+            .found
+            .iter()
+            .map(|(_, c)| c.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Clover", "Clover (Single)"]);
+
+        // Not laid out like the album either: the barcode's comes first.
+        let other = serde_json::json!({"releases": [
+            found("d4444444-4444-4444-8444-444444444444", "Clover", 100, 5, "2026-08-29"),
+        ]});
+        mb::save_search(&cache, "release", title, &other.to_string());
+        let s = tag_candidates(searching(&cache), &tracks, Some("0454736682783")).unwrap();
+        assert_eq!(s.value.method, Method::Barcode);
+        let titles: Vec<&str> = s
+            .value
+            .found
+            .iter()
+            .map(|(_, c)| c.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Clover (Single)", "Clover"]);
+    }
+
+    #[test]
+    fn isrcs_find_the_release_holding_most_of_the_tracks() {
+        let cache = LookupCache::in_memory();
+        let deluxe = found(
+            "a1111111-1111-4111-8111-111111111111",
+            "Messiah (Deluxe)",
+            100,
+            5,
+            "2026-01-07",
+        );
+        let compilation = found(
+            "b2222222-2222-4222-8222-222222222222",
+            "Best",
+            100,
+            4,
+            "2027-01-01",
+        );
+        let original = found(
+            "c3333333-3333-4333-8333-333333333333",
+            "メシア",
+            100,
+            4,
+            "2026-01-07",
+        );
+        let english = found(
+            "d4444444-4444-4444-8444-444444444444",
+            "Messiah",
+            100,
+            4,
+            "2027-06-01",
+        );
+        let all = serde_json::json!([deluxe, compilation, original, english]);
+        let body = serde_json::json!({"recordings": [
+            {"id": "r1", "isrcs": ["JPB602601761"], "releases": all},
+            {"id": "r2", "isrcs": ["JPB602601762"], "releases": all},
+            {"id": "r3", "isrcs": ["JPB602601763", "USXX00000001"], "releases": all},
+            {"id": "r4", "isrcs": ["JPB602601764"], "releases": [deluxe, original, english]},
+        ]});
+        mb::save_search(
+            &cache,
+            "recording",
+            "isrc:(JPB602601761 OR JPB602601762 OR JPB602601763 OR JPB602601764)",
+            &body.to_string(),
+        );
+        let tracks: Vec<Local> = (1..=4)
+            .map(|i| {
+                local(
+                    i,
+                    &[
+                        ("album", "Messiah"),
+                        ("isrc", &format!("jp-b60-26-0176{i}")),
+                    ],
+                )
+            })
+            .collect();
+        let s = tag_candidates(searching(&cache), &tracks, None).unwrap();
+        assert_eq!(s.value.method, Method::Isrc);
+        let found: Vec<(u32, &str)> = s
+            .value
+            .found
+            .iter()
+            .map(|(share, c)| (*share, c.title.as_str()))
+            .collect();
+        // Every recording first, even on a release with a fifth track, and
+        // ahead of a compilation of the album's length holding three. Of
+        // equal ones, the album's title comes before the earlier release.
+        assert_eq!(
+            found,
+            [
+                (100, "Messiah"),
+                (100, "メシア"),
+                (100, "Messiah (Deluxe)"),
+                (75, "Best")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_few_isrcs_and_failed_searches_leave_the_title_search_to_decide() {
+        let cache = LookupCache::in_memory();
+        let tracks: Vec<Local> = (1..=3)
+            .map(|i| {
+                let isrc = format!("JPB60260177{i}");
+                local(
+                    i,
+                    &[
+                        ("album", "Soramimi"),
+                        ("album_artist", "Nanatsukaze"),
+                        ("isrc", &isrc),
+                    ],
+                )
+            })
+            .collect();
+        // One of the three, on a compilation.
+        let best = found(
+            "b2222222-2222-4222-8222-222222222222",
+            "Best",
+            100,
+            20,
+            "2027-01-01",
+        );
+        let body = serde_json::json!({"recordings": [{"id": "r1", "isrcs": ["JPB602601771"], "releases": [best]}]});
+        mb::save_search(
+            &cache,
+            "recording",
+            "isrc:(JPB602601771 OR JPB602601772 OR JPB602601773)",
+            &body.to_string(),
+        );
+        let search = |cache: &LookupCache| {
+            let s = tag_candidates(searching(cache), &tracks, Some("4571694792695")).unwrap();
+            let titles: Vec<(u32, String)> = s
+                .value
+                .found
+                .iter()
+                .map(|(score, c)| (*score, c.title.clone()))
+                .collect();
+            (s.value.method, titles, s.value.by)
+        };
+        // Nothing is saved for the barcode or the title search, so asking
+        // fails: with the compilation found, that only finds nothing.
+        let (method, titles, by) = search(&cache);
+        assert_eq!(by, ["barcode", "ISRC", "title and artist"]);
+        assert_eq!(
+            (method, titles),
+            (Method::Isrc, vec![(33, "Best".to_string())])
+        );
+
+        // Nothing good by title, and the artist search fails too.
+        let title = r#"release:"Soramimi" AND (artist:"Nanatsukaze" OR artistname:"Nanatsukaze")"#;
+        let poor = serde_json::json!({"releases": [found("e5555555-5555-4555-8555-555555555555", "Sora", 40, 1, "")]});
+        mb::save_search(&cache, "release", title, &poor.to_string());
+        assert_eq!(search(&cache).0, Method::Isrc);
+
+        // Found by title with a fourth track, which isn't here: still ahead
+        // of the compilation holding one of the three.
+        let ep = serde_json::json!({"releases": [found("f6666666-6666-4666-8666-666666666666", "Soramimi", 100, 4, "2026-02-01")]});
+        mb::save_search(&cache, "release", title, &ep.to_string());
+        let (method, titles, _) = search(&cache);
+        assert_eq!(method, Method::Tags);
+        assert_eq!(
+            titles,
+            [(100, "Soramimi".to_string()), (33, "Best".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_artist_credited_by_another_name_is_looked_up() {
+        let cache = LookupCache::in_memory();
+        let tracks = [local(
+            1,
+            &[("album", "Clover"), ("album_artist", "Ushio Reira")],
+        )];
+        // The release credits 汐れいら, so searching by "Ushio Reira" finds
+        // nothing good.
+        let poor = serde_json::json!({"releases": [found("e5555555-5555-4555-8555-555555555555", "Clover Field", 40, 1, "")]});
+        mb::save_search(
+            &cache,
+            "release",
+            r#"release:"Clover" AND (artist:"Ushio Reira" OR artistname:"Ushio Reira")"#,
+            &poor.to_string(),
+        );
+        let artists = serde_json::json!({"artists": [
+            {"id": "c9c4b066-7ac7-455a-aff5-b4684f769876", "name": "汐れいら", "score": 100,
+             "sort-name": "Ushio Reira", "aliases": [{"name": "Reira Ushio"}]},
+            {"id": "a2b6c01e-6b23-4a55-ba3f-52851b1d2664", "name": "汐れいら", "score": 96, "sort-name": "Ushio, Reira"},
+            {"id": "0b1c1b0e-7a1e-4c2f-9c2e-6b7f5e0c1d2a", "name": "Ushio Reira Band", "score": 90, "sort-name": "Ushio Reira Band"},
+            {"id": "e807d2cf-0b93-4ba1-ba89-f62347719dfd", "name": "REIRA", "score": 49, "sort-name": "REIRA"},
+        ]});
+        mb::save_search(
+            &cache,
+            "artist",
+            r#"artist:"Ushio Reira" OR sortname:"Ushio Reira" OR alias:"Ushio Reira""#,
+            &artists.to_string(),
+        );
+        let clover = serde_json::json!({"releases": [found("f6666666-6666-4666-8666-666666666666", "Clover", 100, 1, "2026-09-02")]});
+        mb::save_search(
+            &cache,
+            "release",
+            r#"release:"Clover" AND arid:("c9c4b066-7ac7-455a-aff5-b4684f769876" OR "a2b6c01e-6b23-4a55-ba3f-52851b1d2664")"#,
+            &clover.to_string(),
+        );
+        let s = tag_candidates(searching(&cache), &tracks, None).unwrap();
+        assert_eq!(s.value.method, Method::Tags);
+        assert_eq!(s.value.by, ["title and artist"]);
+        let ids: Vec<&str> = s.value.found.iter().map(|(_, c)| c.id.as_str()).collect();
+        assert_eq!(ids, ["f6666666-6666-4666-8666-666666666666"]);
+
+        // Tagged with the artist's own name: the first search matched them by
+        // it (`artistname`) whatever the release credits, so a search by
+        // their id would find nothing more and isn't made.
+        let tracks = [local(
+            1,
+            &[("album", "Clover"), ("album_artist", "汐れいら")],
+        )];
+        mb::save_search(
+            &cache,
+            "release",
+            r#"release:"Clover" AND (artist:"汐れいら" OR artistname:"汐れいら")"#,
+            &poor.to_string(),
+        );
+        mb::save_search(
+            &cache,
+            "artist",
+            r#"artist:"汐れいら" OR sortname:"汐れいら" OR alias:"汐れいら""#,
+            &serde_json::json!({"artists": [{"id": "c9c4b066-7ac7-455a-aff5-b4684f769876", "name": "汐れいら", "sort-name": "Ushio Reira"}]}).to_string(),
+        );
+        mb::save_search(
+            &cache,
+            "release",
+            r#"release:"Clover" AND arid:("c9c4b066-7ac7-455a-aff5-b4684f769876")"#,
+            &clover.to_string(),
+        );
+        let s = tag_candidates(searching(&cache), &tracks, None).unwrap();
+        assert!(s.value.found.is_empty());
+    }
+
+    #[test]
+    fn pairs_by_isrc_before_numbers() {
+        // Numbered the other way round from the release.
+        let tracks = [
+            local(1, &[("track_number", "1"), ("isrc", "se-abc-15-00001")]),
+            local(2, &[("track_number", "2")]),
+        ];
+        let out = suggestions(&tracks, &release(), None, ";");
+        assert_eq!(out[0].via, Some(Via::Isrc));
+        assert_eq!(out[0].position.as_deref(), Some("2"));
+        assert_eq!(find(&out[0], "title").unwrap().value, "Don’t Look Back");
+        // Its number is the ISRC'd track's, so it's left unpaired.
+        assert_eq!(out[1].via, None);
     }
 
     fn release() -> Release {

@@ -308,7 +308,7 @@ export interface Suggestion {
 }
 
 export interface Identification {
-	method: 'acoustid' | 'tags' | 'chosen';
+	method: 'acoustid' | 'barcode' | 'isrc' | 'tags' | 'chosen';
 	release: {
 		id: string;
 		title: string;
@@ -329,7 +329,7 @@ export interface Identification {
 	tracks: {
 		id: number;
 		/** How it was paired with the release's track; null if it wasn't. */
-		via: 'acoustid' | 'position' | 'title' | null;
+		via: 'acoustid' | 'isrc' | 'position' | 'title' | null;
 		position: string | null;
 		suggestions: Suggestion[];
 	}[];

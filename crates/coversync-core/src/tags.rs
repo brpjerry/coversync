@@ -310,6 +310,55 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
+/// The UPC some stores tag files with instead of a barcode, which lofty
+/// leaves out of its generic tags: a Vorbis comment (FLAC, Ogg) or an ID3v2
+/// TXXX frame (MP3, or an ID3v2 tag on a FLAC file).
+pub fn upc(path: &Path) -> Option<String> {
+    use lofty::flac::FlacFile;
+    use lofty::mpeg::MpegFile;
+    use lofty::ogg::{OpusFile, VorbisFile};
+    let file_type = Probe::open(path)
+        .ok()?
+        .guess_file_type()
+        .ok()?
+        .file_type()?;
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    let mut f = fs::File::open(path).ok()?;
+    let found = match file_type {
+        FileType::Flac => {
+            let file = FlacFile::read_from(&mut f, options).ok()?;
+            let vorbis = file
+                .vorbis_comments()
+                .and_then(|t| t.get("UPC"))
+                .filter(|v| !v.trim().is_empty());
+            vorbis
+                .or_else(|| file.id3v2().and_then(|t| t.get_user_text("UPC")))
+                .map(str::to_string)
+        }
+        FileType::Vorbis => VorbisFile::read_from(&mut f, options)
+            .ok()?
+            .vorbis_comments()
+            .get("UPC")
+            .map(str::to_string),
+        FileType::Opus => OpusFile::read_from(&mut f, options)
+            .ok()?
+            .vorbis_comments()
+            .get("UPC")
+            .map(str::to_string),
+        FileType::Mpeg => MpegFile::read_from(&mut f, options)
+            .ok()?
+            .id3v2()?
+            .get_user_text("UPC")
+            .map(str::to_string),
+        _ => None,
+    };
+    found
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Whether a `tag_type` tag can hold `kind` as text (numbers and dates
 /// always fit; some formats have no place for, say, MusicBrainz ids).
 pub fn can_store(tag_type: TagType, kind: &str) -> bool {
@@ -628,6 +677,54 @@ mod tests {
         let fronts = types.iter().filter(|t| **t == PictureType::CoverFront);
         assert_eq!(fronts.count(), 1);
         assert!(types.contains(&PictureType::CoverBack));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FLAC file with no audio, only these Vorbis comments.
+    fn flac_with_comments(path: &Path, comments: &[&str]) {
+        let mut b = b"fLaC".to_vec();
+        // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+        b.extend([
+            0x00, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+        ]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        let mut block = Vec::new();
+        let vendor = b"coversync";
+        block.extend((vendor.len() as u32).to_le_bytes());
+        block.extend(vendor);
+        block.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            block.extend((c.len() as u32).to_le_bytes());
+            block.extend(c.as_bytes());
+        }
+        // The last block: VORBIS_COMMENT.
+        b.push(0x80 | 4);
+        b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+        b.extend(block);
+        fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn a_upc_comment_is_read_though_lofty_leaves_it_out() {
+        let dir = std::env::temp_dir().join(format!("coversync-upc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(&path, &["TITLE=もし、", "upc= 4547366860535 "]);
+        assert_eq!(upc(&path).as_deref(), Some("4547366860535"));
+        // Not a barcode lofty knows, so not one read_kinds sees.
+        assert!(
+            !read_kinds(&path, false)
+                .unwrap()
+                .values
+                .contains_key("barcode")
+        );
+        flac_with_comments(&path, &["TITLE=もし、", "UPC= "]);
+        assert_eq!(upc(&path), None);
+        flac_with_comments(&path, &["TITLE=もし、"]);
+        assert_eq!(upc(&path), None);
+        assert_eq!(upc(&dir.join("missing.flac")), None);
         let _ = fs::remove_dir_all(&dir);
     }
 

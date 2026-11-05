@@ -337,14 +337,75 @@ impl<'a> Client<'a> {
     ) -> Result<Answer<Vec<Release>>> {
         let mut query = format!("release:{}", phrase(album));
         if let Some(artist) = artist {
-            query += &format!(" AND artist:{}", phrase(artist));
+            // As credited ("X feat. Y"), or by an artist's own name when the
+            // release credits them under another.
+            let artist = phrase(artist);
+            query += &format!(" AND (artist:{artist} OR artistname:{artist})");
         }
+        self.release_search(&query)
+    }
+
+    /// Releases titled `album` credited to any of the artists `ids`.
+    pub fn search_releases_by(&self, album: &str, ids: &[&str]) -> Result<Answer<Vec<Release>>> {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter(|id| is_mbid(id))
+            .map(|id| format!("\"{id}\""))
+            .collect();
+        if ids.is_empty() {
+            return Ok(Answer {
+                value: Vec::new(),
+                saved: None,
+            });
+        }
+        let query = format!("release:{} AND arid:({})", phrase(album), ids.join(" OR "));
+        self.release_search(&query)
+    }
+
+    /// Releases with this barcode. A 12-digit UPC is also asked for as the
+    /// 13-digit EAN it's written as elsewhere, and the other way round.
+    pub fn search_barcode(&self, barcode: &str) -> Result<Answer<Vec<Release>>> {
+        let mut codes = vec![barcode.to_string()];
+        match barcode.len() {
+            12 => codes.push(format!("0{barcode}")),
+            13 if barcode.starts_with('0') => codes.push(barcode[1..].to_string()),
+            _ => {}
+        }
+        self.release_search(&format!("barcode:({})", codes.join(" OR ")))
+    }
+
+    fn release_search(&self, query: &str) -> Result<Answer<Vec<Release>>> {
         let res = self.get(
             &format!("{MUSICBRAINZ_URL}/release"),
-            &[("query", &query), ("limit", "15"), ("fmt", "json")],
+            &[("query", query), ("limit", "15"), ("fmt", "json")],
             |r: &SearchResponse| !r.releases.is_empty(),
         )?;
         Ok(res.map(|r| r.releases))
+    }
+
+    /// Recordings with any of these ISRCs, each with the releases it's on.
+    pub fn search_isrcs(&self, isrcs: &[&str]) -> Result<Answer<Vec<FoundRecording>>> {
+        let query = format!("isrc:({})", isrcs.join(" OR "));
+        let res = self.get(
+            &format!("{MUSICBRAINZ_URL}/recording"),
+            &[("query", &query), ("limit", "100"), ("fmt", "json")],
+            |r: &RecordingSearch| !r.recordings.is_empty(),
+        )?;
+        Ok(res.map(|r| r.recordings))
+    }
+
+    /// Artists with `name` as their name, sort name or an alias, best first.
+    /// A release search matches artists by name, so this finds 汐れいら,
+    /// whose sort name is "Ushio Reira".
+    pub fn search_artists(&self, name: &str) -> Result<Answer<Vec<FoundArtist>>> {
+        let name = phrase(name);
+        let query = format!("artist:{name} OR sortname:{name} OR alias:{name}");
+        let res = self.get(
+            &format!("{MUSICBRAINZ_URL}/artist"),
+            &[("query", &query), ("limit", "5"), ("fmt", "json")],
+            |r: &ArtistSearch| !r.artists.is_empty(),
+        )?;
+        Ok(res.map(|r| r.artists))
     }
 }
 
@@ -357,6 +418,20 @@ const RELEASE_QUERY: &[(&str, &str)] = &[
     ("fmt", "json"),
 ];
 
+/// Save `body` as MusicBrainz's answer to a search of `entity` ("release",
+/// "recording" or "artist") for `query`, as the client asks it.
+#[cfg(test)]
+pub(crate) fn save_search(cache: &LookupCache, entity: &str, query: &str, body: &str) {
+    let limit = match entity {
+        "recording" => "100",
+        "artist" => "5",
+        _ => "15",
+    };
+    let url = format!("{MUSICBRAINZ_URL}/{entity}");
+    let request = mb_request(&url, &[("query", query), ("limit", limit), ("fmt", "json")]);
+    cache.put(Service::MusicBrainz, &request, body);
+}
+
 /// What MusicBrainz's answer to a request is saved under: the URL and its
 /// query, which says what the answer includes.
 fn mb_request(url: &str, query: &[(&str, &str)]) -> String {
@@ -368,6 +443,9 @@ fn mb_request(url: &str, query: &[(&str, &str)]) -> String {
 
 /// Each fingerprint's matches, as AcoustID sent them.
 fn lookup_batch(key: &str, prints: &[(u32, &str)]) -> Result<Vec<serde_json::Value>> {
+    if cfg!(test) {
+        return Err(Error::Remote("tests don't ask AcoustID".into()));
+    }
     let mut form: Vec<(String, String)> = [
         ("client", key),
         ("meta", META),
@@ -602,6 +680,39 @@ struct SearchResponse {
     releases: Vec<Release>,
 }
 
+/// A recording found by ISRC, with the releases it's on (as search results:
+/// no tracklists).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FoundRecording {
+    pub id: String,
+    #[serde(default)]
+    pub isrcs: Vec<String>,
+    #[serde(default)]
+    pub releases: Vec<Release>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordingSearch {
+    #[serde(default)]
+    recordings: Vec<FoundRecording>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FoundArtist {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "sort-name")]
+    pub sort_name: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistSearch {
+    #[serde(default)]
+    artists: Vec<FoundArtist>,
+}
+
 /// The credit as printed, e.g. "Artist feat. Other".
 pub fn credit_name(credit: &[Credit]) -> String {
     credit
@@ -631,6 +742,13 @@ pub fn is_mbid(id: &str) -> bool {
 
 /// The body of MusicBrainz's answer to a request.
 fn fetch(url: &str, query: &[(&str, &str)]) -> Result<String> {
+    if cfg!(test) {
+        // Tests answer from saved lookups; one that isn't saved is a mistake.
+        let request = mb_request(url, query);
+        return Err(Error::Remote(format!(
+            "tests don't ask MusicBrainz: {request}"
+        )));
+    }
     for attempt in 0.. {
         MUSICBRAINZ.wait();
         let mut req = AGENT.get(url).header("Accept", "application/json");
