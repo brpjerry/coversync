@@ -53,6 +53,7 @@
 	import ArrowRight from '@lucide/svelte/icons/arrow-right';
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+	import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import CircleCheck from '@lucide/svelte/icons/circle-check';
 	import Info from '@lucide/svelte/icons/info';
@@ -130,7 +131,8 @@
 	/** Romanized or original script, picked here; undefined for Inbox setup's choice. */
 	let romanize = $state<boolean>();
 
-	async function identify(refresh = false) {
+	/** `fresh`: ask AcoustID and MusicBrainz again rather than use saved lookups. */
+	async function identify(refresh = false, fresh = false) {
 		const mine = ++seq;
 		const failed = (e: unknown): IdentifyState => ({
 			state: 'failed',
@@ -138,7 +140,7 @@
 		});
 		let s: IdentifyState;
 		try {
-			s = await api.identify(albumId, picked, refresh, romanize);
+			s = await api.identify(albumId, picked, refresh, romanize, fresh);
 			while (s.state === 'running') {
 				if (mine !== seq) return;
 				lookup = s;
@@ -426,14 +428,37 @@
 		if (cover?.art && want !== artOn && !(want && artSmaller)) toggleArt(want);
 	}
 
-	/** Look again, after taking back what this lookup's suggestions filled in. */
-	function relook() {
-		setAll(() => false);
+	/**
+	 * Put back the fields this lookup's suggestions filled in, where they
+	 * still hold the suggestion, and untick the rest. A field typed in since,
+	 * or one that matched a suggestion without being filled by it, stays.
+	 */
+	function takeBack() {
+		for (const row of rows) {
+			if (!row.field) continue;
+			for (const id of row.field === 'album' ? [null] : row.ids) {
+				const before = restore.get(`${id}:${row.kind}`);
+				const suggested = id === null ? row.value : row.values[id];
+				if (before !== undefined && getField(id, row.kind).trim() === suggested.trim()) {
+					setField(id, row.kind, before);
+				}
+			}
+		}
 		restore.clear();
+		chosen.clear();
+		if (artOn) toggleArt(false);
+	}
+
+	/**
+	 * Look again, after taking back what this lookup's suggestions filled in;
+	 * `fresh` asks AcoustID and MusicBrainz rather than use saved lookups.
+	 */
+	function relook(fresh = false) {
+		takeBack();
 		opened.clear();
 		rows = [];
 		cover = null;
-		identify();
+		identify(fresh, fresh);
 	}
 	function switchRelease(id: string) {
 		picked = id;
@@ -523,6 +548,19 @@
 		if (result.method === 'chosen') return 'Picked by you';
 		if (result.method === 'tags') return 'Found by title and artist';
 		return `Identified by audio: AcoustID recognized ${result.recognized} of ${tracks.length} ${tracks.length === 1 ? 'track' : 'tracks'}`;
+	});
+
+	/** When the saved lookups shown were made, if they weren't made just now. */
+	let lookedUp = $derived.by(() => {
+		if (!result?.saved) return '';
+		const at = new Date(result.saved * 1000);
+		const now = new Date();
+		if (at.toDateString() === now.toDateString()) return 'today';
+		return at.toLocaleDateString(undefined, {
+			month: 'short',
+			day: 'numeric',
+			year: at.getFullYear() === now.getFullYear() ? undefined : 'numeric'
+		});
 	});
 
 	function candidateText(c: Identification['candidates'][number]) {
@@ -717,16 +755,40 @@
 					]
 						.filter(Boolean)
 						.join(' · ')}
-					<span class="how">{how}</span>
+					<span class="how"
+						>{how}{#if lookedUp}<span
+								class="saved"
+								title="Saved answers from AcoustID and MusicBrainz. Look up again to ask them now."
+								>{` · looked up ${lookedUp}`}</span
+							>{/if}</span
+					>
 				</p>
 			{:else}
-				<p class="stage">MusicBrainz has nothing for this album.</p>
+				<p class="stage">
+					MusicBrainz has nothing for this album.{#if lookedUp}<span
+							class="saved"
+							title="Saved answers from AcoustID and MusicBrainz. Look up again to ask them now."
+							>{` · looked up ${lookedUp}`}</span
+						>{/if}
+				</p>
 			{/if}
 		</div>
 		<div class="head-actions">
 			{#if lookup?.state === 'failed'}
-				<button class="btn sm" onclick={() => identify(true)}>
-					<RefreshCw size={14} /> Retry
+				<button
+					class="btn sm"
+					onclick={() => identify(true)}
+					title="Try again, using what was looked up before the failure"
+				>
+					<RotateCcw size={14} /> Retry
+				</button>
+				<button
+					class="btn sm square"
+					onclick={() => relook(true)}
+					title="Look up again on AcoustID and MusicBrainz, instead of using what was saved"
+					aria-label="Look up again"
+				>
+					<RefreshCw size={14} />
 				</button>
 			{:else if result?.release}
 				<a
@@ -736,6 +798,22 @@
 					rel="noreferrer"
 					title="Open the release on MusicBrainz">MusicBrainz <ExternalLink size={13} /></a
 				>
+				<button
+					class="btn sm square"
+					onclick={() => relook(true)}
+					title="Look up again on AcoustID and MusicBrainz, instead of using what was saved"
+					aria-label="Look up again"
+				>
+					<RefreshCw size={14} />
+				</button>
+			{:else if result}
+				<button
+					class="btn sm"
+					onclick={() => relook(true)}
+					title="Ask AcoustID and MusicBrainz again, instead of using what was saved"
+				>
+					<RefreshCw size={14} /> Look up again
+				</button>
 			{/if}
 		</div>
 	</header>
@@ -958,6 +1036,10 @@
 		display: block;
 		color: var(--accent);
 	}
+	.how .saved,
+	.stage .saved {
+		color: var(--text-3);
+	}
 	.progress {
 		display: block;
 		height: 3px;
@@ -1001,6 +1083,11 @@
 		padding: 0 11px;
 		font-size: 12.5px;
 		text-decoration: none;
+	}
+	.head-actions .btn.square {
+		justify-content: center;
+		width: 30px;
+		padding: 0;
 	}
 	.pick {
 		display: flex;

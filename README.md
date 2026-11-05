@@ -41,7 +41,11 @@ Early days: single user, no authentication, used on a home server.
   for empty tags and corrections for differing ones. **Prefer English**
   suggests romanized or English titles and artist names for releases in other
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
-  Korean names family name first.
+  Korean names family name first. AcoustID's and MusicBrainz's answers are
+  saved, so an album identified before (one imported again, say) is only
+  fingerprinted; the dialog says when the lookup was made, and **Look up
+  again** asks both services afresh. Answers that found nothing aren't
+  saved, so those are asked again each time.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
 - **Sync** (planned): the sidebar's Sync section will list the devices the
@@ -93,11 +97,12 @@ Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
 - `--listen` (default `127.0.0.1:8770`). There is no authentication, so keep
   it on localhost or behind a reverse proxy that adds some.
 - `--state-dir` and `--cache-dir`: the local database, `inbox.sqlite3`
-  (default `$XDG_STATE_HOME/coversync`), and cover thumbnails
-  (`$XDG_CACHE_HOME/coversync`). The local database holds the Inbox's index,
-  the Inbox files already imported, and this installation's settings: Inbox
-  setup, Appearance, Sync setup, the Library folder's location and the
-  AcoustID key, which is never sent to the browser. A database from before
+  (default `$XDG_STATE_HOME/coversync`), and cover thumbnails, MusicBrainz's
+  cover images and the saved AcoustID and MusicBrainz lookups,
+  `lookups.sqlite3` (`$XDG_CACHE_HOME/coversync`). The local database holds
+  the Inbox's index, the Inbox files already imported, and this
+  installation's settings: Inbox setup, Appearance, Sync setup, the Library
+  folder's location and the AcoustID key, which is never sent to the browser. A database from before
   the Library had its own, `library.sqlite3`, is renamed on first start;
   rename it back before going back to an older release.
   Everything in the cache directory is rebuilt when missing.

@@ -12,6 +12,8 @@ Needs `geckodriver` and python-websocket-client (for console logs).
     (scratch daemons only: it imports the album); --superset names one that
     AcoustID matches to a bigger release, to check the warning.
 --romanize ALBUM tries Prefer English the same way, on an album in another script.
+--lookup-again ALBUM opens the import dialog on an album identified before, which
+    should say when it was looked up, then presses Look up again (nothing is imported).
 --art FOLDER and --import FOLDER try album art rules and importing, with FOLDER
     as the scratch Library.
 """
@@ -664,6 +666,35 @@ def romanize_flow(d, out, tag, album):
     print("toast:", [t for t in d.toasts() if 'Imported' in t][-1:])
 
 
+def lookup_again_flow(d, out, tag, album):
+    """An album identified before: the saved lookup, then Look up again, at desktop and phone widths."""
+    open_import(d, album)
+    wait_suggestions(d)
+    describe_suggestions(d, "saved", 3)
+    print("   actions:", d.js("return [...document.querySelectorAll('.suggest .head-actions > *')].map(b => b.getAttribute('aria-label') || b.textContent.trim())"))
+    d.shot(out / f"13a-saved-lookup-{tag}.png")
+    d.resize(390, 844)
+    time.sleep(0.6)
+    d.shot(out / f"13b-saved-lookup-phone-{tag}.png")
+    d.resize(1440, 1000)
+    time.sleep(0.4)
+    # A ticked suggestion is taken back before looking up again.
+    print("ticked:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
+    ticked = d.js("const i = document.querySelector('.suggest .sugg.change input[type=checkbox]:not(:checked):not(:disabled)'); i?.click(); return !!i")
+    if ticked:
+        time.sleep(0.3)
+        print("after ticking a change:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
+    else:
+        print("no unticked change to tick")
+    d.click(".suggest .head-actions button[aria-label='Look up again']")
+    d.wait("return !!document.querySelector('.suggest .stage')", 10)
+    print("looking up:", d.js(SUGGEST_TEXT, ".suggest .stage"))
+    d.wait("return !!document.querySelector('.suggest .match') || !!document.querySelector('.suggest .error')", 60)
+    time.sleep(0.8)
+    describe_suggestions(d, "looked up again", 3)
+    d.shot(out / f"13c-looked-up-again-{tag}.png")
+
+
 def suggest_flow(d, out, tag, album, superset=None):
     """Scratch daemons only: Smart suggestions in Inbox setup, then importing with them."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
@@ -750,6 +781,9 @@ def main():
             return
         if "--romanize" in sys.argv:
             romanize_flow(d, out, tag, option("--romanize"))
+            return
+        if "--lookup-again" in sys.argv:
+            lookup_again_flow(d, out, tag, option("--lookup-again"))
             return
         if "--suggest" in sys.argv:
             superset = option("--superset") if "--superset" in sys.argv else None

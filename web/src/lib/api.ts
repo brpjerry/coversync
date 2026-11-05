@@ -332,6 +332,11 @@ export interface Identification {
 		suggestions: Suggestion[];
 	}[];
 	notes: string[];
+	/**
+	 * When the oldest saved lookup used was made (Unix seconds); null when
+	 * AcoustID and MusicBrainz were asked just now.
+	 */
+	saved: number | null;
 	/** Present when the release's titles or names don't sort A–Z. */
 	romanization: {
 		/** Suggestions are romanized, rather than in the original script. */
@@ -450,12 +455,20 @@ export const api = {
 	/**
 	 * Start looking the album up on MusicBrainz (or get the lookup under way).
 	 * `romanize` overrides Inbox setup's Prefer English for this album.
+	 * `refresh` starts over; `fresh` also asks AcoustID and MusicBrainz again
+	 * instead of using their saved answers.
 	 */
-	identify: (album_id: string, release_id?: string, refresh = false, romanize?: boolean) =>
+	identify: (
+		album_id: string,
+		release_id?: string,
+		refresh = false,
+		romanize?: boolean,
+		fresh = false
+	) =>
 		request<IdentifyState>('/api/identify', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ album_id, release_id, refresh, romanize })
+			body: JSON.stringify({ album_id, release_id, refresh, romanize, fresh })
 		}),
 	identifyStatus: (album_id: string) =>
 		request<IdentifyState>(`/api/identify/${encodeURIComponent(album_id)}`),

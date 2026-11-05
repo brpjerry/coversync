@@ -5,9 +5,11 @@
 //!
 //! `identify` does the slow part once (reading, fingerprinting, lookups) and
 //! keeps it as `Evidence`, so `suggest` can switch to another release with a
-//! single MusicBrainz request.
+//! single MusicBrainz request. Lookups are answered from the
+//! [`LookupCache`] where they were made before, so an album identified once
+//! is identified again without asking either service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,6 +19,7 @@ use lofty::tag::TagType;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::lookups::{LookupCache, oldest};
 use crate::musicbrainz::{self as mb, AcoustResult, Medium, Release};
 use crate::romanize::{self, sorts_az};
 use crate::{Error, Library, Result, import, tags};
@@ -166,6 +169,9 @@ pub struct Identification {
     pub notes: Vec<String>,
     /// Present when the release doesn't sort A–Z, romanized or not.
     pub romanization: Option<Romanization>,
+    /// When the oldest saved lookup used was made (seconds since the Unix
+    /// epoch); None when AcoustID and MusicBrainz were asked just now.
+    pub saved: Option<i64>,
 }
 
 /// One of the album's tracks, as the matching sees it.
@@ -189,12 +195,18 @@ pub struct Evidence {
     fingerprinted: u32,
     recognized: u32,
     notes: Vec<String>,
-    /// Releases fetched so far, so switching back and forth is quick.
-    releases: Mutex<HashMap<String, Arc<Release>>>,
+    /// The lookups asked the services again rather than use saved answers;
+    /// releases fetched for this evidence later do too.
+    fresh: bool,
+    /// When the oldest saved answer the lookups used was saved.
+    saved: Option<i64>,
+    /// Releases fetched so far, with when each was saved, so switching back
+    /// and forth is quick.
+    releases: Mutex<HashMap<String, mb::Answer<Arc<Release>>>>,
 }
 
 impl Evidence {
-    fn release(&self, id: &str) -> Result<Arc<Release>> {
+    fn release(&self, cache: &LookupCache, id: &str) -> Result<mb::Answer<Arc<Release>>> {
         let cached = self
             .releases
             .lock()
@@ -204,14 +216,19 @@ impl Evidence {
         if let Some(r) = cached {
             return Ok(r);
         }
-        let release = match mb::release(id) {
+        let client = mb::Client {
+            cache,
+            fresh: self.fresh,
+        };
+        let found = match client.release(id) {
             Err(Error::NotFound) => {
                 return Err(Error::Remote(format!(
                     "MusicBrainz has no release {id} any more."
                 )));
             }
-            r => Arc::new(r?),
+            r => r?,
         };
+        let release = found.map(Arc::new);
         self.releases
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -221,7 +238,11 @@ impl Evidence {
 
     /// A Latin-script tracklist of `release`: a linked one, else one among
     /// the candidates sharing its recordings.
-    fn tracklist(&self, release: &Release) -> Option<Arc<Release>> {
+    fn tracklist(
+        &self,
+        cache: &LookupCache,
+        release: &Release,
+    ) -> Option<mb::Answer<Arc<Release>>> {
         let total: u32 = release.media.iter().map(|m| m.tracks.len() as u32).sum();
         let linked = romanize::linked_tracklists(release);
         let others = self
@@ -237,10 +258,10 @@ impl Evidence {
         };
         ids.iter().take(3).find_map(|id| {
             let list = self
-                .release(id)
+                .release(cache, id)
                 .inspect_err(|e| tracing::warn!("tracklist {id}: {e}"))
                 .ok()?;
-            romanize::is_tracklist_for(&list, release).then_some(list)
+            romanize::is_tracklist_for(&list.value, release).then_some(list)
         })
     }
 }
@@ -386,8 +407,9 @@ fn consensus<'a>(tracks: &'a [Local], kind: &str) -> Option<&'a str> {
 /// A release AcoustID's recordings appear on, with the tracks found there.
 struct Tally<'a> {
     release: &'a mb::AcoustRelease,
-    /// Local track index -> best match score.
-    scores: HashMap<usize, f64>,
+    /// Local track index -> best match score, in track order so equal
+    /// releases' scores add up to exactly the same total.
+    scores: BTreeMap<usize, f64>,
 }
 
 impl Tally<'_> {
@@ -438,7 +460,7 @@ fn audio_candidates(tracks: &[Local], results: &[Vec<AcoustResult>]) -> (Vec<Can
                 for release in &rec.releases {
                     let tally = tallies.entry(release.id.as_str()).or_insert(Tally {
                         release,
-                        scores: HashMap::new(),
+                        scores: BTreeMap::new(),
                     });
                     let best = tally.scores.entry(i).or_default();
                     *best = best.max(result.score);
@@ -477,14 +499,22 @@ fn audio_candidates(tracks: &[Local], results: &[Vec<AcoustResult>]) -> (Vec<Can
 
 /// Releases found by searching for the album's title and artist, best
 /// first, with MusicBrainz's score for each (100: title and artist exact).
-fn tag_candidates(tracks: &[Local]) -> Result<Vec<(u32, Candidate)>> {
+fn tag_candidates(
+    client: mb::Client,
+    tracks: &[Local],
+) -> Result<mb::Answer<Vec<(u32, Candidate)>>> {
     let Some(album) = consensus(tracks, "album") else {
-        return Ok(Vec::new());
+        return Ok(mb::Answer {
+            value: Vec::new(),
+            saved: None,
+        });
     };
     let artist = consensus(tracks, "album_artist").or_else(|| consensus(tracks, "artist"));
     let n = tracks.len() as u32;
     let year_now = consensus(tracks, "date").and_then(year);
-    let mut found: Vec<(i64, (u32, Candidate))> = mb::search_releases(album, artist)?
+    let search = client.search_releases(album, artist)?;
+    let mut found: Vec<(i64, (u32, Candidate))> = search
+        .value
         .into_iter()
         .filter(|r| r.score.unwrap_or(0) >= MIN_SEARCH_SCORE)
         .map(|r| {
@@ -510,18 +540,23 @@ fn tag_candidates(tracks: &[Local]) -> Result<Vec<(u32, Candidate)>> {
         })
         .collect();
     found.sort_by_key(|a| std::cmp::Reverse(a.0));
-    Ok(found
-        .into_iter()
-        .map(|(_, c)| c)
-        .take(MAX_CANDIDATES)
-        .collect())
+    Ok(mb::Answer {
+        value: found
+            .into_iter()
+            .map(|(_, c)| c)
+            .take(MAX_CANDIDATES)
+            .collect(),
+        saved: search.saved,
+    })
 }
 
 /// Read, fingerprint and look up `album_id`, then suggest tags from the
 /// release that fits best. `key` is the AcoustID API key; without it (or
-/// fpcalc) the album is matched by its tags alone.
+/// fpcalc) the album is matched by its tags alone. Lookups made before are
+/// answered from `client`'s cache unless it asks for fresh ones.
 pub fn identify(
     lib: &Library,
+    client: mb::Client,
     album_id: &str,
     key: Option<&str>,
     romanize: Option<romanize::Options>,
@@ -552,6 +587,7 @@ pub fn identify(
         .collect();
 
     let mut notes = Vec::new();
+    let mut saved = None;
     let mut fingerprinted = 0;
     let mut results: Vec<Vec<AcoustResult>> = vec![Vec::new(); tracks.len()];
     match (key, fpcalc_version()) {
@@ -598,7 +634,9 @@ pub fn identify(
                 total: fingerprinted,
             });
             let prints: Vec<(u32, &str)> = sent.iter().map(|(_, d, f)| (*d, *f)).collect();
-            for ((i, _, _), found) in sent.iter().zip(mb::lookup(key, &prints)?) {
+            let found = client.lookup(key, &prints)?;
+            saved = found.saved;
+            for ((i, _, _), found) in sent.iter().zip(found.value) {
                 results[*i] = found;
             }
         }
@@ -632,7 +670,9 @@ pub fn identify(
             done: 0,
             total: 1,
         });
-        let tagged = tag_candidates(&tracks)?;
+        let search = tag_candidates(client, &tracks)?;
+        saved = oldest(saved, search.saved);
+        let tagged = search.value;
         let exact = tagged
             .iter()
             .position(|(score, c)| *score == 100 && complete(c));
@@ -682,11 +722,14 @@ pub fn identify(
         fingerprinted,
         recognized,
         notes,
+        fresh: client.fresh,
+        saved,
         releases: Mutex::default(),
     };
     let result = match evidence.candidates.first() {
         Some(best) => suggest(
             &evidence,
+            client.cache,
             &best.id.clone(),
             false,
             romanize,
@@ -702,6 +745,7 @@ pub fn identify(
             tracks: Vec::new(),
             notes: evidence.notes.clone(),
             romanization: None,
+            saved: evidence.saved,
         },
     };
     Ok((evidence, result))
@@ -710,9 +754,12 @@ pub fn identify(
 /// Suggest tags from release `release_id`; `chosen` when picked by hand.
 /// With `romanize`, titles and names that don't sort A–Z are suggested in
 /// Latin script where MusicBrainz has them, written as its options say.
-/// Tags with several values have them joined by `separator`.
+/// Tags with several values have them joined by `separator`. Releases are
+/// fetched as `identify` fetched the evidence: from `cache` where they were
+/// fetched before, unless it asked the services again.
 pub fn suggest(
     evidence: &Evidence,
+    cache: &LookupCache,
     release_id: &str,
     chosen: bool,
     romanize: Option<romanize::Options>,
@@ -724,7 +771,9 @@ pub fn suggest(
         done: 0,
         total: 1,
     });
-    let release = evidence.release(release_id)?;
+    let found = evidence.release(cache, release_id)?;
+    let mut saved = oldest(evidence.saved, found.saved);
+    let release = found.value;
     let (shown, romanization) = if !romanize::needs_romanizing(&release) {
         (None, None)
     } else if let Some(options) = romanize {
@@ -733,7 +782,10 @@ pub fn suggest(
             done: 0,
             total: 1,
         });
-        let list = evidence.tracklist(&release);
+        let list = evidence.tracklist(cache, &release).map(|list| {
+            saved = oldest(saved, list.saved);
+            list.value
+        });
         let (romanized, counts) = romanize::romanize(&release, list.as_deref(), options);
         let tracklist = list.map(|l| Tracklist {
             id: l.id.clone(),
@@ -784,6 +836,7 @@ pub fn suggest(
         },
         notes: evidence.notes.clone(),
         romanization,
+        saved,
     })
 }
 
@@ -1483,6 +1536,30 @@ mod tests {
 
         let (none, trusted) = audio_candidates(&tracks, &[Vec::new(), Vec::new()]);
         assert!(none.is_empty() && !trusted);
+    }
+
+    #[test]
+    fn equal_releases_rank_the_same_every_time() {
+        // Two releases every track is on: their sums of scores must come out
+        // exactly equal, so the stable order picks, not rounding.
+        let n = 60;
+        let results: Vec<Vec<AcoustResult>> = (0..n)
+            .map(|i| {
+                let score = 0.5 + f64::from(i * 37 % 50) / 101.0;
+                serde_json::from_str(&format!(
+                    r#"[{{"id": "a{i}", "score": {score}, "recordings": [{{"id": "rec-{i}", "releases": [
+                        {{"id": "b", "title": "Album", "track_count": {n}}},
+                        {{"id": "a", "title": "Album", "track_count": {n}}}
+                    ]}}]}}]"#
+                ))
+                .unwrap()
+            })
+            .collect();
+        let tracks: Vec<Local> = (0..n).map(|i| local(i.into(), &[])).collect();
+        for _ in 0..20 {
+            let (candidates, _) = audio_candidates(&tracks, &results);
+            assert_eq!(candidates[0].id, "a");
+        }
     }
 
     #[test]
