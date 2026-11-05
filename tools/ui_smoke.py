@@ -680,9 +680,12 @@ def lookup_again_flow(d, out, tag, album):
     time.sleep(0.4)
     # A ticked suggestion is taken back before looking up again.
     print("ticked:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
-    d.js("const r = [...document.querySelectorAll('.suggest .sugg.change')].find(r => !r.querySelector('input').checked); r.querySelector('input').click()")
-    time.sleep(0.3)
-    print("after ticking a change:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
+    ticked = d.js("const i = document.querySelector('.suggest .sugg.change input[type=checkbox]:not(:checked):not(:disabled)'); i?.click(); return !!i")
+    if ticked:
+        time.sleep(0.3)
+        print("after ticking a change:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
+    else:
+        print("no unticked change to tick")
     d.click(".suggest .head-actions button[aria-label='Look up again']")
     d.wait("return !!document.querySelector('.suggest .stage')", 10)
     print("looking up:", d.js(SUGGEST_TEXT, ".suggest .stage"))

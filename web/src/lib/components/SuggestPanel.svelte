@@ -429,12 +429,32 @@
 	}
 
 	/**
+	 * Put back the fields this lookup's suggestions filled in, where they
+	 * still hold the suggestion, and untick the rest. A field typed in since,
+	 * or one that matched a suggestion without being filled by it, stays.
+	 */
+	function takeBack() {
+		for (const row of rows) {
+			if (!row.field) continue;
+			for (const id of row.field === 'album' ? [null] : row.ids) {
+				const before = restore.get(`${id}:${row.kind}`);
+				const suggested = id === null ? row.value : row.values[id];
+				if (before !== undefined && getField(id, row.kind).trim() === suggested.trim()) {
+					setField(id, row.kind, before);
+				}
+			}
+		}
+		restore.clear();
+		chosen.clear();
+		if (artOn) toggleArt(false);
+	}
+
+	/**
 	 * Look again, after taking back what this lookup's suggestions filled in;
 	 * `fresh` asks AcoustID and MusicBrainz rather than use saved lookups.
 	 */
 	function relook(fresh = false) {
-		setAll(() => false);
-		restore.clear();
+		takeBack();
 		opened.clear();
 		rows = [];
 		cover = null;

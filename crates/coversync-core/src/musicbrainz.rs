@@ -222,7 +222,9 @@ impl Client<'_> {
                 let Some(s) = self.cache.get(Service::AcoustId, request) else {
                     continue;
                 };
-                match serde_json::from_str(&s.body) {
+                match serde_json::from_str::<Vec<AcoustResult>>(&s.body) {
+                    // Found nothing: saved by an earlier build, and asked again.
+                    Ok(results) if results.is_empty() => {}
                     Ok(results) => {
                         *slot = Some(results);
                         saved = lookups::oldest(saved, Some(s.at));
@@ -254,8 +256,9 @@ impl Client<'_> {
         })
     }
 
-    /// The answer to a MusicBrainz request: saved, or asked for and saved
-    /// if it's `worth_saving` (otherwise it replaces nothing).
+    /// The answer to a MusicBrainz request: saved, or asked for and saved,
+    /// if it's `worth_saving`. One that isn't is never used from the cache,
+    /// and a fresh one drops what was saved.
     fn get<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -278,12 +281,14 @@ impl Client<'_> {
             && let Some(s) = self.cache.get(Service::MusicBrainz, &request)
         {
             match serde_json::from_str(&s.body) {
-                Ok(value) => {
+                Ok(value) if worth_saving(&value) => {
                     return Ok(Answer {
                         value,
                         saved: Some(s.at),
                     });
                 }
+                // Not worth saving: saved by an earlier build, and asked again.
+                Ok(_) => {}
                 Err(e) => tracing::warn!(
                     request,
                     "a saved MusicBrainz answer is unreadable, asking again: {e}"
@@ -833,6 +838,8 @@ mod tests {
         }
         // Saved, but unreadable: asked about again.
         cache.put(Service::AcoustId, &print_request(200, "fp6"), "[{");
+        // Saved as finding nothing (as an earlier build did): asked about again.
+        cache.put(Service::AcoustId, &print_request(200, "fp9"), "[]");
         let client = Client {
             cache: &cache,
             fresh: false,
@@ -842,14 +849,15 @@ mod tests {
         let found = client
             .lookup_with(&prints, acoustid(&mut sent, "asked"))
             .unwrap();
-        // The 30 never saved and the unreadable one, in batches of 20.
-        assert_eq!(sent.iter().map(Vec::len).collect::<Vec<_>>(), [20, 11]);
+        // The 30 never saved, the unreadable one and the empty one, in batches of 20.
+        assert_eq!(sent.iter().map(Vec::len).collect::<Vec<_>>(), [20, 12]);
         assert!(sent.concat().contains(&"fp6".to_string()));
+        assert!(sent.concat().contains(&"fp9".to_string()));
         assert!(!sent.concat().contains(&"fp3".to_string()));
         for (i, results) in found.value.iter().enumerate() {
             let expected = match i {
                 7 => None,
-                i if i % 3 == 0 && i != 6 => Some(format!("saved-fp{i}")),
+                i if i % 3 == 0 && i != 6 && i != 9 => Some(format!("saved-fp{i}")),
                 i => Some(format!("asked-fp{i}")),
             };
             assert_eq!(results.first().map(|r| &r.id), expected.as_ref(), "fp{i}");
@@ -922,6 +930,10 @@ mod tests {
         // An unreadable saved answer is asked for again.
         cache.put(Service::MusicBrainz, &mb_request(&url, &query), "{");
         assert_eq!(search(&client, Some(r2)), (Some("r2".into()), false));
+        // So is one that found nothing, as an earlier build saved.
+        cache.put(Service::MusicBrainz, &mb_request(&url, &query), nothing);
+        assert_eq!(search(&client, Some(r1)), (Some("r1".into()), false));
+        assert_eq!(search(&client, None), (Some("r1".into()), true));
     }
 
     #[test]
