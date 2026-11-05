@@ -1,7 +1,8 @@
 //! Smart suggestions as background jobs. Identifying an album takes a few
 //! seconds (fingerprinting, rate-limited web lookups), so the import dialog
 //! starts a job and polls it for progress and the result. The lookups'
-//! answers are saved, so identifying the album again only fingerprints it.
+//! answers are saved (unless Inbox setup's Save lookups is off), so
+//! identifying the album again only fingerprints it.
 //! MusicBrainz's cover art is downloaded when the dialog asks for it, and
 //! cached.
 
@@ -35,10 +36,13 @@ impl Jobs {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Forget every result, e.g. when the AcoustID key changes.
+    /// Forget every result, e.g. when the AcoustID key changes. A job still
+    /// running finishes for the dialog waiting on it, but isn't reused.
     pub fn clear(&self) {
-        self.lock()
-            .retain(|_, j| matches!(j.state, JobState::Running(_)));
+        self.lock().retain(|_, j| {
+            j.stale = true;
+            matches!(j.state, JobState::Running(_))
+        });
     }
 
     pub fn forget(&self, album_id: &str) {
@@ -53,6 +57,9 @@ struct Job {
     romanize: Option<bool>,
     /// Tells a superseded job's thread not to overwrite its successor.
     generation: u64,
+    /// Started under settings since changed: neither its result nor its
+    /// evidence is reused.
+    stale: bool,
     finished: Option<Instant>,
     state: JobState,
     /// Kept from the first identification so other releases come quickly.
@@ -120,8 +127,9 @@ pub async fn start(
     let refresh = req.refresh || req.fresh;
     let mut jobs = state.identify.lock();
     let previous = jobs.get(&req.album_id);
+    let reusable = previous.filter(|j| !refresh && !j.stale);
     if let Some(job) =
-        previous.filter(|j| !refresh && j.release == req.release_id && j.romanize == req.romanize)
+        reusable.filter(|j| j.release == req.release_id && j.romanize == req.romanize)
     {
         let fresh = match job.state {
             JobState::Running(_) => true,
@@ -132,14 +140,14 @@ pub async fn start(
             return Ok(Json(job.into()));
         }
     }
-    let evidence = previous
-        .filter(|_| !refresh)
-        .and_then(|j| j.evidence.clone());
+    let evidence = reusable.and_then(|j| j.evidence.clone());
+    // Counted on from a stale job too, so it can't overwrite this one.
     let generation = previous.map_or(0, |j| j.generation + 1);
     let job = Job {
         release: req.release_id.clone(),
         romanize: req.romanize,
         generation,
+        stale: false,
         finished: None,
         state: JobState::Running(Step {
             stage: Stage::Reading,
@@ -176,7 +184,8 @@ pub async fn start(
             let best = evidence
                 .as_ref()
                 .and_then(|ev| ev.candidates.first().map(|c| c.id.clone()));
-            let lookups = &state.lookups;
+            // Saved lookups are used and kept only while Inbox setup says so.
+            let lookups = setup.save_lookups.then_some(&state.lookups);
             match (release.as_deref().or(best.as_deref()), evidence) {
                 (Some(r), Some(ev)) => Ok((
                     None,
@@ -395,4 +404,41 @@ pub fn chosen_art(state: &AppState, release: &str) -> coversync_core::Result<Art
         )
     })?;
     Art::new(fs::read(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(state: JobState) -> Job {
+        Job {
+            release: None,
+            romanize: None,
+            generation: 3,
+            stale: false,
+            finished: None,
+            state,
+            evidence: None,
+        }
+    }
+
+    #[test]
+    fn clearing_keeps_running_jobs_but_marks_them_stale() {
+        let jobs = Jobs::default();
+        let running = JobState::Running(Step {
+            stage: Stage::Reading,
+            done: 0,
+            total: 0,
+        });
+        jobs.lock().insert("running".into(), job(running));
+        jobs.lock()
+            .insert("failed".into(), job(JobState::Failed("x".into())));
+        jobs.clear();
+        let kept = jobs.lock();
+        assert!(!kept.contains_key("failed"));
+        // Still there for the dialog polling it, and for its generation.
+        let running = &kept["running"];
+        assert!(running.stale);
+        assert_eq!(running.generation, 3);
+    }
 }

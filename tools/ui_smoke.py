@@ -128,7 +128,8 @@ class Driver:
         self._click(self.s("POST", "/element", {"using": "css selector", "value": css}))
 
     def click_text(self, scope, text):
-        xpath = f"//{scope}//button[normalize-space(.)='{text}' or starts-with(normalize-space(.), '{text} ')]"
+        """Click a button by its text; switches (such as Save lookups for "Save") are left alone."""
+        xpath = f"//{scope}//button[not(@role='switch')][normalize-space(.)='{text}' or starts-with(normalize-space(.), '{text} ')]"
         self._click(self.s("POST", "/element", {"using": "xpath", "value": xpath}))
 
     def click_xpath(self, xpath):

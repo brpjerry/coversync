@@ -261,6 +261,8 @@ export interface InboxSetup {
 		prefer_english: boolean;
 		/** Romanized Chinese, Japanese and Korean names of people, family name first. */
 		family_name_first: boolean;
+		/** Keep AcoustID's and MusicBrainz's answers, so an album is looked up once. */
+		save_lookups: boolean;
 	};
 }
 

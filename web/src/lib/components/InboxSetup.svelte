@@ -292,6 +292,12 @@
 							disabled={!inboxSetup.preferEnglish}
 							nested
 						/>
+						<Toggle
+							bind:checked={inboxSetup.saveLookups}
+							label="Save lookups"
+							description="Keep AcoustID's and MusicBrainz's answers, so an album looked up before (one imported again, say) isn't looked up again. Off, every album is looked up afresh, and answers saved before are left unused."
+							nested
+						/>
 					</div>
 					<div class="suggest-setup" transition:slide={{ duration: 260, easing: cubicOut }}>
 						<label class="key-label" for="acoustid-key">

@@ -24,7 +24,8 @@ class InboxSetupStore {
 		autofill: null as Autofill | null,
 		suggestions: false,
 		preferEnglish: false,
-		familyNameFirst: false
+		familyNameFirst: false,
+		saveLookups: true
 	});
 	ingest = $state<IngestMode>('copy');
 	folder = $state('');
@@ -32,6 +33,7 @@ class InboxSetupStore {
 	suggestions = $state(false);
 	preferEnglish = $state(false);
 	familyNameFirst = $state(false);
+	saveLookups = $state(true);
 	/** The saved AcoustID key's last characters; null if none is saved. */
 	keyHint = $state<string | null>(null);
 	/** A new AcoustID key to save; '' removes the saved one, null leaves it be. */
@@ -53,6 +55,7 @@ class InboxSetupStore {
 			(this.suggestions === this.saved.suggestions ? 0 : 1) +
 			(this.preferEnglish === this.saved.preferEnglish ? 0 : 1) +
 			(this.familyNameFirst === this.saved.familyNameFirst ? 0 : 1) +
+			(this.saveLookups === this.saved.saveLookups ? 0 : 1) +
 			(this.keyDraft === null ? 0 : 1)
 	);
 	/** Move deletes originals, so the Inbox folder must be writable. */
@@ -65,7 +68,8 @@ class InboxSetupStore {
 			autofill: r.setup.autofill,
 			suggestions: r.setup.suggestions.enabled,
 			preferEnglish: r.setup.suggestions.prefer_english,
-			familyNameFirst: r.setup.suggestions.family_name_first
+			familyNameFirst: r.setup.suggestions.family_name_first,
+			saveLookups: r.setup.suggestions.save_lookups
 		};
 		this.ingest = this.saved.ingest;
 		this.folder = this.saved.folder;
@@ -73,6 +77,7 @@ class InboxSetupStore {
 		this.suggestions = this.saved.suggestions;
 		this.preferEnglish = this.saved.preferEnglish;
 		this.familyNameFirst = this.saved.familyNameFirst;
+		this.saveLookups = this.saved.saveLookups;
 		this.keyDraft = null;
 		this.#status(r);
 	}
@@ -111,6 +116,7 @@ class InboxSetupStore {
 		this.suggestions = this.saved.suggestions;
 		this.preferEnglish = this.saved.preferEnglish;
 		this.familyNameFirst = this.saved.familyNameFirst;
+		this.saveLookups = this.saved.saveLookups;
 		this.keyDraft = null;
 	}
 
@@ -128,7 +134,8 @@ class InboxSetupStore {
 						suggestions: {
 							enabled: this.suggestions,
 							prefer_english: this.preferEnglish,
-							family_name_first: this.familyNameFirst
+							family_name_first: this.familyNameFirst,
+							save_lookups: this.saveLookups
 						}
 					},
 					this.keyDraft?.trim() ?? undefined

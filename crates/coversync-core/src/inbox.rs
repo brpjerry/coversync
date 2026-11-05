@@ -30,7 +30,7 @@ pub struct InboxSetup {
 /// Smart suggestions: identify albums on MusicBrainz when importing and
 /// offer its tags. The AcoustID API key is stored apart from these settings
 /// (see `Library::acoustid_key`) and never sent back to the browser.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Suggestions {
     #[serde(default)]
     pub enabled: bool,
@@ -42,6 +42,26 @@ pub struct Suggestions {
     /// or Korean put the family name first ("Nishikino Maki").
     #[serde(default)]
     pub family_name_first: bool,
+    /// Keep AcoustID's and MusicBrainz's answers in the
+    /// [`LookupCache`](crate::LookupCache), so an album is looked up once.
+    /// Off, every lookup asks both services and nothing is read or saved.
+    #[serde(default = "yes")]
+    pub save_lookups: bool,
+}
+
+impl Default for Suggestions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefer_english: false,
+            family_name_first: false,
+            save_lookups: true,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Check an AcoustID application API key as typed; None clears it.
@@ -145,5 +165,19 @@ mod tests {
         assert!(acoustid_key("key&client=x").is_err());
         let off: InboxSetup = serde_json::from_str("{}").unwrap();
         assert!(!off.suggestions.enabled);
+    }
+
+    #[test]
+    fn lookups_are_saved_unless_turned_off() {
+        assert!(InboxSetup::default().suggestions.save_lookups);
+        // Saved before the switch existed.
+        let before: InboxSetup =
+            serde_json::from_str(r#"{"suggestions":{"enabled":true,"prefer_english":true}}"#)
+                .unwrap();
+        assert!(before.suggestions.save_lookups);
+        let off: InboxSetup =
+            serde_json::from_str(r#"{"suggestions":{"enabled":true,"save_lookups":false}}"#)
+                .unwrap();
+        assert!(!off.suggestions.save_lookups);
     }
 }
