@@ -196,11 +196,23 @@ fn unreadable(service: &str, e: impl std::fmt::Display) -> Error {
 impl Client<'_> {
     /// Look up Chromaprint fingerprints, each with its audio's length in
     /// seconds; the matches come back in the same order. `key` is the
-    /// AcoustID API key, needed only for fingerprints not looked up before.
+    /// AcoustID API key. Only fingerprints without saved matches are sent;
+    /// one AcoustID had no match for isn't saved, so it's asked about again
+    /// next time, in case AcoustID has learned the recording since.
     pub fn lookup(
         &self,
         key: &str,
         prints: &[(u32, &str)],
+    ) -> Result<Answer<Vec<Vec<AcoustResult>>>> {
+        self.lookup_with(prints, |batch| lookup_batch(key, batch))
+    }
+
+    /// [`Client::lookup`], with `ask` sending a batch of fingerprints to
+    /// AcoustID and returning each one's matches as sent.
+    fn lookup_with(
+        &self,
+        prints: &[(u32, &str)],
+        mut ask: impl FnMut(&[(u32, &str)]) -> Result<Vec<serde_json::Value>>,
     ) -> Result<Answer<Vec<Vec<AcoustResult>>>> {
         let requests: Vec<String> = prints.iter().map(|(d, f)| print_request(*d, f)).collect();
         let mut found: Vec<Option<Vec<AcoustResult>>> = vec![None; prints.len()];
@@ -224,11 +236,15 @@ impl Client<'_> {
         let missing: Vec<usize> = (0..prints.len()).filter(|&i| found[i].is_none()).collect();
         for chunk in missing.chunks(BATCH) {
             let batch: Vec<(u32, &str)> = chunk.iter().map(|&i| prints[i]).collect();
-            for (&i, raw) in chunk.iter().zip(lookup_batch(key, &batch)?) {
-                let results =
-                    serde_json::from_value(raw.clone()).map_err(|e| unreadable("AcoustID", e))?;
-                self.cache
-                    .put(Service::AcoustId, &requests[i], &raw.to_string());
+            for (&i, raw) in chunk.iter().zip(ask(&batch)?) {
+                let body = raw.to_string();
+                let results: Vec<AcoustResult> =
+                    serde_json::from_str(&body).map_err(|e| unreadable("AcoustID", e))?;
+                if results.is_empty() {
+                    self.cache.forget(Service::AcoustId, &requests[i]);
+                } else {
+                    self.cache.put(Service::AcoustId, &requests[i], &body);
+                }
                 found[i] = Some(results);
             }
         }
@@ -238,11 +254,24 @@ impl Client<'_> {
         })
     }
 
-    /// The answer to a MusicBrainz request: saved, or asked for and saved.
+    /// The answer to a MusicBrainz request: saved, or asked for and saved
+    /// if it's `worth_saving` (otherwise it replaces nothing).
     fn get<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
         query: &[(&str, &str)],
+        worth_saving: impl Fn(&T) -> bool,
+    ) -> Result<Answer<T>> {
+        self.get_with(url, query, worth_saving, || fetch(url, query))
+    }
+
+    /// [`Client::get`], with `ask` asking MusicBrainz for the answer's body.
+    fn get_with<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+        worth_saving: impl Fn(&T) -> bool,
+        ask: impl FnOnce() -> Result<String>,
     ) -> Result<Answer<T>> {
         let request = mb_request(url, query);
         if !self.fresh
@@ -261,9 +290,13 @@ impl Client<'_> {
                 ),
             }
         }
-        let body = get(url, query)?;
+        let body = ask()?;
         let value = serde_json::from_str(&body).map_err(|e| unreadable("MusicBrainz", e))?;
-        self.cache.put(Service::MusicBrainz, &request, &body);
+        if worth_saving(&value) {
+            self.cache.put(Service::MusicBrainz, &request, &body);
+        } else {
+            self.cache.forget(Service::MusicBrainz, &request);
+        }
         Ok(Answer { value, saved: None })
     }
 
@@ -272,10 +305,15 @@ impl Client<'_> {
         if !is_mbid(id) {
             return Err(Error::Invalid(format!("'{id}' isn't a MusicBrainz id")));
         }
-        self.get(&format!("{MUSICBRAINZ_URL}/release/{id}"), RELEASE_QUERY)
+        self.get(
+            &format!("{MUSICBRAINZ_URL}/release/{id}"),
+            RELEASE_QUERY,
+            |_: &Release| true,
+        )
     }
 
     /// Releases titled `album` by `artist` (if known), best matches first.
+    /// A search that finds nothing isn't saved, so it's tried again next time.
     pub fn search_releases(
         &self,
         album: &str,
@@ -285,9 +323,10 @@ impl Client<'_> {
         if let Some(artist) = artist {
             query += &format!(" AND artist:{}", phrase(artist));
         }
-        let res: Answer<SearchResponse> = self.get(
+        let res = self.get(
             &format!("{MUSICBRAINZ_URL}/release"),
             &[("query", &query), ("limit", "15"), ("fmt", "json")],
+            |r: &SearchResponse| !r.releases.is_empty(),
         )?;
         Ok(res.map(|r| r.releases))
     }
@@ -575,7 +614,7 @@ pub fn is_mbid(id: &str) -> bool {
 }
 
 /// The body of MusicBrainz's answer to a request.
-fn get(url: &str, query: &[(&str, &str)]) -> Result<String> {
+fn fetch(url: &str, query: &[(&str, &str)]) -> Result<String> {
     for attempt in 0.. {
         MUSICBRAINZ.wait();
         let mut req = AGENT.get(url).header("Accept", "application/json");
@@ -763,6 +802,126 @@ mod tests {
             print_request(215, "AQAAprint"),
             print_request(215, "AQAAprinu")
         );
+    }
+
+    /// Answers AcoustID as if it knew every fingerprint but "fp7", noting
+    /// what was sent.
+    fn acoustid<'a>(
+        sent: &'a mut Vec<Vec<String>>,
+        prefix: &'a str,
+    ) -> impl FnMut(&[(u32, &str)]) -> Result<Vec<serde_json::Value>> + 'a {
+        move |batch| {
+            sent.push(batch.iter().map(|(_, f)| f.to_string()).collect());
+            Ok(batch
+                .iter()
+                .map(|(_, f)| match *f {
+                    "fp7" => serde_json::json!([]),
+                    f => serde_json::json!([{"id": format!("{prefix}-{f}"), "score": 1.0}]),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn only_fingerprints_without_saved_matches_are_sent() {
+        let cache = LookupCache::in_memory();
+        let names: Vec<String> = (0..45).map(|i| format!("fp{i}")).collect();
+        let prints: Vec<(u32, &str)> = names.iter().map(|f| (200, f.as_str())).collect();
+        for f in names.iter().step_by(3) {
+            let saved = format!(r#"[{{"id": "saved-{f}", "score": 1.0}}]"#);
+            cache.put(Service::AcoustId, &print_request(200, f), &saved);
+        }
+        // Saved, but unreadable: asked about again.
+        cache.put(Service::AcoustId, &print_request(200, "fp6"), "[{");
+        let client = Client {
+            cache: &cache,
+            fresh: false,
+        };
+
+        let mut sent = Vec::new();
+        let found = client
+            .lookup_with(&prints, acoustid(&mut sent, "asked"))
+            .unwrap();
+        // The 30 never saved and the unreadable one, in batches of 20.
+        assert_eq!(sent.iter().map(Vec::len).collect::<Vec<_>>(), [20, 11]);
+        assert!(sent.concat().contains(&"fp6".to_string()));
+        assert!(!sent.concat().contains(&"fp3".to_string()));
+        for (i, results) in found.value.iter().enumerate() {
+            let expected = match i {
+                7 => None,
+                i if i % 3 == 0 && i != 6 => Some(format!("saved-fp{i}")),
+                i => Some(format!("asked-fp{i}")),
+            };
+            assert_eq!(results.first().map(|r| &r.id), expected.as_ref(), "fp{i}");
+        }
+        assert!(found.saved.is_some());
+
+        // Every match is saved now; fp7, which AcoustID didn't know, isn't.
+        let mut sent = Vec::new();
+        client
+            .lookup_with(&prints, acoustid(&mut sent, "asked"))
+            .unwrap();
+        assert_eq!(sent, [["fp7"]]);
+
+        // Fresh: everything is asked about, and the answers replace the saved ones.
+        let fresh = Client {
+            cache: &cache,
+            fresh: true,
+        };
+        let mut sent = Vec::new();
+        let found = fresh
+            .lookup_with(&prints, acoustid(&mut sent, "fresh"))
+            .unwrap();
+        assert_eq!(sent.concat().len(), 45);
+        assert!(found.saved.is_none());
+        let again = client
+            .lookup_with(&prints[..1], |_| panic!("fp0 is saved"))
+            .unwrap();
+        assert_eq!(again.value[0][0].id, "fresh-fp0");
+    }
+
+    #[test]
+    fn musicbrainz_answers_are_saved_unless_they_found_nothing() {
+        let cache = LookupCache::in_memory();
+        let client = Client {
+            cache: &cache,
+            fresh: false,
+        };
+        let fresh = Client {
+            cache: &cache,
+            fresh: true,
+        };
+        let url = format!("{MUSICBRAINZ_URL}/release");
+        let query = [("query", r#"release:"X""#), ("fmt", "json")];
+        let found_any = |r: &SearchResponse| !r.releases.is_empty();
+        let search = |client: &Client, body: Option<&str>| {
+            let res: Answer<SearchResponse> = client
+                .get_with(&url, &query, found_any, || {
+                    Ok(body.expect("the answer is saved").to_string())
+                })
+                .unwrap();
+            (
+                res.value.releases.first().map(|r| r.id.clone()),
+                res.saved.is_some(),
+            )
+        };
+        let nothing = r#"{"releases": []}"#;
+        let r1 = r#"{"releases": [{"id": "r1", "title": "X"}]}"#;
+        let r2 = r#"{"releases": [{"id": "r2", "title": "X"}]}"#;
+
+        // Found nothing: not saved, so asked again.
+        assert_eq!(search(&client, Some(nothing)), (None, false));
+        assert_eq!(search(&client, Some(r1)), (Some("r1".into()), false));
+        assert_eq!(search(&client, None), (Some("r1".into()), true));
+        // Fresh: asked, and replaces what was saved.
+        assert_eq!(search(&fresh, Some(r2)), (Some("r2".into()), false));
+        assert_eq!(search(&client, None), (Some("r2".into()), true));
+        // A fresh answer that found nothing drops the saved one.
+        assert_eq!(search(&fresh, Some(nothing)), (None, false));
+        assert_eq!(search(&client, Some(r1)), (Some("r1".into()), false));
+        // An unreadable saved answer is asked for again.
+        cache.put(Service::MusicBrainz, &mb_request(&url, &query), "{");
+        assert_eq!(search(&client, Some(r2)), (Some("r2".into()), false));
     }
 
     #[test]

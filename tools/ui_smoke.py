@@ -678,6 +678,11 @@ def lookup_again_flow(d, out, tag, album):
     d.shot(out / f"13b-saved-lookup-phone-{tag}.png")
     d.resize(1440, 1000)
     time.sleep(0.4)
+    # A ticked suggestion is taken back before looking up again.
+    print("ticked:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
+    d.js("const r = [...document.querySelectorAll('.suggest .sugg.change')].find(r => !r.querySelector('input').checked); r.querySelector('input').click()")
+    time.sleep(0.3)
+    print("after ticking a change:", d.js(SUGGEST_TEXT, ".suggest .toolbar"))
     d.click(".suggest .head-actions button[aria-label='Look up again']")
     d.wait("return !!document.querySelector('.suggest .stage')", 10)
     print("looking up:", d.js(SUGGEST_TEXT, ".suggest .stage"))

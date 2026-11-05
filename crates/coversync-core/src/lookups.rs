@@ -4,6 +4,8 @@
 //! the request that asked for it, so a newer build that reads more of an
 //! answer still finds all of it. Answers are kept until a lookup asks the
 //! services again (Look up again, in the import dialog), which replaces them.
+//! Answers that found nothing aren't kept: the services may learn of the
+//! recording or release later, and asking again costs one request.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -154,6 +156,16 @@ impl LookupCache {
             tracing::warn!("couldn't save a lookup: {e}");
         }
     }
+
+    /// Drop the answer saved for `request`, if there is one.
+    pub fn forget(&self, service: Service, request: &str) {
+        if let Err(e) = self.conn().execute(
+            "DELETE FROM answers WHERE service = ?1 AND request = ?2",
+            params![service.as_str(), request],
+        ) {
+            tracing::warn!("couldn't drop a saved lookup: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +188,10 @@ mod tests {
             cache.get(Service::MusicBrainz, "r").unwrap().body,
             r#"{"id": "two"}"#
         );
+
+        cache.forget(Service::MusicBrainz, "r");
+        assert!(cache.get(Service::MusicBrainz, "r").is_none());
+        assert_eq!(cache.get(Service::AcoustId, "r").unwrap().body, "[]");
     }
 
     #[test]

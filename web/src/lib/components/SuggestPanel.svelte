@@ -53,6 +53,7 @@
 	import ArrowRight from '@lucide/svelte/icons/arrow-right';
 	import ExternalLink from '@lucide/svelte/icons/external-link';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+	import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import CircleCheck from '@lucide/svelte/icons/circle-check';
 	import Info from '@lucide/svelte/icons/info';
@@ -427,14 +428,17 @@
 		if (cover?.art && want !== artOn && !(want && artSmaller)) toggleArt(want);
 	}
 
-	/** Look again, after taking back what this lookup's suggestions filled in. */
-	function relook() {
+	/**
+	 * Look again, after taking back what this lookup's suggestions filled in;
+	 * `fresh` asks AcoustID and MusicBrainz rather than use saved lookups.
+	 */
+	function relook(fresh = false) {
 		setAll(() => false);
 		restore.clear();
 		opened.clear();
 		rows = [];
 		cover = null;
-		identify();
+		identify(fresh, fresh);
 	}
 	function switchRelease(id: string) {
 		picked = id;
@@ -740,13 +744,31 @@
 					>
 				</p>
 			{:else}
-				<p class="stage">MusicBrainz has nothing for this album.</p>
+				<p class="stage">
+					MusicBrainz has nothing for this album.{#if lookedUp}<span
+							class="saved"
+							title="Saved answers from AcoustID and MusicBrainz. Look up again to ask them now."
+							>{` · looked up ${lookedUp}`}</span
+						>{/if}
+				</p>
 			{/if}
 		</div>
 		<div class="head-actions">
 			{#if lookup?.state === 'failed'}
-				<button class="btn sm" onclick={() => identify(true)}>
-					<RefreshCw size={14} /> Retry
+				<button
+					class="btn sm"
+					onclick={() => identify(true)}
+					title="Try again, using what was looked up before the failure"
+				>
+					<RotateCcw size={14} /> Retry
+				</button>
+				<button
+					class="btn sm square"
+					onclick={() => relook(true)}
+					title="Look up again on AcoustID and MusicBrainz, instead of using what was saved"
+					aria-label="Look up again"
+				>
+					<RefreshCw size={14} />
 				</button>
 			{:else if result?.release}
 				<a
@@ -758,7 +780,7 @@
 				>
 				<button
 					class="btn sm square"
-					onclick={() => identify(true, true)}
+					onclick={() => relook(true)}
 					title="Look up again on AcoustID and MusicBrainz, instead of using what was saved"
 					aria-label="Look up again"
 				>
@@ -767,7 +789,7 @@
 			{:else if result}
 				<button
 					class="btn sm"
-					onclick={() => identify(true, true)}
+					onclick={() => relook(true)}
 					title="Ask AcoustID and MusicBrainz again, instead of using what was saved"
 				>
 					<RefreshCw size={14} /> Look up again
@@ -994,7 +1016,8 @@
 		display: block;
 		color: var(--accent);
 	}
-	.how .saved {
+	.how .saved,
+	.stage .saved {
 		color: var(--text-3);
 	}
 	.progress {
