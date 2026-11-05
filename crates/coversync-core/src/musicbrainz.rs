@@ -67,7 +67,8 @@ fn unreachable(service: &'static str) -> impl Fn(ureq::Error) -> Error {
 /// was asked before.
 #[derive(Clone, Copy)]
 pub struct Client<'a> {
-    pub cache: &'a LookupCache,
+    /// Where answers are saved; None to neither use nor save any.
+    pub cache: Option<&'a LookupCache>,
     /// Ask the services even when an answer is saved, and save the new one.
     pub fresh: bool,
 }
@@ -193,7 +194,12 @@ fn unreadable(service: &str, e: impl std::fmt::Display) -> Error {
     Error::Remote(format!("{service} sent an unreadable answer: {e}"))
 }
 
-impl Client<'_> {
+impl<'a> Client<'a> {
+    /// The cache to answer from: none when not saving, or asking afresh.
+    fn answering(&self) -> Option<&'a LookupCache> {
+        self.cache.filter(|_| !self.fresh)
+    }
+
     /// Look up Chromaprint fingerprints, each with its audio's length in
     /// seconds; the matches come back in the same order. `key` is the
     /// AcoustID API key. Only fingerprints without saved matches are sent;
@@ -217,9 +223,9 @@ impl Client<'_> {
         let requests: Vec<String> = prints.iter().map(|(d, f)| print_request(*d, f)).collect();
         let mut found: Vec<Option<Vec<AcoustResult>>> = vec![None; prints.len()];
         let mut saved = None;
-        if !self.fresh {
+        if let Some(cache) = self.answering() {
             for (slot, request) in found.iter_mut().zip(&requests) {
-                let Some(s) = self.cache.get(Service::AcoustId, request) else {
+                let Some(s) = cache.get(Service::AcoustId, request) else {
                     continue;
                 };
                 match serde_json::from_str::<Vec<AcoustResult>>(&s.body) {
@@ -242,10 +248,12 @@ impl Client<'_> {
                 let body = raw.to_string();
                 let results: Vec<AcoustResult> =
                     serde_json::from_str(&body).map_err(|e| unreadable("AcoustID", e))?;
-                if results.is_empty() {
-                    self.cache.forget(Service::AcoustId, &requests[i]);
-                } else {
-                    self.cache.put(Service::AcoustId, &requests[i], &body);
+                if let Some(cache) = self.cache {
+                    if results.is_empty() {
+                        cache.forget(Service::AcoustId, &requests[i]);
+                    } else {
+                        cache.put(Service::AcoustId, &requests[i], &body);
+                    }
                 }
                 found[i] = Some(results);
             }
@@ -277,8 +285,9 @@ impl Client<'_> {
         ask: impl FnOnce() -> Result<String>,
     ) -> Result<Answer<T>> {
         let request = mb_request(url, query);
-        if !self.fresh
-            && let Some(s) = self.cache.get(Service::MusicBrainz, &request)
+        if let Some(s) = self
+            .answering()
+            .and_then(|cache| cache.get(Service::MusicBrainz, &request))
         {
             match serde_json::from_str(&s.body) {
                 Ok(value) if worth_saving(&value) => {
@@ -297,10 +306,12 @@ impl Client<'_> {
         }
         let body = ask()?;
         let value = serde_json::from_str(&body).map_err(|e| unreadable("MusicBrainz", e))?;
-        if worth_saving(&value) {
-            self.cache.put(Service::MusicBrainz, &request, &body);
-        } else {
-            self.cache.forget(Service::MusicBrainz, &request);
+        if let Some(cache) = self.cache {
+            if worth_saving(&value) {
+                cache.put(Service::MusicBrainz, &request, &body);
+            } else {
+                cache.forget(Service::MusicBrainz, &request);
+            }
         }
         Ok(Answer { value, saved: None })
     }
@@ -774,7 +785,7 @@ mod tests {
     fn saved_answers_are_used_without_asking() {
         let cache = LookupCache::in_memory();
         let client = Client {
-            cache: &cache,
+            cache: Some(&cache),
             fresh: false,
         };
         // No such release: asking MusicBrainz would fail.
@@ -841,7 +852,7 @@ mod tests {
         // Saved as finding nothing (as an earlier build did): asked about again.
         cache.put(Service::AcoustId, &print_request(200, "fp9"), "[]");
         let client = Client {
-            cache: &cache,
+            cache: Some(&cache),
             fresh: false,
         };
 
@@ -873,7 +884,7 @@ mod tests {
 
         // Fresh: everything is asked about, and the answers replace the saved ones.
         let fresh = Client {
-            cache: &cache,
+            cache: Some(&cache),
             fresh: true,
         };
         let mut sent = Vec::new();
@@ -892,11 +903,11 @@ mod tests {
     fn musicbrainz_answers_are_saved_unless_they_found_nothing() {
         let cache = LookupCache::in_memory();
         let client = Client {
-            cache: &cache,
+            cache: Some(&cache),
             fresh: false,
         };
         let fresh = Client {
-            cache: &cache,
+            cache: Some(&cache),
             fresh: true,
         };
         let url = format!("{MUSICBRAINZ_URL}/release");
@@ -934,6 +945,68 @@ mod tests {
         cache.put(Service::MusicBrainz, &mb_request(&url, &query), nothing);
         assert_eq!(search(&client, Some(r1)), (Some("r1".into()), false));
         assert_eq!(search(&client, None), (Some("r1".into()), true));
+    }
+
+    #[test]
+    fn without_a_cache_everything_is_asked_and_nothing_saved() {
+        let cache = LookupCache::in_memory();
+        let saving = Client {
+            cache: Some(&cache),
+            fresh: false,
+        };
+        let off = Client {
+            cache: None,
+            fresh: false,
+        };
+        let prints = [(200, "fp1"), (200, "fp2")];
+        let mut sent = Vec::new();
+        saving
+            .lookup_with(&prints[..1], acoustid(&mut sent, "saved"))
+            .unwrap();
+
+        // fp1 is saved, but off asks about both, twice over.
+        for _ in 0..2 {
+            let mut sent = Vec::new();
+            let found = off
+                .lookup_with(&prints, acoustid(&mut sent, "off"))
+                .unwrap();
+            assert_eq!(sent, [["fp1", "fp2"]]);
+            assert_eq!(found.value[0][0].id, "off-fp1");
+            assert!(found.saved.is_none());
+        }
+        // And replaced nothing: fp1's saved answer is the one from before.
+        let found = saving
+            .lookup_with(&prints[..1], |_| panic!("fp1 is saved"))
+            .unwrap();
+        assert_eq!(found.value[0][0].id, "saved-fp1");
+        assert!(
+            cache
+                .get(Service::AcoustId, &print_request(200, "fp2"))
+                .is_none()
+        );
+
+        let url = format!("{MUSICBRAINZ_URL}/release/x");
+        let mut asked = 0;
+        for _ in 0..2 {
+            let r: Answer<Release> = off
+                .get_with(
+                    &url,
+                    RELEASE_QUERY,
+                    |_| true,
+                    || {
+                        asked += 1;
+                        Ok(r#"{"id": "x", "title": "Asked"}"#.into())
+                    },
+                )
+                .unwrap();
+            assert!(r.saved.is_none());
+        }
+        assert_eq!(asked, 2);
+        assert!(
+            cache
+                .get(Service::MusicBrainz, &mb_request(&url, RELEASE_QUERY))
+                .is_none()
+        );
     }
 
     #[test]

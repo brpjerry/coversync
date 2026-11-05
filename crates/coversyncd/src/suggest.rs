@@ -176,7 +176,8 @@ pub async fn start(
             let best = evidence
                 .as_ref()
                 .and_then(|ev| ev.candidates.first().map(|c| c.id.clone()));
-            let lookups = &state.lookups;
+            // Saved lookups are used and kept only while Inbox setup says so.
+            let lookups = setup.save_lookups.then_some(&state.lookups);
             match (release.as_deref().or(best.as_deref()), evidence) {
                 (Some(r), Some(ev)) => Ok((
                     None,

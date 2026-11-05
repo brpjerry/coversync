@@ -45,7 +45,8 @@ Early days: single user, no authentication, used on a home server.
   saved, so an album identified before (one imported again, say) is only
   fingerprinted; the dialog says when the lookup was made, and **Look up
   again** asks both services afresh. Answers that found nothing aren't
-  saved, so those are asked again each time.
+  saved, so those are asked again each time. With **Save lookups** off,
+  every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
 - **Sync** (planned): the sidebar's Sync section will list the devices the

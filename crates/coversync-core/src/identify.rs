@@ -206,7 +206,7 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    fn release(&self, cache: &LookupCache, id: &str) -> Result<mb::Answer<Arc<Release>>> {
+    fn release(&self, cache: Option<&LookupCache>, id: &str) -> Result<mb::Answer<Arc<Release>>> {
         let cached = self
             .releases
             .lock()
@@ -240,7 +240,7 @@ impl Evidence {
     /// the candidates sharing its recordings.
     fn tracklist(
         &self,
-        cache: &LookupCache,
+        cache: Option<&LookupCache>,
         release: &Release,
     ) -> Option<mb::Answer<Arc<Release>>> {
         let total: u32 = release.media.iter().map(|m| m.tracks.len() as u32).sum();
@@ -755,11 +755,11 @@ pub fn identify(
 /// With `romanize`, titles and names that don't sort A–Z are suggested in
 /// Latin script where MusicBrainz has them, written as its options say.
 /// Tags with several values have them joined by `separator`. Releases are
-/// fetched as `identify` fetched the evidence: from `cache` where they were
-/// fetched before, unless it asked the services again.
+/// fetched as `identify` fetched the evidence: from `cache` (if saving) where
+/// they were fetched before, unless it asked the services again.
 pub fn suggest(
     evidence: &Evidence,
-    cache: &LookupCache,
+    cache: Option<&LookupCache>,
     release_id: &str,
     chosen: bool,
     romanize: Option<romanize::Options>,
