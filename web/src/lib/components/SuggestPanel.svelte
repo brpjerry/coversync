@@ -546,6 +546,8 @@
 	let how = $derived.by(() => {
 		if (!result) return '';
 		if (result.method === 'chosen') return 'Picked by you';
+		if (result.method === 'barcode') return 'Found by its barcode';
+		if (result.method === 'isrc') return 'Found by its ISRCs';
 		if (result.method === 'tags') return 'Found by title and artist';
 		return `Identified by audio: AcoustID recognized ${result.recognized} of ${tracks.length} ${tracks.length === 1 ? 'track' : 'tracks'}`;
 	});

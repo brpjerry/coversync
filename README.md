@@ -36,9 +36,12 @@ Early days: single user, no authentication, used on a home server.
 - **Inbox setup**: Copy or Move, and autofill for empty tags that are safe to
   assume (album artist from artist, track numbers from file names, …).
 - **Smart suggestions** (optional): the import dialog looks the album up on
-  MusicBrainz, by Chromaprint fingerprints on AcoustID where it can and by
-  title and artist otherwise, and offers MusicBrainz's tags to tick: values
-  for empty tags and corrections for differing ones. **Prefer English**
+  MusicBrainz, by Chromaprint fingerprints on AcoustID where it can, and
+  otherwise by the barcode (or UPC) and ISRCs its files are tagged with, or
+  its title and artist. An artist MusicBrainz credits under another name
+  (汐れいら for "Ushio Reira") is found by its sort name or aliases. It
+  offers MusicBrainz's tags to tick: values for empty tags and corrections
+  for differing ones. **Prefer English**
   suggests romanized or English titles and artist names for releases in other
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first. AcoustID's and MusicBrainz's answers are

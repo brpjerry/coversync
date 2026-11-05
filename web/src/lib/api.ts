@@ -308,7 +308,7 @@ export interface Suggestion {
 }
 
 export interface Identification {
-	method: 'acoustid' | 'tags' | 'chosen';
+	method: 'acoustid' | 'barcode' | 'isrc' | 'tags' | 'chosen';
 	release: {
 		id: string;
 		title: string;

@@ -310,6 +310,52 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
+/// The UPC some stores tag files with instead of a barcode, which lofty
+/// leaves out of its generic tags: a Vorbis comment (FLAC, Ogg) or an ID3v2
+/// TXXX frame (MP3, or an ID3v2 tag on a FLAC file).
+pub fn upc(path: &Path) -> Option<String> {
+    use lofty::flac::FlacFile;
+    use lofty::mpeg::MpegFile;
+    use lofty::ogg::{OpusFile, VorbisFile};
+    let file_type = Probe::open(path)
+        .ok()?
+        .guess_file_type()
+        .ok()?
+        .file_type()?;
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    let mut f = fs::File::open(path).ok()?;
+    let found = match file_type {
+        FileType::Flac => {
+            let file = FlacFile::read_from(&mut f, options).ok()?;
+            let vorbis = file.vorbis_comments().and_then(|t| t.get("UPC"));
+            vorbis
+                .or_else(|| file.id3v2().and_then(|t| t.get_user_text("UPC")))
+                .map(str::to_string)
+        }
+        FileType::Vorbis => VorbisFile::read_from(&mut f, options)
+            .ok()?
+            .vorbis_comments()
+            .get("UPC")
+            .map(str::to_string),
+        FileType::Opus => OpusFile::read_from(&mut f, options)
+            .ok()?
+            .vorbis_comments()
+            .get("UPC")
+            .map(str::to_string),
+        FileType::Mpeg => MpegFile::read_from(&mut f, options)
+            .ok()?
+            .id3v2()?
+            .get_user_text("UPC")
+            .map(str::to_string),
+        _ => None,
+    };
+    found
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Whether a `tag_type` tag can hold `kind` as text (numbers and dates
 /// always fit; some formats have no place for, say, MusicBrainz ids).
 pub fn can_store(tag_type: TagType, kind: &str) -> bool {
