@@ -702,13 +702,13 @@ fn tag_candidates(
         by.push("barcode");
         let res = or_nothing("barcode search", client.search_barcode(code));
         saved = oldest(saved, res.saved);
-        let found = well_matched(tracks, res.value);
+        let mut found = well_matched(tracks, res.value);
         // The product the files came from, even with tracks missing here
         // (one disc of two, say).
-        if found
-            .iter()
-            .any(|(_, c)| c.track_count.is_none_or(|t| t >= n))
-        {
+        let holds_all = |c: &Candidate| c.track_count.is_none_or(|t| t >= n);
+        if found.iter().any(|(_, c)| holds_all(c)) {
+            // Ahead of an edition sharing the barcode with fewer tracks.
+            found.sort_by_key(|(_, c)| !holds_all(c));
             return done(Method::Barcode, found, by, saved);
         }
         by_barcode = found;
@@ -1656,6 +1656,27 @@ mod tests {
         );
         let s = tag_candidates(searching(&cache), &tracks, Some("454736682784")).unwrap();
         assert_eq!(s.value.method, Method::Barcode);
+        // Shared with an edition with fewer tracks, listed first: that one
+        // goes after.
+        let both = serde_json::json!({"releases": [
+            found("c3333333-3333-4333-8333-333333333333", "Clover (Single)", 100, 1, "2026-07-11"),
+            found("a1111111-1111-4111-8111-111111111111", "Clover (CD)", 100, 3, "2026-09-02"),
+        ]});
+        mb::save_search(
+            &cache,
+            "release",
+            "barcode:(454736682785 OR 0454736682785)",
+            &both.to_string(),
+        );
+        let s = tag_candidates(searching(&cache), &tracks, Some("454736682785")).unwrap();
+        assert_eq!(s.value.method, Method::Barcode);
+        let titles: Vec<&str> = s
+            .value
+            .found
+            .iter()
+            .map(|(_, c)| c.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Clover (CD)", "Clover (Single)"]);
 
         // A 13-digit EAN with a leading 0 is asked for as the UPC too. Found
         // only on a release with fewer tracks, perhaps another edition with
