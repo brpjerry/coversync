@@ -289,15 +289,54 @@
 
 	const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-	/** Run a DOM update as a view transition morphing `from` into the other cover. */
-	async function morph(from: HTMLElement | null, update: () => Promise<void>) {
+	/** Run a DOM update as a view transition morphing `from` into the cover `to` finds after it. */
+	async function morph(
+		from: HTMLElement | null,
+		update: () => Promise<void>,
+		to: () => HTMLElement | null
+	) {
 		if (!from || !document.startViewTransition || reducedMotion()) return update();
 		from.style.viewTransitionName = 'album-cover';
 		const vt = document.startViewTransition(async () => {
 			from.style.viewTransitionName = '';
 			await update();
 		});
+		follow(vt, to);
 		await vt.updateCallbackDone.catch(() => {});
+	}
+
+	/**
+	 * Keep the end of the cover's path on `landing` when the page or the sheet scrolls
+	 * during the transition. Firefox fixes that end when the transition starts, so the
+	 * cover flew to where its card had been and jumped when it finished. The spec (and
+	 * Chrome) follows the element instead, which leaves no end keyframe here to move.
+	 */
+	function follow(vt: ViewTransition, landing: () => HTMLElement | null) {
+		vt.ready
+			.then(() => {
+				const effect = document
+					.getAnimations()
+					.map((a) => a.effect)
+					.find(
+						(e): e is KeyframeEffect =>
+							e instanceof KeyframeEffect &&
+							e.pseudoElement === '::view-transition-group(album-cover)'
+					);
+				const frames = effect?.getKeyframes();
+				const end = frames?.find((k) => k.offset === 1);
+				const el = landing();
+				if (!effect || !frames || typeof end?.transform !== 'string' || !el) return;
+				const fixed = end.transform;
+				const start = el.getBoundingClientRect();
+				const onscroll = () => {
+					const r = el.getBoundingClientRect();
+					end.transform = `translate(${r.left - start.left}px, ${r.top - start.top}px) ${fixed}`;
+					effect.setKeyframes(frames);
+				};
+				addEventListener('scroll', onscroll, { capture: true, passive: true });
+				vt.finished.finally(() => removeEventListener('scroll', onscroll, { capture: true }));
+			})
+			.catch(() => {});
 	}
 
 	function gridCover(id: string): HTMLElement | null {
@@ -309,14 +348,18 @@
 
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
-		await morph(cover, async () => {
-			// Behind the sheet the page is blurred with a filter, which would lay the
-			// fixed drawer out against the page instead of the window.
-			drawerOpen = false;
-			// Shallow: a history entry with the album in page.state, no navigation.
-			await goto(page.url.href, { state: { album: album.id }, shallow: true });
-			await tick();
-		});
+		await morph(
+			cover,
+			async () => {
+				// Behind the sheet the page is blurred with a filter, which would lay the
+				// fixed drawer out against the page instead of the window.
+				drawerOpen = false;
+				// Shallow: a history entry with the album in page.state, no navigation.
+				await goto(page.url.href, { state: { album: album.id }, shallow: true });
+				await tick();
+			},
+			() => document.querySelector<HTMLElement>('.hero-cover')
+		);
 	}
 
 	function back(): Promise<void> {
@@ -339,6 +382,7 @@
 			target.style.viewTransitionName = 'album-cover';
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
+		follow(vt, () => target);
 		vt.finished.finally(() => (target.style.viewTransitionName = ''));
 	}
 
