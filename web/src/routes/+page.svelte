@@ -820,6 +820,10 @@
 	.page.behind {
 		filter: blur(18px) saturate(1.2);
 	}
+	/* Captured with the page while it's blurred: on its own it would lose the blur. */
+	.page.behind > :global(header) {
+		view-transition-name: none;
+	}
 	.shell {
 		display: grid;
 		grid-template-columns: auto minmax(0, 1fr);
