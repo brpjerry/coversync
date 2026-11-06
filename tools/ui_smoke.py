@@ -191,13 +191,15 @@ class Driver:
 def grid_intro_check(d):
     """Cards keep the entrance they mounted with: when the grid's intro ends,
     no card's animation restarts or changes timing, including cards that a
-    scroll mounted during the intro. Remounts the grid (Library and back) so
-    the intro starts on a known frame."""
-    d.click_text("header", "Library")
+    scroll mounted during the intro. Remounts the grid of the collection shown
+    by way of Appearance, which has none, so the intro starts on a known frame."""
+    collection = d.js("return document.querySelector('.tabs button[aria-selected=true]')"
+                      "?.textContent.includes('Library') ? 'Library' : 'Inbox'")
+    d.open_setup("Appearance")
     d.wait("return !document.querySelector('.vgrid')")
-    res = d.s("POST", "/execute/async", {"args": [], "script": """
-        const done = arguments[0], seen = new Map();
-        [...document.querySelectorAll('.tabs button')].find(b => b.textContent.includes('Inbox')).click();
+    res = d.s("POST", "/execute/async", {"args": [collection], "script": """
+        const [collection, done] = arguments, seen = new Map();
+        [...document.querySelectorAll('.tabs button')].find(b => b.textContent.includes(collection)).click();
         let t0 = null, scrolled = false, restarts = 0, retimed = 0, scrolledIn = 0, scrolledInRising = 0;
         const timing = a => { const t = a.effect.getComputedTiming(); return t.duration + '/' + t.delay; };
         const tick = () => {
