@@ -309,7 +309,8 @@
 	 * Keep the end of the cover's path on `landing` when the page or the sheet scrolls
 	 * during the transition. Firefox fixes that end when the transition starts, so the
 	 * cover flew to where its card had been and jumped when it finished. The spec (and
-	 * Chrome) follows the element instead, which leaves no end keyframe here to move.
+	 * Chrome) moves it with the element, so it's only moved here if, a frame after the
+	 * first scroll that moves the cover, the browser hasn't moved it itself.
 	 */
 	function follow(vt: ViewTransition, landing: () => HTMLElement | null) {
 		vt.ready
@@ -322,19 +323,41 @@
 							e instanceof KeyframeEffect &&
 							e.pseudoElement === '::view-transition-group(album-cover)'
 					);
-				const frames = effect?.getKeyframes();
-				const end = frames?.find((k) => k.offset === 1);
+				const end = () => effect?.getKeyframes().find((k) => k.offset === 1);
+				const fixed = end()?.transform;
 				const el = landing();
-				if (!effect || !frames || typeof end?.transform !== 'string' || !el) return;
-				const fixed = end.transform;
+				if (!effect || typeof fixed !== 'string' || !el) return;
 				const start = el.getBoundingClientRect();
-				const onscroll = () => {
+				// Who moves the end: found out at the first scroll that moves the cover.
+				let mover: 'unknown' | 'checking' | 'us' = 'unknown';
+				const move = () => {
 					const r = el.getBoundingClientRect();
-					end.transform = `translate(${r.left - start.left}px, ${r.top - start.top}px) ${fixed}`;
+					const frames = effect.getKeyframes();
+					const last = frames.find((k) => k.offset === 1)!;
+					last.transform = `translate(${r.left - start.left}px, ${r.top - start.top}px) ${fixed}`;
 					effect.setKeyframes(frames);
 				};
+				const stop = () => removeEventListener('scroll', onscroll, { capture: true });
+				const onscroll = () => {
+					// The grid drops cards scrolled far out of view, and a detached card
+					// measures 0×0 at 0,0: keep the last end it had.
+					if (!el.isConnected) return;
+					if (mover === 'us') return move();
+					if (mover === 'checking') return;
+					const r = el.getBoundingClientRect();
+					if (r.left === start.left && r.top === start.top) return;
+					mover = 'checking';
+					// Two frames: the browser updates the end after this one's callbacks.
+					requestAnimationFrame(() =>
+						requestAnimationFrame(() => {
+							if (end()?.transform !== fixed) return stop();
+							mover = 'us';
+							if (el.isConnected) move();
+						})
+					);
+				};
 				addEventListener('scroll', onscroll, { capture: true, passive: true });
-				vt.finished.finally(() => removeEventListener('scroll', onscroll, { capture: true }));
+				vt.finished.finally(stop);
 			})
 			.catch(() => {});
 	}
