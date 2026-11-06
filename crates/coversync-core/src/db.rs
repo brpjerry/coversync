@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, ToSql, params, params_from_it
 
 use crate::appearance::AppearanceSetup;
 use crate::autofill::{self, Autofill, TrackInfo};
+use crate::cover::Cover;
 use crate::inbox::{HiddenStats, InboxSetup};
 use crate::model::{Album, AlbumDetail, Attention, Collection, KindCoverage, TagCoverage, Track};
 use crate::rules::{self, LibrarySetup};
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS covers (
     album_id  TEXT PRIMARY KEY,
     source    TEXT,
     color     TEXT,
-    signature TEXT NOT NULL
+    signature TEXT NOT NULL,
+    version   TEXT
 );
 "#;
 
@@ -420,9 +422,8 @@ const VISIBLE: &str = "path NOT IN (SELECT path FROM hidden)";
 /// A file ready to index: its stat data, album id, album directory and tags.
 pub type IndexedFile = (FileStat, String, PathBuf, TrackTags);
 
-/// An album's stored cover source and colour.
-/// An album's cover source, colour and the signature it was found with.
-type CoverRow = (Option<String>, Option<String>, String);
+/// An album's stored cover source, colour and version (see `cover::Cover`).
+type CoverRow = (Option<String>, Option<String>, Option<String>);
 
 /// Where an album's cover comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,16 +522,6 @@ fn album_added(collection: Collection, times: impl Iterator<Item = i64>) -> i64 
     .unwrap_or(0)
 }
 
-/// A short token for the cover signature: the cover pass re-renders an
-/// album's thumbnails exactly when its signature changes.
-fn cover_version(signature: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(signature.as_bytes())[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) -> Album {
     let title = consensus(tracks.iter().map(|t| t.album.as_str())).unwrap_or_default();
     let album_artist = consensus(tracks.iter().filter_map(|t| t.album_artist.as_deref()));
@@ -556,7 +547,7 @@ fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) 
         duration_ms: tracks.iter().map(|t| t.duration_ms).sum(),
         color: cover.and_then(|c| c.1.clone()),
         has_cover: cover.is_some_and(|c| c.0.is_some()),
-        cover_version: cover.filter(|c| c.0.is_some()).map(|c| cover_version(&c.2)),
+        cover_version: cover.filter(|c| c.0.is_some()).and_then(|c| c.2.clone()),
         added_at: added,
         format: consensus(tracks.iter().map(|t| t.format.as_str()))
             .unwrap_or_default()
@@ -740,6 +731,20 @@ fn migrate(conn: &Connection) -> Result<()> {
             "DELETE FROM tracks WHERE collection = 'library';
              DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM tracks);
              PRAGMA user_version = 4;",
+        )?;
+    }
+    if version < 5 {
+        // v5 versions each cover by its art; the next scan's cover pass looks
+        // at every album again to record it.
+        let has_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('covers') WHERE name = 'version'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute_batch("ALTER TABLE covers ADD COLUMN version TEXT")?;
+        }
+        conn.execute_batch(
+            "UPDATE covers SET signature = '';
+             PRAGMA user_version = 5;",
         )?;
     }
     Ok(())
@@ -1125,7 +1130,7 @@ impl Library {
 
     fn covers(&self) -> Result<HashMap<String, CoverRow>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT album_id, source, color, signature FROM covers")?;
+        let mut stmt = conn.prepare("SELECT album_id, source, color, version FROM covers")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1315,20 +1320,44 @@ impl Library {
         Ok(jobs)
     }
 
-    pub fn set_cover(
-        &self,
-        album_id: &str,
-        source: Option<&CoverSource>,
-        color: Option<&str>,
-        signature: &str,
-    ) -> Result<()> {
+    /// What the cover pass found for an album (nothing, if it has no art).
+    pub fn set_cover(&self, album_id: &str, cover: Option<&Cover>, signature: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO covers (album_id, source, color, signature) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO covers (album_id, source, color, version, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (album_id) DO UPDATE SET source = excluded.source,
-                color = excluded.color, signature = excluded.signature",
-            params![album_id, source.map(CoverSource::encode), color, signature],
+                color = excluded.color, version = excluded.version, signature = excluded.signature",
+            params![
+                album_id,
+                cover.map(|c| c.source.encode()),
+                cover.map(|c| c.color.as_str()),
+                cover.map(|c| c.version.as_str()),
+                signature
+            ],
         )?;
         Ok(())
+    }
+
+    /// An album's art changed after the cover pass looked: record its version.
+    pub fn set_cover_version(&self, album_id: &str, version: &str, color: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE covers SET version = ?2, color = ?3 WHERE album_id = ?1",
+            params![album_id, version, color],
+        )?;
+        Ok(())
+    }
+
+    /// An album's cover source and recorded version, if the cover pass has looked.
+    pub fn cover(&self, album_id: &str) -> Result<Option<(Option<CoverSource>, Option<String>)>> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT source, version FROM covers WHERE album_id = ?1",
+                [album_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(source, version)| (source.as_deref().and_then(CoverSource::decode), version)))
     }
 
     /// A setting of this installation, kept in the local database.
@@ -1613,6 +1642,14 @@ mod tests {
         (stat, album.into(), PathBuf::from("/m/a"), tags)
     }
 
+    fn found(source: CoverSource, version: &str) -> Cover {
+        Cover {
+            source,
+            color: "#000000".into(),
+            version: version.into(),
+        }
+    }
+
     #[test]
     fn migrating_v0_marks_rows_for_rescan() {
         let path = temp_db("migrate");
@@ -1641,7 +1678,28 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn migrating_v4_versions_covers_on_the_next_cover_pass() {
+        let path = temp_db("migratecovers");
+        let conn = Connection::open(&path).unwrap();
+        let v4 = SCHEMA.replace(",\n    version   TEXT", "");
+        assert!(!v4.contains("version   TEXT"));
+        conn.execute_batch(&v4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO covers (album_id, source, color, signature)
+                 VALUES ('a', 'file:/m/a/cover.jpg', '#000000', '5:1');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        drop(conn);
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();
+        // The cover row stays, unversioned, and its album is looked at again.
+        assert_eq!(lib.cover("a").unwrap().unwrap().1, None);
+        assert_eq!(lib.cover_jobs().unwrap().len(), 1);
     }
 
     #[test]
@@ -1773,10 +1831,9 @@ mod tests {
             file("/m/b/1.flac", "b", &[]),
         ])
         .unwrap();
-        let cover = CoverSource::File("/m/a/folder.jpg".into());
-        lib.set_cover("a", Some(&cover), Some("#000000"), "sig")
-            .unwrap();
-        lib.set_cover("b", None, None, "sig").unwrap();
+        let cover = found(CoverSource::File("/m/a/folder.jpg".into()), "1");
+        lib.set_cover("a", Some(&cover), "sig").unwrap();
+        lib.set_cover("b", None, "sig").unwrap();
         let albums = lib
             .albums(
                 Collection::Inbox,
@@ -2248,8 +2305,8 @@ mod tests {
             .unwrap();
         let jobs = lib.cover_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
-        let source = CoverSource::File(root.join("A/cover.jpg"));
-        lib.set_cover(&jobs[0].album_id, Some(&source), None, &jobs[0].signature)
+        let cover = found(CoverSource::File(root.join("A/cover.jpg")), "1");
+        lib.set_cover(&jobs[0].album_id, Some(&cover), &jobs[0].signature)
             .unwrap();
         assert!(lib.cover_jobs().unwrap().is_empty());
         drop(lib);
@@ -2266,33 +2323,31 @@ mod tests {
     }
 
     #[test]
-    fn the_cover_version_follows_the_cover_signature() {
-        let dir = temp_dir("coverversion", &["state", "Lib"]);
-        let root = dir.join("Lib");
-        let lib = Library::open_in(&dir.join("state")).unwrap();
-        lib.set_library_setup(with_folder(&root, &[])).unwrap();
-        lib.prepare_library(&root).unwrap();
-        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
-            .unwrap();
+    fn albums_carry_their_recorded_cover_version() {
+        let lib = Library::open(&temp_db("coverversion")).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();
         let version = |lib: &Library| {
-            lib.albums(Collection::Library, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
                 .unwrap()[0]
                 .cover_version
                 .clone()
         };
         assert_eq!(version(&lib), None);
+        let source = CoverSource::File("/m/a/cover.jpg".into());
         let job = lib.cover_jobs().unwrap().remove(0);
-        let source = CoverSource::File(root.join("A/cover.jpg"));
-        lib.set_cover(&job.album_id, Some(&source), None, &job.signature)
+        lib.set_cover("a", Some(&found(source.clone(), "1")), &job.signature)
             .unwrap();
-        let first = version(&lib).expect("an album with art has a cover version");
-        // Changed tracks give a new signature, and the cover pass redoes the art.
-        lib.set_cover(&job.album_id, Some(&source), None, "8:1")
-            .unwrap();
-        assert_ne!(version(&lib).unwrap(), first);
+        assert_eq!(version(&lib).as_deref(), Some("1"));
+        // Art found changed when a thumbnail was made, with the tracks as they were.
+        lib.set_cover_version("a", "2", "#ffffff").unwrap();
+        assert_eq!(version(&lib).as_deref(), Some("2"));
+        assert_eq!(
+            lib.cover("a").unwrap(),
+            Some((Some(source), Some("2".into())))
+        );
+        assert!(lib.cover_jobs().unwrap().is_empty(), "the signature stays");
         // No art, no cover URL to version.
-        lib.set_cover(&job.album_id, None, None, &job.signature)
-            .unwrap();
+        lib.set_cover("a", None, "sig").unwrap();
         assert_eq!(version(&lib), None);
     }
 

@@ -229,13 +229,8 @@ pub fn refresh_covers(lib: &Library, covers: &CoverCache, progress: &Progress) -
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build();
     let run = || {
         jobs.par_iter().for_each(|job| {
-            let (source, color) = covers.analyze(job);
-            if let Err(e) = lib.set_cover(
-                &job.album_id,
-                source.as_ref(),
-                color.as_deref(),
-                &job.signature,
-            ) {
+            let cover = covers.analyze(job);
+            if let Err(e) = lib.set_cover(&job.album_id, cover.as_ref(), &job.signature) {
                 tracing::warn!(album = job.album_id, "cover: {e}");
             }
             update(progress, |p| p.covers_done += 1);
