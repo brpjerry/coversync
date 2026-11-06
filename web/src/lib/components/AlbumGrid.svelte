@@ -44,7 +44,15 @@
 	);
 
 	/** Staggered entrance on first render; afterwards new cards just fade in. */
-	let intro = $state(true);
+	let intro = true;
+	/**
+	 * Choose a card's entrance once, when it mounts. Switching it later would
+	 * restart the animation, or make one still playing jump, on cards already
+	 * on screen.
+	 */
+	function entrance(cell: HTMLElement) {
+		if (intro) cell.classList.add('rise');
+	}
 	/** No gliding while the width changes (window resize, sidebar collapse). */
 	let settling = $state(true);
 
@@ -92,7 +100,6 @@
 
 <div
 	class="vgrid"
-	class:intro
 	class:settling
 	bind:this={grid}
 	style:max-width="{GRID_MAX_WIDTH}px"
@@ -104,6 +111,7 @@
 		{@const f = flag?.(album) ?? null}
 		<div
 			class="cell"
+			use:entrance
 			role="listitem"
 			style:width="{cellWidth}px"
 			style:transform="translate({(index % cols) * (cellWidth + colGap)}px, {Math.floor(
@@ -134,24 +142,26 @@
 		top: 0;
 		left: 0;
 		transition: transform 480ms var(--ease-out);
-		/* One animation for both entrances, as changing its name when the intro
-		   ends would play it again on every card on screen. */
-		animation: enter 360ms var(--ease-out) both;
+		animation: appear 360ms var(--ease-out) both;
 	}
 	.settling .cell {
 		transition: none;
 	}
-	.intro .cell {
-		--rise: 14px;
-		--shrink: 0.98;
-		animation-duration: 560ms;
+	/* Cards that mount during the intro (see `entrance`). */
+	.cell:global(.rise) {
+		animation: rise 560ms var(--ease-out) both;
 		animation-delay: calc(var(--i) * 16ms);
 	}
-	@keyframes enter {
+	@keyframes appear {
 		from {
 			opacity: 0;
-			translate: 0 var(--rise, 0);
-			scale: var(--shrink, 1);
+		}
+	}
+	@keyframes rise {
+		from {
+			opacity: 0;
+			translate: 0 14px;
+			scale: 0.98;
 		}
 	}
 </style>

@@ -188,6 +188,47 @@ class Driver:
             self.proc.terminate()
 
 
+def grid_intro_check(d):
+    """Cards keep the entrance they mounted with: when the grid's intro ends,
+    no card's animation restarts or changes timing, including cards that a
+    scroll mounted during the intro. Remounts the grid (Library and back) so
+    the intro starts on a known frame."""
+    d.click_text("header", "Library")
+    d.wait("return !document.querySelector('.vgrid')")
+    res = d.s("POST", "/execute/async", {"args": [], "script": """
+        const done = arguments[0], seen = new Map();
+        [...document.querySelectorAll('.tabs button')].find(b => b.textContent.includes('Inbox')).click();
+        let t0 = null, scrolled = false, restarts = 0, retimed = 0, scrolledIn = 0, scrolledInRising = 0;
+        const timing = a => { const t = a.effect.getComputedTiming(); return t.duration + '/' + t.delay; };
+        const tick = () => {
+            if (t0 === null && document.querySelector('.vgrid .cell')) t0 = performance.now();
+            const now = t0 === null ? -1 : performance.now() - t0;
+            // Mount cards well inside the intro (1.4s), while the first ones still rise.
+            if (!scrolled && now > 500) { scrolled = true; scrollBy(0, innerHeight * 2); }
+            for (const c of document.querySelectorAll('.vgrid .cell')) {
+                const a = c.getAnimations().find(a => a.animationName);
+                const was = seen.get(c);
+                if (!was) {
+                    seen.set(c, { a, timing: a && timing(a) });
+                    // The intro's entrance is the 560ms one.
+                    if (scrolled) { scrolledIn++; if (a?.effect.getComputedTiming().duration === 560) scrolledInRising++; }
+                } else if (a) {
+                    if (was.a && a !== was.a) restarts++;
+                    else if (was.timing && timing(a) !== was.timing) retimed++;
+                    was.a = a; was.timing = timing(a);
+                }
+            }
+            if (now < 2600) requestAnimationFrame(tick);
+            else { scrollTo(0, 0); done({ cells: seen.size, scrolledIn, scrolledInRising, restarts, retimed }); }
+        };
+        requestAnimationFrame(tick);
+    """})
+    ok = res["restarts"] == 0 and res["retimed"] == 0
+    print("grid intro:", "ok" if ok else "FAIL", res)
+    if not res["scrolledInRising"]:
+        print("  (no card mounted during the intro, so that case went unchecked)")
+
+
 def appearance_flow(d, out, tag):
     """Add Label and Genre to the sort menu, move Label up; save only with --save."""
     tabs = "return [...document.querySelectorAll('[aria-labelledby=tabs-title] .tab-label')].map(b => b.textContent.trim())"
@@ -770,6 +811,8 @@ def main():
     tag = "dark" if dark else "light"
     try:
         d.go(url)
+        d.wait("return document.querySelectorAll('.card').length > 0")
+        grid_intro_check(d)
         d.wait("return document.querySelectorAll('.card').length > 0")
         # Only covers in the viewport load; the rest are lazy.
         d.wait("return [...document.querySelectorAll('.card img')]"
