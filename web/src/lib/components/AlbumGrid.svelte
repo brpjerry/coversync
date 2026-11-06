@@ -134,25 +134,24 @@
 		top: 0;
 		left: 0;
 		transition: transform 480ms var(--ease-out);
-		animation: appear 360ms var(--ease-out) both;
+		/* One animation for both entrances, as changing its name when the intro
+		   ends would play it again on every card on screen. */
+		animation: enter 360ms var(--ease-out) both;
 	}
 	.settling .cell {
 		transition: none;
 	}
 	.intro .cell {
-		animation: rise 560ms var(--ease-out) both;
+		--rise: 14px;
+		--shrink: 0.98;
+		animation-duration: 560ms;
 		animation-delay: calc(var(--i) * 16ms);
 	}
-	@keyframes appear {
+	@keyframes enter {
 		from {
 			opacity: 0;
-		}
-	}
-	@keyframes rise {
-		from {
-			opacity: 0;
-			translate: 0 14px;
-			scale: 0.98;
+			translate: 0 var(--rise, 0);
+			scale: var(--shrink, 1);
 		}
 	}
 </style>
