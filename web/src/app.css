@@ -177,23 +177,12 @@ button {
 	transform: scale(0.92);
 }
 
-/* Album cover morph between grid and detail */
+/* Album cover morph between grid and detail. The two snapshots cross-fade as
+   they move, which also carries the card's shadow into the sheet's and back. */
 ::view-transition-group(album-cover) {
 	animation-duration: 460ms;
 	animation-timing-function: var(--ease-out);
 	z-index: 10;
-}
-::view-transition-image-pair(album-cover) {
-	isolation: auto;
-}
-::view-transition-old(album-cover),
-::view-transition-new(album-cover) {
-	animation: none;
-	mix-blend-mode: normal;
-	height: 100%;
-	object-fit: cover;
-	border-radius: var(--radius);
-	overflow: clip;
 }
 ::view-transition-old(root),
 ::view-transition-new(root) {
