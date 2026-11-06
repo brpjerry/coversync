@@ -564,197 +564,199 @@
 
 <svelte:window {onkeydown} />
 
-<TopBar
-	bind:query
-	bind:search
-	inert={!!openAlbum}
-	{view}
-	counts={{ inbox: loaded ? albums.length : null, library: loaded ? library.length : null }}
-	scan={status?.scan ?? null}
-	shown={visible.length}
-	total={source.length}
-	sidebarOpen={!collapsed}
-	{filtered}
-	onview={setView}
-	ontogglesidebar={toggleSidebar}
-	onrescan={rescan}
->
-	{#snippet sorts()}
-		<SortMenu
-			sorts={appearance.sorts.saved}
-			active={activeSort}
-			label={(id) => appearance.label(id)}
-			counts={{ attention: flagged.length }}
-			onsort={(id) => (sort = id)}
-			disabled={isSetup(view)}
-		/>
-	{/snippet}
-</TopBar>
-
-<div class="shell" inert={!!openAlbum}>
-	<Sidebar
-		kinds={filterKinds}
-		label={(id) => appearance.label(id)}
-		albums={searched}
-		bind:filters={filters[browsing]}
-		{collapsed}
+<!-- The page under an open album: inert, and blurred (see .behind). -->
+<div class="page" class:behind={!!openAlbum} inert={!!openAlbum}>
+	<TopBar
+		bind:query
+		bind:search
 		{view}
-		sync={syncSetup.loaded && syncSetup.savedEnabled}
-		dirty={{
-			'inbox-setup': inboxSetup.changes > 0,
-			'library-setup': setup.changes > 0,
-			appearance: appearance.changes > 0,
-			'sync-setup': syncSetup.changes > 0
-		}}
+		counts={{ inbox: loaded ? albums.length : null, library: loaded ? library.length : null }}
+		scan={status?.scan ?? null}
+		shown={visible.length}
+		total={source.length}
+		sidebarOpen={!collapsed}
+		{filtered}
 		onview={setView}
-	/>
+		ontogglesidebar={toggleSidebar}
+		onrescan={rescan}
+	>
+		{#snippet sorts()}
+			<SortMenu
+				sorts={appearance.sorts.saved}
+				active={activeSort}
+				label={(id) => appearance.label(id)}
+				counts={{ attention: flagged.length }}
+				onsort={(id) => (sort = id)}
+				disabled={isSetup(view)}
+			/>
+		{/snippet}
+	</TopBar>
 
-	<main bind:contentRect={mainBox}>
-		{#key view}
-			<div class="view" in:fly={{ x: 28 * direction, duration: 420, easing: cubicOut }}>
-				{#if attentionView && !isSetup(view) && loaded && appearance.settled && source.length}
-					<!-- A filter kept across visits, so it's always on show while it applies. -->
-					<div class="attention-note" transition:slide={{ duration: 220 }}>
-						<CircleAlert size={15} strokeWidth={2.2} />
-						<span>
-							Only albums that need attention: <b class="tabular">{count(flagged.length)}</b> of
-							{count(source.length)}
-						</span>
-						{#if plainSort}
-							<button class="link" onclick={showAll}>Show all albums</button>
-						{/if}
-					</div>
-				{/if}
-				{#if view === 'library-setup'}
-					<LibrarySetup
-						{query}
-						back={setupBack}
-						scanning={status?.scan.running ?? false}
-						generation={dataGeneration}
-					/>
-				{:else if view === 'appearance'}
-					<AppearanceSetup
-						{query}
-						back={setupBack}
-						onsaved={loadAlbums}
-						{gridWidth}
-						albums={previewAlbums}
-					/>
-				{:else if view === 'inbox-setup'}
-					<InboxSetup
-						back={setupBack}
-						onchanged={inboxChanged}
-						onrescan={() => setTimeout(poll, 300)}
-					/>
-				{:else if view === 'sync-setup'}
-					<SyncSetup back={setupBack} />
-				{:else if !loaded || !appearance.settled}
-					<div class="grid" aria-busy="true" style:--cover-min="{ghostWidth}px">
-						{#each { length: 18 } as _, i (i)}
-							<div class="ghost" style:--i={i}><span></span><b></b><b></b></div>
-						{/each}
-					</div>
-				{:else if view === 'library' && library.length === 0}
-					<div class="empty">
-						<div class="fan" aria-hidden="true">
-							<span></span><span></span><span><LibraryBig size={30} strokeWidth={1.4} /></span>
+	<div class="shell">
+		<Sidebar
+			kinds={filterKinds}
+			label={(id) => appearance.label(id)}
+			albums={searched}
+			bind:filters={filters[browsing]}
+			{collapsed}
+			{view}
+			sync={syncSetup.loaded && syncSetup.savedEnabled}
+			dirty={{
+				'inbox-setup': inboxSetup.changes > 0,
+				'library-setup': setup.changes > 0,
+				appearance: appearance.changes > 0,
+				'sync-setup': syncSetup.changes > 0
+			}}
+			onview={setView}
+		/>
+
+		<main bind:contentRect={mainBox}>
+			{#key view}
+				<div class="view" in:fly={{ x: 28 * direction, duration: 420, easing: cubicOut }}>
+					{#if attentionView && !isSetup(view) && loaded && appearance.settled && source.length}
+						<!-- A filter kept across visits, so it's always on show while it applies. -->
+						<div class="attention-note" transition:slide={{ duration: 220 }}>
+							<CircleAlert size={15} strokeWidth={2.2} />
+							<span>
+								Only albums that need attention: <b class="tabular">{count(flagged.length)}</b> of
+								{count(source.length)}
+							</span>
+							{#if plainSort}
+								<button class="link" onclick={showAll}>Show all albums</button>
+							{/if}
 						</div>
-						<h2>Your library is empty</h2>
-						<p>Albums you bring in from the Inbox will be organized and managed here.</p>
-						<div class="empty-actions">
-							<button class="btn primary" onclick={() => setView('library-setup')}>
-								<Settings2 size={16} /> Set up rules
-							</button>
-							<button class="btn" onclick={() => setView('inbox')}>
-								<Inbox size={16} /> Browse the Inbox
-							</button>
+					{/if}
+					{#if view === 'library-setup'}
+						<LibrarySetup
+							{query}
+							back={setupBack}
+							scanning={status?.scan.running ?? false}
+							generation={dataGeneration}
+						/>
+					{:else if view === 'appearance'}
+						<AppearanceSetup
+							{query}
+							back={setupBack}
+							onsaved={loadAlbums}
+							{gridWidth}
+							albums={previewAlbums}
+						/>
+					{:else if view === 'inbox-setup'}
+						<InboxSetup
+							back={setupBack}
+							onchanged={inboxChanged}
+							onrescan={() => setTimeout(poll, 300)}
+						/>
+					{:else if view === 'sync-setup'}
+						<SyncSetup back={setupBack} />
+					{:else if !loaded || !appearance.settled}
+						<div class="grid" aria-busy="true" style:--cover-min="{ghostWidth}px">
+							{#each { length: 18 } as _, i (i)}
+								<div class="ghost" style:--i={i}><span></span><b></b><b></b></div>
+							{/each}
 						</div>
-					</div>
-				{:else if source.length === 0}
-					<div class="empty">
-						<span class="empty-icon"><Disc3 size={44} strokeWidth={1.2} /></span>
-						{#if status?.scan.running}
-							<h2>Scanning for music…</h2>
-							<p>Albums appear in the Inbox as their tags are read.</p>
-						{:else if inboxSetup.loaded && !inboxSetup.saved.folder}
-							<h2>No Inbox folder yet</h2>
-							<p>Choose the folder coversync scans for music to bring into the Library.</p>
+					{:else if view === 'library' && library.length === 0}
+						<div class="empty">
+							<div class="fan" aria-hidden="true">
+								<span></span><span></span><span><LibraryBig size={30} strokeWidth={1.4} /></span>
+							</div>
+							<h2>Your library is empty</h2>
+							<p>Albums you bring in from the Inbox will be organized and managed here.</p>
 							<div class="empty-actions">
-								<button class="btn primary" onclick={() => setView('inbox-setup')}>
-									<FolderCog size={16} /> Choose a folder
+								<button class="btn primary" onclick={() => setView('library-setup')}>
+									<Settings2 size={16} /> Set up rules
+								</button>
+								<button class="btn" onclick={() => setView('inbox')}>
+									<Inbox size={16} /> Browse the Inbox
 								</button>
 							</div>
-						{:else if inboxSetup.folderStatus && !inboxSetup.folderStatus.exists}
-							<h2>The Inbox folder can't be found</h2>
+						</div>
+					{:else if source.length === 0}
+						<div class="empty">
+							<span class="empty-icon"><Disc3 size={44} strokeWidth={1.2} /></span>
+							{#if status?.scan.running}
+								<h2>Scanning for music…</h2>
+								<p>Albums appear in the Inbox as their tags are read.</p>
+							{:else if inboxSetup.loaded && !inboxSetup.saved.folder}
+								<h2>No Inbox folder yet</h2>
+								<p>Choose the folder coversync scans for music to bring into the Library.</p>
+								<div class="empty-actions">
+									<button class="btn primary" onclick={() => setView('inbox-setup')}>
+										<FolderCog size={16} /> Choose a folder
+									</button>
+								</div>
+							{:else if inboxSetup.folderStatus && !inboxSetup.folderStatus.exists}
+								<h2>The Inbox folder can't be found</h2>
+								<p>
+									<code>{inboxSetup.saved.folder}</code> isn't there right now. Mount it and rescan, or
+									choose another folder.
+								</p>
+								<div class="empty-actions">
+									<button class="btn primary" onclick={rescan}>
+										<RefreshCw size={16} /> Rescan
+									</button>
+									<button class="btn" onclick={() => setView('inbox-setup')}>
+										<FolderCog size={16} /> Inbox setup
+									</button>
+								</div>
+							{:else}
+								<h2>The Inbox is empty</h2>
+								<p>No audio files were found in the Inbox folder.</p>
+								<div class="empty-actions">
+									<button class="btn primary" onclick={() => setView('inbox-setup')}>
+										<FolderCog size={16} /> Inbox setup
+									</button>
+									<button class="btn" onclick={rescan}>
+										<RefreshCw size={16} /> Rescan
+									</button>
+								</div>
+							{/if}
+						</div>
+					{:else if visible.length === 0 && attentionView && !query.trim() && !filtered}
+						<div class="empty">
+							<span class="empty-ok"><CircleCheck size={44} strokeWidth={1.4} /></span>
+							<h2>Nothing needs attention</h2>
+							<p>Every album here has the tags the library rules and folder structure need.</p>
+						</div>
+					{:else if visible.length === 0 && filtered}
+						<div class="empty">
+							<h2>
+								{attentionView
+									? 'No albums needing attention match these filters'
+									: 'No albums match these filters'}
+							</h2>
 							<p>
-								<code>{inboxSetup.saved.folder}</code> isn't there right now. Mount it and rescan, or
-								choose another folder.
+								{query.trim() ? `Nothing with these tags matches “${query}”.` : 'Try fewer tags.'}
 							</p>
 							<div class="empty-actions">
-								<button class="btn primary" onclick={rescan}>
-									<RefreshCw size={16} /> Rescan
-								</button>
-								<button class="btn" onclick={() => setView('inbox-setup')}>
-									<FolderCog size={16} /> Inbox setup
+								<button class="btn" onclick={clearFilters}>
+									<FilterX size={16} /> Clear filters
 								</button>
 							</div>
-						{:else}
-							<h2>The Inbox is empty</h2>
-							<p>No audio files were found in the Inbox folder.</p>
-							<div class="empty-actions">
-								<button class="btn primary" onclick={() => setView('inbox-setup')}>
-									<FolderCog size={16} /> Inbox setup
-								</button>
-								<button class="btn" onclick={rescan}>
-									<RefreshCw size={16} /> Rescan
-								</button>
-							</div>
-						{/if}
-					</div>
-				{:else if visible.length === 0 && attentionView && !query.trim() && !filtered}
-					<div class="empty">
-						<span class="empty-ok"><CircleCheck size={44} strokeWidth={1.4} /></span>
-						<h2>Nothing needs attention</h2>
-						<p>Every album here has the tags the library rules and folder structure need.</p>
-					</div>
-				{:else if visible.length === 0 && filtered}
-					<div class="empty">
-						<h2>
-							{attentionView
-								? 'No albums needing attention match these filters'
-								: 'No albums match these filters'}
-						</h2>
-						<p>
-							{query.trim() ? `Nothing with these tags matches “${query}”.` : 'Try fewer tags.'}
-						</p>
-						<div class="empty-actions">
-							<button class="btn" onclick={clearFilters}>
-								<FilterX size={16} /> Clear filters
-							</button>
 						</div>
-					</div>
-				{:else if visible.length === 0}
-					<div class="empty">
-						<h2>
-							{attentionView
-								? `Nothing that needs attention matches “${query}”`
-								: `Nothing matches “${query}”`}
-						</h2>
-						<p>Try an artist, album title, genre or year.</p>
-					</div>
-				{:else}
-					<AlbumGrid
-						albums={visible}
-						size={appearance.savedCoverSize}
-						onopen={open}
-						onplay={playAlbum}
-						onmenu={(a, x, y) => (menu = { album: a, x, y })}
-						flag={attentionView ? attentionFlag : undefined}
-					/>
-				{/if}
-			</div>
-		{/key}
-	</main>
+					{:else if visible.length === 0}
+						<div class="empty">
+							<h2>
+								{attentionView
+									? `Nothing that needs attention matches “${query}”`
+									: `Nothing matches “${query}”`}
+							</h2>
+							<p>Try an artist, album title, genre or year.</p>
+						</div>
+					{:else}
+						<AlbumGrid
+							albums={visible}
+							size={appearance.savedCoverSize}
+							onopen={open}
+							onplay={playAlbum}
+							onmenu={(a, x, y) => (menu = { album: a, x, y })}
+							flag={attentionView ? attentionFlag : undefined}
+						/>
+					{/if}
+				</div>
+			{/key}
+		</main>
+	</div>
 </div>
 
 {#if narrow && drawerOpen}
@@ -812,6 +814,12 @@
 <Toasts />
 
 <style>
+	/* Frosted behind an open album's sheet. A filter on the page rather than a
+	   backdrop-filter on the sheet: Firefox leaves backdrop-filter out of
+	   view-transition snapshots, so the blur dropped out while the cover moved. */
+	.page.behind {
+		filter: blur(18px) saturate(1.2);
+	}
 	.shell {
 		display: grid;
 		grid-template-columns: auto minmax(0, 1fr);

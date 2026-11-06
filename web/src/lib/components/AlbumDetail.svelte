@@ -205,8 +205,8 @@
 		overscroll-behavior: contain;
 		/* Room for the player while it's showing (--dock). */
 		padding: 48px 24px calc(var(--dock, 0px) + 40px);
+		/* Over the page, which blurs itself while the sheet is open (.page.behind). */
 		background: color-mix(in oklab, var(--bg) 55%, transparent);
-		backdrop-filter: blur(18px) saturate(1.2);
 	}
 	.sheet {
 		position: relative;

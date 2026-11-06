@@ -30,8 +30,6 @@
 		search?: HTMLInputElement;
 		/** The sort menu, at the bar's right end. */
 		sorts: Snippet;
-		/** A dialog is open over the page: the bar takes no focus or clicks. */
-		inert?: boolean;
 	}
 	let {
 		query = $bindable(),
@@ -46,8 +44,7 @@
 		ontogglesidebar,
 		onrescan,
 		search = $bindable(),
-		sorts,
-		inert = false
+		sorts
 	}: Props = $props();
 
 	const views = [
@@ -84,7 +81,7 @@
 	});
 </script>
 
-<header class="bar" {inert}>
+<header class="bar">
 	<div class="lead">
 		<button
 			class="icon-btn toggle"
