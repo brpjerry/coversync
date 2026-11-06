@@ -15,6 +15,8 @@ export interface Album {
 	duration_ms: number;
 	color: string | null;
 	has_cover: boolean;
+	/** Changes whenever the art is redone: cover URLs carry it, so browsers keep covers until then. */
+	cover_version: string | null;
 	added_at: number;
 	format: string;
 	collection: Collection;
@@ -523,7 +525,9 @@ export const api = {
 		})
 };
 
-export const coverUrl = (id: string, size = 512) => `${BASE}/api/albums/${id}/cover?size=${size}`;
+/** An album's cover, at least `size` px. Its cover version lets the browser keep it until the art changes. */
+export const coverUrl = (album: Pick<Album, 'id' | 'cover_version'>, size = 512) =>
+	`${BASE}/api/albums/${album.id}/cover?size=${size}${album.cover_version ? `&v=${album.cover_version}` : ''}`;
 /** The album's art at full size. */
 export const fullCoverUrl = (id: string) => `${BASE}/api/albums/${id}/cover/full`;
 /** MusicBrainz's cover, once `api.musicbrainzArt` has downloaded it. */

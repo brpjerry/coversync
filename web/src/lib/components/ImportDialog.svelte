@@ -339,7 +339,7 @@
 						src={musicbrainzArtUrl(mbArt.release)}
 						alt=""
 						in:fade={{ duration: 240 }}
-					/>{:else if album.has_cover}<img src={coverUrl(album.id, 256)} alt="" />{:else}<Disc3
+					/>{:else if album.has_cover}<img src={coverUrl(album, 256)} alt="" />{:else}<Disc3
 						size={28}
 						strokeWidth={1.3}
 					/>{/if}
@@ -391,7 +391,7 @@
 					}}
 					original={initial.art.source
 						? {
-								thumb: coverUrl(album.id, 256),
+								thumb: coverUrl(album, 256),
 								full: fullCoverUrl(album.id),
 								width: initial.art.width,
 								height: initial.art.height,

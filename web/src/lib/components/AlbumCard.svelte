@@ -59,9 +59,9 @@
 		>
 			{#if album.has_cover && !failed}
 				<img
-					src={coverUrl(album.id, 256)}
-					srcset="{coverUrl(album.id, 256)} 256w, {coverUrl(album.id, 512)} 512w, {coverUrl(
-						album.id,
+					src={coverUrl(album, 256)}
+					srcset="{coverUrl(album, 256)} 256w, {coverUrl(album, 512)} 512w, {coverUrl(
+						album,
 						1024
 					)} 1024w"
 					sizes="{Math.ceil(width)}px"

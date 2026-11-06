@@ -41,6 +41,9 @@ pub struct Album {
     /// Dominant cover colour as `#rrggbb`, once the cover pass has run.
     pub color: Option<String>,
     pub has_cover: bool,
+    /// Changes whenever the cover pass redoes the album's art. Cover URLs carry
+    /// it, so a browser can keep a cover until the art changes.
+    pub cover_version: Option<String>,
     /// When the album was added (Unix seconds): for the Inbox, its newest
     /// file's modification time; for the Library, when it was first imported.
     pub added_at: i64,

@@ -122,7 +122,7 @@ class Player {
 		const art = this.album?.has_cover
 			? [
 					{
-						src: new URL(coverUrl(t.album_id, 512), location.href).href,
+						src: new URL(coverUrl(this.album, 512), location.href).href,
 						sizes: '512x512',
 						type: 'image/jpeg'
 					}

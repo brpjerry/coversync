@@ -58,7 +58,7 @@
 			{#key track.album_id}
 				<span class="art" in:scale={{ start: 0.85, duration: 380 }}>
 					{#if player.album?.has_cover}
-						<img src={coverUrl(track.album_id, 256)} alt="" />
+						<img src={coverUrl(player.album, 256)} alt="" />
 					{/if}
 				</span>
 			{/key}

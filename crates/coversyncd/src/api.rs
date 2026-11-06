@@ -697,6 +697,19 @@ async fn import_album(
 #[derive(Deserialize)]
 struct CoverQuery {
     size: Option<u32>,
+    /// The album's `cover_version`, which changes whenever its art does.
+    v: Option<String>,
+}
+
+/// How long a thumbnail may be kept. A URL with the album's `cover_version`
+/// stands for one rendering of the art, so it can be kept for good; without
+/// one, the browser has to check every time, as the art may have changed.
+fn cover_caching(versioned: bool) -> &'static str {
+    if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
 }
 
 pub(crate) async fn serve_file(path: PathBuf, req: Request, cache: &'static str) -> Response {
@@ -718,7 +731,7 @@ async fn cover(
 ) -> ApiResult<Response> {
     let size = q.size.unwrap_or(512);
     let path = blocking(&state, move |s| s.covers.thumbnail(&s.lib, &id, size)).await?;
-    Ok(serve_file(path, req, "public, max-age=86400").await)
+    Ok(serve_file(path, req, cover_caching(q.v.is_some())).await)
 }
 
 /// The album's art at full size: the image file beside the tracks, or the
@@ -734,7 +747,9 @@ async fn full_cover(
             .ok_or(coversync_core::Error::NotFound)
     })
     .await?;
-    let cache = "private, max-age=300";
+    // Read from the art as it is now, which can change without the cover pass
+    // noticing (an image beside the tracks replaced on its own): always check.
+    let cache = "no-cache";
     match source {
         CoverSource::File(path) => Ok(serve_file(path, req, cache).await),
         CoverSource::Embedded(path) => {
@@ -885,6 +900,12 @@ async fn write_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_versioned_cover_urls_are_kept() {
+        assert_eq!(cover_caching(false), "no-cache");
+        assert!(cover_caching(true).contains("immutable"));
+    }
 
     #[test]
     fn track_edits_override_album_edits() {
