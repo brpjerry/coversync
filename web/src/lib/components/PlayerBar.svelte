@@ -166,6 +166,28 @@
 		backdrop-filter: saturate(1.8) blur(28px);
 		border: 1px solid var(--border);
 		box-shadow: var(--shadow);
+		/* Firefox leaves backdrop-filter out of view-transition snapshots, so while
+		   an album opens or closes the bar is captured on its own, and its snapshot,
+		   below, frosts the page changing underneath. */
+		view-transition-name: player;
+	}
+	/* Firefox would paint this frost too, at full strength, even as the bar comes or goes. */
+	:global(:root:active-view-transition) .player {
+		backdrop-filter: none;
+	}
+	/* Above the moving album cover (z-index 10), as the bar is above the sheet. */
+	:global(::view-transition-group(player)) {
+		z-index: 11;
+	}
+	/* The bar doesn't change, so it shows as it is now, without a cross-fade. */
+	:global(::view-transition-old(player):not(:only-child)) {
+		display: none;
+	}
+	:global(::view-transition-new(player)) {
+		animation: none;
+		mix-blend-mode: normal;
+		border-radius: 20px;
+		backdrop-filter: saturate(1.8) blur(28px);
 	}
 	.np {
 		display: flex;
