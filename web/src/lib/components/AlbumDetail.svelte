@@ -64,7 +64,7 @@
 >
 	<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="album-title">
 		<div class="backdrop" aria-hidden="true">
-			{#if album.has_cover}<img src={coverUrl(album.id, 256)} alt="" />{/if}
+			{#if album.has_cover}<img src={coverUrl(album, 256)} alt="" />{/if}
 		</div>
 		<button class="icon-btn close" bind:this={closeButton} onclick={onclose} aria-label="Close">
 			<X size={20} />
@@ -74,11 +74,11 @@
 			<div
 				class="hero-cover"
 				style:view-transition-name="album-cover"
-				style:background-image={album.has_cover ? `url(${coverUrl(album.id, 256)})` : 'none'}
+				style:background-image={album.has_cover ? `url(${coverUrl(album, 256)})` : 'none'}
 			>
 				{#if album.has_cover}
 					<img
-						src={coverUrl(album.id, 1024)}
+						src={coverUrl(album, 1024)}
 						alt="Cover of {album.title}"
 						class:loaded={heroLoaded}
 						onload={() => (heroLoaded = true)}

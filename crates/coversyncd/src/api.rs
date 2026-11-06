@@ -697,11 +697,27 @@ async fn import_album(
 #[derive(Deserialize)]
 struct CoverQuery {
     size: Option<u32>,
+    /// The album's `cover_version`, which changes whenever its art does.
+    v: Option<String>,
+}
+
+/// How long a thumbnail may be kept. One served for the `cover_version` its
+/// URL names is that rendering of the art for good; any other (no version, or
+/// one the art has since moved on from) has to be checked every time.
+fn cover_caching(current: bool) -> &'static str {
+    if current {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
 }
 
 pub(crate) async fn serve_file(path: PathBuf, req: Request, cache: &'static str) -> Response {
     match ServeFile::new(path).oneshot(req).await {
         Ok(mut res) => {
+            // Never keep an error, least of all under a URL kept for good.
+            let served = res.status().is_success() || res.status() == StatusCode::NOT_MODIFIED;
+            let cache = if served { cache } else { "no-store" };
             res.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             res.into_response()
@@ -717,8 +733,11 @@ async fn cover(
     req: Request,
 ) -> ApiResult<Response> {
     let size = q.size.unwrap_or(512);
-    let path = blocking(&state, move |s| s.covers.thumbnail(&s.lib, &id, size)).await?;
-    Ok(serve_file(path, req, "public, max-age=86400").await)
+    let (path, current) = blocking(&state, move |s| {
+        s.covers.thumbnail(&s.lib, &id, size, q.v.as_deref())
+    })
+    .await?;
+    Ok(serve_file(path, req, cover_caching(current)).await)
 }
 
 /// The album's art at full size: the image file beside the tracks, or the
@@ -734,7 +753,9 @@ async fn full_cover(
             .ok_or(coversync_core::Error::NotFound)
     })
     .await?;
-    let cache = "private, max-age=300";
+    // Read from the art as it is now, which can change without the cover pass
+    // noticing (an image beside the tracks replaced on its own): always check.
+    let cache = "no-cache";
     match source {
         CoverSource::File(path) => Ok(serve_file(path, req, cache).await),
         CoverSource::Embedded(path) => {
@@ -885,6 +906,31 @@ async fn write_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_current_cover_renderings_are_kept() {
+        assert_eq!(cover_caching(false), "no-cache");
+        assert!(cover_caching(true).contains("immutable"));
+    }
+
+    #[tokio::test]
+    async fn errors_are_never_kept() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-serve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.jpg"), b"jpeg").unwrap();
+        let get = || {
+            axum::http::Request::builder()
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let served = serve_file(dir.join("c.jpg"), get(), cover_caching(true)).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers()[header::CACHE_CONTROL], cover_caching(true));
+        let missing = serve_file(dir.join("gone.jpg"), get(), cover_caching(true)).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
+    }
 
     #[test]
     fn track_edits_override_album_edits() {
