@@ -204,6 +204,7 @@
 	   blurred behind an album (.page.behind), which would lose the bar that blur.
 	   Chrome keeps the frost in the page's snapshot but won't frost one of the
 	   bar's own, so it captures the bar with the page. */
+	/* Gecko only: no other engine knows -moz-appearance. */
 	@supports (-moz-appearance: none) {
 		.bar {
 			view-transition-name: top-bar;

@@ -172,6 +172,7 @@
 	   snapshot, below, frosts the page changing underneath. Chrome keeps the
 	   frost in the page's snapshot but won't frost one of the bar's own, so it
 	   captures the bar with the page. */
+	/* Gecko only: no other engine knows -moz-appearance. */
 	@supports (-moz-appearance: none) {
 		.player {
 			view-transition-name: player;
@@ -182,7 +183,7 @@
 		}
 	}
 	/* Above the moving album cover (z-index 10), as the bar is above the sheet.
-	   In Chrome the bar is part of the page's snapshot, under the cover. */
+	   Outside Firefox the bar is part of the page's snapshot, under the cover. */
 	:global(::view-transition-group(player)) {
 		z-index: 11;
 	}
