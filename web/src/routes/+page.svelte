@@ -310,6 +310,9 @@
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
 		await morph(cover, async () => {
+			// Behind the sheet the page is blurred with a filter, which would lay the
+			// fixed drawer out against the page instead of the window.
+			drawerOpen = false;
 			// Shallow: a history entry with the album in page.state, no navigation.
 			await goto(page.url.href, { state: { album: album.id }, shallow: true });
 			await tick();

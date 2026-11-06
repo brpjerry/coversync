@@ -890,7 +890,7 @@ def main():
         d.shot(out / f"2-album-{tag}.png")
         # The top bar is inert behind the sheet: "/" mustn't focus the search field.
         d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: '/', bubbles: true}))")
-        print("top bar inert:", d.js("return document.querySelector('.bar').inert"),
+        print("top bar inert:", d.js("return !!document.querySelector('.bar').closest('[inert]')"),
               "| '/' focused search:", d.js("return document.activeElement === document.querySelector('.search input')"))
 
         d.click(".actions .btn.primary")
