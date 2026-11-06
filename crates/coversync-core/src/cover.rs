@@ -145,9 +145,12 @@ impl CoverCache {
         static TEMP: AtomicU64 = AtomicU64::new(0);
         fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
         let tmp = path.with_extension(format!("{}.tmp", TEMP.fetch_add(1, Ordering::Relaxed)));
-        fs::write(&tmp, encode_jpeg(img)?)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        let bytes = encode_jpeg(img)?;
+        let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(written?)
     }
 
     /// Remove an album's thumbnails, except those of the `keep` version.
@@ -188,8 +191,11 @@ impl CoverCache {
                 let thumb = fit(&image::load_from_memory(&art)?, SIZES[1]);
                 let version = version_of(&art);
                 let path = self.path(&job.album_id, &version, SIZES[1]);
-                if !path.exists() {
-                    self.write(&path, &thumb)?;
+                // The art is found all the same: a thumbnail request renders it again.
+                if !path.exists()
+                    && let Err(e) = self.write(&path, &thumb)
+                {
+                    tracing::warn!(album = job.album_id, "cover thumbnail: {e}");
                 }
                 Ok((dominant_color(&thumb), version))
             });
@@ -295,6 +301,41 @@ mod tests {
         assert_ne!(green.version, red.version);
         assert!(!cache.path("a", &red.version, 512).exists());
         assert!(cache.path("a", &green.version, 512).exists());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let dir = temp_dir("tmpfiles");
+        let cache = CoverCache::new(dir.join("cache")).unwrap();
+        // Renaming onto a directory fails after the temporary file is written.
+        let target = cache.path("a", "v", 256);
+        fs::create_dir_all(&target).unwrap();
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 8, Rgb([1, 2, 3])));
+        assert!(cache.write(&target, &img).is_err());
+        let left: Vec<_> = fs::read_dir(dir.join("cache/a"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(left.len(), 1, "only the directory in the way: {left:?}");
+    }
+
+    #[test]
+    fn a_cache_that_cant_be_written_keeps_the_cover() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("readonly");
+        let cache = CoverCache::new(dir.join("cache")).unwrap();
+        paint(&dir, [200, 40, 40]);
+        let lock = |mode| fs::set_permissions(dir.join("cache"), fs::Permissions::from_mode(mode));
+        lock(0o555).unwrap();
+        // Root writes regardless, and there's nothing to test.
+        let writable = fs::write(dir.join("cache/probe"), b"").is_ok();
+        let cover = cache.analyze(&job(&dir));
+        lock(0o755).unwrap();
+        if writable {
+            return;
+        }
+        let cover = cover.expect("the art was found, though its thumbnail couldn't be written");
+        assert!(!cache.path("a", &cover.version, 512).exists());
     }
 
     #[test]
