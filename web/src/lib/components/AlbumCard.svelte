@@ -6,6 +6,7 @@
 	import { coverUrl, type Album } from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { session } from '#lib/session.svelte.ts';
 
 	interface Props {
 		album: Album;
@@ -32,6 +33,10 @@
 	let loaded = $state(false);
 	let cached = $state(false);
 	let failed = $state(false);
+	// A cover asked for while signed out failed; try again once signed back in.
+	$effect(() => {
+		if (session.generation) failed = false;
+	});
 	let cover: HTMLElement;
 	let playing = $derived(player.album?.id === album.id && player.playing);
 </script>

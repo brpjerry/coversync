@@ -10,6 +10,7 @@
 	import Palette from '@lucide/svelte/icons/palette';
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
+	import LogOut from '@lucide/svelte/icons/log-out';
 	import type { Album } from '#lib/api.ts';
 	import { isSetup, readPref, writePref, type View } from '#lib/browse.ts';
 	import {
@@ -24,7 +25,9 @@
 	} from '#lib/filters.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { session } from '#lib/session.svelte.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
+	import { toast } from '#lib/toast.svelte.ts';
 
 	interface Props {
 		/** Tags to filter by, in the dropdown's order (configured in Appearance). */
@@ -103,6 +106,10 @@
 	);
 
 	const pick = (k: string, value: string) => (filters = toggled(filters, k, value));
+
+	async function signOut() {
+		if (!(await session.logout())) toast('Signing out failed', 'error');
+	}
 </script>
 
 <aside
@@ -256,6 +263,10 @@
 					{item.label}
 				</button>
 			{/each}
+			<button class="nav-item sign-out" onclick={signOut}>
+				<span class="icon"><LogOut size={17} strokeWidth={1.8} /></span>
+				Sign out
+			</button>
 		</nav>
 	</div>
 </aside>
@@ -629,6 +640,11 @@
 		transition:
 			color 160ms,
 			background 140ms;
+	}
+	/* Not a setup screen: set apart from them. */
+	.sign-out {
+		margin-top: 6px;
+		color: var(--text-3);
 	}
 	.nav-item:hover:not(.on) {
 		background: var(--surface);

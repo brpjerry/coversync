@@ -45,6 +45,7 @@
 	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { session } from '#lib/session.svelte.ts';
 	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
 	import SortMenu from '#lib/components/SortMenu.svelte';
@@ -263,9 +264,10 @@
 	let openId = $derived(page.state.album ?? null);
 	let openAlbum = $derived(openId ? (byId.get(openId) ?? null) : null);
 
-	// Load the open album's tracks.
+	// Load the open album's tracks (again after signing back in, if that failed).
 	$effect(() => {
 		const id = openId;
+		void session.generation;
 		if (!id || untrack(() => detail?.id) === id) return;
 		let cancelled = false;
 		api
@@ -455,6 +457,8 @@
 	let pollTimer: ReturnType<typeof setTimeout>;
 	async function poll() {
 		clearTimeout(pollTimer);
+		// Signed out: signing back in polls again.
+		if (session.state === 'out') return;
 		try {
 			const wasRunning = status?.scan.running ?? false;
 			status = await api.status();
@@ -609,16 +613,26 @@
 		filters[browsing] = {};
 	}
 
-	onMount(() => {
-		appearance.load();
+	/** What the page needs from the daemon. Setups that have loaded aren't asked again (they may hold unsaved edits). */
+	function loadAll() {
+		if (!appearance.loaded) appearance.load();
 		// Whether the sidebar shows its Sync section.
-		syncSetup.load();
+		if (!syncSetup.loaded) syncSetup.load();
 		// Whether an Inbox folder is set, for the empty Inbox's message.
-		inboxSetup.load();
-		// Tag labels for attention badges.
+		if (!inboxSetup.loaded) inboxSetup.load();
+		// Tag labels for attention badges (loaded once).
 		setup.load();
 		loadAlbums();
 		poll();
+	}
+
+	// Signed back in after the session ended: whatever was asked for meanwhile failed.
+	$effect(() => {
+		if (session.generation > 0) untrack(loadAll);
+	});
+
+	onMount(() => {
+		loadAll();
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;
