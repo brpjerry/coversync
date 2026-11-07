@@ -42,6 +42,7 @@
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
+	import { listen, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
@@ -432,7 +433,7 @@
 	}
 
 	let lastAlbums = 0;
-	async function loadAlbums() {
+	async function fetchAlbums() {
 		try {
 			[albums, library] = await Promise.all([api.albums('inbox'), api.albums('library')]);
 			lastAlbums = Date.now();
@@ -440,6 +441,21 @@
 			toast('Could not reach coversyncd', 'error');
 		}
 		loaded = true;
+	}
+	let albumsLoading: Promise<void> | null = null;
+	let albumsNext: Promise<void> | null = null;
+	/**
+	 * Reload both grids. Asked again while a reload runs, which may have been
+	 * answered before the change, one more follows it (just one, however often
+	 * it's asked), so the albums shown last are always the newest.
+	 */
+	function loadAlbums(): Promise<void> {
+		if (!albumsLoading)
+			return (albumsLoading = fetchAlbums().finally(() => (albumsLoading = null)));
+		return (albumsNext ??= albumsLoading.then(() => {
+			albumsNext = null;
+			return loadAlbums();
+		}));
 	}
 
 	// New rules or folder structure change which albums need attention.
@@ -454,6 +470,20 @@
 		await loadAlbums();
 		dataGeneration++;
 	}
+	/** A scan ended: show what it found. */
+	function scanFinished() {
+		dataGeneration++;
+		// The Inbox folder may have come or gone; the empty Inbox's message says which.
+		inboxSetup.load();
+		return loadAlbums();
+	}
+
+	/**
+	 * The daemon's change notices are arriving, so polling is only a safety
+	 * net. Without them, scans are polled for as before.
+	 */
+	let live = false;
+	const SAFETY_POLL_MS = 60_000;
 	let pollTimer: ReturnType<typeof setTimeout>;
 	async function poll() {
 		clearTimeout(pollTimer);
@@ -462,15 +492,78 @@
 		try {
 			const wasRunning = status?.scan.running ?? false;
 			status = await api.status();
-			if (wasRunning && !status.scan.running) {
-				dataGeneration++;
-				// The Inbox folder may have come or gone; the empty Inbox's message says which.
-				inboxSetup.load();
-			}
-			if (status.scan.running ? Date.now() - lastAlbums > 4000 : wasRunning) await loadAlbums();
+			if (wasRunning && !status.scan.running) await scanFinished();
+			else if (status.scan.running && Date.now() - lastAlbums > 4000) await loadAlbums();
 		} catch {}
-		pollTimer = setTimeout(poll, status?.scan.running ? 1500 : 10000);
+		// Only one poll waits at a time, even when two ran at once.
+		clearTimeout(pollTimer);
+		pollTimer = setTimeout(poll, live ? SAFETY_POLL_MS : status?.scan.running ? 1500 : 10000);
 	}
+
+	function onlive(up: boolean) {
+		if (up === live) return;
+		live = up;
+		// Down: poll again straight away. Up: the safety poll takes over after a resync.
+		if (!up) poll();
+	}
+
+	/** Reload the open album if it's `id`, or was `previous` before an edit gave it a new id. */
+	async function reloadOpen(id: string, previous: string | null = null) {
+		const shown = () => openId === id || openId === previous;
+		if (!shown()) return;
+		const fresh = await api.album(id).catch(() => null);
+		if (!fresh || !shown()) return;
+		detail = fresh;
+		if (openId !== id)
+			await goto(page.url.href, { state: { album: id }, shallow: true, replace: true });
+	}
+
+	/** An album was edited, here or elsewhere: show it as it is now. */
+	function albumChanged({ id, previous_id, collection }: Notices['album_changed']) {
+		// The Inbox's tag coverage, which Library setup shows, may have changed.
+		if (collection === 'inbox') dataGeneration++;
+		loadAlbums();
+		reloadOpen(id, previous_id);
+	}
+
+	/** Reload everything: notices were missed, or the stream has just come back. */
+	function resync() {
+		poll();
+		appearance.refresh();
+		syncSetup.load();
+		setup.refresh();
+		inboxSetup.load();
+		dataGeneration++;
+		loadAlbums();
+		if (openId) reloadOpen(openId);
+	}
+
+	/** What each change notice reloads. */
+	const notices: NoticeHandlers = {
+		scan(scan) {
+			if (status) status = { ...status, scan };
+			// Albums appear in the grids as the scan reads their tags.
+			if (!albumsLoading && Date.now() - lastAlbums > 4000) loadAlbums();
+		},
+		scan_finished(scan) {
+			if (status) status = { ...status, scan };
+			scanFinished();
+		},
+		imported: inboxChanged,
+		album_changed: albumChanged,
+		setup_saved({ setup: saved }) {
+			// Each can change which albums need attention, or what sorts and filters show.
+			if (saved === 'library') setup.refresh();
+			else if (saved === 'inbox') {
+				// Hidden files may be back in the Inbox.
+				inboxSetup.load();
+				dataGeneration++;
+			} else if (saved === 'appearance') appearance.refresh();
+			else return syncSetup.load();
+			loadAlbums();
+		},
+		resync
+	};
 
 	// Right-click menu on album cards.
 	let menu = $state<{ album: Album; x: number; y: number } | null>(null);
@@ -636,6 +729,7 @@
 
 	onMount(() => {
 		loadAll();
+		const stop = listen(notices, onlive);
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;
@@ -643,6 +737,7 @@
 		};
 		mq.addEventListener('change', onchange);
 		return () => {
+			stop();
 			clearTimeout(pollTimer);
 			mq.removeEventListener('change', onchange);
 		};

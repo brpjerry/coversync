@@ -6,6 +6,7 @@
 	import ListMusic from '@lucide/svelte/icons/list-music';
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
+	import { untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import {
 		coverUrl,
@@ -32,6 +33,17 @@
 	let { album, detail, allowWrites, onclose, onsaved, onimport }: Props = $props();
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
+	let detailId = $derived(detail?.id);
+	/**
+	 * What the tag editor edits: the album as it was when editing began. A
+	 * newer copy of the same album (edited elsewhere) shows in the track list,
+	 * but would reset the editor and lose the edits under way.
+	 */
+	let editing = $derived.by(() => {
+		detailId;
+		mode;
+		return untrack(() => detail);
+	});
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -187,11 +199,14 @@
 				</div>
 			{:else}
 				<div in:fade={{ duration: 200 }}>
-					{#key detail}
+					{#key editing}
 						<TagEditor
-							{detail}
+							detail={editing ?? detail}
 							{allowWrites}
-							{onsaved}
+							onsaved={(result) => {
+								editing = result.album;
+								onsaved(result);
+							}}
 							{onimport}
 							oncancel={() => (mode = 'tracks')}
 						/>

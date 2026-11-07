@@ -56,6 +56,11 @@ used on a home server.
 - **Sync** (planned): the sidebar's Sync section will list the devices the
   Library syncs to, each with its own settings. For now it's a placeholder,
   which Sync setup can turn off.
+- **Live updates**: tag edits, imports and saved setups made in one browser,
+  and scans, show in every other open browser as they happen, without
+  reloading. They come from the daemon's event stream, `/api/events`; while
+  it's down (the daemon restarting, say), the page polls instead, and
+  catches up once the stream is back.
 
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
@@ -125,7 +130,9 @@ To serve the UI under a path prefix behind a reverse proxy, build it with that
 prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
 as it appears in the URL: ASCII, with anything else percent-encoded
 (`/m%C3%BCsik`, not `/müsik`). The session cookie is then limited to that
-prefix, so other sites on the same host never get it.
+prefix, so other sites on the same host never get it. The proxy has to pass
+`/api/events` on as it comes rather than buffer it: Caddy does by itself, and
+the stream asks nginx to with `X-Accel-Buffering: no`.
 
 ### Signing in
 
