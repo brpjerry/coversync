@@ -25,6 +25,8 @@ fn app(name: &str) -> App {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let state = crate::test_state(&dir);
+    // However slow the password checks, no try comes back mid-test.
+    state.auth.stop_clock();
     App {
         router: crate::app(state.clone()),
         state,
@@ -475,7 +477,7 @@ async fn failed_logins_are_limited_per_client() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((1..=60).contains(&retry), "{retry}");
+    assert_eq!(retry, 60);
     let b = body(res).await;
     assert_eq!(b["code"], "too_many_attempts");
     assert_eq!(b["retry_after"], retry);
@@ -540,6 +542,7 @@ async fn failed_logins_are_limited_overall() {
     }
     let res = app.login_from("10.0.4.1:1000", PASSWORD).await;
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.headers()[header::RETRY_AFTER], "6");
 }
 
 #[tokio::test]

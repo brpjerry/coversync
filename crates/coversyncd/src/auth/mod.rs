@@ -66,6 +66,10 @@ pub struct Auth {
     hashing: Semaphore,
     /// Sessions and devices whose last use is being written.
     touching: Mutex<HashSet<Touch>>,
+    /// A stopped clock for the rate limits, so tests don't depend on how
+    /// fast password checks run.
+    #[cfg(test)]
+    stopped: Mutex<Option<Instant>>,
 }
 
 impl Auth {
@@ -77,12 +81,45 @@ impl Auth {
             limiter: Mutex::new(Limiter::new(Instant::now())),
             hashing: Semaphore::new(HASHING),
             touching: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            stopped: Mutex::new(None),
         })
+    }
+
+    /// The time the rate limits count by.
+    fn instant(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(at) = *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) {
+            return at;
+        }
+        Instant::now()
+    }
+
+    fn limiter(&self) -> std::sync::MutexGuard<'_, Limiter> {
+        self.limiter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a login attempt for `client`, or say how long until it may try again.
+    fn take_try(&self, client: limit::Client) -> Result<(), std::time::Duration> {
+        let now = self.instant();
+        self.limiter().take(client, now)
+    }
+
+    /// Give back the attempt of a login that succeeded.
+    fn give_back(&self, client: limit::Client) {
+        let now = self.instant();
+        self.limiter().refund(client, now);
     }
 
     #[cfg(test)]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Stop the rate limits' clock: no bucket refills from here on.
+    #[cfg(test)]
+    pub fn stop_clock(&self) {
+        *self.stopped.lock().unwrap() = Some(Instant::now());
     }
 }
 
@@ -494,13 +531,7 @@ async fn login(
         Err(e) => return internal(e),
     };
     let client = limit::Client::new(ip);
-    let taken = state
-        .auth
-        .limiter
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take(client, Instant::now());
-    if let Err(wait) = taken {
+    if let Err(wait) = state.auth.take_try(client) {
         tracing::info!(client = ?ip, "login refused: too many failed attempts");
         return too_many(wait);
     }
@@ -515,12 +546,7 @@ async fn login(
         tracing::warn!(client = ?ip, "failed login: wrong password");
         return denied(Denied::WrongPassword);
     }
-    state
-        .auth
-        .limiter
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .refund(client, Instant::now());
+    state.auth.give_back(client);
     let s = state.clone();
     let now = now();
     match tokio::task::spawn_blocking(move || s.auth.store.create_session(None, Scope::Manage, now))
@@ -562,13 +588,7 @@ async fn login_with_token(
         return denied(Denied::InvalidToken);
     };
     let client = limit::Client::new(ip);
-    let taken = state
-        .auth
-        .limiter
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take(client, Instant::now());
-    if let Err(wait) = taken {
+    if let Err(wait) = state.auth.take_try(client) {
         return too_many(wait);
     }
     let s = state.clone();
@@ -589,12 +609,7 @@ async fn login_with_token(
     .await;
     match traded {
         Ok(Ok(Ok((id, device)))) => {
-            state
-                .auth
-                .limiter
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .refund(client, Instant::now());
+            state.auth.give_back(client);
             tracing::info!(client = ?ip, device, "traded a token for a session");
             signed_in(&id, &path, &headers)
         }
