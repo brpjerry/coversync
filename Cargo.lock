@@ -336,6 +336,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "cookie_store",
  "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
@@ -343,9 +344,11 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "rustls",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

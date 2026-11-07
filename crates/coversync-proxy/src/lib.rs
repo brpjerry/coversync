@@ -9,7 +9,8 @@
 //! - Paths stay the same. A server at `https://n5pro.internal/coversync/` is
 //!   served at `http://127.0.0.1:<port>/coversync/`, where a UI built with
 //!   `BASE_PATH=/coversync` expects to be.
-//! - The server's cookies work over the local plain-HTTP origin, and the
+//! - The servers' cookies stay in the proxy, apart for each server, and go
+//!   with requests as a browser would send them to the server itself. The
 //!   app's `Authorization` header goes on every request once there is one
 //!   ([`Upstream::with_authorization`]).
 //! - Only the app's window gets in: any local process can reach a localhost
@@ -18,6 +19,7 @@
 //!   refuses every request without that cookie.
 
 mod headers;
+mod jar;
 mod pages;
 mod unreachable;
 mod upstream;
@@ -25,14 +27,15 @@ mod upstream;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, HOST};
-use axum::http::{HeaderValue, Method, StatusCode, Version};
+use axum::http::header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, LOCATION};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Version};
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use hyper_rustls::HttpsConnector;
@@ -40,23 +43,39 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
+use url::Url;
 
+use jar::Jar;
 pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};
 
 /// How long to wait for a TCP connection to the server.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long [`Proxy::check`] waits for an answer.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a page load, or [`Proxy::check`], waits for the server to start
+/// answering.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 type UnreachableHandler = Arc<dyn Fn(Unreachable) + Send + Sync>;
 
 /// Sets up a [`Proxy`].
-#[derive(Default)]
 pub struct Builder {
     upstream: Option<Upstream>,
     port: Option<u16>,
+    cookie_file: Option<PathBuf>,
+    page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            port: None,
+            cookie_file: None,
+            page_timeout: PAGE_TIMEOUT,
+            on_unreachable: None,
+        }
+    }
 }
 
 impl Builder {
@@ -76,10 +95,27 @@ impl Builder {
         self
     }
 
+    /// Where the servers' persistent cookies are kept between runs (a login,
+    /// say), readable only by the user. Without one, cookies last as long as
+    /// the proxy.
+    pub fn cookie_file(mut self, file: Option<PathBuf>) -> Self {
+        self.cookie_file = file;
+        self
+    }
+
+    /// How long a page load waits for the server to start answering before
+    /// it counts as unreachable (15 seconds by default). Other requests, and
+    /// bodies once they've started (uploads, playback, events), aren't timed.
+    pub fn page_timeout(mut self, timeout: Duration) -> Self {
+        self.page_timeout = timeout;
+        self
+    }
+
     /// Called when loading a page (a navigation, not an API call or a cover)
-    /// can't reach the server, or gets 502, 503 or 504 from it. The proxy
-    /// answers with a short error page of its own either way; the app can
-    /// show its fallback page instead.
+    /// can't reach the server, gets 502, 503 or 504 from it, or would be sent
+    /// off to another origin. The proxy answers with a short error page of
+    /// its own, or passes the server's on; the app can show its fallback
+    /// page instead.
     pub fn on_unreachable(mut self, handler: impl Fn(Unreachable) + Send + Sync + 'static) -> Self {
         self.on_unreachable = Some(Arc::new(handler));
         self
@@ -100,11 +136,13 @@ impl Builder {
         let shared = Arc::new(Shared {
             client: client()?,
             upstream: RwLock::new(self.upstream.map(Arc::new)),
+            jar: Jar::open(self.cookie_file),
             secret: random_hex()?,
             cookie: random_hex()?,
             origin: format!("http://{addr}"),
             host: HeaderValue::from_str(&addr.to_string()).expect("an address is a valid header"),
             addr,
+            page_timeout: self.page_timeout,
             on_unreachable: self.on_unreachable,
         });
         let app = Router::new()
@@ -168,16 +206,19 @@ impl Proxy {
     }
 
     /// Switches to another server, or to none. Requests already under way
-    /// finish with the old one.
+    /// finish with the old one. Each server's cookies stay its own.
     pub fn set_upstream(&self, upstream: Option<Upstream>) {
         *self.shared.upstream.write().expect("upstream lock") = upstream.map(Arc::new);
     }
 
-    /// Whether `upstream` answers, by loading its UI's page. Doesn't change
+    /// Whether `upstream` shows a UI: its page answers with a success, a
+    /// login (401 or 403), or a redirect on its own origin. Doesn't change
     /// which server the proxy uses.
     pub async fn check(&self, upstream: &Upstream) -> Result<(), Unreachable> {
+        let url = upstream.url();
+        let page = Url::parse(&url).expect("a server's URL is valid");
         let uri = upstream
-            .uri(&format!("{}/", upstream.prefix()))
+            .uri(page.path())
             .ok_or_else(|| Unreachable::new(upstream, "Its address isn't valid."))?;
         let mut req = Request::get(uri)
             .header(HOST, upstream.host())
@@ -188,21 +229,38 @@ impl Proxy {
             req.headers_mut()
                 .insert(AUTHORIZATION, authorization.clone());
         }
-        match tokio::time::timeout(CHECK_TIMEOUT, self.shared.client.request(req)).await {
-            Err(_) => Err(Unreachable::new(
-                upstream,
-                format!(
-                    "It didn't answer within {} seconds.",
-                    CHECK_TIMEOUT.as_secs()
-                ),
-            )),
+        let timeout = self.shared.page_timeout;
+        match tokio::time::timeout(timeout, self.shared.client.request(req)).await {
+            Err(_) => Err(Unreachable::too_slow(upstream, timeout)),
             Ok(Err(err)) => Err(Unreachable::from_error(upstream, &err)),
-            Ok(Ok(res)) => match Unreachable::from_status(upstream, res.status()) {
-                Some(unreachable) => Err(unreachable),
-                None => Ok(()),
-            },
+            Ok(Ok(res)) => check_answer(upstream, &page, res.status(), res.headers()),
         }
     }
+}
+
+/// Whether a check's answer shows the UI is there.
+fn check_answer(
+    upstream: &Upstream,
+    page: &Url,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<(), Unreachable> {
+    if status.is_success() || status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+    {
+        return Ok(());
+    }
+    if status.is_redirection() {
+        // An http:// address its server sends on to https://, say: the
+        // window would follow it out of the proxy.
+        let location = headers.get(LOCATION).and_then(|l| l.to_str().ok());
+        return match location {
+            Some(location) => upstream
+                .keeps_origin(page, location)
+                .map_err(|to| Unreachable::redirected(upstream, &to)),
+            None => Err(Unreachable::answered(upstream, status)),
+        };
+    }
+    Err(Unreachable::answered(upstream, status))
 }
 
 type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
@@ -210,6 +268,7 @@ type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
 struct Shared {
     client: HttpsClient,
     upstream: RwLock<Option<Arc<Upstream>>>,
+    jar: Jar,
     /// In the entry URL; traded for the cookie.
     secret: String,
     /// The value of the proxy's cookie.
@@ -217,6 +276,7 @@ struct Shared {
     addr: SocketAddr,
     origin: String,
     host: HeaderValue,
+    page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
 }
 
@@ -231,6 +291,19 @@ impl Shared {
         }
     }
 
+    /// The proxy's own error page for a page load, reported to the app; or
+    /// the server's error shape for anything else.
+    fn unreachable(&self, unreachable: Unreachable, document: bool) -> Response {
+        tracing::warn!("{unreachable}");
+        if document {
+            let page = pages::unreachable_page(&unreachable);
+            self.report(unreachable);
+            page
+        } else {
+            pages::unreachable_json(&unreachable)
+        }
+    }
+
     async fn forward(&self, upstream: &Upstream, req: Request) -> Response {
         let document = is_document(&req);
         let (mut parts, body) = req.into_parts();
@@ -238,34 +311,55 @@ impl Shared {
         let Some(uri) = upstream.uri(path_and_query) else {
             return pages::text(StatusCode::BAD_REQUEST, "Bad request.");
         };
+        let Ok(url) = Url::parse(&uri.to_string()) else {
+            return pages::text(StatusCode::BAD_REQUEST, "Bad request.");
+        };
         parts.uri = uri;
         parts.version = Version::HTTP_11;
         headers::to_upstream(&mut parts.headers, &self.origin, upstream);
-        let (method, uri) = (parts.method.clone(), parts.uri.clone());
-        match self.client.request(Request::from_parts(parts, body)).await {
-            Ok(res) => {
-                tracing::debug!("{method} {uri} -> {}", res.status());
-                if document
-                    && let Some(unreachable) = Unreachable::from_status(upstream, res.status())
-                {
-                    self.report(unreachable);
+        // The webview's cookies are only ever the proxy's own; the server's
+        // come from the jar.
+        parts.headers.remove(COOKIE);
+        if let Some(cookies) = self.jar.header(upstream.origin(), &url) {
+            parts.headers.insert(COOKIE, cookies);
+        }
+        let method = parts.method.clone();
+        let sent = self.client.request(Request::from_parts(parts, body));
+        // Only a page load is timed, and only until the answer starts: an
+        // upload, playback or an event stream can take as long as it takes.
+        let answer = if document {
+            match tokio::time::timeout(self.page_timeout, sent).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    let too_slow = Unreachable::too_slow(upstream, self.page_timeout);
+                    return self.unreachable(too_slow, true);
                 }
-                let (mut parts, body) = res.into_parts();
-                headers::from_upstream(&mut parts.headers, &self.origin, upstream);
-                Response::from_parts(parts, Body::new(body))
             }
+        } else {
+            sent.await
+        };
+        let res = match answer {
+            Ok(res) => res,
             Err(err) => {
-                let unreachable = Unreachable::from_error(upstream, &err);
-                tracing::warn!("{unreachable} ({err:?})");
-                if document {
-                    let page = pages::unreachable_page(&unreachable);
-                    self.report(unreachable);
-                    page
-                } else {
-                    pages::unreachable_json(&unreachable)
-                }
+                tracing::debug!("{method} {url}: {err:?}");
+                return self.unreachable(Unreachable::from_error(upstream, &err), document);
+            }
+        };
+        tracing::debug!("{method} {url} -> {}", res.status());
+        let (mut parts, body) = res.into_parts();
+        self.jar.take(upstream.origin(), &url, &mut parts.headers);
+        if document {
+            if let Some(down) = Unreachable::from_status(upstream, parts.status) {
+                self.report(down);
+            } else if parts.status.is_redirection()
+                && let Some(location) = parts.headers.get(LOCATION).and_then(|l| l.to_str().ok())
+                && let Err(to) = upstream.keeps_origin(&url, location)
+            {
+                return self.unreachable(Unreachable::redirected(upstream, &to), true);
             }
         }
+        headers::from_upstream(&mut parts.headers, &self.origin, upstream);
+        Response::from_parts(parts, Body::new(body))
     }
 }
 
@@ -291,6 +385,11 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
         return pages::forbidden();
     }
     let upstream = proxy.upstream();
+    // Where the UI starts, as a full URL: a prefix can't then be read as a
+    // host name.
+    let start = |upstream: Option<&Upstream>| {
+        format!("{}{}/", proxy.origin, upstream.map_or("", Upstream::prefix))
+    };
     let path = req.uri().path();
     if path == "/"
         && let Some(key) = entry_key(req.uri().query())
@@ -298,8 +397,7 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
         if req.method() == Method::GET
             && headers::constant_time_eq(key.as_bytes(), proxy.secret.as_bytes())
         {
-            let to = format!("{}/", upstream.as_deref().map_or("", Upstream::prefix));
-            return pages::enter(&proxy.cookie, &to);
+            return pages::enter(&proxy.cookie, &start(upstream.as_deref()));
         }
         return pages::forbidden();
     }
@@ -311,7 +409,7 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
     };
     if !upstream.serves(path) {
         if path == "/" {
-            return pages::see_other(&format!("{}/", upstream.prefix()));
+            return pages::see_other(&start(Some(&upstream)));
         }
         return pages::text(StatusCode::NOT_FOUND, "Not found.");
     }
@@ -354,5 +452,28 @@ mod tests {
         assert_eq!(entry_key(Some("x=1&k=abc")), Some("abc"));
         assert_eq!(entry_key(Some("kk=abc")), None);
         assert_eq!(entry_key(None), None);
+    }
+
+    #[test]
+    fn checks_answers() {
+        let up = Upstream::parse("http://n5pro.internal/coversync/").unwrap();
+        let page = Url::parse(&up.url()).unwrap();
+        let answer = |status: u16, location: Option<&'static str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(location) = location {
+                headers.insert(LOCATION, HeaderValue::from_static(location));
+            }
+            check_answer(&up, &page, StatusCode::from_u16(status).unwrap(), &headers)
+        };
+        for ok in [200, 204, 401, 403] {
+            assert_eq!(answer(ok, None), Ok(()), "{ok}");
+        }
+        assert_eq!(answer(302, Some("/coversync/login")), Ok(()));
+        assert_eq!(answer(308, Some("//n5pro.internal/coversync/x")), Ok(()));
+        assert!(answer(308, Some("https://n5pro.internal/coversync/")).is_err());
+        assert!(answer(302, None).is_err());
+        for refused in [400, 404, 410, 500, 502, 503] {
+            assert!(answer(refused, None).is_err(), "{refused}");
+        }
     }
 }

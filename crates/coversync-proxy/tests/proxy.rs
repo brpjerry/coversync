@@ -4,6 +4,7 @@ mod common;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -14,6 +15,7 @@ use axum::http::header::{
     RANGE, REFERER, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
 };
 use axum::http::{HeaderValue, Method, Response, StatusCode};
+use axum::response::{IntoResponse, Redirect};
 use bytes::Bytes;
 use common::{
     Log, WAIT, Window, bytes, channel_body, client, echo, pattern, serve, text, upstream,
@@ -68,10 +70,8 @@ async fn the_entry_url_sets_the_cookie_and_moves_on() {
     }
     assert!(!cookie.contains(&secret), "the cookie isn't the secret");
     let page = text(res).await;
-    assert!(
-        page.contains(r#"location.replace("/coversync/")"#),
-        "{page}"
-    );
+    let start = format!(r#"location.replace("{}/coversync/")"#, proxy.origin());
+    assert!(page.contains(&start), "{page}");
     assert!(!page.contains(&secret));
     assert_eq!(log.len(), 0, "the server never sees the entry URL");
 }
@@ -132,7 +132,7 @@ async fn keeps_the_servers_path_prefix() {
 
     let res = window.get("/").await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(res.headers()[LOCATION], "/coversync/");
+    assert_eq!(res.headers()[LOCATION], window.url("/coversync/"));
     for outside in ["/coversyncx", "/favicon.ico", "/api/status"] {
         assert_eq!(
             window.get(outside).await.status(),
@@ -199,7 +199,7 @@ async fn rewrites_headers_for_the_server() {
     let window = Window::open(addr, "/coversync/").await;
     let local = window.proxy.origin().to_owned();
 
-    // The window's cookies: the proxy's, and the server's own.
+    // The proxy's cookie, and one the webview shouldn't have.
     let req = Request::post(window.url("/coversync/api/library/setup"))
         .header(
             COOKIE,
@@ -223,7 +223,10 @@ async fn rewrites_headers_for_the_server() {
         seen[REFERER],
         format!("http://{addr}/coversync/library?q=1")
     );
-    assert_eq!(seen[COOKIE], "session=abc; theme=dark");
+    assert!(
+        !seen.contains_key(COOKIE),
+        "the webview's cookies stay here; the server's come from the proxy's jar"
+    );
     assert_eq!(
         seen[AUTHORIZATION], "Basic d2Vidmlldzpvd24=",
         "without a token, the window's own passes"
@@ -232,17 +235,14 @@ async fn rewrites_headers_for_the_server() {
     assert!(!seen.contains_key(PROXY_AUTHORIZATION));
     assert_eq!(seen["x-kept"], "1");
 
-    // A request with only the proxy's cookie sends none, and an Origin from
-    // elsewhere isn't touched.
+    // An Origin from elsewhere isn't touched.
     let req = window
         .request(Method::GET, "/coversync/")
         .header(ORIGIN, "null")
         .body(Body::empty())
         .unwrap();
     window.send(req).await;
-    let seen = log.last().headers;
-    assert!(!seen.contains_key(COOKIE));
-    assert_eq!(seen[ORIGIN], "null");
+    assert_eq!(log.last().headers[ORIGIN], "null");
 }
 
 #[tokio::test]
@@ -265,52 +265,40 @@ async fn adds_the_apps_authorization() {
 }
 
 #[tokio::test]
-async fn server_cookies_and_redirects_work_locally() {
-    let router = Router::new()
-        .fallback(|req: Request| async move {
-            let host = req.headers()[HOST].to_str().unwrap().to_owned();
-            let to = if req.uri().path().ends_with("/out") {
-                "https://example.com/elsewhere".to_owned()
-            } else {
-                format!("http://{host}/coversync/?from=login")
-            };
-            Response::builder()
-                .status(StatusCode::SEE_OTHER)
-                .header(LOCATION, to)
-                .header(
-                    SET_COOKIE,
-                    format!(
-                        "session=abc; Path=/coversync; Domain={}; Secure; HttpOnly; SameSite=Lax; Max-Age=60",
-                        host.split(':').next().unwrap()
-                    ),
-                )
-                .header(SET_COOKIE, "pref=1; Secure; SameSite=None")
-                .header(STRICT_TRANSPORT_SECURITY, "max-age=31536000")
-                .header(ALT_SVC, "h3=\":443\"")
-                .body(Body::empty())
-                .unwrap()
-        });
+async fn redirects_stay_in_the_proxy() {
+    let router = Router::new().fallback(|req: Request| async move {
+        let host = req.headers()[HOST].to_str().unwrap().to_owned();
+        let to = match req.uri().path() {
+            "/coversync/out" => "https://example.com/elsewhere".to_owned(),
+            "/coversync/relative" => "//example.com/elsewhere".to_owned(),
+            "/coversync/scheme-relative" => format!("//{host}/coversync/?from=login"),
+            _ => format!("http://{host}/coversync/?from=login"),
+        };
+        Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(LOCATION, to)
+            .header(STRICT_TRANSPORT_SECURITY, "max-age=31536000")
+            .header(ALT_SVC, "h3=\":443\"")
+            .body(Body::empty())
+            .unwrap()
+    });
     let window = Window::open(serve(router).await, "/coversync/").await;
+    let local = |path: &str| window.url(path);
 
     let res = window.get("/coversync/api/login").await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        res.headers()[LOCATION],
-        format!("{}/coversync/?from=login", window.proxy.origin())
-    );
-    let cookies: Vec<_> = res.headers().get_all(SET_COOKIE).iter().collect();
-    assert_eq!(
-        cookies,
-        [
-            "session=abc; Path=/coversync; HttpOnly; SameSite=Lax; Max-Age=60",
-            "pref=1; SameSite=Lax"
-        ]
-    );
+    assert_eq!(res.headers()[LOCATION], local("/coversync/?from=login"));
     assert!(!res.headers().contains_key(STRICT_TRANSPORT_SECURITY));
     assert!(!res.headers().contains_key(ALT_SVC));
 
+    let res = window.get("/coversync/scheme-relative").await;
+    assert_eq!(res.headers()[LOCATION], local("/coversync/?from=login"));
+
+    // Other sites are other sites.
     let res = window.get("/coversync/out").await;
     assert_eq!(res.headers()[LOCATION], "https://example.com/elsewhere");
+    let res = window.get("/coversync/relative").await;
+    assert_eq!(res.headers()[LOCATION], "//example.com/elsewhere");
 }
 
 /// A route whose body is whatever the test sends down `rx`, with these headers.
@@ -660,7 +648,8 @@ async fn switches_servers() {
         .get(window.proxy.entry_url().parse().unwrap())
         .await
         .unwrap();
-    assert!(text(res).await.contains(r#"location.replace("/two/")"#));
+    let start = format!(r#"location.replace("{}/two/")"#, window.proxy.origin());
+    assert!(text(res).await.contains(&start));
 
     window.proxy.set_upstream(None);
     assert_eq!(
@@ -688,4 +677,114 @@ async fn keeps_its_port_when_it_can() {
         .await
         .unwrap();
     assert_ne!(second.addr().port(), free);
+}
+
+#[tokio::test]
+async fn check_wants_a_ui() {
+    let router = Router::new().fallback(|req: Request| async move {
+        let host = req.headers()[HOST].to_str().unwrap().to_owned();
+        match req.uri().path() {
+            "/ui/" => StatusCode::OK.into_response(),
+            "/login/" => StatusCode::UNAUTHORIZED.into_response(),
+            "/same/" => Redirect::permanent("/ui/").into_response(),
+            "/https/" => Redirect::permanent(&format!("https://{host}/https/")).into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    });
+    let addr = serve(router).await;
+    let proxy = Proxy::builder().start().await.unwrap();
+    let check = |prefix: &'static str| {
+        let proxy = proxy.clone();
+        async move { proxy.check(&upstream(addr, prefix)).await }
+    };
+
+    assert_eq!(check("/ui/").await, Ok(()));
+    assert_eq!(check("/login/").await, Ok(()), "a login page is a UI");
+    assert_eq!(
+        check("/same/").await,
+        Ok(()),
+        "a redirect on its own origin"
+    );
+
+    let typo = check("/coversycn/").await.unwrap_err();
+    assert!(
+        typo.reason.starts_with("It answered 404 Not Found"),
+        "{typo:?}"
+    );
+    let upgrade = check("/https/").await.unwrap_err();
+    assert!(
+        upgrade
+            .reason
+            .contains(&format!("on to https://{addr}/https/")),
+        "{upgrade:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_page_load_that_gets_no_answer_is_reported() {
+    // A server that takes connections and never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let (tx, mut reports) = mpsc::unbounded_channel::<Unreachable>();
+    let builder = Proxy::builder()
+        .upstream(Some(upstream(addr, "/coversync/")))
+        .page_timeout(Duration::from_millis(300))
+        .on_unreachable(move |unreachable| tx.send(unreachable).unwrap());
+    let window = Window::open_with(builder).await;
+
+    // An API call, a download or an event stream isn't timed.
+    let api = tokio::spawn({
+        let window = window.clone();
+        async move {
+            window
+                .client
+                .request(
+                    window
+                        .request(Method::GET, "/coversync/api/events")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        }
+    });
+
+    let res = window.send(page_load(&window, "/coversync/")).await;
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let report = reports.try_recv().unwrap();
+    assert_eq!(report.reason, "It didn't answer within 0.3 seconds.");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!api.is_finished(), "the API call still waits");
+    api.abort();
+}
+
+#[tokio::test]
+async fn a_page_load_sent_off_to_another_origin_is_reported() {
+    let router = Router::new().fallback(|req: Request| async move {
+        let host = req.headers()[HOST].to_str().unwrap().to_owned();
+        Redirect::permanent(&format!("https://{host}/coversync/"))
+    });
+    let addr = serve(router).await;
+    let (tx, mut reports) = mpsc::unbounded_channel::<Unreachable>();
+    let builder = Proxy::builder()
+        .upstream(Some(upstream(addr, "/coversync/")))
+        .on_unreachable(move |unreachable| tx.send(unreachable).unwrap());
+    let window = Window::open_with(builder).await;
+
+    let res = window.send(page_load(&window, "/coversync/")).await;
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert!(!res.headers().contains_key(LOCATION), "the window stays");
+    let report = reports.try_recv().unwrap();
+    assert!(
+        report
+            .reason
+            .contains(&format!("on to https://{addr}/coversync/")),
+        "{report:?}"
+    );
 }

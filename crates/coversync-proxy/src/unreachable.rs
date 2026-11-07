@@ -3,6 +3,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use rustls::CertificateError;
@@ -48,6 +49,8 @@ impl Unreachable {
         }
     }
 
+    /// A page load's answer that means the server is down: what a reverse
+    /// proxy says when the server behind it is (502, 503 or 504).
     pub(crate) fn from_status(upstream: &Upstream, status: StatusCode) -> Option<Self> {
         matches!(
             status,
@@ -59,6 +62,44 @@ impl Unreachable {
                 format!("It answered {status}, so coversync behind it may be stopped."),
             )
         })
+    }
+
+    /// A check's answer that isn't a UI.
+    pub(crate) fn answered(upstream: &Upstream, status: StatusCode) -> Self {
+        Self::from_status(upstream, status).unwrap_or_else(|| {
+            if status == StatusCode::NOT_FOUND {
+                Self::new(
+                    upstream,
+                    "It answered 404 Not Found: there's no coversync at that address.",
+                )
+            } else {
+                Self::new(upstream, format!("It answered {status}."))
+            }
+        })
+    }
+
+    /// The server sends its page on to another origin, `to`, which the
+    /// window would follow out of the proxy.
+    pub(crate) fn redirected(upstream: &Upstream, to: &str) -> Self {
+        Self::new(
+            upstream,
+            format!(
+                "It sends the page on to {to}. If that's the server, enter that address instead."
+            ),
+        )
+    }
+
+    /// No answer had started after `timeout`.
+    pub(crate) fn too_slow(upstream: &Upstream, timeout: Duration) -> Self {
+        let seconds = if timeout.subsec_millis() == 0 {
+            timeout.as_secs().to_string()
+        } else {
+            format!("{:.1}", timeout.as_secs_f64())
+        };
+        Self::new(
+            upstream,
+            format!("It didn't answer within {seconds} seconds."),
+        )
     }
 }
 

@@ -4,6 +4,7 @@ use std::fmt;
 
 use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderValue, Uri};
+use url::Url;
 
 /// A coversync server: its origin and the path prefix it serves the UI under.
 ///
@@ -17,6 +18,8 @@ pub struct Upstream {
     authority: Authority,
     host: HeaderValue,
     origin: String,
+    /// The origin as a URL, to resolve redirects against.
+    base: Url,
     prefix: String,
     authorization: Option<HeaderValue>,
 }
@@ -35,49 +38,63 @@ impl std::error::Error for UpstreamError {}
 
 impl Upstream {
     /// Reads a server URL such as `https://n5pro.internal/coversync/`. Without
-    /// a scheme, `https://` is assumed. A trailing `/` makes no difference.
-    pub fn parse(url: &str) -> Result<Self, UpstreamError> {
-        let url = url.trim();
-        if url.is_empty() {
+    /// a scheme, `https://` is assumed.
+    ///
+    /// It's read the way a browser reads it, so the prefix is the path the
+    /// webview asks for: the scheme's default port goes, dot segments are
+    /// resolved, other characters are percent-encoded and an international
+    /// name becomes its `xn--` form. Repeated and trailing slashes go too.
+    pub fn parse(input: &str) -> Result<Self, UpstreamError> {
+        let input = input.trim();
+        if input.is_empty() {
             return Err(UpstreamError("Enter the server's address.".into()));
         }
-        let url = if url.contains("://") {
-            url.to_owned()
+        let input = if input.contains("://") {
+            input.to_owned()
         } else {
-            format!("https://{url}")
+            format!("https://{input}")
         };
-        let invalid = || UpstreamError(format!("{url} isn't a valid address."));
-        let uri: Uri = url.parse().map_err(|_| invalid())?;
-        let scheme = uri.scheme().cloned().ok_or_else(invalid)?;
-        if scheme != Scheme::HTTP && scheme != Scheme::HTTPS {
+        let invalid = || UpstreamError(format!("{input} isn't a valid address."));
+        let url = Url::parse(&input).map_err(|_| invalid())?;
+        let scheme = match url.scheme() {
+            "https" => Scheme::HTTPS,
+            "http" => Scheme::HTTP,
+            _ => {
+                return Err(UpstreamError(format!(
+                    "{input} isn't an http:// or https:// address."
+                )));
+            }
+        };
+        if !url.username().is_empty() || url.password().is_some() {
             return Err(UpstreamError(format!(
-                "{url} isn't an http:// or https:// address."
+                "{input} has a user name in it; leave it out."
             )));
         }
-        let authority = uri.authority().ok_or_else(invalid)?;
-        if authority.as_str().contains('@') {
+        if url.query().is_some() || url.fragment().is_some() {
             return Err(UpstreamError(format!(
-                "{url} has a user name in it; leave it out."
+                "{input} has a ? or # part; leave it out."
             )));
         }
-        if uri.query().is_some() {
-            return Err(UpstreamError(format!(
-                "{url} has a query (?…) in it; leave it out."
-            )));
-        }
-        let authority: Authority = authority
-            .as_str()
-            .to_ascii_lowercase()
-            .parse()
-            .map_err(|_| invalid())?;
+        let host = url.host_str().ok_or_else(invalid)?;
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let authority: Authority = authority.parse().map_err(|_| invalid())?;
         let host = HeaderValue::from_str(authority.as_str()).map_err(|_| invalid())?;
         let origin = format!("{scheme}://{authority}");
-        let prefix = uri.path().trim_end_matches('/').to_owned();
+        let base = Url::parse(&origin).map_err(|_| invalid())?;
+        let mut prefix = String::with_capacity(url.path().len());
+        for segment in url.path().split('/').filter(|s| !s.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(segment);
+        }
         Ok(Self {
             scheme,
             authority,
             host,
             origin,
+            base,
             prefix,
             authorization: None,
         })
@@ -99,7 +116,7 @@ impl Upstream {
         format!("{}{}/", self.origin, self.prefix)
     }
 
-    /// `https://n5pro.internal`.
+    /// `https://n5pro.internal`, without the scheme's default port.
     pub fn origin(&self) -> &str {
         &self.origin
     }
@@ -136,31 +153,79 @@ impl Upstream {
             .build()
             .ok()
     }
+
+    /// Where a `Location` from the server leads, if it's on the server's own
+    /// origin: its path, query and fragment. Absolute (`https://…`) and
+    /// scheme-relative (`//…`) references are resolved the way a browser
+    /// would, so a default port written out (`:443`) or left out matches.
+    /// A relative reference (`/coversync/`) needs no change and gives `None`.
+    pub(crate) fn own_location(&self, location: &str) -> Option<String> {
+        let absolute = location.starts_with("//") || location.contains("://");
+        if !absolute {
+            return None;
+        }
+        let target = self.base.join(location).ok()?;
+        (target.origin() == self.base.origin())
+            .then(|| target[url::Position::BeforePath..].to_owned())
+    }
+
+    /// Whether a redirect from the server stays on its origin. `location` is
+    /// resolved against `from`, the URL that answered with it.
+    pub(crate) fn keeps_origin(&self, from: &Url, location: &str) -> Result<(), String> {
+        let target = from.join(location).map_err(|_| location.to_owned())?;
+        if target.origin() == self.base.origin() {
+            Ok(())
+        } else {
+            Err(target.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn reads_the_origin_and_prefix() {
-        let up = Upstream::parse("https://n5pro.internal/coversync/").unwrap();
-        assert_eq!(up.origin(), "https://n5pro.internal");
-        assert_eq!(up.prefix(), "/coversync");
-        assert_eq!(up.url(), "https://n5pro.internal/coversync/");
-        assert_eq!(up.host(), "n5pro.internal");
-
-        let up = Upstream::parse("http://127.0.0.1:8770").unwrap();
-        assert_eq!(up.origin(), "http://127.0.0.1:8770");
-        assert_eq!(up.prefix(), "");
-        assert_eq!(up.url(), "http://127.0.0.1:8770/");
-        assert_eq!(up.host(), "127.0.0.1:8770");
+    fn up(url: &str) -> Upstream {
+        Upstream::parse(url).unwrap()
     }
 
     #[test]
-    fn assumes_https_and_lowercases_the_host() {
-        let up = Upstream::parse("  N5Pro.Internal/coversync ").unwrap();
-        assert_eq!(up.url(), "https://n5pro.internal/coversync/");
+    fn reads_the_origin_and_prefix() {
+        let up_ = up("https://n5pro.internal/coversync/");
+        assert_eq!(up_.origin(), "https://n5pro.internal");
+        assert_eq!(up_.prefix(), "/coversync");
+        assert_eq!(up_.url(), "https://n5pro.internal/coversync/");
+        assert_eq!(up_.host(), "n5pro.internal");
+
+        let local = up("http://127.0.0.1:8770");
+        assert_eq!(local.origin(), "http://127.0.0.1:8770");
+        assert_eq!(local.prefix(), "");
+        assert_eq!(local.url(), "http://127.0.0.1:8770/");
+        assert_eq!(local.host(), "127.0.0.1:8770");
+    }
+
+    #[test]
+    fn reads_it_as_a_browser_does() {
+        assert_eq!(
+            up("  N5Pro.Internal/coversync ").url(),
+            "https://n5pro.internal/coversync/"
+        );
+        // A default port goes; another stays.
+        assert_eq!(
+            up("https://n5pro.internal:443/coversync/").origin(),
+            "https://n5pro.internal"
+        );
+        assert_eq!(up("http://host:80/").origin(), "http://host");
+        assert_eq!(up("https://host:8443/").origin(), "https://host:8443");
+        // The path the webview asks for: percent-encoded, dot segments resolved.
+        assert_eq!(up("https://server/音乐/").prefix(), "/%E9%9F%B3%E4%B9%90");
+        assert_eq!(up("https://server/a/../coversync/").prefix(), "/coversync");
+        assert_eq!(up("https://server//coversync//").prefix(), "/coversync");
+        assert_eq!(
+            up("https://Bücher.example/").host(),
+            "xn--bcher-kva.example"
+        );
+        assert_eq!(up("http://[::1]:8770/").host(), "[::1]:8770");
     }
 
     #[test]
@@ -170,7 +235,9 @@ mod tests {
             "ftp://n5pro.internal/",
             "https://user:pw@n5pro.internal/",
             "https://n5pro.internal/coversync/?x=1",
-            "https:///nohost",
+            "https://n5pro.internal/coversync/#x",
+            "https://",
+            "https://exa mple/",
         ] {
             assert!(Upstream::parse(url).is_err(), "{url}");
         }
@@ -178,25 +245,71 @@ mod tests {
 
     #[test]
     fn serves_only_paths_under_the_prefix() {
-        let up = Upstream::parse("https://n5pro.internal/coversync/").unwrap();
-        assert!(up.serves("/coversync"));
-        assert!(up.serves("/coversync/"));
-        assert!(up.serves("/coversync/api/status"));
-        assert!(!up.serves("/coversyncx"));
-        assert!(!up.serves("/"));
-        assert!(!up.serves("/favicon.ico"));
+        let up_ = up("https://n5pro.internal/coversync/");
+        assert!(up_.serves("/coversync"));
+        assert!(up_.serves("/coversync/"));
+        assert!(up_.serves("/coversync/api/status"));
+        assert!(!up_.serves("/coversyncx"));
+        assert!(!up_.serves("/"));
+        assert!(!up_.serves("/favicon.ico"));
 
-        let root = Upstream::parse("https://n5pro.internal/").unwrap();
+        let root = up("https://n5pro.internal/");
         assert!(root.serves("/"));
         assert!(root.serves("/api/status"));
     }
 
     #[test]
+    fn knows_its_own_locations() {
+        let up_ = up("https://n5pro.internal/coversync/");
+        let own = |l| up_.own_location(l);
+        assert_eq!(
+            own("https://n5pro.internal/coversync/?a=1").as_deref(),
+            Some("/coversync/?a=1")
+        );
+        assert_eq!(
+            own("https://n5pro.internal:443/coversync/").as_deref(),
+            Some("/coversync/")
+        );
+        assert_eq!(
+            own("//n5pro.internal/coversync/").as_deref(),
+            Some("/coversync/")
+        );
+        assert_eq!(own("//elsewhere/coversync/"), None);
+        assert_eq!(
+            own("http://n5pro.internal/coversync/"),
+            None,
+            "another scheme"
+        );
+        assert_eq!(own("https://n5pro.internal:8443/"), None, "another port");
+        assert_eq!(own("/coversync/"), None, "relative: left as it is");
+
+        // Given with its default port, it still knows locations without one.
+        let explicit = up("https://n5pro.internal:443/coversync/");
+        assert_eq!(
+            explicit
+                .own_location("https://n5pro.internal/coversync/")
+                .as_deref(),
+            Some("/coversync/")
+        );
+    }
+
+    #[test]
+    fn tells_where_redirects_lead() {
+        let up_ = up("http://n5pro.internal/coversync/");
+        let from = Url::parse(&up_.url()).unwrap();
+        assert_eq!(up_.keeps_origin(&from, "/coversync/login"), Ok(()));
+        assert_eq!(up_.keeps_origin(&from, "//n5pro.internal/x"), Ok(()));
+        assert_eq!(
+            up_.keeps_origin(&from, "https://n5pro.internal/coversync/"),
+            Err("https://n5pro.internal/coversync/".to_owned())
+        );
+    }
+
+    #[test]
     fn keeps_the_token_out_of_debug_output() {
-        let up = Upstream::parse("https://n5pro.internal/")
-            .unwrap()
+        let up_ = up("https://n5pro.internal/")
             .with_authorization(Some(HeaderValue::from_static("Bearer secret")));
-        assert!(!format!("{up:?}").contains("secret"));
-        assert_eq!(up.authorization().unwrap(), "Bearer secret");
+        assert!(!format!("{up_:?}").contains("secret"));
+        assert_eq!(up_.authorization().unwrap(), "Bearer secret");
     }
 }

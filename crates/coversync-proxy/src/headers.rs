@@ -2,7 +2,7 @@
 
 use axum::http::header::{
     ALT_SVC, AUTHORIZATION, CONNECTION, COOKIE, EXPECT, HOST, LOCATION, ORIGIN, REFERER,
-    SET_COOKIE, STRICT_TRANSPORT_SECURITY,
+    STRICT_TRANSPORT_SECURITY,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -63,7 +63,6 @@ pub(crate) fn to_upstream(headers: &mut HeaderMap, local_origin: &str, upstream:
     {
         headers.insert(REFERER, value);
     }
-    strip_own_cookie(headers);
     if let Some(authorization) = upstream.authorization() {
         headers.insert(AUTHORIZATION, authorization.clone());
     }
@@ -75,54 +74,14 @@ pub(crate) fn from_upstream(headers: &mut HeaderMap, local_origin: &str, upstrea
     strip_hop_by_hop(headers);
     headers.remove(STRICT_TRANSPORT_SECURITY);
     headers.remove(ALT_SVC);
+    // The server's own absolute URLs ("https://n5pro.internal/…" or
+    // "//n5pro.internal/…") would take the window out of the proxy.
     if let Some(location) = headers.get(LOCATION).and_then(|l| l.to_str().ok())
-        && let Some(rest) = after_origin(location, upstream.origin())
+        && let Some(rest) = upstream.own_location(location)
         && let Ok(value) = HeaderValue::from_str(&format!("{local_origin}{rest}"))
     {
         headers.insert(LOCATION, value);
     }
-    if headers.contains_key(SET_COOKIE) {
-        let cookies: Vec<HeaderValue> = headers
-            .get_all(SET_COOKIE)
-            .iter()
-            .map(local_set_cookie)
-            .collect();
-        headers.remove(SET_COOKIE);
-        for cookie in cookies {
-            headers.append(SET_COOKIE, cookie);
-        }
-    }
-}
-
-/// A server's `Set-Cookie` made to work at `http://127.0.0.1:<port>`:
-/// without `Secure` the webview stores it over plain HTTP, and without
-/// `Domain` it belongs to 127.0.0.1. `SameSite=None` needs `Secure`, so it
-/// becomes `Lax`, and `Partitioned` (which needs `Secure` too) goes.
-fn local_set_cookie(value: &HeaderValue) -> HeaderValue {
-    let Ok(cookie) = value.to_str() else {
-        return value.clone();
-    };
-    let mut parts = cookie.split(';');
-    let mut out = parts.next().unwrap_or_default().trim().to_owned();
-    for attribute in parts {
-        let attribute = attribute.trim();
-        let (name, val) = attribute.split_once('=').unwrap_or((attribute, ""));
-        let name = name.trim();
-        if name.eq_ignore_ascii_case("secure")
-            || name.eq_ignore_ascii_case("domain")
-            || name.eq_ignore_ascii_case("partitioned")
-            || attribute.is_empty()
-        {
-            continue;
-        }
-        out.push_str("; ");
-        if name.eq_ignore_ascii_case("samesite") && val.trim().eq_ignore_ascii_case("none") {
-            out.push_str("SameSite=Lax");
-        } else {
-            out.push_str(attribute);
-        }
-    }
-    HeaderValue::from_str(&out).unwrap_or_else(|_| value.clone())
 }
 
 /// `name=value` pairs of every `Cookie` header.
@@ -151,24 +110,6 @@ pub(crate) fn has_own_cookie(headers: &HeaderMap, value: &str) -> bool {
     })
 }
 
-/// Drops the proxy's cookie, which is no business of the server's, and keeps
-/// the rest (the server's own session cookie, say).
-fn strip_own_cookie(headers: &mut HeaderMap) {
-    if !headers.contains_key(COOKIE) {
-        return;
-    }
-    let kept: Vec<&[u8]> = cookie_pairs(headers)
-        .filter(|pair| cookie_name(pair) != COOKIE_NAME.as_bytes())
-        .collect();
-    let joined = kept.join(&b"; "[..]);
-    headers.remove(COOKIE);
-    if !joined.is_empty()
-        && let Ok(value) = HeaderValue::from_bytes(&joined)
-    {
-        headers.insert(COOKIE, value);
-    }
-}
-
 /// Compares secrets without returning early on the first difference.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -180,30 +121,8 @@ mod tests {
 
     use super::*;
 
-    fn set_cookie(value: &'static str) -> String {
-        local_set_cookie(&HeaderValue::from_static(value))
-            .to_str()
-            .unwrap()
-            .to_owned()
-    }
-
     #[test]
-    fn server_cookies_lose_secure_and_domain() {
-        assert_eq!(
-            set_cookie(
-                "session=abc; Path=/coversync; Domain=n5pro.internal; Secure; HttpOnly; SameSite=Lax; Max-Age=2592000"
-            ),
-            "session=abc; Path=/coversync; HttpOnly; SameSite=Lax; Max-Age=2592000"
-        );
-        assert_eq!(
-            set_cookie("a=1;secure;samesite=none;Partitioned"),
-            "a=1; SameSite=Lax"
-        );
-        assert_eq!(set_cookie("a=1"), "a=1");
-    }
-
-    #[test]
-    fn the_own_cookie_stays_local() {
+    fn finds_the_own_cookie() {
         let mut headers = HeaderMap::new();
         headers.append(
             COOKIE,
@@ -213,14 +132,6 @@ mod tests {
         assert!(has_own_cookie(&headers, "k1"));
         assert!(!has_own_cookie(&headers, "k2"));
         assert!(!has_own_cookie(&headers, "k"));
-        strip_own_cookie(&mut headers);
-        assert_eq!(headers.get_all(COOKIE).iter().count(), 1);
-        assert_eq!(headers[COOKIE], "session=abc; theme=dark");
-
-        let mut only_own = HeaderMap::new();
-        only_own.insert(COOKIE, HeaderValue::from_static("coversync-app=k1"));
-        strip_own_cookie(&mut only_own);
-        assert!(!only_own.contains_key(COOKIE));
     }
 
     #[test]
