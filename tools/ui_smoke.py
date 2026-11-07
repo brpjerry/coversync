@@ -6,9 +6,11 @@ Needs `geckodriver` and python-websocket-client (for console logs).
 
     COVERSYNC_PASSWORD=... tools/ui_smoke.py http://127.0.0.1:8770/ shots/ [--light] [--save]
 
-It signs in with the password in COVERSYNC_PASSWORD, or the one after --password.
---auth tries the login view instead of the tour: a wrong password, signing in, a
-    session that ends while the app is open (unsaved edits stay), and signing out.
+It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
+(which other users can see in the process list: prefer the variable).
+--auth checks the login view instead of the tour, and stops at the first failure: a
+    wrong password, signing in, a session that ends under unsaved tag edits (Escape in
+    the login view must keep them), and signing out (asked first while edits are unsaved).
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -712,62 +714,110 @@ def sign_in(d, pw=None):
     d.wait("return !document.querySelector('.login') && !!document.querySelector('.page')")
 
 
+def check(ok, what):
+    """Stop the run unless `ok`; say what was checked."""
+    if not ok:
+        raise AssertionError(what)
+    print("  ok:", what)
+
+
 def auth_flow(d, out, tag):
     """The login view: a wrong password, signing in, a session that ends under
-    the open app, and signing out. Starts signed out."""
+    an album with unsaved tag edits (Escape in the login view must not close
+    it), signing back in, and signing out (asked first while a setup screen
+    has unsaved changes). Starts signed out; stops at the first failed check."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
     d.wait(f"return !!document.querySelector('{LOGIN_FIELD}')")
     time.sleep(0.6)
-    print("login view:", d.js(text, ".login h1"), "|", d.js(text, ".login .card > p"),
-          "| focused:", d.js(f"return document.activeElement === document.querySelector('{LOGIN_FIELD}')"))
+    print("login view:", d.js(text, ".login h1"), "|", d.js(text, ".login .card > p"))
+    check(d.js(f"return document.activeElement === document.querySelector('{LOGIN_FIELD}')"),
+          "the password field has focus")
     d.shot(out / f"a1-login-{tag}.png")
     d.type(LOGIN_FIELD, "not the password")
     d.click(".login button[type=submit]")
     d.wait("return !!document.querySelector('.login .problem')")
     time.sleep(0.4)
-    print("wrong password:", d.js(text, ".login .problem"))
+    check("isn't right" in d.js(text, ".login .problem"), "a wrong password is refused")
     d.shot(out / f"a2-wrong-{tag}.png")
     d.clear_and_type(LOGIN_FIELD, password())
     d.click(".login button[type=submit]")
     d.wait("return !document.querySelector('.login') && document.querySelectorAll('.card').length > 0")
     d.wait("return [...document.querySelectorAll('.card img')]"
            ".filter(i => i.getBoundingClientRect().top < innerHeight).every(i => i.complete)")
-    covers = ("return [...document.querySelectorAll('.card img')].filter(i => i.complete && i.naturalWidth).length"
-              " + ' of ' + document.querySelectorAll('.card img').length")
-    print("signed in; covers shown:", d.js(covers))
+    shown = d.js("return [...document.querySelectorAll('.card img')].filter(i => i.naturalWidth).length")
+    check(shown > 0, f"signed in, {shown} covers shown through the cookie")
     d.shot(out / f"a3-signed-in-{tag}.png")
 
-    # An unsaved edit, then the session ends under it (as when another tab signs out).
+    # An album with unsaved tag edits, then the session ends under it (as when
+    # another tab signs out, or the password is reset).
+    time.sleep(1.2)
+    d.click(".cell:first-child .cover")
+    d.wait("return !!document.querySelector('.tracks li')")
+    time.sleep(1.2)
+    d.click(".mode button:nth-child(3)")
+    d.wait("return !!document.querySelector('.editor')")
+    field = ".album-grid .field:nth-child(4) input"
+    d.type(field, " (edited)")
+    time.sleep(0.5)
+    summary = "return document.querySelector('.editor .summary')?.textContent.replace(/\\s+/g, ' ').trim()"
+    edited = d.js(summary)
+    value = d.js("return document.querySelector(arguments[0]).value", field)
+    check(value.endswith(" (edited)") and "change" in edited and "No changes" not in edited,
+          f"an unsaved tag edit: {edited!r}")
+    d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
+    started = time.time()
+    d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
+    print(f"session ended: login view over the app after {time.time() - started:.1f}s")
+    check(d.js(text, ".login h1") == "You’ve been signed out", "it says the session ended")
+    check(d.js("return !!document.querySelector('.page').closest('[inert]')"), "the app under it is inert")
+    check(d.js("return document.querySelectorAll('.toast.error').length") == 0, "no error toasts")
+    # Escape typed in the login view stays there.
+    el = d.s("POST", "/element", {"using": "css selector", "value": LOGIN_FIELD})
+    d.s("POST", f"/element/{el[ELEMENT]}/value", {"text": ""})
+    time.sleep(0.6)
+    check(d.js("return !!document.querySelector('.sheet .editor')") and d.js(summary) == edited,
+          "Escape in the login view leaves the album and its tag edit open")
+    d.shot(out / f"a4-session-ended-{tag}.png")
+    sign_in(d)
+    time.sleep(0.8)
+    check(d.js(summary) == edited and d.js("return document.querySelector(arguments[0]).value", field) == value,
+          "signed back in, the tag edit is still there")
+    check(d.js("const i = document.querySelector('.hero-cover img'); return !i || (i.complete && i.naturalWidth > 0)"),
+          "the album's cover shows")
+    # Now Escape closes the album again (dropping the edit, as it always has).
+    d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+    d.wait("return !document.querySelector('.sheet')")
+    time.sleep(0.8)
+
+    # Signing out asks first while a setup screen has unsaved changes.
     d.open_setup("Appearance")
     d.wait("return !!document.querySelector('.slider')")
-    d.js("const s = document.querySelector('.slider'); s.value = +s.min;"
+    d.js("const s = document.querySelector('.slider');"
+         "s.value = +s.value === +s.min ? s.max : s.min;"
          "s.dispatchEvent(new Event('input', {bubbles: true}))")
     time.sleep(0.6)
     unsaved = "return document.querySelector('.savebar .summary')?.textContent.trim() ?? null"
     before = d.js(unsaved)
-    d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
-    started = time.time()
-    d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
-    print(f"session ended: login view over the app after {time.time() - started:.1f}s:",
-          d.js(text, ".login h1"), "| app inert:", d.js("return !!document.querySelector('.page').closest('[inert]')"),
-          "| error toasts:", d.js("return document.querySelectorAll('.toast.error').length"))
-    time.sleep(0.4)
-    d.shot(out / f"a4-session-ended-{tag}.png")
-    sign_in(d)
-    time.sleep(0.6)
-    print("signed back in; unsaved edit kept:", d.js(unsaved) == before, repr(before))
+    check(before is not None, f"an unsaved Appearance change: {before!r}")
+    # The question is answered "no" here, and noted.
+    d.js("window.asked = []; window.confirm = (m) => (window.asked.push(m), false)")
+    d.click_xpath("//aside//button[normalize-space(.)='Sign out']")
+    time.sleep(0.5)
+    asked = d.js("return window.asked")
+    check(len(asked) == 1 and "unsaved" in asked[0], f"Sign out asks first: {asked!r}")
+    check(not d.js("return !!document.querySelector('.login')") and d.js(unsaved) == before,
+          "declining keeps the session and the change")
     d.click_text("main", "Revert")
     time.sleep(0.4)
-    d.click(".setup .back")
-    d.wait("return document.querySelectorAll('.card').length > 0")
 
-    # Signing out starts the page afresh, signed out.
-    d.click_xpath("//nav[@aria-label='Setup']//button[normalize-space(.)='Sign out']")
+    # With nothing unsaved, Sign out starts the page afresh, signed out.
+    d.click_xpath("//aside//button[normalize-space(.)='Sign out']")
     d.wait("return !!document.querySelector('.login:not(.over) input[type=password]')")
     time.sleep(0.6)
-    print("signed out:", d.js(text, ".login h1"), "| app gone:", d.js("return !document.querySelector('.page')"),
-          "| /api/status now:", d.js("const r = new XMLHttpRequest(); r.open('GET', new URL('api/status', document.baseURI), false);"
-                                     "r.send(); return r.status"))
+    check(d.js("return !document.querySelector('.page')"), "signed out, nothing of the library on screen")
+    status = d.js("const r = new XMLHttpRequest(); r.open('GET', new URL('api/status', document.baseURI), false);"
+                  "r.send(); return r.status")
+    check(status == 401, "the API answers 401 afterwards")
     d.shot(out / f"a5-signed-out-{tag}.png")
 
 

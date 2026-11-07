@@ -122,8 +122,10 @@ options:
   file is touched.
 
 To serve the UI under a path prefix behind a reverse proxy, build it with that
-prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The session cookie is
-then limited to that prefix, so other sites on the same host never get it.
+prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
+as it appears in the URL: ASCII, with anything else percent-encoded
+(`/m%C3%BCsik`, not `/müsik`). The session cookie is then limited to that
+prefix, so other sites on the same host never get it.
 
 ### Signing in
 
@@ -161,11 +163,17 @@ until the command is run on the server.
   (the server's name, coversyncd's version and the API versions it speaks, for
   clients checking a URL) and logging in and out. The UI's own files stay open:
   they are the app's source and hold no data.
-- **Failed logins are limited**, for each client and overall: five tries, then
-  one a minute. Behind a reverse proxy on the same machine, the client's
-  address is taken from `X-Forwarded-For`, which is only trusted from
-  loopback; loopback itself gets no other trust, since every request through
-  the proxy comes from it.
+- **Failed logins are limited.** Each client gets five tries, then one a
+  minute; a client with a try left is always checked, so the right password
+  always gets in. Overall, twenty failures are allowed, then one every six
+  seconds; past that (an attack from many addresses), each failure also costs
+  its client every try it has left, so each address gets one guess a minute.
+  At most two passwords are checked at once. Behind a reverse proxy on the
+  same machine, the client's address is taken from `X-Forwarded-For`, which
+  is only trusted from loopback; loopback itself gets no other trust, since
+  every request through the proxy comes from it.
+- **Nothing a login is served is kept by shared caches**: API responses are
+  `Cache-Control: private`, and `no-cache` unless they set their own policy.
 
 ### Moving the Library
 
