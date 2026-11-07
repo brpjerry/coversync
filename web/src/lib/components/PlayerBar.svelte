@@ -166,16 +166,24 @@
 		backdrop-filter: saturate(1.8) blur(28px);
 		border: 1px solid var(--border);
 		box-shadow: var(--shadow);
-		/* Firefox leaves backdrop-filter out of view-transition snapshots, so while
-		   an album opens or closes the bar is captured on its own, and its snapshot,
-		   below, frosts the page changing underneath. */
-		view-transition-name: player;
 	}
-	/* Firefox would paint this frost too, at full strength, even as the bar comes or goes. */
-	:global(:root:active-view-transition) .player {
-		backdrop-filter: none;
+	/* Firefox leaves backdrop-filter out of view-transition snapshots, so there,
+	   while an album opens or closes, the bar is captured on its own, and its
+	   snapshot, below, frosts the page changing underneath. Chrome keeps the
+	   frost in the page's snapshot but won't frost one of the bar's own, so it
+	   captures the bar with the page. */
+	/* Gecko only: no other engine knows -moz-appearance. */
+	@supports (-moz-appearance: none) {
+		.player {
+			view-transition-name: player;
+		}
+		/* Firefox would paint this frost too, at full strength, even as the bar comes or goes. */
+		:global(:root:active-view-transition) .player {
+			backdrop-filter: none;
+		}
 	}
-	/* Above the moving album cover (z-index 10), as the bar is above the sheet. */
+	/* Above the moving album cover (z-index 10), as the bar is above the sheet.
+	   Outside Firefox the bar is part of the page's snapshot, under the cover. */
 	:global(::view-transition-group(player)) {
 		z-index: 11;
 	}

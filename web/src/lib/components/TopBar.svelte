@@ -197,15 +197,22 @@
 		background: var(--bg-overlay);
 		backdrop-filter: saturate(1.6) blur(20px);
 		border-bottom: 1px solid var(--border);
-		/* Firefox leaves backdrop-filter out of view-transition snapshots, so while
-		   an album opens or closes the bar is captured on its own, and its snapshot,
-		   below, frosts what's under it as it fades. Not while the page is blurred
-		   behind an album (.page.behind), which would lose the bar that blur. */
-		view-transition-name: top-bar;
 	}
-	/* Firefox would paint this frost at full strength over the sheet the whole time. */
-	:global(:root:active-view-transition) .bar {
-		backdrop-filter: none;
+	/* Firefox leaves backdrop-filter out of view-transition snapshots, so there,
+	   while an album opens or closes, the bar is captured on its own, and its
+	   snapshot, below, frosts what's under it as it fades. Not while the page is
+	   blurred behind an album (.page.behind), which would lose the bar that blur.
+	   Chrome keeps the frost in the page's snapshot but won't frost one of the
+	   bar's own, so it captures the bar with the page. */
+	/* Gecko only: no other engine knows -moz-appearance. */
+	@supports (-moz-appearance: none) {
+		.bar {
+			view-transition-name: top-bar;
+		}
+		/* Firefox would paint this frost at full strength over the sheet the whole time. */
+		:global(:root:active-view-transition) .bar {
+			backdrop-filter: none;
+		}
 	}
 	:global(::view-transition-old(top-bar)),
 	:global(::view-transition-new(top-bar)) {
