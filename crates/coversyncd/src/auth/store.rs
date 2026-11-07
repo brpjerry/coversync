@@ -9,7 +9,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use base64::Engine;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -163,6 +163,9 @@ pub struct Session {
     pub access: Access,
     /// Its last use should be written down (see [`Store::touch_session`]).
     pub stale: bool,
+    /// So should its device's, for one traded for a token (see
+    /// [`Store::touch_device`]).
+    pub device_stale: bool,
 }
 
 /// A device whose token the guard found valid.
@@ -205,7 +208,9 @@ impl Store {
     /// Returns whether a password was replaced.
     pub fn set_password_hash(&self, hash: &str, now: i64) -> rusqlite::Result<bool> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        // Take the write lock first: a deferred transaction that read before
+        // writing could fail outright when the running service writes between.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let replaced = tx
             .query_row("SELECT 1 FROM password WHERE id = 1", [], |_| Ok(()))
             .optional()?
@@ -220,12 +225,35 @@ impl Store {
         Ok(replaced)
     }
 
-    /// Start a session: a password login (`device` none, full access) or one
-    /// traded for a device's token, with its scope. Returns the session id
-    /// for the cookie; only its hash is kept.
-    pub fn create_session(
+    /// Start a password login's session, if `checked` (the hash the password
+    /// was checked against) is still the stored one. Comparing and inserting
+    /// in one statement orders it against a reset: before it, the reset ends
+    /// the session; after it, nothing matches. Returns the session id for
+    /// the cookie; only its hash is kept.
+    pub fn create_password_session(
         &self,
-        device: Option<i64>,
+        checked: &str,
+        now: i64,
+    ) -> rusqlite::Result<Option<String>> {
+        let id = random_secret()?;
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM sessions WHERE seen_at <= ?1",
+            [now - SESSION_IDLE],
+        )?;
+        let inserted = conn.execute(
+            "INSERT INTO sessions (id_hash, device_id, scope, created_at, seen_at)
+             SELECT ?1, NULL, 'manage', ?2, ?2 FROM password WHERE id = 1 AND hash = ?3",
+            params![&digest(&id)[..], now, checked],
+        )?;
+        Ok((inserted == 1).then_some(id))
+    }
+
+    /// Start a session traded for a device's token, with its scope. Returns
+    /// the session id for the cookie; only its hash is kept.
+    pub fn create_device_session(
+        &self,
+        device: i64,
         scope: Scope,
         now: i64,
     ) -> rusqlite::Result<String> {
@@ -249,7 +277,7 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                "SELECT s.device_id, s.scope, s.seen_at, d.scope
+                "SELECT s.device_id, s.scope, s.seen_at, d.scope, d.last_seen_at
                  FROM sessions s LEFT JOIN devices d ON d.id = s.device_id
                  WHERE s.id_hash = ?1 AND s.seen_at > ?2
                    AND (s.device_id IS NULL OR (d.id IS NOT NULL AND d.revoked_at IS NULL))",
@@ -260,11 +288,12 @@ impl Store {
                         r.get::<_, String>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.map(|(device, scope, seen, device_scope)| {
+        Ok(row.map(|(device, scope, seen, device_scope, device_seen)| {
             let mut scope = Scope::parse(&scope);
             // A device re-scoped since the trade takes its sessions along.
             if device_scope.is_some_and(|s| Scope::parse(&s) == Scope::Sync) {
@@ -281,6 +310,9 @@ impl Store {
                     device,
                 },
                 stale: seen <= now - SESSION_REFRESH,
+                // Using a traded session counts as using the device.
+                device_stale: device.is_some()
+                    && device_seen.is_none_or(|s| s <= now - DEVICE_REFRESH),
             }
         }))
     }
@@ -358,6 +390,22 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub fn device_last_seen(&self, id: i64) -> rusqlite::Result<Option<i64>> {
+        self.conn().query_row(
+            "SELECT last_seen_at FROM devices WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn forget_last_seen(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn()
+            .execute("UPDATE devices SET last_seen_at = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn rescope_device(&self, id: i64, scope: Scope) -> rusqlite::Result<()> {
         self.conn().execute(
             "UPDATE devices SET scope = ?2 WHERE id = ?1",
@@ -394,9 +442,9 @@ mod tests {
         assert_eq!(s.password_hash().unwrap(), None);
         assert!(!s.set_password_hash("$first", 10).unwrap());
         assert_eq!(s.password_hash().unwrap().as_deref(), Some("$first"));
-        let browser = s.create_session(None, Scope::Manage, 20).unwrap();
+        let browser = s.create_password_session("$first", 20).unwrap().unwrap();
         let (phone, token) = s.add_device("Phone", Scope::Manage, 20).unwrap();
-        let traded = s.create_session(Some(phone), Scope::Manage, 20).unwrap();
+        let traded = s.create_device_session(phone, Scope::Manage, 20).unwrap();
         assert!(s.set_password_hash("$second", 30).unwrap());
         assert_eq!(s.password_hash().unwrap().as_deref(), Some("$second"));
         // A reset signs browsers out, but leaves apps alone.
@@ -405,10 +453,65 @@ mod tests {
         assert!(s.device(&token, 40).unwrap().is_some());
     }
 
+    fn sessions_count(s: &Store) -> i64 {
+        s.conn()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_reset_during_a_login_leaves_no_session() {
+        let s = store("race");
+        s.set_password_hash("$old", 0).unwrap();
+        // A login reads the hash and checks the password against it, while
+        // set-password commits a new one.
+        let checked = s.password_hash().unwrap().unwrap();
+        s.set_password_hash("$new", 1).unwrap();
+        assert!(s.create_password_session(&checked, 2).unwrap().is_none());
+        assert_eq!(sessions_count(&s), 0);
+        // The other order: the session comes first, and the reset ends it.
+        let early = s.create_password_session("$new", 3).unwrap().unwrap();
+        s.set_password_hash("$newer", 4).unwrap();
+        assert!(s.session(&early, 5).unwrap().is_none());
+        assert_eq!(sessions_count(&s), 0);
+    }
+
+    #[test]
+    fn a_reset_waits_for_another_writer() {
+        let dir =
+            std::env::temp_dir().join(format!("coversyncd-store-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("inbox.sqlite3");
+        let s = Store::open(&path).unwrap();
+        s.conn().execute_batch("PRAGMA journal_mode = WAL").unwrap();
+        s.set_password_hash("$old", 0).unwrap();
+        // The running service, in the middle of a write of its own.
+        let service = Connection::open(&path).unwrap();
+        service.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started, wait) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            s.set_password_hash("$new", 1).map(|_| s)
+        });
+        wait.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        service
+            .execute("DELETE FROM sessions WHERE seen_at < 0", [])
+            .unwrap();
+        service.execute_batch("COMMIT").unwrap();
+        let s = reset
+            .join()
+            .unwrap()
+            .expect("the reset waits, then succeeds");
+        assert_eq!(s.password_hash().unwrap().as_deref(), Some("$new"));
+    }
+
     #[test]
     fn sessions_slide_and_expire() {
         let s = store("sessions");
-        let id = s.create_session(None, Scope::Manage, 1000).unwrap();
+        s.set_password_hash("$pw", 0).unwrap();
+        let id = s.create_password_session("$pw", 1000).unwrap().unwrap();
         let fresh = s.session(&id, 1000 + 60).unwrap().unwrap();
         assert_eq!(fresh.access.via, Via::Password);
         assert!(fresh.access.password_login());
@@ -426,8 +529,9 @@ mod tests {
     #[test]
     fn logging_out_ends_only_that_session() {
         let s = store("logout");
-        let a = s.create_session(None, Scope::Manage, 0).unwrap();
-        let b = s.create_session(None, Scope::Manage, 0).unwrap();
+        s.set_password_hash("$pw", 0).unwrap();
+        let a = s.create_password_session("$pw", 0).unwrap().unwrap();
+        let b = s.create_password_session("$pw", 0).unwrap().unwrap();
         s.end_session(&a).unwrap();
         assert!(s.session(&a, 1).unwrap().is_none());
         assert!(s.session(&b, 1).unwrap().is_some());
@@ -460,7 +564,11 @@ mod tests {
     fn traded_sessions_follow_their_device() {
         let s = store("traded");
         let (id, _) = s.add_device("Phone", Scope::Manage, 0).unwrap();
-        let session = s.create_session(Some(id), Scope::Manage, 0).unwrap();
+        let session = s.create_device_session(id, Scope::Manage, 0).unwrap();
+        // Using the session counts as using the device.
+        assert!(s.session(&session, 1).unwrap().unwrap().device_stale);
+        s.touch_device(id, 1).unwrap();
+        assert!(!s.session(&session, 2).unwrap().unwrap().device_stale);
         let found = s.session(&session, 1).unwrap().unwrap().access;
         assert_eq!(
             found,

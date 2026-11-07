@@ -111,6 +111,12 @@ impl Auth {
         self.limiter().refund(client, now);
     }
 
+    /// Count a login that failed against the overall limit.
+    fn failed(&self, client: limit::Client) {
+        let now = self.instant();
+        self.limiter().failed(client, now);
+    }
+
     #[cfg(test)]
     pub fn store(&self) -> &Store {
         &self.store
@@ -265,8 +271,8 @@ fn credentials(headers: &HeaderMap) -> Credentials {
 /// What checking credentials found, and what to write down about it.
 struct Checked {
     access: Result<Access, Denied>,
-    /// A session (by its hash) or device to note the use of.
-    touch: Option<Touch>,
+    /// Sessions (by their hash) and devices to note the use of.
+    touch: Vec<Touch>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,7 +284,7 @@ enum Touch {
 fn check(store: &Store, credentials: Credentials, now: i64) -> rusqlite::Result<Checked> {
     let denied = |why| Checked {
         access: Err(why),
-        touch: None,
+        touch: Vec::new(),
     };
     let unknown = match credentials {
         Credentials::Token(token) => {
@@ -293,7 +299,7 @@ fn check(store: &Store, credentials: Credentials, now: i64) -> rusqlite::Result<
                         scope: d.scope,
                         device: Some(d.id),
                     }),
-                    touch: d.stale.then_some(Touch::Device(d.id)),
+                    touch: d.stale.then_some(Touch::Device(d.id)).into_iter().collect(),
                 },
                 None => denied(Denied::InvalidToken),
             });
@@ -301,9 +307,16 @@ fn check(store: &Store, credentials: Credentials, now: i64) -> rusqlite::Result<
         Credentials::Sessions(ids) => {
             for id in ids {
                 if let Some(s) = store.session(&id, now)? {
+                    let mut touch = Vec::new();
+                    if s.stale {
+                        touch.push(Touch::Session(store::digest(&id)));
+                    }
+                    if let Some(device) = s.access.device.filter(|_| s.device_stale) {
+                        touch.push(Touch::Device(device));
+                    }
                     return Ok(Checked {
                         access: Ok(s.access),
-                        touch: s.stale.then(|| Touch::Session(store::digest(&id))),
+                        touch,
                     });
                 }
             }
@@ -365,7 +378,7 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
-    if let Some(t) = checked.touch {
+    for t in checked.touch {
         touch(&state, t, now);
     }
     match checked.access {
@@ -376,10 +389,39 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         ),
         Ok(access) => {
             req.extensions_mut().insert(access);
-            next.run(req).await
+            let mut res = next.run(req).await;
+            keep_private(&mut res);
+            res
         }
         Err(why) => denied(why),
     }
+}
+
+/// What a login was served may be kept by the browser only, never by a
+/// shared cache, which would hand it to requests without one. A response
+/// with no policy of its own is checked every time.
+fn keep_private(res: &mut Response) {
+    let own = res
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let directives: Vec<&str> = own
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("public"))
+        .collect();
+    let private =
+        |d: &&str| d.eq_ignore_ascii_case("private") || d.eq_ignore_ascii_case("no-store");
+    let policy = if directives.is_empty() {
+        "private, no-cache".to_owned()
+    } else if directives.iter().any(private) {
+        directives.join(", ")
+    } else {
+        format!("private, {}", directives.join(", "))
+    };
+    let policy = HeaderValue::from_str(&policy).unwrap_or(HeaderValue::from_static("no-store"));
+    res.headers_mut().insert(header::CACHE_CONTROL, policy);
 }
 
 /// The client's address: the connecting peer's, or, when that is a proxy on
@@ -425,7 +467,8 @@ fn over_https(headers: &HeaderMap) -> bool {
 
 /// The UI's base path, which the cookie is limited to so that other sites
 /// behind the same host never get it. coversyncd doesn't know it behind a
-/// proxy that strips its prefix, so the UI sends it.
+/// proxy that strips its prefix, so the UI sends it. Like the URL it is part
+/// of, it is ASCII, with anything else percent-encoded (`/m%C3%BCsik/`).
 fn cookie_path(path: &str) -> Option<&str> {
     let ok = path.starts_with('/')
         && path.len() <= 512
@@ -535,6 +578,7 @@ async fn login(
         tracing::info!(client = ?ip, "login refused: too many failed attempts");
         return too_many(wait);
     }
+    let checked = stored.clone();
     let right = body.password.len() <= MAX_PASSWORD && {
         let _slot = state.auth.hashing.acquire().await;
         let password = body.password;
@@ -542,19 +586,27 @@ async fn login(
             .await
             .unwrap_or(false)
     };
-    if !right {
-        tracing::warn!(client = ?ip, "failed login: wrong password");
-        return denied(Denied::WrongPassword);
-    }
-    state.auth.give_back(client);
     let s = state.clone();
     let now = now();
-    match tokio::task::spawn_blocking(move || s.auth.store.create_session(None, Scope::Manage, now))
-        .await
-    {
-        Ok(Ok(id)) => {
+    // Only while the hash checked is still the stored one: a reset that
+    // committed meanwhile makes this password wrong.
+    let created = match right {
+        true => {
+            tokio::task::spawn_blocking(move || s.auth.store.create_password_session(&checked, now))
+                .await
+        }
+        false => Ok(Ok(None)),
+    };
+    match created {
+        Ok(Ok(Some(id))) => {
+            state.auth.give_back(client);
             tracing::info!(client = ?ip, "signed in");
             signed_in(&id, &path, &headers)
+        }
+        Ok(Ok(None)) => {
+            state.auth.failed(client);
+            tracing::warn!(client = ?ip, "failed login: wrong password");
+            denied(Denied::WrongPassword)
         }
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
@@ -595,15 +647,23 @@ async fn login_with_token(
     let now = now();
     let traded = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<_, Denied>> {
         let found = check(&s.auth.store, Credentials::Token(token), now)?;
-        match found.access {
-            Ok(access) => {
-                let id = s
-                    .auth
-                    .store
-                    .create_session(access.device, access.scope, now)?;
-                Ok(Ok((id, access.device)))
+        match (found.access, found.touch.first()) {
+            (
+                Ok(Access {
+                    device: Some(device),
+                    scope,
+                    ..
+                }),
+                touch,
+            ) => {
+                let id = s.auth.store.create_device_session(device, scope, now)?;
+                if touch.is_some() {
+                    s.auth.store.touch_device(device, now)?;
+                }
+                Ok(Ok((id, device)))
             }
-            Err(why) => Ok(Err(why)),
+            (Ok(_), _) => Ok(Err(Denied::InvalidToken)),
+            (Err(why), _) => Ok(Err(why)),
         }
     })
     .await;
@@ -614,6 +674,7 @@ async fn login_with_token(
             signed_in(&id, &path, &headers)
         }
         Ok(Ok(Err(why))) => {
+            state.auth.failed(client);
             tracing::warn!(client = ?ip, "failed token trade: {}", why.code());
             denied(why)
         }
@@ -661,6 +722,9 @@ async fn logout(
 /// `coversyncd set-password`: set or reset the password, in the local
 /// database in `state_dir`. A running service uses it from the next login.
 pub fn set_password(state_dir: &Path) -> anyhow::Result<()> {
+    // First, so a refused password leaves no new state directory behind.
+    let password = read_password()?;
+    let hash = store::hash_password(&password)?;
     let db = state_dir.join(coversync_core::db::LOCAL_DB);
     // A new state directory gets its database the way the service makes it
     // (or takes over one from an older release).
@@ -668,8 +732,6 @@ pub fn set_password(state_dir: &Path) -> anyhow::Result<()> {
         coversync_core::Library::open_in(state_dir)?;
     }
     let store = Store::open(&db)?;
-    let password = read_password()?;
-    let hash = store::hash_password(&password)?;
     let replaced = store.set_password_hash(&hash, now())?;
     if replaced {
         println!(

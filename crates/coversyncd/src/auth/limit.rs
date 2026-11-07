@@ -1,8 +1,14 @@
 //! Failed logins, limited per client and overall, in memory.
 //!
-//! Each attempt takes a token from its client's bucket and from the overall
-//! one before the password is checked, and a successful one gives them back.
-//! Taking first also bounds how many password checks can run at once.
+//! Each client has its own bucket of tries. An attempt takes one before the
+//! password is checked (so one address can't queue up checks), and a
+//! successful one gives it back. A client with a try left is always checked,
+//! so a correct password always gets in.
+//!
+//! The overall bucket counts failures from everywhere. Once it is empty (an
+//! attack from many addresses), each further failure uses up its client's
+//! remaining tries, so every address gets one guess a minute, with no burst.
+//! The password checks themselves are capped by `Auth`'s hashing slots.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -20,7 +26,8 @@ const CLIENT: Rate = Rate {
     burst: 5.0,
     per_second: 1.0 / 60.0,
 };
-/// Twenty tries from anywhere, then one every six seconds.
+/// Twenty failures from anywhere, then one every six seconds, before each
+/// failure costs its client every try it has left.
 const OVERALL: Rate = Rate {
     burst: 20.0,
     per_second: 1.0 / 6.0,
@@ -102,13 +109,11 @@ impl Limiter {
             .entry(client)
             .or_insert_with(|| Bucket::full(CLIENT, now));
         mine.refill(CLIENT, now);
-        self.overall.refill(OVERALL, now);
-        let wait = mine.wait(CLIENT).max(self.overall.wait(OVERALL));
+        let wait = mine.wait(CLIENT);
         if !wait.is_zero() {
             return Err(wait);
         }
         mine.tokens -= 1.0;
-        self.overall.tokens -= 1.0;
         Ok(())
     }
 
@@ -118,8 +123,18 @@ impl Limiter {
             mine.refill(CLIENT, now);
             mine.tokens = (mine.tokens + 1.0).min(CLIENT.burst);
         }
+    }
+
+    /// Count an attempt that failed against the overall bucket. When that is
+    /// empty, the client loses the tries it has left.
+    pub fn failed(&mut self, client: Client, now: Instant) {
         self.overall.refill(OVERALL, now);
-        self.overall.tokens = (self.overall.tokens + 1.0).min(OVERALL.burst);
+        if self.overall.tokens >= 1.0 {
+            self.overall.tokens -= 1.0;
+        } else if let Some(mine) = self.clients.get_mut(&client) {
+            mine.refill(CLIENT, now);
+            mine.tokens = mine.tokens.min(0.0);
+        }
     }
 }
 
@@ -164,15 +179,26 @@ mod tests {
     }
 
     #[test]
-    fn many_clients_together_are_limited_too() {
+    fn many_failures_overall_take_away_each_clients_burst() {
         let t0 = Instant::now();
         let mut l = Limiter::new(t0);
         for i in 0..20 {
-            assert!(l.take(ip(&format!("10.0.1.{i}")), t0).is_ok());
+            let c = ip(&format!("10.0.1.{i}"));
+            l.take(c, t0).unwrap();
+            l.failed(c, t0);
         }
-        let wait = l.take(ip("10.0.2.1"), t0).unwrap_err();
-        assert!(wait <= Duration::from_secs(6), "{wait:?}");
-        assert!(l.take(ip("10.0.2.1"), t0 + Duration::from_secs(6)).is_ok());
+        // A new client still gets its try: a right password would get in.
+        let late = ip("10.0.2.1");
+        assert!(l.take(late, t0).is_ok());
+        // A wrong one costs it every try it had left.
+        l.failed(late, t0);
+        assert_eq!(l.take(late, t0).unwrap_err(), Duration::from_secs(60));
+        // Once the overall bucket has refilled, a failure costs just its try.
+        let t1 = t0 + Duration::from_secs(6);
+        let next = ip("10.0.2.2");
+        l.take(next, t1).unwrap();
+        l.failed(next, t1);
+        assert!(l.take(next, t1).is_ok());
     }
 
     #[test]

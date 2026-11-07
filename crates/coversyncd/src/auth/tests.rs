@@ -150,58 +150,70 @@ async fn nothing_is_reachable_before_a_password_is_set() {
     );
 }
 
-/// Every route the API has, and some it doesn't.
-const ROUTES: &[(&str, &str)] = &[
-    ("GET", "/api/status"),
-    ("POST", "/api/rescan"),
-    ("GET", "/api/albums"),
-    ("GET", "/api/albums/a1"),
-    ("GET", "/api/albums/a1/cover"),
-    ("GET", "/api/albums/a1/cover/full"),
-    ("PUT", "/api/albums/a1/tags"),
-    ("GET", "/api/tracks/1/stream"),
-    ("GET", "/api/library/setup"),
-    ("PUT", "/api/library/setup"),
-    ("GET", "/api/inbox/coverage"),
-    ("GET", "/api/inbox/setup"),
-    ("PUT", "/api/inbox/setup"),
-    ("POST", "/api/inbox/unhide"),
-    ("GET", "/api/library/preview?structure=x"),
-    ("GET", "/api/fs/check?path=/"),
-    ("POST", "/api/import/plan"),
-    ("POST", "/api/import"),
-    ("GET", "/api/appearance"),
-    ("PUT", "/api/appearance"),
-    ("GET", "/api/sync/setup"),
-    ("PUT", "/api/sync/setup"),
-    ("POST", "/api/identify"),
-    ("GET", "/api/identify/a1"),
-    ("GET", "/api/musicbrainz/art/r1"),
-    ("GET", "/api/musicbrainz/art/r1/image"),
-    ("GET", "/api/session"),
-    ("GET", "/api"),
-    ("GET", "/api/"),
-    ("GET", "/api/no-such-route"),
-    ("GET", "/api/hello/"),
-    ("DELETE", "/api/login/other"),
+/// Every path the routers in `api.rs` and here register, with `{params}`
+/// filled in. axum can't list a router's routes, so they're read from the
+/// source: a route added there is checked here without being listed.
+fn registered_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    for source in [include_str!("../api.rs"), include_str!("mod.rs")] {
+        for (at, _) in source.match_indices(".route(") {
+            let Some(rest) = source[at + ".route(".len()..]
+                .trim_start()
+                .strip_prefix('"')
+            else {
+                continue;
+            };
+            let path = &rest[..rest.find('"').unwrap()];
+            let filled: Vec<&str> = path
+                .split('/')
+                .map(|seg| if seg.starts_with('{') { "x1" } else { seg })
+                .collect();
+            paths.push(filled.join("/"));
+        }
+    }
+    paths
+}
+
+/// Paths the API doesn't have, which must not be open either.
+const UNKNOWN: &[&str] = &[
+    "/api",
+    "/api/",
+    "/api/no-such-route",
+    "/api/hello/",
+    "/api/login/other",
 ];
 
 #[tokio::test]
 async fn every_api_route_needs_a_login() {
     let app = App::with_password("routes");
-    for (method, path) in ROUTES {
-        let req = Request::builder()
-            .method(*method)
-            .uri(*path)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-        let (status, c) = code(app.send(req).await).await;
-        assert_eq!(
-            (status, c.as_str()),
-            (StatusCode::UNAUTHORIZED, "login_required"),
-            "{method} {path}"
-        );
+    let registered = registered_paths();
+    assert!(registered.len() >= 25, "{registered:?}");
+    assert!(registered.contains(&"/api/tracks/x1/stream".to_owned()));
+    let guarded: Vec<&str> = registered
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !OPEN.contains(p))
+        .chain(UNKNOWN.iter().copied())
+        .collect();
+    for path in guarded {
+        for method in ["GET", "POST", "PUT", "DELETE"] {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let (status, c) = code(app.send(req).await).await;
+            assert_eq!(
+                (status, c.as_str()),
+                (StatusCode::UNAUTHORIZED, "login_required"),
+                "{method} {path}"
+            );
+        }
+    }
+    // Only the open ones are, and they're all registered.
+    for open in OPEN {
+        assert!(registered.iter().any(|p| p == open), "{open}");
     }
     // The UI's own files are open: it shows its login view on a 401.
     for path in ["/", "/index.html", "/?view=library"] {
@@ -290,6 +302,10 @@ async fn cookie_paths_are_checked() {
     let res = app.send(login_request(PASSWORD, "/music/coversync")).await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     assert!(set_cookie(&res).contains("Path=/music/coversync;"));
+    // Other characters come percent-encoded, as in the URL.
+    let res = app.send(login_request(PASSWORD, "/m%C3%BCsik/")).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(set_cookie(&res).contains("Path=/m%C3%BCsik/;"));
 }
 
 #[tokio::test]
@@ -336,7 +352,10 @@ fn bearer(path: &str, token: &str) -> Request<Body> {
 async fn app_tokens_open_the_api_by_scope() {
     let app = App::with_password("tokens");
     let (id, token) = app.device(Scope::Manage);
-    for (_, path) in ROUTES.iter().filter(|(m, _)| *m == "GET").take(8) {
+    for path in registered_paths()
+        .iter()
+        .filter(|p| !OPEN.contains(&p.as_str()))
+    {
         let status = app.send(bearer(path, &token)).await.status();
         assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
         assert_ne!(status, StatusCode::FORBIDDEN, "{path}");
@@ -540,9 +559,80 @@ async fn failed_logins_are_limited_overall() {
         let res = app.login_from(&format!("10.0.3.{i}:1000"), "guess").await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "attempt {i}");
     }
+    // The overall bucket is empty, but the right password from a client with
+    // tries left still gets in.
     let res = app.login_from("10.0.4.1:1000", PASSWORD).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // A wrong one now costs its client every try it had left.
+    let res = app.login_from("10.0.4.2:1000", "guess").await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let res = app.login_from("10.0.4.2:1000", PASSWORD).await;
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(res.headers()[header::RETRY_AFTER], "6");
+    assert_eq!(res.headers()[header::RETRY_AFTER], "60");
+}
+
+#[tokio::test]
+async fn what_a_login_is_served_stays_in_the_browser() {
+    let app = App::with_password("private");
+    let cookie = app.cookie().await;
+    for path in [
+        "/api/status",
+        "/api/session",
+        "/api/albums",
+        "/api/appearance",
+    ] {
+        let res = app.get(path, Some(&cookie)).await;
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            res.headers()[header::CACHE_CONTROL],
+            "private, no-cache",
+            "{path}"
+        );
+    }
+    // Responses that set their own policy keep it, made private.
+    let res = |cache: Option<&'static str>| {
+        let mut r = StatusCode::OK.into_response();
+        if let Some(c) = cache {
+            r.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
+        }
+        keep_private(&mut r);
+        r.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(res(None), "private, no-cache");
+    assert_eq!(res(Some("no-cache")), "private, no-cache");
+    assert_eq!(
+        res(Some("private, max-age=31536000, immutable")),
+        "private, max-age=31536000, immutable"
+    );
+    assert_eq!(res(Some("public, max-age=60")), "private, max-age=60");
+    assert_eq!(res(Some("no-store")), "no-store");
+}
+
+#[tokio::test]
+async fn a_session_traded_for_a_token_counts_as_the_device_being_used() {
+    let app = App::with_password("lastseen");
+    let (id, token) = app.device(Scope::Manage);
+    let res = app.send(trade(Some(&token), Some("/"))).await;
+    let cookie = cookie_of(&res);
+    let seen = || -> Option<i64> { app.state.auth.store().device_last_seen(id).unwrap() };
+    assert!(seen().is_some(), "the trade itself is a use");
+    app.state.auth.store().forget_last_seen(id).unwrap();
+    assert_eq!(
+        app.get("/api/status", Some(&cookie)).await.status(),
+        StatusCode::OK
+    );
+    // Written in the background.
+    for _ in 0..250 {
+        if seen().is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("a request through the traded session didn't note the device's use");
 }
 
 #[tokio::test]
