@@ -113,11 +113,25 @@ class AppearanceStore {
 		this.savedCoverSize = this.coverSize = r.setup.cover_size;
 	}
 
+	/** Bumped by each read, so only the newest one lands. */
+	#reads = 0;
+	/** Bumped as each save starts and ends, so no read sent before or during one lands. */
+	#saves = 0;
+
+	/** Read the saved setup; with `keep`, not over unsaved edits. */
+	async #read(keep: boolean) {
+		const read = ++this.#reads;
+		const saves = this.#saves;
+		const r = await api.appearance();
+		if (read !== this.#reads || saves !== this.#saves || (keep && this.changes)) return;
+		this.#apply(r);
+		this.loaded = true;
+		this.failed = false;
+	}
+
 	async load() {
 		try {
-			this.#apply(await api.appearance());
-			this.loaded = true;
-			this.failed = false;
+			await this.#read(false);
 		} catch {
 			this.failed = !this.loaded;
 		}
@@ -126,8 +140,7 @@ class AppearanceStore {
 	/** Re-read the saved setup (after a save elsewhere), unless there are unsaved edits to keep. */
 	async refresh() {
 		try {
-			const r = await api.appearance();
-			if (!this.changes && !this.saving) this.#apply(r);
+			await this.#read(true);
 		} catch {}
 	}
 
@@ -144,6 +157,8 @@ class AppearanceStore {
 	/** Returns whether it saved; new sorts and filters need fresh album data for their values. */
 	async save(): Promise<boolean> {
 		this.saving = true;
+		this.#saves++;
+		const reads = this.#reads;
 		try {
 			this.#apply(
 				await api.saveAppearance({
@@ -159,6 +174,9 @@ class AppearanceStore {
 			return false;
 		} finally {
 			this.saving = false;
+			this.#saves++;
+			// Reads asked for meanwhile (a save elsewhere, say) were dropped: read again.
+			if (this.#reads !== reads) void this.refresh();
 		}
 	}
 }
