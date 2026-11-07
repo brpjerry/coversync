@@ -22,6 +22,7 @@ use coversync_core::{musicbrainz, romanize};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiResult, blocking, serve_file};
+use crate::events::Notice;
 use crate::{AppState, Shared};
 
 /// Finished identifications are reused for this long.
@@ -169,7 +170,7 @@ pub async fn start(
         let progress = |step: Step| {
             update(&state, &album_id, generation, |job| {
                 job.state = JobState::Running(step)
-            })
+            });
         };
         let outcome = (|| -> coversync_core::Result<(Option<Evidence>, Identification)> {
             let setup = state.lib.inbox_setup()?.suggestions;
@@ -235,7 +236,8 @@ pub async fn start(
             ),
             Err(e) => tracing::warn!(album = album_id, "identify: {e}"),
         }
-        update(&state, &album_id, generation, |job| {
+        let finished = if outcome.is_ok() { "done" } else { "failed" };
+        let current = update(&state, &album_id, generation, |job| {
             job.finished = Some(Instant::now());
             match outcome {
                 Ok((ev, result)) => {
@@ -250,20 +252,29 @@ pub async fn start(
                 Err(e) => job.state = JobState::Failed(e.to_string()),
             }
         });
+        // A newer lookup for the album tells of its own end.
+        if current {
+            state.events.publish(Notice::LookupFinished {
+                album_id,
+                state: finished,
+            });
+        }
     });
     Ok(Json(snapshot))
 }
 
-/// Change the album's job, unless a newer one replaced it.
-fn update(state: &Shared, album_id: &str, generation: u64, f: impl FnOnce(&mut Job)) {
-    if let Some(job) = state
-        .identify
-        .lock()
+/// Change the album's job, unless a newer one replaced it. Returns whether
+/// the job was still the album's.
+fn update(state: &Shared, album_id: &str, generation: u64, f: impl FnOnce(&mut Job)) -> bool {
+    let mut jobs = state.identify.lock();
+    let job = jobs
         .get_mut(album_id)
-        .filter(|j| j.generation == generation)
-    {
+        .filter(|j| j.generation == generation);
+    let current = job.is_some();
+    if let Some(job) = job {
         f(job);
     }
+    current
 }
 
 /// The album's identification job, as it stands.

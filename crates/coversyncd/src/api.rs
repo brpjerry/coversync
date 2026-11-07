@@ -25,11 +25,13 @@ use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use crate::events::{Notice, Setup};
 use crate::{Shared, spawn_scan};
 
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/status", get(status))
+        .route("/api/events", get(crate::events::stream))
         .route("/api/rescan", post(rescan))
         .route("/api/albums", get(albums))
         .route("/api/albums/{id}", get(album))
@@ -332,6 +334,9 @@ async fn save_library_setup(
         spawn_scan(state.clone());
     }
     let (response, _) = result?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Library,
+    });
     Ok(Json(response))
 }
 
@@ -430,6 +435,9 @@ async fn save_inbox_setup(
         Ok((inbox_response(s, saved)?, moved))
     })
     .await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Inbox,
+    });
     if moved {
         spawn_scan(state.clone());
     }
@@ -443,15 +451,18 @@ struct UnhideResult {
 }
 
 async fn unhide_all(State(state): State<Shared>) -> ApiResult<Json<UnhideResult>> {
-    blocking(&state, |s| {
+    let result = blocking(&state, |s| {
         let unhidden = s.lib.unhide_all()?;
         Ok(UnhideResult {
             unhidden,
             hidden: s.lib.hidden_stats()?,
         })
     })
-    .await
-    .map(Json)
+    .await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Inbox,
+    });
+    Ok(Json(result))
 }
 
 #[derive(Serialize)]
@@ -487,9 +498,11 @@ async fn save_appearance(
     State(state): State<Shared>,
     Json(setup): Json<AppearanceSetup>,
 ) -> ApiResult<Json<AppearanceResponse>> {
-    blocking(&state, move |s| s.lib.set_appearance(setup))
-        .await
-        .map(appearance_response)
+    let saved = blocking(&state, move |s| s.lib.set_appearance(setup)).await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Appearance,
+    });
+    Ok(appearance_response(saved))
 }
 
 #[derive(Serialize)]
@@ -507,9 +520,11 @@ async fn save_sync_setup(
     State(state): State<Shared>,
     Json(setup): Json<SyncSetup>,
 ) -> ApiResult<Json<SyncSetupResponse>> {
-    blocking(&state, move |s| s.lib.set_sync_setup(setup))
-        .await
-        .map(|setup| Json(SyncSetupResponse { setup }))
+    let setup = blocking(&state, move |s| s.lib.set_sync_setup(setup)).await?;
+    state
+        .events
+        .publish(Notice::SetupSaved { setup: Setup::Sync });
+    Ok(Json(SyncSetupResponse { setup }))
 }
 
 #[derive(Deserialize)]
@@ -672,6 +687,7 @@ async fn import_album(
     Json(req): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportResult>> {
     let _guard = state.jobs.lock().await;
+    let inbox_id = req.album_id.clone();
     let result = blocking(&state, move |s| {
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
@@ -697,7 +713,12 @@ async fn import_album(
     })
     .await;
     crate::release_memory();
-    result.map(Json)
+    let imported = result?;
+    state.events.publish(Notice::Imported {
+        album_id: imported.album_id.clone(),
+        inbox_id,
+    });
+    Ok(Json(imported))
 }
 
 #[derive(Deserialize)]
@@ -834,6 +855,7 @@ async fn write_tags(
     let _guard = state.jobs.lock().await;
     // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
     let lookup = id.clone();
+    let previous_id = id.clone();
     let in_library = blocking(&state, move |s| {
         Ok(s.lib
             .album(&lookup)?
@@ -907,6 +929,15 @@ async fn write_tags(
     })
     .await?;
     crate::release_memory();
+    state.events.publish(Notice::AlbumChanged {
+        id: result.album_id.clone(),
+        previous_id: (result.album_id != previous_id).then_some(previous_id),
+        collection: if in_library {
+            Collection::Library
+        } else {
+            Collection::Inbox
+        },
+    });
     Ok(Json(result))
 }
 

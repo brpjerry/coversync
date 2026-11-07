@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod events;
 mod suggest;
 mod web;
 
@@ -74,6 +75,8 @@ pub struct AppState {
     pub identify: suggest::Jobs,
     /// The password, sessions and app tokens.
     pub auth: auth::Auth,
+    /// Change notices for clients listening on `/api/events`.
+    pub events: events::Events,
 }
 
 impl AppState {
@@ -133,6 +136,7 @@ pub fn spawn_scan(state: Shared) {
             return;
         };
         state.rescan.store(false, Ordering::SeqCst);
+        let reporting = tokio::spawn(events::report_scan(state.clone()));
         let s = state.clone();
         let result = tokio::task::spawn_blocking(move || {
             // The Library folder may have appeared (or gone) since the last scan.
@@ -145,11 +149,13 @@ pub fn spawn_scan(state: Shared) {
             Ok(Err(e)) => tracing::error!("scan failed: {e}"),
             Err(e) => tracing::error!("scan panicked: {e}"),
         }
-        state
-            .progress
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .running = false;
+        reporting.abort();
+        let progress = {
+            let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
+            p.running = false;
+            p.clone()
+        };
+        state.events.publish(events::Notice::ScanFinished(progress));
         release_memory();
         drop(_guard);
         if state.rescan.swap(false, Ordering::SeqCst) {
@@ -227,15 +233,16 @@ async fn run() -> anyhow::Result<()> {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
+        events: events::Events::default(),
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
     spawn_scan(state.clone());
 
-    let app = app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let app = app(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("SIGTERM handler");
@@ -243,6 +250,8 @@ async fn run() -> anyhow::Result<()> {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
+            // Event streams never end on their own, and would hold up the shutdown.
+            state.events.close();
         })
         .await?;
     Ok(())
