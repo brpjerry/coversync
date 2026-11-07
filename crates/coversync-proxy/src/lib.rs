@@ -350,6 +350,7 @@ impl Shared {
         self.jar.take(upstream.origin(), &url, &mut parts.headers);
         if document {
             if let Some(down) = Unreachable::from_status(upstream, parts.status) {
+                tracing::warn!("{down}");
                 self.report(down);
             } else if parts.status.is_redirection()
                 && let Some(location) = parts.headers.get(LOCATION).and_then(|l| l.to_str().ok())

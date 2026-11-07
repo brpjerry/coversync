@@ -19,6 +19,7 @@ use coversync_proxy::{Proxy, Unreachable, Upstream, UpstreamError};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 use config::Store;
 
@@ -284,8 +285,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
             .upstream(upstream)
             .preferred_port(saved.port)
             .cookie_file(Some(config_dir.join("cookies.json")))
+            // The proxy logs it.
             .on_unreachable(move |unreachable| {
-                tracing::warn!("{unreachable}");
                 show_fallback(&handle, Problem::unreachable(unreachable));
             })
             .start(),
@@ -319,11 +320,31 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Warnings from everything, with `RUST_LOG`'s directives on top: so
+/// `RUST_LOG=coversync_proxy=debug` adds the proxy's requests without hiding
+/// the app's own warnings. A level of its own in `RUST_LOG` (`debug`)
+/// replaces the default.
+fn log_filter(rust_log: &str) -> EnvFilter {
+    let directives: Vec<&str> = rust_log
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .collect();
+    let has_level = directives.iter().any(|d| d.parse::<LevelFilter>().is_ok());
+    let all = if has_level {
+        directives.join(",")
+    } else {
+        std::iter::once("warn")
+            .chain(directives)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    EnvFilter::try_new(all).unwrap_or_else(|_| EnvFilter::new("warn"))
+}
+
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
+        .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
         .with_writer(std::io::stderr)
         .init();
     tauri::Builder::default()
@@ -339,6 +360,19 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
 
     use super::*;
+
+    #[test]
+    fn keeps_warnings_whatever_rust_log_adds() {
+        let filter = |env: &str| log_filter(env).to_string();
+        assert_eq!(filter(""), "warn");
+        let proxy = filter("coversync_proxy=debug");
+        assert!(
+            proxy.contains("coversync_proxy=debug") && proxy.contains("warn"),
+            "{proxy}"
+        );
+        assert_eq!(filter("debug"), "debug");
+        assert_eq!(filter("not a [directive"), "warn");
+    }
 
     #[test]
     fn reads_the_server_argument() {

@@ -220,7 +220,7 @@ pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
 It runs natively on Wayland. The app has its own Cargo workspace and lockfile
 in `apps/desktop/src-tauri`, apart from the repository's, so building and
 testing the rest doesn't need WebKitGTK. `RUST_LOG=coversync_proxy=debug`
-shows what the proxy does.
+also logs each request the proxy forwards; warnings show either way.
 
 ## Develop
 
