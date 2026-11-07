@@ -709,10 +709,11 @@ struct CoverQuery {
 
 /// How long a thumbnail may be kept. One served for the `cover_version` its
 /// URL names is that rendering of the art for good; any other (no version, or
-/// one the art has since moved on from) has to be checked every time.
+/// one the art has since moved on from) has to be checked every time. Private:
+/// it was served to a login, so only the browser keeps it.
 fn cover_caching(current: bool) -> &'static str {
     if current {
-        "public, max-age=31536000, immutable"
+        "private, max-age=31536000, immutable"
     } else {
         "no-cache"
     }
