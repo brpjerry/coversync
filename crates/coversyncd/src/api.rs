@@ -18,8 +18,8 @@ use coversync_core::scan::{self, album_dir_in, album_id_in};
 use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
-    AlbumDetail, Collection, HiddenStats, InboxSetup, LibrarySetup, TagCoverage, TagEdit, inbox,
-    rules, tags,
+    AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
+    TagEdit, inbox, rules, tags,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -106,19 +106,25 @@ struct Status {
     version: &'static str,
     allow_writes: bool,
     scan: coversync_core::ScanProgress,
+    /// `library`: the Library's id and change counter (null without a
+    /// Library folder); `inbox`: the Inbox's counter.
+    #[serde(flatten)]
+    index: IndexVersions,
 }
 
-async fn status(State(state): State<Shared>) -> Json<Status> {
+async fn status(State(state): State<Shared>) -> ApiResult<Json<Status>> {
     let scan = state
         .progress
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(Status {
+    let index = blocking(&state, |s| s.lib.index_versions()).await?;
+    Ok(Json(Status {
         version: env!("CARGO_PKG_VERSION"),
         allow_writes: state.allow_writes,
         scan,
-    })
+        index,
+    }))
 }
 
 async fn rescan(State(state): State<Shared>) -> StatusCode {
@@ -930,6 +936,47 @@ mod tests {
         let missing = serve_file(dir.join("gone.jpg"), get(), cover_caching(true)).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn status_reports_the_library_and_inbox_counters() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = coversync_core::Library::open_in(&dir.join("state")).unwrap();
+        let status = |lib: &coversync_core::Library| {
+            serde_json::to_value(Status {
+                version: "0",
+                allow_writes: false,
+                scan: Default::default(),
+                index: lib.index_versions().unwrap(),
+            })
+            .unwrap()
+        };
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let v = status(&lib);
+        assert_eq!(
+            keys(&v),
+            ["allow_writes", "inbox", "library", "scan", "version"]
+        );
+        assert_eq!(v["library"], serde_json::Value::Null);
+        assert_eq!(v["inbox"], serde_json::json!({ "generation": 0 }));
+
+        let root = dir.join("Lib");
+        lib.set_library_setup(LibrarySetup {
+            folder: Some(root.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        lib.prepare_library(&root).unwrap();
+        let v = status(&lib);
+        assert_eq!(keys(&v["library"]), ["generation", "id"]);
+        assert_eq!(v["library"]["generation"], 0);
+        assert_eq!(v["library"]["id"].as_str().unwrap().len(), 36);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

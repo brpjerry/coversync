@@ -103,6 +103,75 @@ pub struct AlbumDetail {
     pub tracks: Vec<Track>,
 }
 
+/// Which Library an index is of, and how far its changes go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryVersion {
+    /// A random UUID, made with the Library's database. Another id is
+    /// another Library, whose counter says nothing about this one's. A
+    /// Library restored from an older copy gets a new one from an
+    /// installation that saw its counter get further.
+    pub id: String,
+    /// The change counter, which goes up with every change to the Library's
+    /// tracks. Lower than a client saw before, under the same id, means the
+    /// Library was restored from an older copy somewhere that didn't know
+    /// the later state.
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxVersion {
+    /// The Inbox's change counter: it goes up whenever its tracks change or
+    /// files are hidden or shown again.
+    pub generation: i64,
+}
+
+/// Where both indexes stand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexVersions {
+    /// None while no Library folder is set up.
+    pub library: Option<LibraryVersion>,
+    pub inbox: InboxVersion,
+}
+
+/// A Library track written after the generation asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedTrack {
+    pub id: i64,
+    /// Relative to the Library folder.
+    pub path: String,
+    pub album_id: String,
+    pub generation: i64,
+}
+
+/// A track that left the Library. A file may since have come back at the
+/// same path: that is a new track, usually under a new id, listed among the
+/// changed tracks (see [`LibraryChanges`] for the order to apply them in).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedTrack {
+    /// The id the track had.
+    pub id: i64,
+    /// Relative to the Library folder.
+    pub path: String,
+    pub album_id: String,
+    pub generation: i64,
+    /// Unix seconds.
+    pub removed_at: i64,
+}
+
+/// What changed in the Library after a generation, each list earliest
+/// change first. Apply them in generation order, and within a generation,
+/// the removals before the tracks. A track listed is one still in the
+/// Library, written after any removal of its id or path, and a removal and
+/// a track can share a generation: an older coversyncd stamps all its
+/// changes one above the counter, so its deleting a track and writing one
+/// at the same path, or under the reused highest id, land together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryChanges {
+    pub library: LibraryVersion,
+    pub tracks: Vec<ChangedTrack>,
+    pub removed: Vec<RemovedTrack>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanProgress {
     pub running: bool,

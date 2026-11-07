@@ -21,7 +21,10 @@ pub mod template;
 pub use db::Library;
 pub use inbox::{HiddenStats, InboxSetup, IngestMode};
 pub use lookups::LookupCache;
-pub use model::{Album, AlbumDetail, Collection, ScanProgress, TagCoverage, TagEdit, Track};
+pub use model::{
+    Album, AlbumDetail, Collection, IndexVersions, LibraryChanges, LibraryVersion, ScanProgress,
+    TagCoverage, TagEdit, Track,
+};
 pub use rules::LibrarySetup;
 
 #[derive(Debug, thiserror::Error)]
