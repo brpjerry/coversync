@@ -103,6 +103,62 @@ pub struct AlbumDetail {
     pub tracks: Vec<Track>,
 }
 
+/// Which Library an index is of, and how far its changes go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LibraryVersion {
+    /// A random UUID, made with the Library's database. Another id is
+    /// another Library, whose counter says nothing about this one's.
+    pub id: String,
+    /// The change counter, which goes up with every change to the Library's
+    /// tracks. Lower than a client saw before, under the same id, means the
+    /// Library was restored from an older copy.
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxVersion {
+    /// The Inbox's change counter: it goes up whenever its tracks change or
+    /// files are hidden or shown again.
+    pub generation: i64,
+}
+
+/// Where both indexes stand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexVersions {
+    /// None while no Library folder is set up.
+    pub library: Option<LibraryVersion>,
+    pub inbox: InboxVersion,
+}
+
+/// A Library track written after the generation asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedTrack {
+    pub id: i64,
+    /// Relative to the Library folder.
+    pub path: String,
+    pub album_id: String,
+    pub generation: i64,
+}
+
+/// A track that left the Library, at a path no track has now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedTrack {
+    /// Relative to the Library folder.
+    pub path: String,
+    pub album_id: String,
+    pub generation: i64,
+    /// Unix seconds.
+    pub removed_at: i64,
+}
+
+/// What changed in the Library after a generation, earliest change first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryChanges {
+    pub library: LibraryVersion,
+    pub tracks: Vec<ChangedTrack>,
+    pub removed: Vec<RemovedTrack>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScanProgress {
     pub running: bool,
