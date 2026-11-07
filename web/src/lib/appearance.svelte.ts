@@ -117,6 +117,7 @@ class AppearanceStore {
 		try {
 			this.#apply(await api.appearance());
 			this.loaded = true;
+			this.failed = false;
 		} catch {
 			this.failed = !this.loaded;
 		}

@@ -14,6 +14,7 @@
 		type TagWriteResult,
 		type Track
 	} from '#lib/api.ts';
+	import { drafts } from '#lib/drafts.svelte.ts';
 	import { toast } from '#lib/toast.svelte.ts';
 
 	interface Props {
@@ -93,6 +94,11 @@
 				0
 			)
 	);
+	// So that signing out asks before dropping them.
+	$effect(() => {
+		drafts.tags = changes > 0;
+		return () => (drafts.tags = false);
+	});
 	let errors = $derived(
 		albumFields.some((f) => invalid(f.key, form.album[f.key])) ||
 			detail.tracks.some((t) => trackFields.some((f) => invalid(f.key, form.tracks[t.id][f.key])))
