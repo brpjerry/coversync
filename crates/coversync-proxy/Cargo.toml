@@ -1,0 +1,24 @@
+[package]
+name = "coversync-proxy"
+version = "0.1.0"
+description = "The desktop app's local proxy: forwards a webview's requests to a coversync server"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+getrandom = "0.4.3"
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "rustls-platform-verifier", "tls12", "logging"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio = { version = "1.54.1", features = ["net", "rt", "sync", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+bytes = "1.12.1"
+futures-util = "0.3.34"
+http-body-util = "0.1.5"
+hyper = "1.12.0"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
