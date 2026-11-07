@@ -123,6 +123,14 @@ class AppearanceStore {
 		}
 	}
 
+	/** Re-read the saved setup (after a save elsewhere), unless there are unsaved edits to keep. */
+	async refresh() {
+		try {
+			const r = await api.appearance();
+			if (!this.changes && !this.saving) this.#apply(r);
+		} catch {}
+	}
+
 	label(id: string) {
 		return this.sortable.find((s) => s.id === id)?.label ?? DEFAULT_LABELS[id] ?? id;
 	}
