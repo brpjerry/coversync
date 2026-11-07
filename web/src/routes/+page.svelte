@@ -61,6 +61,8 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
+	import type { Draft } from '#lib/components/TagEditor.svelte';
+	import { sameJson } from '#lib/same.ts';
 
 	const SORT_KEY = 'coversync.sort';
 	const SIDEBAR_KEY = 'coversync.sidebar';
@@ -265,8 +267,8 @@
 	let openId = $derived(page.state.album ?? null);
 	let openAlbum = $derived(openId ? (byId.get(openId) ?? null) : null);
 
-	/** The open album's tag editor has edits not sent yet. */
-	let draft = $state(false);
+	/** The open album's tag editor's edits: none, some not sent yet, or some being saved. */
+	let draft = $state<Draft>('none');
 	/**
 	 * The sheet stays on the open album as it last showed it, though the grids
 	 * have moved on. When `changed`, the album changed elsewhere (edited,
@@ -291,16 +293,21 @@
 		holding ? holding.detail : detail?.id === sheetAlbum?.id ? detail : null
 	);
 
+	/** Bumped by each load or save of `detail`, so an older answer can't land after a newer one. */
+	let detailGen = 0;
+
 	// Load the open album's tracks (again after signing back in, if that failed).
 	$effect(() => {
 		const id = openId;
 		void session.generation;
 		if (!id || untrack(() => detail?.id) === id) return;
 		let cancelled = false;
+		const gen = ++detailGen;
+		const current = () => !cancelled && gen === detailGen;
 		api
 			.album(id)
-			.then((d) => !cancelled && (detail = d))
-			.catch(() => toast('Could not load album', 'error'));
+			.then((d) => current() && (detail = d))
+			.catch(() => current() && toast('Could not load album', 'error'));
 		return () => (cancelled = true);
 	});
 
@@ -448,11 +455,24 @@
 	}
 
 	async function onsaved(result: TagWriteResult) {
-		// Saved over whatever changed elsewhere: the sheet shows the album as saved.
+		const from = openId;
+		// Saved over whatever changed elsewhere: the sheet shows the album as
+		// saved straight away, so edits begun after Save stay.
 		held = null;
-		await loadAlbums();
+		detailGen++;
 		if (result.album) detail = result.album;
-		if (result.album_id !== openId)
+		if (!from || result.album_id === from) return loadAlbums();
+		// A new title: the sheet stays while the grids catch up with the new id.
+		if (sheetAlbum)
+			held = {
+				from,
+				next: result.album_id,
+				album: sheetAlbum,
+				detail: result.album,
+				changed: false
+			};
+		await loadAlbums();
+		if (openId === from)
 			await goto(page.url.href, {
 				state: { album: result.album_id },
 				shallow: true,
@@ -468,7 +488,9 @@
 			// elsewhere) while its tags have unsaved edits: the sheet stays on it.
 			const gone = (id: string) =>
 				!inbox.some((a) => a.id === id) && !managed.some((a) => a.id === id);
-			if (openId && draft && !holding && openId !== importingHere && gone(openId)) hold(null);
+			// During a save it stays without a word: the save may be what moved it.
+			if (openId && draft !== 'none' && !holding && openId !== importingHere && gone(openId))
+				hold(null, draft === 'draft');
 			[albums, library] = [inbox, managed];
 			lastAlbums = Date.now();
 		} catch {
@@ -552,56 +574,90 @@
 
 	/**
 	 * Keep the sheet on the open album as it shows it now, with its unsaved
-	 * edits, and say it changed elsewhere. `next` is the album's id now, if known.
+	 * edits, and say it changed elsewhere (unless not `changed`, yet). `next` is
+	 * the album's id now, if known.
 	 */
-	function hold(next: string | null) {
+	function hold(next: string | null, changed = true) {
 		if (!openId || !sheetAlbum) return;
 		held = {
 			from: openId,
 			next: next ?? holding?.next ?? null,
 			album: sheetAlbum,
 			detail: sheetDetail,
-			changed: true
+			changed
 		};
+	}
+
+	function ondraft(next: Draft) {
+		// A save failed, and the album moved meanwhile (the sheet stayed for it): say so now.
+		if (draft === 'saving' && next === 'draft' && holding && !holding.changed) hold(holding.next);
+		draft = next;
 	}
 
 	/**
 	 * Show the open album as it is now, under its new id `to` if it has one,
 	 * once its tracks and the grids (`grids`) have both caught up. The sheet
 	 * stays as it is meanwhile, rather than closing while neither has the new
-	 * id. Unless `discard`, edits begun meanwhile hold the sheet instead.
-	 * Returns false if the album is gone.
+	 * id. Unless `discard`, edits begun meanwhile hold the sheet instead, and a
+	 * save begun meanwhile replaces the album itself. Returns false if the
+	 * album is gone.
 	 */
 	async function followOpen(to: string, grids: Promise<void>, discard = false): Promise<boolean> {
 		const from = openId;
 		if (!from || !sheetAlbum) return true;
+		// Where a follow under way was taking the sheet.
+		const via = holding?.next;
+		const gen = ++detailGen;
 		if (to !== from)
 			held = { from, next: to, album: sheetAlbum, detail: sheetDetail, changed: false };
 		const [fresh] = await Promise.all([api.album(to).catch(() => null), grids]);
-		if (openId !== from) return true;
-		if (draft && !discard) {
+		// The user opened another album, or a newer load or a save took over.
+		if ((openId !== from && openId !== via) || gen !== detailGen) return true;
+		if (!discard && draft === 'saving') return true;
+		if (!discard && draft === 'draft') {
 			hold(to);
 			return true;
 		}
+		const shown = $state.snapshot(sheetDetail);
 		if (!fresh || to === from) held = null;
 		if (!fresh) return false;
+		// Unchanged (after this page's own save, say): the editor is left be.
+		if (!discard && to === openId && sameJson(fresh, shown)) return true;
 		detail = fresh;
-		if (to !== from)
+		if (openId !== to)
 			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
 		return true;
 	}
 
+	/**
+	 * After notices were missed, a sheet with unsaved edits stays as it is,
+	 * but says so if its album changed meanwhile.
+	 */
+	async function holdIfChanged(id: string) {
+		const from = openId;
+		const shown = $state.snapshot(sheetDetail);
+		if (!shown) return;
+		const fresh = await api.album(id).catch(() => null);
+		if (openId !== from || draft !== 'draft' || holding?.changed) return;
+		if (!fresh || !sameJson(fresh, shown)) hold(fresh ? id : null);
+	}
+
 	/** The open album changed elsewhere and is now `to`: follow it, unless that would lose edits. */
 	function openChanged(to: string, grids: Promise<void>) {
-		if (draft) hold(to);
+		// A save under way replaces the album once it's done; if it fails, its
+		// edits become a draft again.
+		if (draft === 'saving') return;
+		if (draft === 'draft') hold(to);
 		else followOpen(to, grids);
 	}
 
 	/** Drop the held sheet's unsaved edits and show its album as it is now. */
 	async function reloadHeld() {
 		const h = holding;
-		if (h && !(await followOpen(h.next ?? h.from, loadAlbums(), true)))
-			toast('This album isn’t there any more', 'info');
+		if (!h || (await followOpen(h.next ?? h.from, loadAlbums(), true))) return;
+		// Its new id isn't known when the notice was missed (a hidden tab, the stream down).
+		toast('This album was renamed, imported or removed elsewhere', 'info');
+		await close();
 	}
 
 	/** An album was edited, here or elsewhere: show it as it is now. */
@@ -622,9 +678,10 @@
 		inboxSetup.load();
 		dataGeneration++;
 		const grids = loadAlbums();
-		// A sheet with unsaved edits stays as it is, unless its album is gone (see fetchAlbums).
 		const open = openNow();
-		if (open && !draft) followOpen(open, grids);
+		if (open && draft === 'none') followOpen(open, grids);
+		// Unless its album is gone (see fetchAlbums), or changed:
+		else if (open && draft === 'draft' && !holding?.changed) holdIfChanged(open);
 	}
 
 	/** What each change notice reloads. */
@@ -1067,7 +1124,7 @@
 			: undefined}
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
-		ondraft={(d) => (draft = d)}
+		{ondraft}
 	/>
 {/if}
 

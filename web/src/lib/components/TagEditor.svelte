@@ -1,3 +1,8 @@
+<script lang="ts" module>
+	/** Edits in the editor: none, some not sent yet, or some being saved. */
+	export type Draft = 'none' | 'draft' | 'saving';
+</script>
+
 <script lang="ts">
 	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import Undo2 from '@lucide/svelte/icons/undo-2';
@@ -26,8 +31,8 @@
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
-		/** Hears whether there are edits not sent yet (a save under way has sent them). */
-		ondraft?: (draft: boolean) => void;
+		/** Hears what edits there are; a failed save turns them back into a draft. */
+		ondraft?: (draft: Draft) => void;
 	}
 	let { detail, allowWrites, onsaved, oncancel, onimport, ondraft }: Props = $props();
 
@@ -107,8 +112,8 @@
 			detail.tracks.some((t) => trackFields.some((f) => invalid(f.key, form.tracks[t.id][f.key])))
 	);
 
-	$effect(() => ondraft?.(changes > 0 && !saving));
-	onDestroy(() => ondraft?.(false));
+	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 ? 'draft' : 'none'));
+	onDestroy(() => ondraft?.('none'));
 
 	function revert() {
 		form = structuredClone($state.snapshot(base));

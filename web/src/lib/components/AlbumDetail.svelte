@@ -19,7 +19,7 @@
 	import { duration, longDuration, quality } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor from './TagEditor.svelte';
+	import TagEditor, { type Draft } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -33,8 +33,8 @@
 		changed?: boolean;
 		/** Drop the edits and show the album as it is now. */
 		onreload?: () => void;
-		/** Hears whether the tag editor has edits not sent yet. */
-		ondraft?: (draft: boolean) => void;
+		/** Hears what edits the tag editor has. */
+		ondraft?: (draft: Draft) => void;
 	}
 	let {
 		album,
