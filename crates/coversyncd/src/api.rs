@@ -18,8 +18,8 @@ use coversync_core::scan::{self, album_dir_in, album_id_in};
 use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
-    AlbumDetail, Collection, HiddenStats, InboxSetup, LibrarySetup, TagCoverage, TagEdit, inbox,
-    rules, tags,
+    AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
+    TagEdit, inbox, rules, tags,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -106,19 +106,25 @@ struct Status {
     version: &'static str,
     allow_writes: bool,
     scan: coversync_core::ScanProgress,
+    /// `library`: the Library's id and change counter (null without a
+    /// Library folder); `inbox`: the Inbox's counter.
+    #[serde(flatten)]
+    index: IndexVersions,
 }
 
-async fn status(State(state): State<Shared>) -> Json<Status> {
+async fn status(State(state): State<Shared>) -> ApiResult<Json<Status>> {
     let scan = state
         .progress
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(Status {
+    let index = blocking(&state, |s| s.lib.index_versions()).await?;
+    Ok(Json(Status {
         version: env!("CARGO_PKG_VERSION"),
         allow_writes: state.allow_writes,
         scan,
-    })
+        index,
+    }))
 }
 
 async fn rescan(State(state): State<Shared>) -> StatusCode {
