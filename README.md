@@ -21,6 +21,16 @@ used on a home server.
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
   separator) offer each.
+- **Tag editor** (an album's Edit tags): album-wide fields and each track's.
+  A save is refused, and nothing written, if the album changed after the
+  editor loaded it: saved from another browser or app, or changed on disk
+  and found by a scan, tracks added or removed included. The editor then
+  shows the album as it is now, with the fields that changed marked and
+  your unsaved edits on top, to save again or drop with Reload. API clients
+  get the same check by sending back the album's `version` and track ids
+  with a tag save (`PUT /api/albums/{id}/tags`), and a 409 with the album as
+  it is now when it no longer matches; a save without them is written as
+  before.
 - **Library setup**: required tags; album art rules (a cover file, embedded
   art or both, required or not, and the cover file's name); and the folder
   structure, a template such as

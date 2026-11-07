@@ -1,3 +1,35 @@
+<script lang="ts" module>
+	import type { AlbumDetail } from '#lib/api.ts';
+
+	export type AlbumField = 'album' | 'album_artist' | 'year' | 'genre';
+	export type TrackField = 'track_no' | 'disc_no' | 'title' | 'artist';
+	/** The editor's values: the album's fields, and each track's by id. */
+	export interface TagValues {
+		album: Record<AlbumField, string>;
+		tracks: Record<number, Record<TrackField, string>>;
+	}
+	/**
+	 * Unsaved edits whose save was refused because the album had changed
+	 * elsewhere, kept to put on top of the album as it is now: the values
+	 * the edits were made on (`base`) and the values with them (`form`).
+	 */
+	export interface TagDraft {
+		base: TagValues;
+		form: TagValues;
+	}
+
+	/** How many tracks a draft edited that `detail` no longer has: those edits can't be put back. */
+	export function lostTracks(draft: TagDraft, detail: AlbumDetail): number {
+		const here = new Set(detail.tracks.map((t) => t.id));
+		return Object.entries(draft.form.tracks).filter(([id, values]) => {
+			const was = draft.base.tracks[+id];
+			return (
+				!here.has(+id) && Object.entries(values).some(([k, v]) => was?.[k as TrackField] !== v)
+			);
+		}).length;
+	}
+</script>
+
 <script lang="ts">
 	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import Undo2 from '@lucide/svelte/icons/undo-2';
@@ -7,7 +39,7 @@
 	import {
 		api,
 		ApiError,
-		type AlbumDetail,
+		TagConflict,
 		type ImportEdits,
 		type TagEdit,
 		type TagField,
@@ -25,11 +57,29 @@
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
+		/**
+		 * Edits kept from a refused save, put on top of `detail` (the album as it
+		 * is now) when the editor opens. Fields changed since they were made are marked.
+		 */
+		draft?: TagDraft | null;
+		/**
+		 * A save was refused: the album changed elsewhere since `detail`. `current`
+		 * is the album as it is now (null when it's gone); `draft` holds the edits.
+		 */
+		onconflict?: (current: AlbumDetail | null, draft: TagDraft) => void;
+		/** The edits were reverted, kept ones (`draft`) included. */
+		onrevert?: () => void;
 	}
-	let { detail, allowWrites, onsaved, oncancel, onimport }: Props = $props();
-
-	type AlbumField = 'album' | 'album_artist' | 'year' | 'genre';
-	type TrackField = 'track_no' | 'disc_no' | 'title' | 'artist';
+	let {
+		detail,
+		allowWrites,
+		onsaved,
+		oncancel,
+		onimport,
+		draft = null,
+		onconflict,
+		onrevert
+	}: Props = $props();
 
 	const albumFields: { key: AlbumField; label: string; wide?: boolean }[] = [
 		{ key: 'album', label: 'Album', wide: true },
@@ -70,12 +120,58 @@
 		) as Record<number, Record<TrackField, string>>;
 	}
 
+	/** The album's values as `detail` has them. */
+	const initial = (): TagValues => ({ album: initialAlbum(), tracks: initialTracks() });
+
+	/** `values` with the kept draft's edits on top: every field it changed, on tracks still here. */
+	function withDraft(values: TagValues): TagValues {
+		if (!draft) return values;
+		for (const f of albumFields)
+			if (draft.form.album[f.key] !== draft.base.album[f.key])
+				values.album[f.key] = draft.form.album[f.key];
+		for (const [id, edited] of Object.entries(draft.form.tracks)) {
+			const now = values.tracks[+id];
+			const was = draft.base.tracks[+id];
+			if (!now || !was) continue;
+			for (const f of trackFields) if (edited[f.key] !== was[f.key]) now[f.key] = edited[f.key];
+		}
+		return values;
+	}
+
+	/**
+	 * Fields changed elsewhere since the kept draft's edits were made, each with
+	 * the value it had then (null on a track that has joined the album since).
+	 */
+	function changedElsewhere(now: TagValues) {
+		const album: Partial<Record<AlbumField, string>> = {};
+		const tracks: Record<number, Partial<Record<TrackField, string | null>>> = {};
+		const was = draft?.base;
+		if (!was) return { album, tracks };
+		for (const f of albumFields)
+			if (was.album[f.key] !== now.album[f.key]) album[f.key] = was.album[f.key];
+		for (const [id, values] of Object.entries(now.tracks)) {
+			const old = was.tracks[+id];
+			const fields: Partial<Record<TrackField, string | null>> = {};
+			for (const f of trackFields)
+				if (old?.[f.key] !== values[f.key]) fields[f.key] = old?.[f.key] ?? null;
+			if (Object.keys(fields).length) tracks[+id] = fields;
+		}
+		return { album, tracks };
+	}
+
 	const mixed = Object.fromEntries(
 		albumFields.map((f) => [f.key, shared(f.key) === null])
 	) as Record<AlbumField, boolean>;
-	let base = $state({ album: initialAlbum(), tracks: initialTracks() });
-	let form = $state(structuredClone($state.snapshot(base)));
+	let base = $state(initial());
+	let form = $state(withDraft(initial()));
 	let saving = $state(false);
+	const elsewhere = changedElsewhere(initial());
+	/** What a field marked as changed elsewhere says about it. */
+	function elsewhereNote(was: string | null | undefined): string | undefined {
+		if (was === undefined) return undefined;
+		if (was === null) return 'Added elsewhere';
+		return was ? `Changed elsewhere, from “${was}”` : 'Changed elsewhere, from empty';
+	}
 
 	const albumChanged = (k: AlbumField) => form.album[k] !== base.album[k];
 	const trackChanged = (id: number, k: TrackField) => form.tracks[id][k] !== base.tracks[id][k];
@@ -106,6 +202,7 @@
 
 	function revert() {
 		form = structuredClone($state.snapshot(base));
+		onrevert?.();
 	}
 
 	/** Editor fields as library rule tag kinds, for the import. */
@@ -144,14 +241,28 @@
 		}
 		saving = true;
 		try {
-			const result = await api.writeTags(detail.id, { album, tracks });
+			const result = await api.writeTags(detail.id, {
+				album,
+				tracks,
+				version: detail.version,
+				track_ids: detail.tracks.map((t) => t.id)
+			});
 			toast(
 				`Saved tags to ${result.files_written} ${result.files_written === 1 ? 'file' : 'files'}`,
 				'success'
 			);
 			onsaved(result);
 		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
+			if (e instanceof TagConflict && onconflict) {
+				toast(
+					e.album
+						? 'Not saved: this album was changed elsewhere'
+						: 'Not saved: this album isn’t in the Inbox or Library any more',
+					'error',
+					6000
+				);
+				onconflict(e.album, $state.snapshot({ base, form }));
+			} else toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 		} finally {
 			saving = false;
 		}
@@ -167,12 +278,15 @@
 					class="field"
 					class:wide={f.wide}
 					class:changed={albumChanged(f.key)}
+					class:elsewhere={f.key in elsewhere.album}
 					class:invalid={invalid(f.key, form.album[f.key])}
 				>
 					<span class="label"
-						>{f.label}{#if albumChanged(f.key)}<i class="dot" in:fly={{ y: -4 }}></i>{/if}</span
+						>{f.label}{#if albumChanged(f.key)}<i class="dot" in:fly={{ y: -4 }}
+							></i>{/if}{#if f.key in elsewhere.album}<i class="dot warn"></i>{/if}</span
 					>
 					<input
+						title={elsewhereNote(elsewhere.album[f.key])}
 						bind:value={form.album[f.key]}
 						placeholder={mixed[f.key] ? 'Mixed — leave empty to keep' : ''}
 						spellcheck="false"
@@ -196,6 +310,8 @@
 						<input
 							class="cell col-{f.key}"
 							class:changed={trackChanged(t.id, f.key)}
+							class:elsewhere={f.key in (elsewhere.tracks[t.id] ?? {})}
+							title={elsewhereNote(elsewhere.tracks[t.id]?.[f.key])}
 							class:invalid={invalid(f.key, form.tracks[t.id][f.key])}
 							bind:value={form.tracks[t.id][f.key]}
 							aria-label="{f.label}, track {i + 1}"
@@ -315,10 +431,24 @@
 		background: var(--bg-raised);
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
 	}
+	/* Changed elsewhere since kept edits were made (see TagDraft). */
+	.elsewhere input,
+	input.elsewhere {
+		border-color: var(--warn-border);
+		background: color-mix(in oklab, var(--warn-surface) 70%, var(--surface));
+	}
 	.changed input,
 	input.changed {
 		border-color: color-mix(in oklab, var(--accent) 55%, transparent);
 		background: color-mix(in oklab, var(--accent) 8%, var(--surface));
+	}
+	/* Edited here and changed elsewhere too: the edit is on top. */
+	.changed.elsewhere input,
+	input.changed.elsewhere {
+		background: color-mix(in oklab, var(--warn-surface) 70%, var(--surface));
+	}
+	.dot.warn {
+		background: var(--warn);
 	}
 	.invalid input,
 	input.invalid {

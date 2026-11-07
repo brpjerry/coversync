@@ -6,7 +6,8 @@
 	import ListMusic from '@lucide/svelte/icons/list-music';
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
-	import { fade } from 'svelte/transition';
+	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { fade, slide } from 'svelte/transition';
 	import {
 		coverUrl,
 		type Album,
@@ -18,7 +19,7 @@
 	import { duration, longDuration, quality } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor from './TagEditor.svelte';
+	import TagEditor, { lostTracks, type TagDraft } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -28,10 +29,32 @@
 		onsaved: (result: TagWriteResult) => void;
 		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
 		onimport?: (edits?: ImportEdits) => void;
+		/**
+		 * Unsaved tag edits whose save was refused because the album had changed
+		 * elsewhere, put on top of `detail`, the album as it is now. The sheet says so.
+		 */
+		draft?: TagDraft | null;
+		/** A tag save was refused (see TagEditor's onconflict). */
+		onconflict?: (current: AlbumDetail | null, draft: TagDraft) => void;
+		/** Drop the kept edits and show the album as it is now. */
+		ondiscard?: () => void;
 	}
-	let { album, detail, allowWrites, onclose, onsaved, onimport }: Props = $props();
+	let {
+		album,
+		detail,
+		allowWrites,
+		onclose,
+		onsaved,
+		onimport,
+		draft = null,
+		onconflict,
+		ondiscard
+	}: Props = $props();
 
-	let mode = $state<'tracks' | 'edit'>('tracks');
+	// A sheet opened with kept edits (as when a refused save followed the album to its new id) opens on them.
+	const startMode = (): 'tracks' | 'edit' => (draft ? 'edit' : 'tracks');
+	let mode = $state(startMode());
+	let dropped = $derived(draft && detail ? lostTracks(draft, detail) : 0);
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -147,6 +170,20 @@
 		</header>
 
 		<div class="body">
+			{#if draft && detail}
+				<p class="changed" role="status" transition:slide={{ duration: 200 }}>
+					<CircleAlert size={15} strokeWidth={2.2} />
+					<span
+						>This album was changed elsewhere while you were editing it. It shows those changes now
+						(marked), with your edits on top: save to apply them.{#if dropped}
+							Edits to {dropped}
+							{dropped === 1 ? 'track' : 'tracks'} no longer in it were dropped.{/if}</span
+					>
+					<button class="link" title="Your edits here are dropped" onclick={() => ondiscard?.()}>
+						Reload
+					</button>
+				</p>
+			{/if}
 			{#if !detail}
 				<div class="skeleton" aria-busy="true">
 					{#each { length: Math.min(album.track_count, 10) } as _, i (i)}
@@ -193,6 +230,9 @@
 							{allowWrites}
 							{onsaved}
 							{onimport}
+							{draft}
+							{onconflict}
+							onrevert={() => draft && ondiscard?.()}
 							oncancel={() => (mode = 'tracks')}
 						/>
 					{/key}
@@ -402,6 +442,35 @@
 	.body {
 		padding: 8px 32px 36px;
 		min-height: 200px;
+	}
+	.changed {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 8px 0 14px;
+		padding: 8px 8px 8px 14px;
+		border-radius: 12px;
+		font-size: 13.5px;
+		color: var(--text-2);
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+	}
+	.changed :global(svg) {
+		flex: none;
+		color: var(--warn);
+	}
+	.changed .link {
+		margin-left: auto;
+		padding: 4px 10px;
+		border-radius: 999px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--accent);
+		white-space: nowrap;
+		transition: background 140ms;
+	}
+	.changed .link:hover {
+		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.disc {
 		margin: 18px 16px 6px;

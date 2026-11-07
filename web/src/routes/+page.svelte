@@ -56,6 +56,7 @@
 	import SyncSetup from '#lib/components/SyncSetup.svelte';
 	import AlbumGrid from '#lib/components/AlbumGrid.svelte';
 	import AlbumDetail from '#lib/components/AlbumDetail.svelte';
+	import type { TagDraft } from '#lib/components/TagEditor.svelte';
 	import PlayerBar from '#lib/components/PlayerBar.svelte';
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
@@ -264,6 +265,17 @@
 	let openId = $derived(page.state.album ?? null);
 	let openAlbum = $derived(openId ? (byId.get(openId) ?? null) : null);
 
+	/**
+	 * Tag edits whose save was refused because the open album had changed
+	 * elsewhere, kept on top of the album as it is now (`album`, its id) until
+	 * they're saved or dropped. `from` is the id the save was sent to, which
+	 * the sheet stays on until it follows a new title to the new id.
+	 */
+	let kept = $state<{ from: string; album: string; draft: TagDraft } | null>(null);
+	$effect(() => {
+		if (kept && openId !== kept.album && openId !== kept.from) kept = null;
+	});
+
 	// Load the open album's tracks (again after signing back in, if that failed).
 	$effect(() => {
 		const id = openId;
@@ -421,6 +433,7 @@
 	}
 
 	async function onsaved(result: TagWriteResult) {
+		kept = null;
 		await loadAlbums();
 		if (result.album) detail = result.album;
 		if (result.album_id !== openId)
@@ -429,6 +442,36 @@
 				shallow: true,
 				replace: true
 			});
+	}
+
+	/**
+	 * A tag save was refused because the album had changed elsewhere: show it as
+	 * it is now (`current`, under its new id if it has one), with the edits on
+	 * top. With the album gone, the sheet stays as it is.
+	 */
+	async function onconflict(current: Detail | null, draft: TagDraft) {
+		const from = openId;
+		if (!from || !current) return;
+		await loadAlbums();
+		if (openId !== from) return;
+		kept = { from, album: current.id, draft };
+		detail = current;
+		if (current.id !== from)
+			await goto(page.url.href, { state: { album: current.id }, shallow: true, replace: true });
+	}
+
+	/** Drop the kept edits and show the open album as it is now. */
+	async function discardKept() {
+		kept = null;
+		const id = openId;
+		if (!id) return;
+		try {
+			const fresh = await api.album(id);
+			if (openId === id) detail = fresh;
+		} catch {
+			toast('This album isn’t there any more', 'info');
+		}
+		loadAlbums();
 	}
 
 	let lastAlbums = 0;
@@ -865,6 +908,9 @@
 		onimport={openAlbum.collection === 'inbox'
 			? (edits) => startImport(openAlbum!, edits)
 			: undefined}
+		draft={kept?.album === openAlbum.id ? kept.draft : null}
+		{onconflict}
+		ondiscard={discardKept}
 	/>
 {/if}
 
