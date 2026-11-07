@@ -1,3 +1,5 @@
+import { session } from './session.svelte';
+
 export type ToastKind = 'info' | 'success' | 'error' | 'progress';
 
 export interface ToastAction {
@@ -18,6 +20,8 @@ export const toasts = $state<Toast[]>([]);
 /** Show a toast; `ms = 0` keeps it until dismissed. Returns its id. */
 export function toast(message: string, kind: ToastKind = 'info', ms = 4200, action?: ToastAction) {
 	const id = next++;
+	// A request turned away for want of a login: the login view says so.
+	if (kind === 'error' && session.state === 'out') return id;
 	toasts.push({ id, kind, message, action });
 	if (ms > 0) setTimeout(() => dismiss(id), ms);
 	return id;

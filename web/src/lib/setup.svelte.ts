@@ -79,6 +79,7 @@ class SetupStore {
 				this.artFileNames = r.art_file_names;
 				this.#apply(r);
 				this.loaded = true;
+				this.failed = false;
 			})
 			.catch(() => {
 				this.failed = true;

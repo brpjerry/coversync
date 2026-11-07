@@ -17,6 +17,7 @@
 	import { accent, shade } from '#lib/color.ts';
 	import { duration, longDuration, quality } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { session } from '#lib/session.svelte.ts';
 	import TagEditor from './TagEditor.svelte';
 
 	interface Props {
@@ -63,8 +64,11 @@
 	role="presentation"
 >
 	<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="album-title">
+		<!-- Covers asked for while signed out failed: signing back in asks again. -->
 		<div class="backdrop" aria-hidden="true">
-			{#if album.has_cover}<img src={coverUrl(album, 256)} alt="" />{/if}
+			{#key session.generation}
+				{#if album.has_cover}<img src={coverUrl(album, 256)} alt="" />{/if}
+			{/key}
 		</div>
 		<button class="icon-btn close" bind:this={closeButton} onclick={onclose} aria-label="Close">
 			<X size={20} />
@@ -77,12 +81,14 @@
 				style:background-image={album.has_cover ? `url(${coverUrl(album, 256)})` : 'none'}
 			>
 				{#if album.has_cover}
-					<img
-						src={coverUrl(album, 1024)}
-						alt="Cover of {album.title}"
-						class:loaded={heroLoaded}
-						onload={() => (heroLoaded = true)}
-					/>
+					{#key session.generation}
+						<img
+							src={coverUrl(album, 1024)}
+							alt="Cover of {album.title}"
+							class:loaded={heroLoaded}
+							onload={() => (heroLoaded = true)}
+						/>
+					{/key}
 				{:else}
 					<span class="placeholder"><Disc3 size={72} strokeWidth={1} /></span>
 				{/if}

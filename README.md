@@ -6,7 +6,8 @@ albums into a **Library** it manages: copied (or moved) into a folder structure
 you define, held to rules about tags and album art, with tags filled in or
 corrected on the way. Syncing the Library to devices is planned.
 
-Early days: single user, no authentication, used on a home server.
+Early days: a single user with a password (see [Signing in](#signing-in)),
+used on a home server.
 
 ## Features
 
@@ -74,10 +75,11 @@ package. Install it and start the daemon as a user service:
 sudo pacman -U coversync-0.1.0-1-x86_64.pkg.tar.zst
 sudo pacman -S --asdeps chromaprint                # optional: fpcalc for Smart suggestions
 systemctl --user enable --now coversyncd
+coversyncd set-password                            # the password to sign in with
 ```
 
-The service listens on <http://127.0.0.1:8770/>; choose the Inbox folder
-under Setup > Inbox (in the sidebar, under the tag filter). To build the
+The service listens on <http://127.0.0.1:8770/>; sign in, then choose the
+Inbox folder under Setup > Inbox (in the sidebar, under the tag filter). To build the
 package from a checkout instead, run `packaging/arch/build.sh` (it packages
 the current commit into `dist/`).
 
@@ -91,15 +93,19 @@ barcode, ISRCs, or title and artist.
 ```sh
 (cd web && pnpm install && pnpm build)   # the daemon embeds web/build
 cargo build --release -p coversyncd
+target/release/coversyncd set-password
 target/release/coversyncd --inbox ~/Music
 ```
 
-Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
+Then open <http://127.0.0.1:8770/> and sign in. `coversyncd --help` lists the
+options:
 
 - `--inbox` seeds the Inbox folder setting the first time; Inbox setup owns it
   afterwards.
-- `--listen` (default `127.0.0.1:8770`). There is no authentication, so keep
-  it on localhost or behind a reverse proxy that adds some.
+- `--listen` (default `127.0.0.1:8770`). coversyncd itself only speaks plain
+  HTTP, so to reach it from other machines put a reverse proxy that adds HTTPS
+  in front (see [Signing in](#signing-in)); otherwise the password and the
+  session cookie cross the network unencrypted.
 - `--state-dir` and `--cache-dir`: the local database, `inbox.sqlite3`
   (default `$XDG_STATE_HOME/coversync`), and cover thumbnails, MusicBrainz's
   cover images and the saved AcoustID and MusicBrainz lookups,
@@ -116,7 +122,59 @@ Then open <http://127.0.0.1:8770/>. `coversyncd --help` lists the options:
   file is touched.
 
 To serve the UI under a path prefix behind a reverse proxy, build it with that
-prefix: `(cd web && BASE_PATH=/coversync pnpm build)`.
+prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
+as it appears in the URL: ASCII, with anything else percent-encoded
+(`/m%C3%BCsik`, not `/müsik`). The session cookie is then limited to that
+prefix, so other sites on the same host never get it.
+
+### Signing in
+
+coversync has one user, with a password set on the server itself; there is
+no way to set or reset it from the web.
+
+```sh
+coversyncd set-password                       # prompts twice, without echo
+printf '%s\n' "$PASSWORD" | coversyncd set-password   # or one line on stdin
+coversyncd set-password --state-dir /path/to/state    # a service with its own
+```
+
+It writes the password's argon2id hash to the local database in the state
+directory, so give it the same `--state-dir` as the service if that has one.
+It works whether the service runs or not: the service reads the hash at each
+login. Running it again resets the password and signs out every browser
+signed in with the old one; apps keep their tokens.
+
+**Until a password is set, nothing but the login page can be opened.** The UI
+says to run `coversyncd set-password`, and the API answers 401 with the code
+`no_password`. Upgrading from a release without login therefore locks the UI
+until the command is run on the server.
+
+- **Browsers** sign in on the login page and get a session cookie,
+  `coversync_session`: HttpOnly, SameSite=Lax, and Secure when the proxy
+  reports HTTPS (`X-Forwarded-Proto: https`). It is limited to the UI's path,
+  and the session ends after 90 days without use, or with **Sign out** in the
+  sidebar. Covers and audio streams work with the cookie alone.
+- **Apps** send a token, `Authorization: Bearer cst_…`. Pairing will issue them,
+  one per device, each with a scope: `manage` (everything a browser can do) or
+  `sync` (syncing only; refused with 403 for now). `POST /api/login/token`
+  trades a token for a session cookie, for an app's web view; that session has
+  the device's scope and isn't a password login.
+- **Everything under `/api` needs one or the other**, except `GET /api/hello`
+  (the server's name, coversyncd's version and the API versions it speaks, for
+  clients checking a URL) and logging in and out. The UI's own files stay open:
+  they are the app's source and hold no data.
+- **Failed logins are limited.** Each client gets five tries, then one a
+  minute; a client with a try left is always checked, so the right password
+  always gets in. Overall, twenty failures are allowed, then one every six
+  seconds; past that (an attack from many addresses), each attempt costs its
+  client every try it has left (the right password gets one back), so each
+  address gets one guess a minute, even sending its tries all at once.
+  At most two passwords are checked at once. Behind a reverse proxy on the
+  same machine, the client's address is taken from `X-Forwarded-For`, which
+  is only trusted from loopback; loopback itself gets no other trust, since
+  every request through the proxy comes from it.
+- **Nothing a login is served is kept by shared caches**: API responses are
+  `Cache-Control: private`, and `no-cache` unless they set their own policy.
 
 ### Moving the Library
 
@@ -189,10 +247,13 @@ WantedBy=default.target
 (cd web && pnpm dev)        # Vite on :5173, proxying /api to 127.0.0.1:8770
 cargo test --workspace && cargo clippy --workspace --all-targets
 (cd web && pnpm check)
-tools/ui_smoke.py http://127.0.0.1:8770/ shots/     # read-only tour of the UI
+COVERSYNC_PASSWORD=… tools/ui_smoke.py http://127.0.0.1:8770/ shots/   # read-only tour of the UI
 ```
 
-The smoke test's other modes (`--save`, `--import`, `--suggest`, …, listed at
+A scratch daemon gets a password with
+`coversyncd set-password --state-dir <scratch state dir>`. The smoke test
+signs in with `COVERSYNC_PASSWORD` (or `--password`); `--auth` tries the login
+page itself. Its other modes (`--save`, `--import`, `--suggest`, …, listed at
 the top of the script) change settings or import albums: run them only against
 a daemon with a scratch `--state-dir` and Library folder.
 
