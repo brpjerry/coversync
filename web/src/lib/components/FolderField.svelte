@@ -8,6 +8,7 @@
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import { fade } from 'svelte/transition';
 	import { api, ApiError, type FolderStatus } from '#lib/api.ts';
+	import { session } from '#lib/session.svelte.ts';
 
 	interface Props {
 		value: string;
@@ -26,8 +27,10 @@
 	let checking = $state(false);
 	let seq = 0;
 
-	// Ask the daemon about the folder as it's typed, after a short pause.
+	// Ask the daemon about the folder as it's typed, after a short pause, and
+	// again after signing back in (an answer while signed out was a 401).
 	$effect(() => {
+		void session.generation;
 		const path = value.trim();
 		const mine = ++seq;
 		error = null;

@@ -773,7 +773,7 @@ def auth_flow(d, out, tag):
     check(d.js("return document.querySelectorAll('.toast.error').length") == 0, "no error toasts")
     # Escape typed in the login view stays there.
     el = d.s("POST", "/element", {"using": "css selector", "value": LOGIN_FIELD})
-    d.s("POST", f"/element/{el[ELEMENT]}/value", {"text": ""})
+    d.s("POST", f"/element/{el[ELEMENT]}/value", {"text": "\ue00c"})  # Escape
     time.sleep(0.6)
     check(d.js("return !!document.querySelector('.sheet .editor')") and d.js(summary) == edited,
           "Escape in the login view leaves the album and its tag edit open")
@@ -788,6 +788,39 @@ def auth_flow(d, out, tag):
     d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
     d.wait("return !document.querySelector('.sheet')")
     time.sleep(0.8)
+
+    # A track whose stream was refused while signed out plays once signed back in.
+    d.click(".cell:first-child .cover")
+    d.wait("return !!document.querySelector('.tracks li')")
+    time.sleep(1.2)
+    d.click(".actions .btn.primary")
+    d.wait("return !!document.querySelector('.player')")
+    time.sleep(2)
+    play = ".player button.main"
+    d.click(play)
+    d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+    d.wait("return !document.querySelector('.sheet')")
+    time.sleep(0.8)
+    d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
+    d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
+    # Seek well ahead under the login view, past what was fetched: refused.
+    d.js("const s = document.querySelector('.player [role=slider]');"
+         "for (let i = 0; i < 30; i++) s.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))")
+    time.sleep(1.5)
+    sign_in(d)
+    time.sleep(0.5)
+
+    def position():
+        m, s = d.js("return document.querySelector('.player .t').textContent").split(":")
+        return int(m) * 60 + int(s)
+
+    before = position()
+    d.click(play)
+    time.sleep(3)
+    check(d.js(f"return document.querySelector('{play}').getAttribute('aria-label')") == "Pause"
+          and position() > before >= 60,
+          f"Play after signing back in plays on from {before}s (now {position()}s)")
+    d.click(play)
 
     # Signing out asks first while a setup screen has unsaved changes.
     d.open_setup("Appearance")
