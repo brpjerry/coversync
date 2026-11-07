@@ -175,10 +175,10 @@ fn stamp_triggers(schema: &str, key: &str) -> String {
 /// column: indexes for asking what changed since a generation, a record of
 /// every track removed (its row id and its path relative to the folder, as
 /// the tracks have them), and triggers that keep both up to date whatever
-/// writes or deletes a track. A file back at a removed path is a new track,
-/// with a new id and a later generation; its removal stays recorded, so a
-/// client going through the changes in order sees the old id go before the
-/// new one arrives.
+/// writes or deletes a track. A file back at a removed path is a new track
+/// with a later generation, usually under a new id (SQLite can reuse the
+/// highest one); its removal stays recorded, so a client going through the
+/// changes in order sees the old track go before the new one arrives.
 fn counter_schema(schema: &str) -> String {
     let next = next_generation_sql(GENERATION);
     let stamps = stamp_triggers(schema, GENERATION);
