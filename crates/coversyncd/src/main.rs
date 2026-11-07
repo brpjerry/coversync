@@ -1,6 +1,7 @@
 //! coversyncd: indexes a music library and serves the coversync web UI.
 
 mod api;
+mod auth;
 mod suggest;
 mod web;
 
@@ -10,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use clap::Parser;
+use axum::Router;
+use clap::{Parser, Subcommand};
 use coversync_core::cover::CoverCache;
 use coversync_core::lookups::{self, LookupCache};
 use coversync_core::scan::{self, Progress};
@@ -22,6 +24,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Inbox folder to use until one is chosen in Inbox setup.
     #[arg(long, alias = "library")]
     inbox: Option<PathBuf>,
@@ -31,7 +35,7 @@ struct Args {
     /// Where the Inbox's database and this installation's settings live
     /// (default: $XDG_STATE_HOME/coversync). The Library keeps its own
     /// database in its folder.
-    #[arg(long)]
+    #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
     /// Where cover thumbnails, MusicBrainz's covers and saved AcoustID and
     /// MusicBrainz lookups are kept (default: $XDG_CACHE_HOME/coversync).
@@ -40,6 +44,17 @@ struct Args {
     /// Allow the tag editor to modify files. Off by default.
     #[arg(long)]
     allow_writes: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Set or reset the password for the web UI and the API.
+    ///
+    /// Prompts for it on a terminal, or reads one line from standard input.
+    /// Run it with the service's --state-dir, if it has one; it works while
+    /// the service runs. Browsers signed in with an old password are signed
+    /// out; apps keep their tokens.
+    SetPassword,
 }
 
 pub struct AppState {
@@ -57,6 +72,8 @@ pub struct AppState {
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
     pub identify: suggest::Jobs,
+    /// The password, sessions and app tokens.
+    pub auth: auth::Auth,
 }
 
 impl AppState {
@@ -84,6 +101,20 @@ impl AppState {
 }
 
 pub type Shared = Arc<AppState>;
+
+/// The API, the login routes and the UI, behind the login guard.
+fn app(state: Shared) -> Router {
+    api::router()
+        .merge(auth::router())
+        .merge(web::router())
+        // Every /api route but the few auth::router opens needs a login.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::guard,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
@@ -164,6 +195,9 @@ async fn run() -> anyhow::Result<()> {
     let state_dir = args
         .state_dir
         .unwrap_or_else(|| xdg("XDG_STATE_HOME", ".local/state"));
+    if let Some(Command::SetPassword) = args.command {
+        return auth::set_password(&state_dir);
+    }
     let cache_dir = args
         .cache_dir
         .unwrap_or_else(|| xdg("XDG_CACHE_HOME", ".cache"));
@@ -180,6 +214,7 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     let covers = CoverCache::new(cache_dir.join("covers"))?;
+    let auth = auth::Auth::open(&state_dir)?;
 
     let state = Arc::new(AppState {
         lib,
@@ -191,14 +226,12 @@ async fn run() -> anyhow::Result<()> {
         jobs: Mutex::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
+        auth,
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
     spawn_scan(state.clone());
 
-    let app = api::router()
-        .merge(web::router())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = app(state).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
     axum::serve(listener, app)
@@ -213,4 +246,22 @@ async fn run() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// A daemon's state in a scratch directory, for tests of the whole app.
+#[cfg(test)]
+pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
+    let state_dir = dir.join("state");
+    Arc::new(AppState {
+        lib: Library::open_in(&state_dir).unwrap(),
+        covers: CoverCache::new(dir.join("covers")).unwrap(),
+        mb_art: dir.join("musicbrainz"),
+        lookups: LookupCache::open_or_memory(&dir.join(lookups::FILE)),
+        progress: Arc::new(RwLock::new(ScanProgress::default())),
+        allow_writes: false,
+        jobs: Mutex::new(()),
+        rescan: AtomicBool::new(false),
+        identify: suggest::Jobs::default(),
+        auth: auth::Auth::open(&state_dir).unwrap(),
+    })
 }

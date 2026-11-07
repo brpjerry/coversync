@@ -96,7 +96,14 @@ class Player {
 	toggle() {
 		const a = this.#audio;
 		if (!a || !this.current) return;
-		if (a.paused) a.play();
+		if (a.error) {
+			// The stream failed (refused while signed out, say), and play()
+			// would too: load it afresh, from where it stopped.
+			const at = this.time;
+			this.buffering = false;
+			this.#load();
+			this.seek(at);
+		} else if (a.paused) a.play().catch(() => (this.playing = false));
 		else a.pause();
 	}
 

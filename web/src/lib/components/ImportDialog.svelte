@@ -28,6 +28,7 @@
 		type ImportPlan
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
+	import { session } from '#lib/session.svelte.ts';
 	import SuggestPanel, { type ChosenArt } from './SuggestPanel.svelte';
 
 	interface Props {
@@ -236,11 +237,13 @@
 		return out;
 	});
 
-	// Re-plan as values change, for the destination preview and server-side checks.
+	// Re-plan as values change, for the destination preview and server-side
+	// checks, and again after signing back in (a plan asked for meanwhile failed).
 	let live = $state<ImportPlan>(initial);
 	let planning = $state(false);
 	let seq = 0;
 	$effect(() => {
+		void session.generation;
 		const e = $state.snapshot(edits) as ImportEdits;
 		const mine = ++seq;
 		planning = true;

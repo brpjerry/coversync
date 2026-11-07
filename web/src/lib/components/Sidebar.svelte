@@ -10,6 +10,7 @@
 	import Palette from '@lucide/svelte/icons/palette';
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
+	import LogOut from '@lucide/svelte/icons/log-out';
 	import type { Album } from '#lib/api.ts';
 	import { isSetup, readPref, writePref, type View } from '#lib/browse.ts';
 	import {
@@ -24,7 +25,10 @@
 	} from '#lib/filters.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { drafts } from '#lib/drafts.svelte.ts';
+	import { session } from '#lib/session.svelte.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
+	import { toast } from '#lib/toast.svelte.ts';
 
 	interface Props {
 		/** Tags to filter by, in the dropdown's order (configured in Appearance). */
@@ -103,6 +107,13 @@
 	);
 
 	const pick = (k: string, value: string) => (filters = toggled(filters, k, value));
+
+	async function signOut() {
+		// Signing out starts the page afresh: ask before unsaved edits go with it.
+		const unsaved = Object.values(dirty).some(Boolean) || drafts.tags;
+		if (unsaved && !confirm('Sign out? Your unsaved changes will be lost.')) return;
+		if (!(await session.logout())) toast('Signing out failed', 'error');
+	}
 </script>
 
 <aside
@@ -240,23 +251,29 @@
 			</section>
 		{/if}
 
-		<nav class="setup" aria-label="Setup">
-			<h2 class="section">Setup</h2>
-			{#each setups as item (item.id)}
-				<button
-					class="nav-item"
-					class:on={view === item.id}
-					aria-current={view === item.id ? 'page' : undefined}
-					onclick={() => onview(item.id)}
-				>
-					<span class="icon">
-						<item.icon size={17} strokeWidth={1.8} />
-						{#if dirty[item.id]}<i class="dot" aria-label="Unsaved changes"></i>{/if}
-					</span>
-					{item.label}
-				</button>
-			{/each}
-		</nav>
+		<div class="setup">
+			<nav aria-label="Setup">
+				<h2 class="section">Setup</h2>
+				{#each setups as item (item.id)}
+					<button
+						class="nav-item"
+						class:on={view === item.id}
+						aria-current={view === item.id ? 'page' : undefined}
+						onclick={() => onview(item.id)}
+					>
+						<span class="icon">
+							<item.icon size={17} strokeWidth={1.8} />
+							{#if dirty[item.id]}<i class="dot" aria-label="Unsaved changes"></i>{/if}
+						</span>
+						{item.label}
+					</button>
+				{/each}
+			</nav>
+			<button class="nav-item sign-out" onclick={signOut}>
+				<span class="icon"><LogOut size={17} strokeWidth={1.8} /></span>
+				Sign out
+			</button>
+		</div>
 	</div>
 </aside>
 
@@ -602,6 +619,10 @@
 		border-top: 1px solid var(--border);
 		transition: padding-bottom 380ms var(--ease-out);
 	}
+	.setup nav {
+		display: grid;
+		gap: 2px;
+	}
 	/* Clear of the player, which floats over the bottom of the window. */
 	.playing .setup {
 		padding-bottom: calc(var(--player-h) + 24px);
@@ -629,6 +650,11 @@
 		transition:
 			color 160ms,
 			background 140ms;
+	}
+	/* Not a setup screen: set apart from them. */
+	.sign-out {
+		margin-top: 6px;
+		color: var(--text-3);
 	}
 	.nav-item:hover:not(.on) {
 		background: var(--surface);

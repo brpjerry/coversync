@@ -419,6 +419,14 @@ export interface SyncSetupResponse {
 	setup: SyncSetup;
 }
 
+/** How this browser is signed in (`GET /api/session`). */
+export interface Access {
+	/** A password login, an app's token, or a session traded for one. */
+	via: 'password' | 'token' | 'token_session';
+	scope: 'manage' | 'sync';
+	device: number | null;
+}
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
@@ -428,16 +436,24 @@ export class ApiError extends Error {
 	}
 }
 
+let unauthorized: (code: string) => void = () => {};
+/** Hear about every 401: the session has ended, or there was none. */
+export function onUnauthorized(handler: (code: string) => void) {
+	unauthorized = handler;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(BASE + path, init);
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
+		if (res.status === 401) unauthorized(body.code ?? 'login_required');
 		throw new ApiError(res.status, body.error ?? res.statusText);
 	}
 	return res.status === 202 ? (undefined as T) : res.json();
 }
 
 export const api = {
+	session: () => request<Access>('/api/session'),
 	status: () => request<Status>('/api/status'),
 	albums: (collection: Collection = 'inbox') =>
 		request<Album[]>(`/api/albums?collection=${collection}`),

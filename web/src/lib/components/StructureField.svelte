@@ -6,6 +6,7 @@
 	import ShowAll from './ShowAll.svelte';
 	import { api, type StructurePreview } from '#lib/api.ts';
 	import { fold } from '#lib/format.ts';
+	import { session } from '#lib/session.svelte.ts';
 
 	interface Props {
 		value: string;
@@ -22,7 +23,9 @@
 	let varFilter = $state('');
 	let seq = 0;
 
+	// Again after signing back in, if the last preview was refused.
 	$effect(() => {
+		void session.generation;
 		const structure = value.trim();
 		const mine = ++seq;
 		const timer = setTimeout(async () => {
