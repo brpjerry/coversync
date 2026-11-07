@@ -28,8 +28,31 @@ class Player {
 			this.#tick();
 		});
 		a.addEventListener('pause', () => (this.playing = false));
-		a.addEventListener('waiting', () => (this.buffering = true));
-		a.addEventListener('playing', () => (this.buffering = false));
+		// Buffering is read from the element on every event that can change it, rather than
+		// set on `waiting` and cleared on `playing`: WebKitGTK fires no `playing` after a seek,
+		// which left the spinner up, even once paused. Time moving on in normal playback
+		// (not a seek) also means it isn't buffering, whatever readyState says.
+		let last = 0;
+		const buffering = (event: Event) => {
+			const advancing = event.type === 'timeupdate' && !a.seeking && a.currentTime !== last;
+			last = a.currentTime;
+			this.buffering =
+				!a.paused && !a.ended && !advancing && a.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+		};
+		for (const event of [
+			'waiting',
+			'playing',
+			'play',
+			'pause',
+			'seeking',
+			'seeked',
+			'canplay',
+			'timeupdate',
+			'emptied',
+			'ended'
+		]) {
+			a.addEventListener(event, buffering);
+		}
 		a.addEventListener('loadedmetadata', () => (this.duration = a.duration || 0));
 		a.addEventListener('ended', () => this.next());
 		this.#audio = a;
