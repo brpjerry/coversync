@@ -42,7 +42,7 @@
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
-	import { listen, type NoticeHandlers, type Notices } from '#lib/events.ts';
+	import { listen, type Listening, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
@@ -917,9 +917,17 @@
 		if (session.generation > 0) untrack(loadAll);
 	});
 
+	let listening: Listening | undefined;
+	// Signed out, the stream would only be refused: it waits, and catches up
+	// once signed back in.
+	$effect(() => {
+		const out = session.state === 'out';
+		untrack(() => (out ? listening?.pause() : listening?.resume()));
+	});
+
 	onMount(() => {
 		firstReads = loadAll();
-		const stop = listen(notices, onlive, onfirst);
+		listening = listen(notices, onlive, onfirst);
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;
@@ -927,7 +935,7 @@
 		};
 		mq.addEventListener('change', onchange);
 		return () => {
-			stop();
+			listening?.stop();
 			clearTimeout(pollTimer);
 			mq.removeEventListener('change', onchange);
 		};

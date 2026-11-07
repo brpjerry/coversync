@@ -274,5 +274,6 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),
+        events: events::Events::default(),
     })
 }

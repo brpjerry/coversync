@@ -60,7 +60,10 @@ used on a home server.
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
   it's down (the daemon restarting, say), the page polls instead, and
-  catches up once the stream is back. Tag edits in progress are kept: if the
+  catches up once the stream is back. The stream needs a login like the rest
+  of the API, and ends within 20 seconds of its session ending (signing out,
+  a password reset); signed out, the page waits, and opens it again once
+  signed back in. Tag edits in progress are kept: if the
   album changes elsewhere meanwhile, the album says so and offers to reload.
   Each tab showing coversync holds a connection open for the stream (one
   hidden for a few seconds lets it go). Over plain HTTP/1.1, as at
