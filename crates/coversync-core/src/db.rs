@@ -891,6 +891,27 @@ fn filter_values<'a>(
     out
 }
 
+/// An album's version (see [`AlbumDetail::version`]) from its tracks' ids
+/// and generations. Every write to a track gives it a higher generation,
+/// and a track leaving or joining the album changes the ids, so the
+/// digest changes with either, whichever of the tracks it was. (The
+/// highest generation alone wouldn't: a track removed that wasn't the
+/// latest written leaves it as it was.) Ids are unique across the Inbox
+/// and Library, and in each the generation is that database's counter.
+fn album_version(mut tracks: Vec<(i64, i64)>) -> String {
+    use sha2::{Digest, Sha256};
+    tracks.sort_unstable();
+    let mut h = Sha256::new();
+    for (id, generation) in tracks {
+        h.update(id.to_le_bytes());
+        h.update(generation.to_le_bytes());
+    }
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn sort_tracks(tracks: &mut [Track]) {
     tracks.sort_by(|a, b| {
         (
@@ -1623,22 +1644,24 @@ impl Library {
     }
 
     pub fn album(&self, id: &str) -> Result<Option<AlbumDetail>> {
-        let (mut tracks, dir, added) = {
+        let (mut tracks, dir, added, generations) = {
             let conn = self.conn();
             let mut stmt = conn.prepare(&format!(
                 "SELECT * FROM temp.indexed_tracks WHERE album_id = ?1 AND {VISIBLE}"
             ))?;
             let mut dir = String::new();
             let mut added = Vec::new();
+            let mut generations = Vec::new();
             let mut tracks = Vec::new();
             let mut rows = stmt.query([id])?;
             while let Some(r) = rows.next()? {
                 let (t, d) = track_from_row(r)?;
                 dir = d;
                 added.push(r.get::<_, i64>("added_at")?);
+                generations.push((t.id, r.get::<_, i64>("generation")?));
                 tracks.push(t);
             }
-            (tracks, dir, added)
+            (tracks, dir, added, generations)
         };
         let Some(collection) = tracks.first().map(|t| t.collection) else {
             return Ok(None);
@@ -1648,7 +1671,47 @@ impl Library {
         let refs: Vec<&Track> = tracks.iter().collect();
         let added = album_added(collection, added.into_iter());
         let album = summarize(id, &refs, added, covers.get(id));
-        Ok(Some(AlbumDetail { album, dir, tracks }))
+        Ok(Some(AlbumDetail {
+            album,
+            dir,
+            tracks,
+            version: album_version(generations),
+        }))
+    }
+
+    /// The album most of `tracks` are in now (the earliest listed on a
+    /// tie), among those still indexed and shown. None when none of them
+    /// is. An album's tracks can be found this way after an edit elsewhere
+    /// has given it a new id, as a new title does.
+    pub fn album_of_tracks(&self, tracks: &[i64]) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut inbox = conn.prepare_cached(&format!(
+            "SELECT album_id FROM main.tracks WHERE id = ?1 AND {VISIBLE}"
+        ))?;
+        // A Library id names its prefix and row (see ID_SPAN), as in track_root.
+        let mut lib = conn.prepare_cached(
+            "SELECT t.album_id FROM lib.tracks t JOIN temp.lib_root r
+             WHERE r.prefix = ?1 AND t.id = ?2",
+        )?;
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for &id in tracks {
+            let album: Option<String> = if id >= 0 {
+                inbox.query_row([id], |r| r.get(0)).optional()?
+            } else {
+                lib.query_row([-id / ID_SPAN, -id % ID_SPAN], |r| r.get(0))
+                    .optional()?
+            };
+            let Some(album) = album else { continue };
+            match counts.iter_mut().find(|(a, _)| *a == album) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((album, 1)),
+            }
+        }
+        Ok(counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, (_, n))| (*n, std::cmp::Reverse(*i)))
+            .map(|(_, (album, _))| album.clone()))
     }
 
     pub fn track_path(&self, id: i64) -> Result<Option<PathBuf>> {
