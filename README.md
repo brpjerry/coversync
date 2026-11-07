@@ -59,7 +59,9 @@ Early days: single user, no authentication, used on a home server.
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
+crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 web/                    SvelteKit / Svelte 5 single-page app
+apps/desktop/           Tauri 2 desktop app, a window onto a server's UI (its own Cargo workspace)
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
@@ -170,6 +172,48 @@ NoNewPrivileges=yes
 WantedBy=default.target
 ```
 
+## Desktop app
+
+`apps/desktop` is a desktop app (Tauri 2) that shows a coversync server's UI
+in a window of its own. The UI comes from the server, so the app doesn't
+need updating when the server does. Everything the window loads goes through
+a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
+
+- Bodies stream both ways, so covers, playback and seeking, uploads and
+  server-sent events work as in a browser.
+- The server's path prefix stays: `https://n5pro.internal/coversync/` is
+  served at `http://127.0.0.1:<port>/coversync/`.
+- Cookies the server sets work through it, so a server's login works as in a
+  browser.
+- Only the app's window can use it. The window opens the proxy with a secret
+  made at each launch, which the proxy trades for a cookie, and requests
+  without that cookie are refused.
+- HTTPS servers are checked against the system's certificate store, so a LAN
+  server with a certificate from your own CA (mkcert's, say) works once that
+  CA is installed there.
+
+When no server is set, or it can't be reached, the window shows a page
+bundled with the app, to try again or change the server. The server's
+address is saved in `config.json` in the app's config directory
+(`~/.config/io.github.brpjerry.coversync/` on Linux). `--server URL` or
+`COVERSYNC_SERVER=URL` picks a server for one run without saving it.
+
+There are no packages for it yet. To build and run it on Arch Linux, you
+need WebKitGTK as well as Rust and pnpm:
+
+```sh
+sudo pacman -S --needed webkit2gtk-4.1
+cd apps/desktop
+pnpm install                 # the Tauri CLI
+pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
+pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
+```
+
+It runs natively on Wayland. The app has its own Cargo workspace and lockfile
+in `apps/desktop/src-tauri`, apart from the repository's, so building and
+testing the rest doesn't need WebKitGTK. `RUST_LOG=coversync_proxy=debug`
+shows what the proxy does.
+
 ## Develop
 
 ```sh
@@ -186,6 +230,10 @@ a daemon with a scratch `--state-dir` and Library folder.
 For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
 `pnpm lint`, `pnpm check`, rustfmt, Clippy with warnings as errors and the
 tests, and builds the pacman package.
+
+Changes to the desktop app or its proxy also run
+`.github/workflows/desktop.yml`, which builds the app against WebKitGTK and
+runs rustfmt and Clippy on it.
 
 ### Release
 

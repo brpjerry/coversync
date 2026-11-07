@@ -1,0 +1,21 @@
+[package]
+name = "coversync-desktop"
+version = "0.1.0"
+description = "The coversync desktop app: a window onto a coversync server"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Its own workspace, apart from the repository's: it needs WebKitGTK to build.
+[workspace]
+
+[build-dependencies]
+tauri-build = "2.7.4"
+
+[dependencies]
+coversync-proxy = { path = "../../../crates/coversync-proxy" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = "2.12.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
