@@ -123,6 +123,12 @@ impl Events {
         self.closed.send_replace(true);
     }
 
+    /// Notices from now on, as published.
+    #[cfg(test)]
+    pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
+        self.notices.subscribe()
+    }
+
     /// Notices from now on, ending when [`Events::close`] is called.
     fn listen(&self) -> impl Stream<Item = Event> + use<> {
         let state = (self.notices.subscribe(), self.closed.subscribe());
