@@ -63,6 +63,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -799,6 +800,20 @@ struct TagWrite {
     /// Per-track edits keyed by track id; applied after the album edit.
     #[serde(default)]
     tracks: HashMap<i64, TagEdit>,
+    /// The album's `version` (from its details) the edits were made on.
+    /// If the album has changed since, nothing is written and the answer
+    /// is 409 Conflict, with the album as it is now (see [`TagConflict`]).
+    /// Without one, the edits are written whatever changed since, as for
+    /// clients from before versions.
+    #[serde(default)]
+    version: Option<String>,
+    /// The ids of the album's tracks the edits were made on, from the same
+    /// details. With a version, the album is found by its tracks, so an
+    /// edit elsewhere that gave it a new id (a new title does) is reported
+    /// as a conflict with the album under its new id. Without them, the
+    /// album is the one its id names now.
+    #[serde(default)]
+    track_ids: Option<Vec<i64>>,
 }
 
 #[derive(Serialize)]
@@ -807,6 +822,38 @@ struct TagWriteResult {
     album_id: String,
     files_written: usize,
     album: Option<AlbumDetail>,
+}
+
+/// The answer to a tag save made on a version of the album that is no
+/// longer current: nothing was written.
+#[derive(Debug, Serialize)]
+struct TagConflict {
+    error: &'static str,
+    /// The album as it is now, with its current version; null when none of
+    /// its tracks is in the Inbox or Library any more.
+    album: Option<AlbumDetail>,
+}
+
+/// Why a tag save wrote nothing.
+#[derive(Debug)]
+enum TagWriteError {
+    Api(ApiError),
+    Conflict(Box<TagConflict>),
+}
+
+impl From<ApiError> for TagWriteError {
+    fn from(e: ApiError) -> Self {
+        TagWriteError::Api(e)
+    }
+}
+
+impl IntoResponse for TagWriteError {
+    fn into_response(self) -> Response {
+        match self {
+            TagWriteError::Api(e) => e.into_response(),
+            TagWriteError::Conflict(c) => (StatusCode::CONFLICT, Json(c)).into_response(),
+        }
+    }
 }
 
 fn merge(album: &TagEdit, track: Option<&TagEdit>) -> TagEdit {
@@ -829,28 +876,44 @@ async fn write_tags(
     State(state): State<Shared>,
     Path(id): Path<String>,
     Json(body): Json<TagWrite>,
-) -> ApiResult<Json<TagWriteResult>> {
+) -> Result<Json<TagWriteResult>, TagWriteError> {
     // Before resolving the album: saving Library setup can switch the Library.
+    // Held until the files are written and indexed, so nothing can change
+    // the album between the version check and the write.
     let _guard = state.jobs.lock().await;
-    // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
-    let lookup = id.clone();
-    let in_library = blocking(&state, move |s| {
-        Ok(s.lib
-            .album(&lookup)?
-            .is_some_and(|d| d.album.collection == Collection::Library))
-    })
-    .await?;
-    if !state.allow_writes && !in_library {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Editing Inbox files in place is disabled on this server (start coversyncd with --allow-writes). Import the album to edit its Library copy.".into(),
-        ));
-    }
-    let result = blocking(&state, move |s| {
-        let ids = s.lib.album_track_ids(&id)?;
-        if ids.is_empty() {
-            return Err(coversync_core::Error::NotFound);
+    let allow_writes = state.allow_writes;
+    let saved = blocking(&state, move |s| {
+        // The album the edits are for, as it is now.
+        let current = match (&body.version, &body.track_ids) {
+            (Some(_), Some(tracks)) => match s.lib.album_of_tracks(tracks)? {
+                Some(album) => s.lib.album(&album)?,
+                None => None,
+            },
+            _ => s.lib.album(&id)?,
+        };
+        // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
+        if !allow_writes
+            && current
+                .as_ref()
+                .is_some_and(|d| d.album.collection == Collection::Inbox)
+        {
+            return Ok(Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "Editing Inbox files in place is disabled on this server (start coversyncd with --allow-writes). Import the album to edit its Library copy.".into(),
+            )
+            .into()));
         }
+        if let Some(version) = &body.version
+            && current.as_ref().map(|d| &d.version) != Some(version)
+        {
+            return Ok(Err(TagWriteError::Conflict(Box::new(TagConflict {
+                error: "This album has changed since it was loaded, so nothing was saved.",
+                album: current,
+            }))));
+        }
+        let current = current.ok_or(coversync_core::Error::NotFound)?;
+        let collection = current.album.collection;
+        let ids: Vec<i64> = current.tracks.iter().map(|t| t.id).collect();
         if let Some(stray) = body.tracks.keys().find(|t| !ids.contains(t)) {
             return Err(coversync_core::Error::Tags(format!(
                 "track {stray} is not in this album"
@@ -875,11 +938,6 @@ async fn write_tags(
             tags::write(&path, edit)?;
             written.push((path, root));
         }
-        let collection = if in_library {
-            Collection::Library
-        } else {
-            Collection::Inbox
-        };
         let stats: Vec<FileStat> = written
             .into_iter()
             .filter_map(|(path, root)| scan::stat(path, &root, collection))
@@ -896,23 +954,333 @@ async fn write_tags(
                 &album_dir_in(collection, &root, &p),
                 tags::read(&p)?.album.as_deref(),
             ),
-            None => id.clone(),
+            None => current.album.id.clone(),
         };
         let album = s.lib.album(&new_id)?;
-        Ok(TagWriteResult {
+        Ok(Ok(TagWriteResult {
             album_id: new_id,
             files_written: count,
             album,
-        })
+        }))
     })
-    .await?;
+    .await;
     crate::release_memory();
-    Ok(Json(result))
+    saved?.map(Json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as FsPath;
+    use std::sync::Arc;
+
+    /// A FLAC file with no audio, only these Vorbis comments.
+    fn flac(path: &FsPath, comments: &[&str]) {
+        let mut b = b"fLaC".to_vec();
+        // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+        b.extend([0, 0, 0, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        let mut block = Vec::new();
+        block.extend(9u32.to_le_bytes());
+        block.extend(b"coversync");
+        block.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            block.extend((c.len() as u32).to_le_bytes());
+            block.extend(c.as_bytes());
+        }
+        // The last block: VORBIS_COMMENT.
+        b.push(0x80 | 4);
+        b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+        b.extend(block);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// Track `n` of the album `title`, in the Inbox's folder of that name.
+    fn track(inbox: &FsPath, title: &str, n: u32) {
+        flac(
+            &inbox.join(format!("{title}/{n:02}.flac")),
+            &[
+                &format!("TITLE=Song {n}"),
+                "ARTIST=Artist",
+                "ALBUMARTIST=Artist",
+                &format!("ALBUM={title}"),
+                &format!("TRACKNUMBER={n}"),
+            ],
+        );
+    }
+
+    /// A daemon's state that may edit Inbox files in place, over an Inbox
+    /// holding albums "Record" (three tracks) and "Other" (two), scanned;
+    /// and the Inbox folder.
+    fn editing_daemon(name: &str) -> (Shared, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inbox = dir.join("inbox");
+        for n in 1..=3 {
+            track(&inbox, "Record", n);
+        }
+        for n in 1..=2 {
+            track(&inbox, "Other", n);
+        }
+        let mut state = Arc::into_inner(crate::test_state(&dir)).unwrap();
+        state.allow_writes = true;
+        state
+            .lib
+            .set_inbox_setup(InboxSetup {
+                folder: Some(inbox.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let state = Arc::new(state);
+        rescan_now(&state);
+        (state, inbox)
+    }
+
+    fn rescan_now(state: &Shared) {
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+    }
+
+    /// The details of the Inbox album titled `title`.
+    fn detail(state: &Shared, title: &str) -> AlbumDetail {
+        let albums = state
+            .lib
+            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .unwrap();
+        let album = albums.iter().find(|a| a.title == title).unwrap();
+        state.lib.album(&album.id).unwrap().unwrap()
+    }
+
+    fn genre(genre: &str) -> TagEdit {
+        TagEdit {
+            genre: Some(genre.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A save of `edit` to every track, made on `base` as the tag editor
+    /// sends it: with its version and tracks.
+    fn save_on(base: &AlbumDetail, edit: TagEdit) -> Json<TagWrite> {
+        Json(TagWrite {
+            album: edit,
+            tracks: HashMap::new(),
+            version: Some(base.version.clone()),
+            track_ids: Some(base.tracks.iter().map(|t| t.id).collect()),
+        })
+    }
+
+    async fn put(
+        state: &Shared,
+        id: &str,
+        body: Json<TagWrite>,
+    ) -> Result<TagWriteResult, TagWriteError> {
+        write_tags(State(state.clone()), Path(id.to_string()), body)
+            .await
+            .map(|Json(r)| r)
+    }
+
+    /// The album a save was refused with.
+    fn conflict(result: Result<TagWriteResult, TagWriteError>) -> Option<AlbumDetail> {
+        match result {
+            Err(TagWriteError::Conflict(c)) => c.album,
+            Err(TagWriteError::Api(e)) => panic!("not a conflict: {e:?}"),
+            Ok(r) => panic!("saved {} files", r.files_written),
+        }
+    }
+
+    /// The genre each of an album's files is tagged with now.
+    fn genres(state: &Shared, album: &AlbumDetail) -> Vec<Option<String>> {
+        album
+            .tracks
+            .iter()
+            .map(|t| {
+                let path = state.lib.track_path(t.id).unwrap().unwrap();
+                tags::read(&path).unwrap().genre
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_second_save_from_the_same_version_is_refused() {
+        let (state, _) = editing_daemon("conflict-twice");
+        let base = detail(&state, "Record");
+        let first = put(&state, &base.album.id, save_on(&base, genre("Rock")))
+            .await
+            .unwrap();
+        assert_eq!(first.files_written, 3);
+        let saved = first.album.unwrap();
+        assert_ne!(saved.version, base.version);
+        let counted = state.lib.index_versions().unwrap();
+
+        // The second, from the same base, writes nothing and answers with
+        // the album as the first left it.
+        let second = put(&state, &base.album.id, save_on(&base, genre("Jazz"))).await;
+        let Err(TagWriteError::Conflict(refused)) = second else {
+            panic!("not refused");
+        };
+        let res = TagWriteError::Conflict(refused).into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was saved")
+        );
+        assert_eq!(body["album"]["id"], saved.album.id);
+        assert_eq!(body["album"]["version"], saved.version);
+        assert_eq!(body["album"]["genre"], "Rock");
+        assert_eq!(body["album"]["tracks"].as_array().unwrap().len(), 3);
+        assert_eq!(genres(&state, &saved), vec![Some("Rock".to_string()); 3]);
+        assert_eq!(state.lib.index_versions().unwrap(), counted);
+
+        // Made again on the album as it is now, it goes through.
+        let current = detail(&state, "Record");
+        assert_eq!(current.version, saved.version);
+        let again = put(&state, &current.album.id, save_on(&current, genre("Jazz")))
+            .await
+            .unwrap();
+        assert_eq!(
+            genres(&state, &again.album.unwrap()),
+            vec![Some("Jazz".to_string()); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_after_another_album_changed_goes_through() {
+        let (state, _) = editing_daemon("conflict-other");
+        let base = detail(&state, "Record");
+        let other = detail(&state, "Other");
+        put(&state, &other.album.id, save_on(&other, genre("Jazz")))
+            .await
+            .unwrap();
+        rescan_now(&state);
+        assert_eq!(detail(&state, "Record").version, base.version);
+        let saved = put(&state, &base.album.id, save_on(&base, genre("Rock")))
+            .await
+            .unwrap();
+        assert_eq!(saved.files_written, 3);
+        assert_eq!(
+            genres(&state, &saved.album.unwrap()),
+            vec![Some("Rock".to_string()); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_after_a_track_left_or_joined_the_album_is_refused() {
+        let (state, inbox) = editing_daemon("conflict-tracks");
+        let base = detail(&state, "Record");
+        // Not the track written last: they were all written together.
+        std::fs::remove_file(inbox.join("Record/01.flac")).unwrap();
+        rescan_now(&state);
+        let now =
+            conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).unwrap();
+        assert_eq!(now.tracks.len(), 2);
+        assert_eq!(genres(&state, &now), [None, None]);
+
+        track(&inbox, "Record", 4);
+        rescan_now(&state);
+        let joined =
+            conflict(put(&state, &now.album.id, save_on(&now, genre("Rock"))).await).unwrap();
+        assert_eq!(joined.tracks.len(), 3);
+        assert_eq!(genres(&state, &joined), [None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_rename_saves_and_saves_after_it_follow_the_new_id() {
+        let (state, _) = editing_daemon("conflict-rename");
+        let base = detail(&state, "Record");
+        let title = TagEdit {
+            album: Some("Renamed".into()),
+            ..Default::default()
+        };
+        let renamed = put(&state, &base.album.id, save_on(&base, title))
+            .await
+            .unwrap();
+        assert_ne!(renamed.album_id, base.album.id);
+        let now = renamed.album.unwrap();
+        assert_eq!(now.album.title, "Renamed");
+
+        // The next save, on the version the rename answered with.
+        let saved = put(&state, &now.album.id, save_on(&now, genre("Rock")))
+            .await
+            .unwrap();
+        assert_eq!(saved.album_id, now.album.id);
+
+        // A save made on the album before the rename, as another client
+        // would send it, to the id it had then: refused, with the album
+        // found by its tracks under its new id.
+        let stale =
+            conflict(put(&state, &base.album.id, save_on(&base, genre("Jazz"))).await).unwrap();
+        assert_eq!(stale.album.id, now.album.id);
+        assert_eq!(stale.album.genre.as_deref(), Some("Rock"));
+        assert_eq!(genres(&state, &stale), vec![Some("Rock".to_string()); 3]);
+    }
+
+    #[tokio::test]
+    async fn a_save_on_an_album_no_longer_there_is_refused_with_none() {
+        let (state, inbox) = editing_daemon("conflict-gone");
+        let base = detail(&state, "Other");
+        std::fs::remove_dir_all(inbox.join("Other")).unwrap();
+        rescan_now(&state);
+        assert!(
+            conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_without_a_version_is_written_as_before() {
+        let (state, _) = editing_daemon("conflict-unversioned");
+        let base = detail(&state, "Record");
+        put(&state, &base.album.id, save_on(&base, genre("Rock")))
+            .await
+            .unwrap();
+        // An older client's save, made on the album before that one.
+        let old = Json(TagWrite {
+            album: genre("Jazz"),
+            tracks: HashMap::new(),
+            version: None,
+            track_ids: None,
+        });
+        let saved = put(&state, &base.album.id, old).await.unwrap();
+        assert_eq!(
+            genres(&state, &saved.album.unwrap()),
+            vec![Some("Jazz".to_string()); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_without_tracks_is_checked_against_the_albums_id() {
+        let (state, _) = editing_daemon("conflict-by-id");
+        let base = detail(&state, "Record");
+        let by_id = |edit| {
+            Json(TagWrite {
+                album: edit,
+                tracks: HashMap::new(),
+                version: Some(base.version.clone()),
+                track_ids: None,
+            })
+        };
+        put(&state, &base.album.id, by_id(genre("Rock")))
+            .await
+            .unwrap();
+        let now = conflict(put(&state, &base.album.id, by_id(genre("Jazz"))).await).unwrap();
+        assert_eq!(now.album.genre.as_deref(), Some("Rock"));
+    }
+
+    #[test]
+    fn album_details_carry_their_version() {
+        let (state, _) = editing_daemon("version-json");
+        let base = detail(&state, "Record");
+        let json = serde_json::to_value(&base).unwrap();
+        assert_eq!(json["version"], base.version);
+        assert_eq!(base.version.len(), 16);
+    }
 
     #[test]
     fn only_current_cover_renderings_are_kept() {

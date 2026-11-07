@@ -55,6 +55,8 @@ export interface Track {
 export interface AlbumDetail extends Album {
 	dir: string;
 	tracks: Track[];
+	/** Changes whenever any of the album's tracks is written, or a track joins or leaves it. */
+	version: string;
 }
 
 export interface ScanProgress {
@@ -86,6 +88,10 @@ export type TagEdit = Partial<Record<TagField, string>>;
 export interface TagWrite {
 	album: TagEdit;
 	tracks: Record<number, TagEdit>;
+	/** The album's version the edits were made on: if it has changed since, nothing is saved (see TagConflict). */
+	version?: string;
+	/** The album's tracks then, to find it by if it has a new id since (a new title gives it one). */
+	track_ids?: number[];
 }
 
 export interface TagWriteResult {
@@ -430,9 +436,22 @@ export interface Access {
 export class ApiError extends Error {
 	constructor(
 		public status: number,
-		message: string
+		message: string,
+		/** The error response's JSON, `{}` if it had none. */
+		public body: Record<string, unknown> = {}
 	) {
 		super(message);
+	}
+}
+
+/** A tag save refused because the album had changed since the version it was made on: nothing was saved. */
+export class TagConflict extends ApiError {
+	constructor(
+		message: string,
+		/** The album as it is now; null when it's no longer in the Inbox or Library. */
+		public album: AlbumDetail | null
+	) {
+		super(409, message);
 	}
 }
 
@@ -447,7 +466,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
 		if (res.status === 401) unauthorized(body.code ?? 'login_required');
-		throw new ApiError(res.status, body.error ?? res.statusText);
+		throw new ApiError(res.status, body.error ?? res.statusText, body);
 	}
 	return res.status === 202 ? (undefined as T) : res.json();
 }
@@ -536,11 +555,16 @@ export const api = {
 		}),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
+	/** Throws TagConflict when `body.version` is no longer the album's. */
 	writeTags: (id: string, body: TagWrite) =>
 		request<TagWriteResult>(`/api/albums/${id}/tags`, {
 			method: 'PUT',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(body)
+		}).catch((e) => {
+			if (e instanceof ApiError && e.status === 409)
+				throw new TagConflict(e.message, (e.body.album as AlbumDetail | null) ?? null);
+			throw e;
 		})
 };
 
