@@ -460,6 +460,40 @@ async fn a_token_can_be_traded_for_a_cookie() {
 }
 
 #[tokio::test]
+async fn the_event_stream_needs_a_login_and_ends_with_it() {
+    let app = App::with_password("events");
+    let res = app.get("/api/events", None).await;
+    assert_eq!(
+        code(res).await,
+        (StatusCode::UNAUTHORIZED, "login_required".into())
+    );
+    let cookie = app.cookie().await;
+    let res = app.get("/api/events", Some(&cookie)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "text/event-stream");
+    drop(res);
+    // What an open stream checks, every ping, to go on.
+    let headers = |cookie: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+        h
+    };
+    assert!(still_valid(&app.state, &headers(&cookie)).await);
+    let other = app.cookie().await;
+    let req = Request::post("/api/logout")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"path": "/coversync/"}"#))
+        .unwrap();
+    assert_eq!(app.send(req).await.status(), StatusCode::NO_CONTENT);
+    assert!(!still_valid(&app.state, &headers(&cookie)).await);
+    assert!(still_valid(&app.state, &headers(&other)).await);
+    app.set_password("a brand new password");
+    assert!(!still_valid(&app.state, &headers(&other)).await);
+    assert!(!still_valid(&app.state, &HeaderMap::new()).await);
+}
+
+#[tokio::test]
 async fn resetting_the_password_signs_browsers_out() {
     let app = App::with_password("reset");
     let cookie = app.cookie().await;

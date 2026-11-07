@@ -172,7 +172,7 @@ pub struct LibraryChanges {
     pub removed: Vec<RemovedTrack>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ScanProgress {
     pub running: bool,
     pub phase: String,

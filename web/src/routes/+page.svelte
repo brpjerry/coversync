@@ -42,6 +42,7 @@
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
+	import { listen, type Listening, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
@@ -60,6 +61,8 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
+	import type { Draft } from '#lib/components/TagEditor.svelte';
+	import { sameJson } from '#lib/same.ts';
 
 	const SORT_KEY = 'coversync.sort';
 	const SIDEBAR_KEY = 'coversync.sidebar';
@@ -264,21 +267,52 @@
 	let openId = $derived(page.state.album ?? null);
 	let openAlbum = $derived(openId ? (byId.get(openId) ?? null) : null);
 
+	/** The open album's tag editor's edits: none, some not sent yet, or some being saved. */
+	let draft = $state<Draft>('none');
+	/**
+	 * The sheet stays on the open album as it last showed it, though the grids
+	 * have moved on. When `changed`, the album changed elsewhere (edited,
+	 * renamed, imported, gone) while its tags had unsaved edits here, and the
+	 * sheet keeps them until the user reloads it. Otherwise the sheet is on its
+	 * way to the album's new id. `next` is the album's id now, if known.
+	 */
+	let held = $state<{
+		from: string;
+		next: string | null;
+		album: Album;
+		detail: Detail | null;
+		changed: boolean;
+	} | null>(null);
+	let holding = $derived(held?.from === openId ? held : null);
+	$effect(() => {
+		if (held && held.from !== openId) held = null;
+	});
+	/** What the album sheet shows. */
+	let sheetAlbum = $derived(holding?.album ?? openAlbum);
+	let sheetDetail = $derived(
+		holding ? holding.detail : detail?.id === sheetAlbum?.id ? detail : null
+	);
+
+	/** Bumped by each load or save of `detail`, so an older answer can't land after a newer one. */
+	let detailGen = 0;
+
 	// Load the open album's tracks (again after signing back in, if that failed).
 	$effect(() => {
 		const id = openId;
 		void session.generation;
 		if (!id || untrack(() => detail?.id) === id) return;
 		let cancelled = false;
+		const gen = ++detailGen;
+		const current = () => !cancelled && gen === detailGen;
 		api
 			.album(id)
-			.then((d) => !cancelled && (detail = d))
-			.catch(() => toast('Could not load album', 'error'));
+			.then((d) => current() && (detail = d))
+			.catch(() => current() && toast('Could not load album', 'error'));
 		return () => (cancelled = true);
 	});
 
 	$effect(() => {
-		document.documentElement.style.overflow = openAlbum || importing ? 'hidden' : '';
+		document.documentElement.style.overflow = sheetAlbum || importing ? 'hidden' : '';
 	});
 
 	// Room the player takes at the bottom of the window, for bars that float above it.
@@ -421,9 +455,24 @@
 	}
 
 	async function onsaved(result: TagWriteResult) {
-		await loadAlbums();
+		const from = openId;
+		// Saved over whatever changed elsewhere: the sheet shows the album as
+		// saved straight away, so edits begun after Save stay.
+		held = null;
+		detailGen++;
 		if (result.album) detail = result.album;
-		if (result.album_id !== openId)
+		if (!from || result.album_id === from) return loadAlbums();
+		// A new title: the sheet stays while the grids catch up with the new id.
+		if (sheetAlbum)
+			held = {
+				from,
+				next: result.album_id,
+				album: sheetAlbum,
+				detail: result.album,
+				changed: false
+			};
+		await loadAlbums();
+		if (openId === from)
 			await goto(page.url.href, {
 				state: { album: result.album_id },
 				shallow: true,
@@ -432,14 +481,37 @@
 	}
 
 	let lastAlbums = 0;
-	async function loadAlbums() {
+	async function fetchAlbums() {
 		try {
-			[albums, library] = await Promise.all([api.albums('inbox'), api.albums('library')]);
+			const [inbox, managed] = await Promise.all([api.albums('inbox'), api.albums('library')]);
+			// The open album has left the grids (renamed, imported or removed
+			// elsewhere) while its tags have unsaved edits: the sheet stays on it.
+			const gone = (id: string) =>
+				!inbox.some((a) => a.id === id) && !managed.some((a) => a.id === id);
+			// During a save it stays without a word: the save may be what moved it.
+			if (openId && draft !== 'none' && !holding && openId !== importingHere && gone(openId))
+				hold(null, draft === 'draft');
+			[albums, library] = [inbox, managed];
 			lastAlbums = Date.now();
 		} catch {
 			toast('Could not reach coversyncd', 'error');
 		}
 		loaded = true;
+	}
+	let albumsLoading: Promise<void> | null = null;
+	let albumsNext: Promise<void> | null = null;
+	/**
+	 * Reload both grids. Asked again while a reload runs, which may have been
+	 * answered before the change, one more follows it (just one, however often
+	 * it's asked), so the albums shown last are always the newest.
+	 */
+	function loadAlbums(): Promise<void> {
+		if (!albumsLoading)
+			return (albumsLoading = fetchAlbums().finally(() => (albumsLoading = null)));
+		return (albumsNext ??= albumsLoading.then(() => {
+			albumsNext = null;
+			return loadAlbums();
+		}));
 	}
 
 	// New rules or folder structure change which albums need attention.
@@ -454,6 +526,24 @@
 		await loadAlbums();
 		dataGeneration++;
 	}
+	/** A scan ended: show what it found. */
+	function scanFinished() {
+		dataGeneration++;
+		// The Inbox folder may have come or gone; the empty Inbox's message says which.
+		inboxSetup.load();
+		return loadAlbums();
+	}
+
+	/** While a scan runs, the grids reload about this often, so albums appear as it reads them. */
+	const SCAN_RELOAD_MS = 4000;
+	/**
+	 * The daemon's change notices are arriving, so polling is only a safety
+	 * net. Without them, scans are polled for as before.
+	 */
+	let live = false;
+	const SAFETY_POLL_MS = 60_000;
+	/** The scan's progress as last pushed, which a poll answered before it mustn't undo. */
+	let pushedScan: Status['scan'] | null = null;
 	let pollTimer: ReturnType<typeof setTimeout>;
 	async function poll() {
 		clearTimeout(pollTimer);
@@ -461,16 +551,201 @@
 		if (session.state === 'out') return;
 		try {
 			const wasRunning = status?.scan.running ?? false;
-			status = await api.status();
-			if (wasRunning && !status.scan.running) {
-				dataGeneration++;
-				// The Inbox folder may have come or gone; the empty Inbox's message says which.
-				inboxSetup.load();
-			}
-			if (status.scan.running ? Date.now() - lastAlbums > 4000 : wasRunning) await loadAlbums();
+			const pushed = pushedScan;
+			const fresh = await api.status();
+			firstCounters ??= { library: fresh.library, inbox: fresh.inbox };
+			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
+			if (wasRunning && !status.scan.running) await scanFinished();
+			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
 		} catch {}
-		pollTimer = setTimeout(poll, status?.scan.running ? 1500 : 10000);
+		// Only one poll waits at a time, even when two ran at once.
+		clearTimeout(pollTimer);
+		pollTimer = setTimeout(poll, live ? SAFETY_POLL_MS : status?.scan.running ? 1500 : 10000);
 	}
+
+	type Counters = Pick<Status, 'library' | 'inbox'>;
+	/** The change counters as the page's first reads found them. */
+	let firstCounters: Counters | null = null;
+	let firstReads: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * The stream first opened after the page's first reads: catch up if the
+	 * Inbox or Library changed in between. (Saved setups aren't counted; the
+	 * gap is short.)
+	 */
+	async function onfirst() {
+		await firstReads;
+		const now = await api.status().catch(() => null);
+		const before = firstCounters;
+		const moved =
+			!now ||
+			!before ||
+			now.inbox.generation !== before.inbox.generation ||
+			now.library?.id !== before.library?.id ||
+			now.library?.generation !== before.library?.generation;
+		if (moved) resync();
+	}
+
+	function onlive(up: boolean) {
+		if (up === live) return;
+		live = up;
+		// Down: poll again straight away. Up: the safety poll takes over after a resync.
+		if (!up) poll();
+	}
+
+	/** The open album's id as of the latest notice (a held sheet's album may have a new one). */
+	const openNow = () => holding?.next ?? openId;
+
+	/**
+	 * Keep the sheet on the open album as it shows it now, with its unsaved
+	 * edits, and say it changed elsewhere (unless not `changed`, yet). `next` is
+	 * the album's id now, if known.
+	 */
+	function hold(next: string | null, changed = true) {
+		if (!openId || !sheetAlbum) return;
+		held = {
+			from: openId,
+			next: next ?? holding?.next ?? null,
+			album: sheetAlbum,
+			detail: sheetDetail,
+			changed
+		};
+	}
+
+	function ondraft(next: Draft) {
+		// A save failed, and the album moved meanwhile (the sheet stayed for it): say so now.
+		if (draft === 'saving' && next === 'draft' && holding && !holding.changed) hold(holding.next);
+		draft = next;
+	}
+
+	/**
+	 * Show the open album as it is now, under its new id `to` if it has one,
+	 * once its tracks and the grids (`grids`) have both caught up. The sheet
+	 * stays as it is meanwhile, rather than closing while neither has the new
+	 * id. Unless `discard`, edits begun meanwhile hold the sheet instead, and a
+	 * save begun meanwhile replaces the album itself. Returns false if the
+	 * album is gone.
+	 */
+	async function followOpen(to: string, grids: Promise<void>, discard = false): Promise<boolean> {
+		const from = openId;
+		if (!from || !sheetAlbum) return true;
+		// Where a follow under way was taking the sheet.
+		const via = holding?.next;
+		const gen = ++detailGen;
+		if (to !== from)
+			held = { from, next: to, album: sheetAlbum, detail: sheetDetail, changed: false };
+		const [fresh] = await Promise.all([api.album(to).catch(() => null), grids]);
+		// The user opened another album, or a newer load or a save took over.
+		if ((openId !== from && openId !== via) || gen !== detailGen) return true;
+		if (!discard && draft === 'saving') return true;
+		if (!discard && draft === 'draft') {
+			hold(to);
+			return true;
+		}
+		const shown = $state.snapshot(sheetDetail);
+		if (!fresh || to === from) held = null;
+		if (!fresh) return false;
+		// Unchanged (after this page's own save, say): the editor is left be.
+		if (!discard && to === openId && sameJson(fresh, shown)) return true;
+		detail = fresh;
+		if (openId !== to)
+			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
+		return true;
+	}
+
+	/**
+	 * After notices were missed, a sheet with unsaved edits stays as it is,
+	 * but says so if its album changed meanwhile.
+	 */
+	async function holdIfChanged(id: string) {
+		const from = openId;
+		const shown = $state.snapshot(sheetDetail);
+		if (!shown) return;
+		const fresh = await api.album(id).catch(() => null);
+		if (openId !== from || draft !== 'draft' || holding?.changed) return;
+		if (!fresh || !sameJson(fresh, shown)) hold(fresh ? id : null);
+	}
+
+	/** The open album changed elsewhere and is now `to`: follow it, unless that would lose edits. */
+	function openChanged(to: string, grids: Promise<void>) {
+		// A save under way replaces the album once it's done; if it fails, its
+		// edits become a draft again.
+		if (draft === 'saving') return;
+		if (draft === 'draft') hold(to);
+		else followOpen(to, grids);
+	}
+
+	/** Drop the held sheet's unsaved edits and show its album as it is now. */
+	async function reloadHeld() {
+		const h = holding;
+		if (!h || (await followOpen(h.next ?? h.from, loadAlbums(), true))) return;
+		// Its new id isn't known when the notice was missed (a hidden tab, the stream down).
+		toast('This album was renamed, imported or removed elsewhere', 'info');
+		await close();
+	}
+
+	/** An album was edited, here or elsewhere: show it as it is now. */
+	function albumChanged({ id, previous_id, collection }: Notices['album_changed']) {
+		// The Inbox's tag coverage, which Library setup shows, may have changed.
+		if (collection === 'inbox') dataGeneration++;
+		const grids = loadAlbums();
+		const open = openNow();
+		if (open !== null && (open === id || open === previous_id)) openChanged(id, grids);
+	}
+
+	/** Reload everything: notices were missed, or the stream has just come back. */
+	function resync() {
+		poll();
+		appearance.refresh();
+		syncSetup.load();
+		setup.refresh();
+		inboxSetup.load();
+		dataGeneration++;
+		const grids = loadAlbums();
+		const open = openNow();
+		if (open && draft === 'none') followOpen(open, grids);
+		// Unless its album is gone (see fetchAlbums), or changed:
+		else if (open && draft === 'draft' && !holding?.changed) holdIfChanged(open);
+	}
+
+	/** What each change notice reloads. */
+	const notices: NoticeHandlers = {
+		scan(scan) {
+			pushedScan = scan;
+			// Until the first poll answers, it's kept for that (see poll).
+			if (status) status = { ...status, scan };
+			// Albums appear in the grids as the scan reads their tags.
+			if (!albumsLoading && Date.now() - lastAlbums > SCAN_RELOAD_MS) loadAlbums();
+		},
+		scan_finished(scan) {
+			pushedScan = scan;
+			if (status) status = { ...status, scan };
+			scanFinished();
+		},
+		imported({ album_id, inbox_id }) {
+			// Copies hide the Inbox files, which Inbox setup counts.
+			inboxSetup.load();
+			const grids = inboxChanged();
+			const open = openNow();
+			// An import made here closes its sheet itself.
+			if (open === inbox_id && inbox_id !== importingHere) openChanged(album_id, grids);
+			// Tracks added to a Library album that's open.
+			else if (open === album_id) openChanged(album_id, grids);
+		},
+		album_changed: albumChanged,
+		setup_saved({ setup: saved }) {
+			// Each can change which albums need attention, or what sorts and filters show.
+			if (saved === 'library') setup.refresh();
+			else if (saved === 'inbox') {
+				// Hidden files may be back in the Inbox.
+				inboxSetup.load();
+				dataGeneration++;
+			} else if (saved === 'appearance') appearance.refresh();
+			else return syncSetup.load();
+			loadAlbums();
+		},
+		resync
+	};
 
 	// Right-click menu on album cards.
 	let menu = $state<{ album: Album; x: number; y: number } | null>(null);
@@ -527,6 +802,8 @@
 		}
 	}
 
+	/** The Inbox album this page is importing, whose sheet it closes itself. */
+	let importingHere: string | null = null;
 	/** Returns an error message, or null when the album was imported. */
 	/** `autofilled`: kinds autofill sets, mentioned in the success toast. */
 	async function runImport(
@@ -538,6 +815,7 @@
 		musicbrainzArt?: string
 	): Promise<string | null> {
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
+		importingHere = album.id;
 		try {
 			const r = await api.importAlbum(album.id, edits, art, musicbrainzArt);
 			importing = null;
@@ -567,6 +845,7 @@
 			if (!importing) toast(message, 'error', 8000, fixAction(message));
 			return message;
 		} finally {
+			importingHere = null;
 			dismiss(working);
 		}
 	}
@@ -616,17 +895,21 @@
 		filters[browsing] = {};
 	}
 
-	/** What the page needs from the daemon. Setups that have loaded aren't asked again (they may hold unsaved edits). */
+	/**
+	 * What the page needs from the daemon. Setups that have loaded aren't asked
+	 * again (they may hold unsaved edits).
+	 */
 	function loadAll() {
-		if (!appearance.loaded) appearance.load();
+		// First, so the change counters it reads are no newer than the albums.
+		const reads: Promise<unknown>[] = [poll()];
+		if (!appearance.loaded) reads.push(appearance.load());
 		// Whether the sidebar shows its Sync section.
-		if (!syncSetup.loaded) syncSetup.load();
+		if (!syncSetup.loaded) reads.push(syncSetup.load());
 		// Whether an Inbox folder is set, for the empty Inbox's message.
-		if (!inboxSetup.loaded) inboxSetup.load();
+		if (!inboxSetup.loaded) reads.push(inboxSetup.load());
 		// Tag labels for attention badges (loaded once).
-		setup.load();
-		loadAlbums();
-		poll();
+		reads.push(setup.load(), loadAlbums());
+		return Promise.all(reads);
 	}
 
 	// Signed back in after the session ended: whatever was asked for meanwhile failed.
@@ -634,8 +917,17 @@
 		if (session.generation > 0) untrack(loadAll);
 	});
 
+	let listening: Listening | undefined;
+	// Signed out, the stream would only be refused: it waits, and catches up
+	// once signed back in.
+	$effect(() => {
+		const out = session.state === 'out';
+		untrack(() => (out ? listening?.pause() : listening?.resume()));
+	});
+
 	onMount(() => {
-		loadAll();
+		firstReads = loadAll();
+		listening = listen(notices, onlive, onfirst);
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;
@@ -643,6 +935,7 @@
 		};
 		mq.addEventListener('change', onchange);
 		return () => {
+			listening?.stop();
 			clearTimeout(pollTimer);
 			mq.removeEventListener('change', onchange);
 		};
@@ -652,7 +945,7 @@
 <svelte:window {onkeydown} />
 
 <!-- The page under an open album: inert, and blurred (see .behind). -->
-<div class="page" class:behind={!!openAlbum} inert={!!openAlbum}>
+<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum}>
 	<TopBar
 		bind:query
 		bind:search
@@ -855,16 +1148,19 @@
 	></button>
 {/if}
 
-{#if openAlbum}
+{#if sheetAlbum}
 	<AlbumDetail
-		album={openAlbum}
-		detail={detail?.id === openAlbum.id ? detail : null}
-		allowWrites={openAlbum.collection === 'library' || (status?.allow_writes ?? false)}
+		album={sheetAlbum}
+		detail={sheetDetail}
+		allowWrites={sheetAlbum.collection === 'library' || (status?.allow_writes ?? false)}
 		onclose={close}
 		{onsaved}
-		onimport={openAlbum.collection === 'inbox'
-			? (edits) => startImport(openAlbum!, edits)
+		onimport={sheetAlbum.collection === 'inbox'
+			? (edits) => startImport(sheetAlbum!, edits)
 			: undefined}
+		changed={holding?.changed ?? false}
+		onreload={reloadHeld}
+		{ondraft}
 	/>
 {/if}
 

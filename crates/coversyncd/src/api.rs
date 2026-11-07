@@ -25,11 +25,13 @@ use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use crate::events::{Notice, Setup};
 use crate::{Shared, spawn_scan};
 
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/api/status", get(status))
+        .route("/api/events", get(crate::events::stream))
         .route("/api/rescan", post(rescan))
         .route("/api/albums", get(albums))
         .route("/api/albums/{id}", get(album))
@@ -63,6 +65,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -332,6 +335,9 @@ async fn save_library_setup(
         spawn_scan(state.clone());
     }
     let (response, _) = result?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Library,
+    });
     Ok(Json(response))
 }
 
@@ -430,6 +436,9 @@ async fn save_inbox_setup(
         Ok((inbox_response(s, saved)?, moved))
     })
     .await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Inbox,
+    });
     if moved {
         spawn_scan(state.clone());
     }
@@ -443,15 +452,18 @@ struct UnhideResult {
 }
 
 async fn unhide_all(State(state): State<Shared>) -> ApiResult<Json<UnhideResult>> {
-    blocking(&state, |s| {
+    let result = blocking(&state, |s| {
         let unhidden = s.lib.unhide_all()?;
         Ok(UnhideResult {
             unhidden,
             hidden: s.lib.hidden_stats()?,
         })
     })
-    .await
-    .map(Json)
+    .await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Inbox,
+    });
+    Ok(Json(result))
 }
 
 #[derive(Serialize)]
@@ -487,9 +499,11 @@ async fn save_appearance(
     State(state): State<Shared>,
     Json(setup): Json<AppearanceSetup>,
 ) -> ApiResult<Json<AppearanceResponse>> {
-    blocking(&state, move |s| s.lib.set_appearance(setup))
-        .await
-        .map(appearance_response)
+    let saved = blocking(&state, move |s| s.lib.set_appearance(setup)).await?;
+    state.events.publish(Notice::SetupSaved {
+        setup: Setup::Appearance,
+    });
+    Ok(appearance_response(saved))
 }
 
 #[derive(Serialize)]
@@ -507,9 +521,11 @@ async fn save_sync_setup(
     State(state): State<Shared>,
     Json(setup): Json<SyncSetup>,
 ) -> ApiResult<Json<SyncSetupResponse>> {
-    blocking(&state, move |s| s.lib.set_sync_setup(setup))
-        .await
-        .map(|setup| Json(SyncSetupResponse { setup }))
+    let setup = blocking(&state, move |s| s.lib.set_sync_setup(setup)).await?;
+    state
+        .events
+        .publish(Notice::SetupSaved { setup: Setup::Sync });
+    Ok(Json(SyncSetupResponse { setup }))
 }
 
 #[derive(Deserialize)]
@@ -672,6 +688,7 @@ async fn import_album(
     Json(req): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportResult>> {
     let _guard = state.jobs.lock().await;
+    let inbox_id = req.album_id.clone();
     let result = blocking(&state, move |s| {
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
@@ -697,7 +714,12 @@ async fn import_album(
     })
     .await;
     crate::release_memory();
-    result.map(Json)
+    let imported = result?;
+    state.events.publish(Notice::Imported {
+        album_id: imported.album_id.clone(),
+        inbox_id,
+    });
+    Ok(Json(imported))
 }
 
 #[derive(Deserialize)]
@@ -834,6 +856,7 @@ async fn write_tags(
     let _guard = state.jobs.lock().await;
     // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
     let lookup = id.clone();
+    let previous_id = id.clone();
     let in_library = blocking(&state, move |s| {
         Ok(s.lib
             .album(&lookup)?
@@ -907,12 +930,161 @@ async fn write_tags(
     })
     .await?;
     crate::release_memory();
+    state.events.publish(Notice::AlbumChanged {
+        id: result.album_id.clone(),
+        previous_id: (result.album_id != previous_id).then_some(previous_id),
+        collection: if in_library {
+            Collection::Library
+        } else {
+            Collection::Inbox
+        },
+    });
     Ok(Json(result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as FsPath;
+
+    /// A FLAC file with no audio, only these Vorbis comments.
+    fn flac(path: &FsPath, comments: &[&str]) {
+        let mut b = b"fLaC".to_vec();
+        // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+        b.extend([0, 0, 0, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        let mut block = Vec::new();
+        block.extend(9u32.to_le_bytes());
+        block.extend(b"coversync");
+        block.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            block.extend((c.len() as u32).to_le_bytes());
+            block.extend(c.as_bytes());
+        }
+        // The last block: VORBIS_COMMENT.
+        b.push(0x80 | 4);
+        b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+        b.extend(block);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// A daemon's state over an Inbox holding one album and an empty Library
+    /// folder, scanned; and the Inbox album's id.
+    fn daemon(name: &str) -> (Shared, String) {
+        let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inbox = dir.join("inbox");
+        flac(
+            &inbox.join("Artist/Record/01.flac"),
+            &[
+                "TITLE=Song",
+                "ARTIST=Artist",
+                "ALBUMARTIST=Artist",
+                "ALBUM=Record",
+                "TRACKNUMBER=1",
+            ],
+        );
+        std::fs::create_dir_all(dir.join("library")).unwrap();
+        let state = crate::test_state(&dir);
+        state
+            .lib
+            .set_inbox_setup(InboxSetup {
+                folder: Some(inbox.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .lib
+            .set_library_setup(LibrarySetup {
+                folder: Some(dir.join("library").display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        let albums = state
+            .lib
+            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        let id = albums[0].id.clone();
+        (state, id)
+    }
+
+    fn edit(album: TagEdit) -> Json<TagWrite> {
+        Json(TagWrite {
+            album,
+            tracks: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn imports_and_edits_are_published() {
+        let (state, inbox_id) = daemon("notices");
+        let mut heard = state.events.subscribe();
+
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        match heard.try_recv().unwrap() {
+            Notice::Imported {
+                album_id,
+                inbox_id: from,
+            } => {
+                assert_eq!(album_id, imported.album_id);
+                assert_eq!(from, inbox_id);
+                assert_ne!(album_id, inbox_id);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // An edit that keeps the album's id comes with no previous id.
+        let genre = TagEdit {
+            genre: Some("Rock".into()),
+            ..Default::default()
+        };
+        let path = Path(imported.album_id.clone());
+        let Json(kept) = write_tags(State(state.clone()), path, edit(genre))
+            .await
+            .unwrap();
+        assert_eq!(kept.album_id, imported.album_id);
+        match heard.try_recv().unwrap() {
+            Notice::AlbumChanged {
+                id,
+                previous_id,
+                collection,
+            } => {
+                assert_eq!(id, imported.album_id);
+                assert_eq!(previous_id, None);
+                assert_eq!(collection, Collection::Library);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A new album title gives the album a new id, and the old one comes along.
+        let title = TagEdit {
+            album: Some("Another record".into()),
+            ..Default::default()
+        };
+        let path = Path(imported.album_id.clone());
+        let Json(renamed) = write_tags(State(state.clone()), path, edit(title))
+            .await
+            .unwrap();
+        assert_ne!(renamed.album_id, imported.album_id);
+        match heard.try_recv().unwrap() {
+            Notice::AlbumChanged {
+                id, previous_id, ..
+            } => {
+                assert_eq!(id, renamed.album_id);
+                assert_eq!(previous_id.as_deref(), Some(imported.album_id.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(heard.try_recv().is_err());
+    }
 
     #[test]
     fn only_current_cover_renderings_are_kept() {
