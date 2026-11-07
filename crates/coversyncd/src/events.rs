@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::HeaderName;
-use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use coversync_core::{Collection, ScanProgress};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::Serialize;
@@ -146,14 +146,23 @@ impl Events {
 
 /// `GET /api/events`: notices as server-sent events, for as long as the
 /// client stays.
-pub async fn stream(State(state): State<Shared>) -> impl IntoResponse {
+pub async fn stream(State(state): State<Shared>) -> Response {
+    respond(&state.events)
+}
+
+fn respond(events: &Events) -> Response {
+    // A comment goes out first: Firefox only reports a stream open once
+    // some of its body has arrived, and the first notice or ping could be
+    // 20 s away.
+    let hello = stream::iter([Event::default().comment("coversyncd")]);
+    let events = hello.chain(events.listen()).map(Ok::<_, Infallible>);
     let ping = Event::default().event("ping").data("{}");
-    let events = state.events.listen().map(Ok::<_, Infallible>);
     (
         // Caddy passes event streams on as they come; nginx needs telling.
         [(HeaderName::from_static("x-accel-buffering"), "no")],
         Sse::new(events).keep_alive(KeepAlive::new().interval(PING).event(ping)),
     )
+        .into_response()
 }
 
 /// Publish a running scan's progress whenever it has moved on, about once a
@@ -186,12 +195,12 @@ mod tests {
         Notice::SetupSaved { setup }
     }
 
-    /// What a client listening from now on is sent, as it goes over the wire.
-    fn listen(events: &Events) -> BodyDataStream {
-        Sse::new(events.listen().map(Ok::<_, Infallible>))
-            .into_response()
-            .into_body()
-            .into_data_stream()
+    /// What a client listening from now on is sent, as it goes over the
+    /// wire, after the comment every stream starts with.
+    async fn listen(events: &Events) -> BodyDataStream {
+        let mut sent = respond(events).into_body().into_data_stream();
+        assert_eq!(next(&mut sent).await.unwrap(), ": coversyncd\n\n");
+        sent
     }
 
     async fn next(sent: &mut BodyDataStream) -> Option<String> {
@@ -225,7 +234,7 @@ mod tests {
     async fn listeners_hear_notices_published_after_they_start() {
         let events = Events::default();
         events.publish(setup_saved(Setup::Library));
-        let mut sent = listen(&events);
+        let mut sent = listen(&events).await;
         events.publish(setup_saved(Setup::Sync));
         assert_eq!(
             next(&mut sent).await.unwrap(),
@@ -236,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn a_listener_that_falls_behind_is_told_to_resync() {
         let events = Events::default();
-        let mut sent = listen(&events);
+        let mut sent = listen(&events).await;
         for _ in 0..BACKLOG + 10 {
             events.publish(setup_saved(Setup::Appearance));
         }
@@ -250,10 +259,10 @@ mod tests {
     #[tokio::test]
     async fn closing_ends_every_stream() {
         let events = Events::default();
-        let mut open = listen(&events);
+        let mut open = listen(&events).await;
         events.close();
         assert_eq!(next(&mut open).await, None);
-        let mut opened_after = listen(&events);
+        let mut opened_after = listen(&events).await;
         assert_eq!(next(&mut opened_after).await, None);
     }
 }
