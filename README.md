@@ -147,6 +147,19 @@ so the folder alone holds every change. One coversyncd at a time should use
 a Library folder, and anything that syncs the folder elsewhere (a backup, a
 sync tool) can copy `.coversync` along with it.
 
+The database also gives the Library a random id and a change counter, which
+`/api/status` reports. The counter goes up once for each batch of changes
+coversyncd commits: an import, a tag edit, or a scan that finds files added,
+changed or removed (a large scan or import commits in several batches). The
+tracks each batch wrote, and the files it removed, carry the new value. There
+is no endpoint yet to ask for the changes since a given value; that comes
+with sync. If a Library's counter is ever lower than the highest one this
+installation has seen it reach, as when its folder is restored from an older
+backup, coversyncd gives it a new id, so clients that knew the later state
+start over rather than trust it. A Library moved to another installation
+keeps its id. An older coversyncd still opens a database a newer one has
+upgraded, and the changes it makes are counted too.
+
 ### As a systemd user service
 
 The Arch package installs this unit, with `/usr/bin/coversyncd`.

@@ -73,6 +73,9 @@ export interface Status {
 	version: string;
 	allow_writes: boolean;
 	scan: ScanProgress;
+	/** null while no Library folder is set up. */
+	library: { id: string; generation: number } | null;
+	inbox: { generation: number };
 }
 
 export type TagField =
