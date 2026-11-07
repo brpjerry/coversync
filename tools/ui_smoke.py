@@ -793,34 +793,44 @@ def auth_flow(d, out, tag):
     d.click(".cell:first-child .cover")
     d.wait("return !!document.querySelector('.tracks li')")
     time.sleep(1.2)
-    d.click(".actions .btn.primary")
-    d.wait("return !!document.querySelector('.player')")
-    time.sleep(2)
-    play = ".player button.main"
-    d.click(play)
-    d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
-    d.wait("return !document.querySelector('.sheet')")
-    time.sleep(0.8)
-    d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
-    d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
-    # Seek well ahead under the login view, past what was fetched: refused.
-    d.js("const s = document.querySelector('.player [role=slider]');"
-         "for (let i = 0; i < 30; i++) s.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))")
-    time.sleep(1.5)
-    sign_in(d)
-    time.sleep(0.5)
+    # The seek below goes 150s in, and playing on is watched for a few more.
+    long_track = d.js("return [...document.querySelectorAll('.tracks li .row')].findIndex(row =>"
+                      " row.querySelector('.dur').textContent.trim().split(':')"
+                      ".reduce((n, part) => n * 60 + Number(part), 0) >= 180)")
+    if long_track < 0:
+        print("  skip: replaying a refused stream needs a track of 3 minutes or more on this album")
+        d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        d.wait("return !document.querySelector('.sheet')")
+        time.sleep(0.8)
+    else:
+        d.js("document.querySelectorAll('.tracks li .row')[arguments[0]].click()", long_track)
+        d.wait("return !!document.querySelector('.player')")
+        time.sleep(2)
+        play = ".player button.main"
+        d.click(play)
+        d.js("window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        d.wait("return !document.querySelector('.sheet')")
+        time.sleep(0.8)
+        d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
+        d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
+        # Seek well ahead under the login view, past what was fetched: refused.
+        d.js("const s = document.querySelector('.player [role=slider]');"
+             "for (let i = 0; i < 30; i++) s.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))")
+        time.sleep(1.5)
+        sign_in(d)
+        time.sleep(0.5)
 
-    def position():
-        m, s = d.js("return document.querySelector('.player .t').textContent").split(":")
-        return int(m) * 60 + int(s)
+        def position():
+            shown = d.js("return document.querySelector('.player .t').textContent").strip()
+            return sum(int(p) * 60 ** i for i, p in enumerate(reversed(shown.split(":"))))
 
-    before = position()
-    d.click(play)
-    time.sleep(3)
-    check(d.js(f"return document.querySelector('{play}').getAttribute('aria-label')") == "Pause"
-          and position() > before >= 60,
-          f"Play after signing back in plays on from {before}s (now {position()}s)")
-    d.click(play)
+        before = position()
+        d.click(play)
+        time.sleep(3)
+        check(d.js(f"return document.querySelector('{play}').getAttribute('aria-label')") == "Pause"
+              and position() > before >= 60,
+              f"Play after signing back in plays on from {before}s (now {position()}s)")
+        d.click(play)
 
     # Signing out asks first while a setup screen has unsaved changes.
     d.open_setup("Appearance")

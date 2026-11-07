@@ -28,8 +28,9 @@ const CLIENT: Rate = Rate {
     burst: 5.0,
     per_second: 1.0 / 60.0,
 };
-/// Twenty failures from anywhere, then one every six seconds, before each
-/// failure costs its client every try it has left.
+/// Twenty failures from anywhere, then one every six seconds. While it is
+/// empty, each try taken (not only each failure) costs its client every try
+/// it has left; a right password gets one back.
 const OVERALL: Rate = Rate {
     burst: 20.0,
     per_second: 1.0 / 6.0,
