@@ -1,7 +1,7 @@
 //! The desktop app's local proxy.
 //!
 //! The app's window loads the server's UI from this proxy, which listens on
-//! 127.0.0.1 on a random port and forwards every request to the server:
+//! 127.0.0.1 on a port of its own and forwards every request to the server:
 //!
 //! - Bodies stream both ways as they arrive, so covers, audio (and its `Range`
 //!   seeks), uploads and server-sent events pass through untouched, and
@@ -218,7 +218,7 @@ impl Proxy {
         Builder::default()
     }
 
-    /// The address it listens on, 127.0.0.1 and a random port.
+    /// The address it listens on: 127.0.0.1 and its port.
     pub fn addr(&self) -> SocketAddr {
         self.shared.addr
     }
