@@ -10,10 +10,11 @@
 //! still alive.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::HeaderName;
+use axum::http::{HeaderMap, HeaderName};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use coversync_core::{Collection, ScanProgress};
@@ -151,17 +152,34 @@ impl Events {
 }
 
 /// `GET /api/events`: notices as server-sent events, for as long as the
-/// client stays.
-pub async fn stream(State(state): State<Shared>) -> Response {
-    respond(&state.events)
+/// client stays and its login lasts.
+pub async fn stream(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let events = &state.events;
+    respond(events, signed_out(state.clone(), headers))
 }
 
-fn respond(events: &Events) -> Response {
+/// Resolves once the login a stream was opened with has ended, as checked
+/// every [`PING`]: the stream then ends too, rather than going on telling
+/// a browser that has signed out.
+async fn signed_out(state: Shared, headers: HeaderMap) {
+    loop {
+        tokio::time::sleep(PING).await;
+        if !crate::auth::still_valid(&state, &headers).await {
+            return;
+        }
+    }
+}
+
+/// The event stream for a client listening from now on, until `ended`.
+fn respond(events: &Events, ended: impl Future<Output = ()> + Send + 'static) -> Response {
     // A comment goes out first: Firefox only reports a stream open once
     // some of its body has arrived, and the first notice or ping could be
     // 20 s away.
     let hello = stream::iter([Event::default().comment("coversyncd")]);
-    let events = hello.chain(events.listen()).map(Ok::<_, Infallible>);
+    let events = hello
+        .chain(events.listen())
+        .take_until(ended)
+        .map(Ok::<_, Infallible>);
     let ping = Event::default().event("ping").data("{}");
     (
         // Caddy passes event streams on as they come; nginx needs telling.
@@ -204,7 +222,9 @@ mod tests {
     /// What a client listening from now on is sent, as it goes over the
     /// wire, after the comment every stream starts with.
     async fn listen(events: &Events) -> BodyDataStream {
-        let mut sent = respond(events).into_body().into_data_stream();
+        let mut sent = respond(events, std::future::pending())
+            .into_body()
+            .into_data_stream();
         assert_eq!(next(&mut sent).await.unwrap(), ": coversyncd\n\n");
         sent
     }
@@ -270,5 +290,26 @@ mod tests {
         assert_eq!(next(&mut open).await, None);
         let mut opened_after = listen(&events).await;
         assert_eq!(next(&mut opened_after).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_stream_ends_when_its_login_does() {
+        let events = Events::default();
+        let (signed_out, ended) = tokio::sync::oneshot::channel::<()>();
+        let mut sent = respond(&events, async {
+            let _ = ended.await;
+        })
+        .into_body()
+        .into_data_stream();
+        assert_eq!(next(&mut sent).await.unwrap(), ": coversyncd\n\n");
+        events.publish(setup_saved(Setup::Sync));
+        assert!(
+            next(&mut sent)
+                .await
+                .unwrap()
+                .starts_with("event: setup_saved\n")
+        );
+        signed_out.send(()).unwrap();
+        assert_eq!(next(&mut sent).await, None);
     }
 }

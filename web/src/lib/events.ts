@@ -24,6 +24,15 @@ export interface Notices {
 
 export type NoticeHandlers = { [K in keyof Notices]?: (notice: Notices[K]) => void };
 
+export interface Listening {
+	/** Close the stream for good. */
+	stop(): void;
+	/** Close it until `resume` (while signed out, say), without telling `onlive`. */
+	pause(): void;
+	/** Open it again, catching up on what was missed. */
+	resume(): void;
+}
+
 const NAMES = [
 	'scan',
 	'scan_finished',
@@ -50,7 +59,7 @@ const RETRY_MAX_MS = 10_000;
 const HIDDEN_MS = 10_000;
 
 /**
- * Listen for notices until the returned function is called. When the stream
+ * Listen for notices until told to stop. When the stream
  * drops (the daemon restarted, the network went), it's opened again after a
  * growing delay. `onlive` hears each time the stream comes up or goes down,
  * and `resync` is called whenever it comes back up, as notices sent while it
@@ -63,7 +72,7 @@ export function listen(
 	handlers: NoticeHandlers,
 	onlive: (live: boolean) => void,
 	onfirst?: () => void
-): () => void {
+): Listening {
 	let source: EventSource | null = null;
 	let retry: ReturnType<typeof setTimeout> | undefined;
 	let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -71,7 +80,11 @@ export function listen(
 	let away: ReturnType<typeof setTimeout> | undefined;
 	/** It has been down since the page loaded, so notices may have been missed. */
 	let dropped = false;
-	/** Closed while the page is hidden. */
+	/** The page has been hidden a while. */
+	let hidden = false;
+	/** Paused by the page. */
+	let held = false;
+	/** Closed for one of those, rather than down. */
 	let paused = false;
 	let opened = false;
 	let stopped = false;
@@ -128,28 +141,49 @@ export function listen(
 		delay = Math.min(delay * 2, RETRY_MAX_MS);
 	}
 
-	function pause() {
-		close();
-		paused = dropped = true;
-	}
-
-	function onvisibility() {
-		clearTimeout(away);
-		if (document.hidden) away = setTimeout(pause, HIDDEN_MS);
-		else if (paused) {
+	/** Close or open the stream as the page is hidden or paused. */
+	function settle() {
+		if (hidden || held) {
+			if (paused) return;
+			close();
+			paused = dropped = true;
+		} else if (paused) {
 			paused = false;
 			delay = RETRY_MIN_MS;
 			connect();
 		}
 	}
 
-	document.addEventListener('visibilitychange', onvisibility);
-	if (document.hidden) pause();
-	else connect();
-	return () => {
-		stopped = true;
+	function onvisibility() {
 		clearTimeout(away);
-		document.removeEventListener('visibilitychange', onvisibility);
-		close();
+		if (!document.hidden) {
+			hidden = false;
+			settle();
+		} else
+			away = setTimeout(() => {
+				hidden = true;
+				settle();
+			}, HIDDEN_MS);
+	}
+
+	document.addEventListener('visibilitychange', onvisibility);
+	hidden = document.hidden;
+	if (hidden) paused = dropped = true;
+	else connect();
+	return {
+		stop() {
+			stopped = true;
+			clearTimeout(away);
+			document.removeEventListener('visibilitychange', onvisibility);
+			close();
+		},
+		pause() {
+			held = true;
+			settle();
+		},
+		resume() {
+			held = false;
+			settle();
+		}
 	};
 }

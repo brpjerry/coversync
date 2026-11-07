@@ -307,6 +307,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),
         uploads: Uploads::default(),
+        events: events::Events::default(),
     })
 }
 

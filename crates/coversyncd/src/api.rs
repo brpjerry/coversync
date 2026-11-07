@@ -999,7 +999,6 @@ async fn write_tags(
 mod tests {
     use super::*;
     use std::path::Path as FsPath;
-    use std::sync::Arc;
 
     /// A FLAC file with no audio, only these Vorbis comments.
     fn flac(path: &FsPath, comments: &[&str]) {
@@ -1042,29 +1041,21 @@ mod tests {
             ],
         );
         std::fs::create_dir_all(dir.join("library")).unwrap();
-        let lib = coversync_core::Library::open_in(&dir.join("state")).unwrap();
-        lib.set_inbox_setup(InboxSetup {
-            folder: Some(inbox.display().to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        lib.set_library_setup(LibrarySetup {
-            folder: Some(dir.join("library").display().to_string()),
-            ..Default::default()
-        })
-        .unwrap();
-        let state = Arc::new(crate::AppState {
-            lib,
-            covers: coversync_core::cover::CoverCache::new(dir.join("covers")).unwrap(),
-            mb_art: dir.join("musicbrainz"),
-            lookups: coversync_core::LookupCache::open_or_memory(&dir.join("lookups.sqlite3")),
-            progress: Progress::default(),
-            allow_writes: false,
-            jobs: tokio::sync::Mutex::new(()),
-            rescan: Default::default(),
-            identify: Default::default(),
-            events: Default::default(),
-        });
+        let state = crate::test_state(&dir);
+        state
+            .lib
+            .set_inbox_setup(InboxSetup {
+                folder: Some(inbox.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .lib
+            .set_library_setup(LibrarySetup {
+                folder: Some(dir.join("library").display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
         scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
         let albums = state
             .lib

@@ -429,6 +429,20 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
     }
 }
 
+/// Whether the credentials a request came with would still get it past the
+/// guard. A long request, such as an event stream, ends once they don't: its
+/// browser signed out, the password was reset, the device was revoked. When
+/// that can't be told (the database is busy, say), they're taken as good.
+pub async fn still_valid(state: &Shared, headers: &HeaderMap) -> bool {
+    let found = credentials(headers);
+    let s = state.clone();
+    let now = now();
+    match tokio::task::spawn_blocking(move || check(&s.auth.store, found, now)).await {
+        Ok(Ok(checked)) => checked.access.is_ok_and(|a| a.scope != Scope::Sync),
+        _ => true,
+    }
+}
+
 /// What a login was served may be kept by the browser only, never by a
 /// shared cache, which would hand it to requests without one. A response
 /// with no policy of its own is checked every time.
