@@ -55,9 +55,15 @@ const HIDDEN_MS = 10_000;
  * growing delay. `onlive` hears each time the stream comes up or goes down,
  * and `resync` is called whenever it comes back up, as notices sent while it
  * was down are lost. A hidden page closes the stream without telling
- * `onlive`, and opens it again (and resyncs) when it's shown.
+ * `onlive`, and opens it again (and resyncs) when it's shown. `onfirst` is
+ * called instead of `resync` when the stream first opens: only changes made
+ * since the page's first reads were missed, if any.
  */
-export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void): () => void {
+export function listen(
+	handlers: NoticeHandlers,
+	onlive: (live: boolean) => void,
+	onfirst?: () => void
+): () => void {
 	let source: EventSource | null = null;
 	let retry: ReturnType<typeof setTimeout> | undefined;
 	let watchdog: ReturnType<typeof setTimeout> | undefined;
@@ -67,6 +73,7 @@ export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void
 	let dropped = false;
 	/** Closed while the page is hidden. */
 	let paused = false;
+	let opened = false;
 	let stopped = false;
 
 	function watch() {
@@ -95,6 +102,8 @@ export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void
 			watch();
 			onlive(true);
 			if (dropped) handlers.resync?.({});
+			else if (!opened) onfirst?.();
+			opened = true;
 		};
 		// The browser would retry by itself, but not after an error response
 		// (a proxy's 502 while the daemon restarts), and without backing off.

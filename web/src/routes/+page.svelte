@@ -553,6 +553,7 @@
 			const wasRunning = status?.scan.running ?? false;
 			const pushed = pushedScan;
 			const fresh = await api.status();
+			firstCounters ??= { library: fresh.library, inbox: fresh.inbox };
 			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
 			if (wasRunning && !status.scan.running) await scanFinished();
 			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
@@ -560,6 +561,29 @@
 		// Only one poll waits at a time, even when two ran at once.
 		clearTimeout(pollTimer);
 		pollTimer = setTimeout(poll, live ? SAFETY_POLL_MS : status?.scan.running ? 1500 : 10000);
+	}
+
+	type Counters = Pick<Status, 'library' | 'inbox'>;
+	/** The change counters as the page's first reads found them. */
+	let firstCounters: Counters | null = null;
+	let firstReads: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * The stream first opened after the page's first reads: catch up if the
+	 * Inbox or Library changed in between. (Saved setups aren't counted; the
+	 * gap is short.)
+	 */
+	async function onfirst() {
+		await firstReads;
+		const now = await api.status().catch(() => null);
+		const before = firstCounters;
+		const moved =
+			!now ||
+			!before ||
+			now.inbox.generation !== before.inbox.generation ||
+			now.library?.id !== before.library?.id ||
+			now.library?.generation !== before.library?.generation;
+		if (moved) resync();
 	}
 
 	function onlive(up: boolean) {
@@ -871,17 +895,21 @@
 		filters[browsing] = {};
 	}
 
-	/** What the page needs from the daemon. Setups that have loaded aren't asked again (they may hold unsaved edits). */
+	/**
+	 * What the page needs from the daemon. Setups that have loaded aren't asked
+	 * again (they may hold unsaved edits).
+	 */
 	function loadAll() {
-		if (!appearance.loaded) appearance.load();
+		// First, so the change counters it reads are no newer than the albums.
+		const reads: Promise<unknown>[] = [poll()];
+		if (!appearance.loaded) reads.push(appearance.load());
 		// Whether the sidebar shows its Sync section.
-		if (!syncSetup.loaded) syncSetup.load();
+		if (!syncSetup.loaded) reads.push(syncSetup.load());
 		// Whether an Inbox folder is set, for the empty Inbox's message.
-		if (!inboxSetup.loaded) inboxSetup.load();
+		if (!inboxSetup.loaded) reads.push(inboxSetup.load());
 		// Tag labels for attention badges (loaded once).
-		setup.load();
-		loadAlbums();
-		poll();
+		reads.push(setup.load(), loadAlbums());
+		return Promise.all(reads);
 	}
 
 	// Signed back in after the session ended: whatever was asked for meanwhile failed.
@@ -890,8 +918,8 @@
 	});
 
 	onMount(() => {
-		loadAll();
-		const stop = listen(notices, onlive);
+		firstReads = loadAll();
+		const stop = listen(notices, onlive, onfirst);
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;

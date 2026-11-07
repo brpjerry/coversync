@@ -165,7 +165,7 @@
 
 		<div class="body">
 			{#if changed}
-				<p class="changed" role="status" transition:slide={{ duration: 200 }}>
+				<p class="elsewhere" role="status" transition:slide={{ duration: 200 }}>
 					<CircleAlert size={15} strokeWidth={2.2} />
 					<span>This album was changed elsewhere while you were editing it.</span>
 					<button class="link" title="Your edits here are dropped" onclick={() => onreload?.()}>
@@ -430,7 +430,7 @@
 		padding: 8px 32px 36px;
 		min-height: 200px;
 	}
-	.changed {
+	.elsewhere {
 		display: flex;
 		align-items: center;
 		gap: 10px;
@@ -442,11 +442,11 @@
 		background: var(--warn-surface);
 		border: 1px solid var(--warn-border);
 	}
-	.changed :global(svg) {
+	.elsewhere :global(svg) {
 		flex: none;
 		color: var(--warn);
 	}
-	.changed .link {
+	.elsewhere .link {
 		margin-left: auto;
 		padding: 4px 10px;
 		border-radius: 999px;
@@ -456,7 +456,7 @@
 		white-space: nowrap;
 		transition: background 140ms;
 	}
-	.changed .link:hover {
+	.elsewhere .link:hover {
 		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.disc {
