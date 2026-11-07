@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>coversync</title>
+		<link rel="icon" href="logo.svg" />
+		<link rel="stylesheet" href="fallback.css" />
+		<script src="fallback.js" defer></script>
+	</head>
+	<body>
+		<main>
+			<img class="logo" src="logo.svg" alt="" width="56" height="56" />
+			<h1 id="title">coversync</h1>
+			<div id="problem" class="problem" hidden>
+				<p id="message"></p>
+				<p id="detail" class="detail" hidden></p>
+			</div>
+			<div id="retry-row" class="row" hidden>
+				<button id="retry" type="button" class="primary">Try again</button>
+			</div>
+			<form id="form">
+				<label for="server">Server address</label>
+				<div class="row">
+					<input
+						id="server"
+						type="text"
+						inputmode="url"
+						placeholder="https://coversync.example.com/"
+						autocomplete="url"
+						autocapitalize="off"
+						spellcheck="false"
+						required
+					/>
+					<button id="connect" type="submit">Connect</button>
+				</div>
+				<p class="hint">
+					The address you open coversync at in a browser. A server whose certificate comes from its
+					own CA (mkcert, say) needs that CA installed in the system's certificate store.
+				</p>
+			</form>
+			<p id="busy" class="busy" hidden></p>
+		</main>
+	</body>
+</html>

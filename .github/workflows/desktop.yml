@@ -1,0 +1,70 @@
+name: Desktop app
+
+# The Tauri app builds apart from the workspace, against WebKitGTK, so it has
+# its own job that runs only when the app or its proxy changes. The proxy's
+# tests run with the workspace's, in CI.
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/desktop/**
+      - crates/coversync-proxy/**
+      - .github/workflows/desktop.yml
+  pull_request:
+    paths:
+      - apps/desktop/**
+      - crates/coversync-proxy/**
+      - .github/workflows/desktop.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: Linux build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v7
+      # What Tauri 2 needs on Linux: WebKitGTK 4.1 (with GTK 3 and
+      # JavaScriptCore), libsoup 3, and librsvg for icons.
+      - name: Install WebKitGTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Install the Tauri CLI
+        run: pnpm install --frozen-lockfile
+      - name: rustfmt
+        working-directory: apps/desktop/src-tauri
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+      # The app's binary, without installers (DSK-07 adds those).
+      - name: Build
+        run: pnpm tauri build --debug --no-bundle --ci -- --locked
