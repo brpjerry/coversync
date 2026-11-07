@@ -65,6 +65,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
+#[derive(Debug)]
 pub struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -944,6 +945,155 @@ async fn write_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path as FsPath;
+    use std::sync::Arc;
+
+    /// A FLAC file with no audio, only these Vorbis comments.
+    fn flac(path: &FsPath, comments: &[&str]) {
+        let mut b = b"fLaC".to_vec();
+        // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+        b.extend([0, 0, 0, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        let mut block = Vec::new();
+        block.extend(9u32.to_le_bytes());
+        block.extend(b"coversync");
+        block.extend((comments.len() as u32).to_le_bytes());
+        for c in comments {
+            block.extend((c.len() as u32).to_le_bytes());
+            block.extend(c.as_bytes());
+        }
+        // The last block: VORBIS_COMMENT.
+        b.push(0x80 | 4);
+        b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+        b.extend(block);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// A daemon's state over an Inbox holding one album and an empty Library
+    /// folder, scanned; and the Inbox album's id.
+    fn daemon(name: &str) -> (Shared, String) {
+        let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inbox = dir.join("inbox");
+        flac(
+            &inbox.join("Artist/Record/01.flac"),
+            &[
+                "TITLE=Song",
+                "ARTIST=Artist",
+                "ALBUMARTIST=Artist",
+                "ALBUM=Record",
+                "TRACKNUMBER=1",
+            ],
+        );
+        std::fs::create_dir_all(dir.join("library")).unwrap();
+        let lib = coversync_core::Library::open_in(&dir.join("state")).unwrap();
+        lib.set_inbox_setup(InboxSetup {
+            folder: Some(inbox.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        lib.set_library_setup(LibrarySetup {
+            folder: Some(dir.join("library").display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = Arc::new(crate::AppState {
+            lib,
+            covers: coversync_core::cover::CoverCache::new(dir.join("covers")).unwrap(),
+            mb_art: dir.join("musicbrainz"),
+            lookups: coversync_core::LookupCache::open_or_memory(&dir.join("lookups.sqlite3")),
+            progress: Progress::default(),
+            allow_writes: false,
+            jobs: tokio::sync::Mutex::new(()),
+            rescan: Default::default(),
+            identify: Default::default(),
+            events: Default::default(),
+        });
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        let albums = state
+            .lib
+            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        let id = albums[0].id.clone();
+        (state, id)
+    }
+
+    fn edit(album: TagEdit) -> Json<TagWrite> {
+        Json(TagWrite {
+            album,
+            tracks: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn imports_and_edits_are_published() {
+        let (state, inbox_id) = daemon("notices");
+        let mut heard = state.events.subscribe();
+
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        match heard.try_recv().unwrap() {
+            Notice::Imported {
+                album_id,
+                inbox_id: from,
+            } => {
+                assert_eq!(album_id, imported.album_id);
+                assert_eq!(from, inbox_id);
+                assert_ne!(album_id, inbox_id);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // An edit that keeps the album's id comes with no previous id.
+        let genre = TagEdit {
+            genre: Some("Rock".into()),
+            ..Default::default()
+        };
+        let path = Path(imported.album_id.clone());
+        let Json(kept) = write_tags(State(state.clone()), path, edit(genre))
+            .await
+            .unwrap();
+        assert_eq!(kept.album_id, imported.album_id);
+        match heard.try_recv().unwrap() {
+            Notice::AlbumChanged {
+                id,
+                previous_id,
+                collection,
+            } => {
+                assert_eq!(id, imported.album_id);
+                assert_eq!(previous_id, None);
+                assert_eq!(collection, Collection::Library);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A new album title gives the album a new id, and the old one comes along.
+        let title = TagEdit {
+            album: Some("Another record".into()),
+            ..Default::default()
+        };
+        let path = Path(imported.album_id.clone());
+        let Json(renamed) = write_tags(State(state.clone()), path, edit(title))
+            .await
+            .unwrap();
+        assert_ne!(renamed.album_id, imported.album_id);
+        match heard.try_recv().unwrap() {
+            Notice::AlbumChanged {
+                id, previous_id, ..
+            } => {
+                assert_eq!(id, renamed.album_id);
+                assert_eq!(previous_id.as_deref(), Some(imported.album_id.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(heard.try_recv().is_err());
+    }
 
     #[test]
     fn only_current_cover_renderings_are_kept() {

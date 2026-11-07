@@ -150,6 +150,8 @@ pub fn spawn_scan(state: Shared) {
             Err(e) => tracing::error!("scan panicked: {e}"),
         }
         reporting.abort();
+        // Once it has stopped, no `scan` notice can follow `scan_finished`.
+        let _ = reporting.await;
         let progress = {
             let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
             p.running = false;
