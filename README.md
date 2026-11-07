@@ -166,8 +166,9 @@ until the command is run on the server.
 - **Failed logins are limited.** Each client gets five tries, then one a
   minute; a client with a try left is always checked, so the right password
   always gets in. Overall, twenty failures are allowed, then one every six
-  seconds; past that (an attack from many addresses), each failure also costs
-  its client every try it has left, so each address gets one guess a minute.
+  seconds; past that (an attack from many addresses), each attempt costs its
+  client every try it has left (the right password gets one back), so each
+  address gets one guess a minute, even sending its tries all at once.
   At most two passwords are checked at once. Behind a reverse proxy on the
   same machine, the client's address is taken from `X-Forwarded-For`, which
   is only trusted from loopback; loopback itself gets no other trust, since

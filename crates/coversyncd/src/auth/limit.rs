@@ -6,9 +6,11 @@
 //! so a correct password always gets in.
 //!
 //! The overall bucket counts failures from everywhere. Once it is empty (an
-//! attack from many addresses), each further failure uses up its client's
-//! remaining tries, so every address gets one guess a minute, with no burst.
-//! The password checks themselves are capped by `Auth`'s hashing slots.
+//! attack from many addresses), each try taken, and each failure, uses up
+//! its client's remaining tries, so every address gets one guess a minute,
+//! with no burst, even when it sends its tries all at once; a right password
+//! gets its try back. The password checks themselves are capped by `Auth`'s
+//! hashing slots.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -114,6 +116,14 @@ impl Limiter {
             return Err(wait);
         }
         mine.tokens -= 1.0;
+        // During an attack from many addresses, this try takes the client's
+        // others with it now: sent all at once, they would all be checked
+        // before the first failure was counted. A right password gets its
+        // try back (`refund`).
+        self.overall.refill(OVERALL, now);
+        if self.overall.tokens < 1.0 {
+            mine.tokens = mine.tokens.min(0.0);
+        }
         Ok(())
     }
 
@@ -199,6 +209,31 @@ mod tests {
         l.take(next, t1).unwrap();
         l.failed(next, t1);
         assert!(l.take(next, t1).is_ok());
+    }
+
+    #[test]
+    fn tries_sent_at_once_get_no_burst_either() {
+        let t0 = Instant::now();
+        let mut l = Limiter::new(t0);
+        for i in 0..20 {
+            let c = ip(&format!("10.0.1.{i}"));
+            l.take(c, t0).unwrap();
+            l.failed(c, t0);
+        }
+        // Five tries sent in parallel: all are taken before any fails.
+        let fresh = ip("10.0.3.1");
+        assert!(l.take(fresh, t0).is_ok());
+        assert_eq!(l.take(fresh, t0).unwrap_err(), Duration::from_secs(60));
+        // The right password gets its try back, and no more.
+        l.refund(fresh, t0);
+        assert!(l.take(fresh, t0).is_ok());
+        assert!(l.take(fresh, t0).is_err());
+        // While the overall bucket has tries, a client keeps its burst.
+        let mut calm = Limiter::new(t0);
+        let me = ip("10.0.3.2");
+        for _ in 0..5 {
+            assert!(calm.take(me, t0).is_ok());
+        }
     }
 
     #[test]

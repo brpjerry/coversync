@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::io::{BufRead, IsTerminal};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
@@ -63,13 +63,27 @@ const OPEN: &[&str] = &[
 pub struct Auth {
     store: Store,
     limiter: Mutex<Limiter>,
-    hashing: Semaphore,
+    /// Slots for password checks. A check holds its slot until argon2 is
+    /// done, even if its client has given up.
+    hashing: Arc<Semaphore>,
     /// Sessions and devices whose last use is being written.
     touching: Mutex<HashSet<Touch>>,
+    #[cfg(test)]
+    probe: Probe,
+}
+
+/// What tests steer and watch.
+#[cfg(test)]
+#[derive(Default)]
+struct Probe {
     /// A stopped clock for the rate limits, so tests don't depend on how
     /// fast password checks run.
-    #[cfg(test)]
     stopped: Mutex<Option<Instant>>,
+    /// Added to each password check, to keep it running a while.
+    check_delay: Mutex<std::time::Duration>,
+    /// Password checks running now, and the most that ran at once.
+    running: std::sync::atomic::AtomicUsize,
+    most_running: std::sync::atomic::AtomicUsize,
 }
 
 impl Auth {
@@ -79,20 +93,38 @@ impl Auth {
         Ok(Auth {
             store: Store::open(&state_dir.join(coversync_core::db::LOCAL_DB))?,
             limiter: Mutex::new(Limiter::new(Instant::now())),
-            hashing: Semaphore::new(HASHING),
+            hashing: Arc::new(Semaphore::new(HASHING)),
             touching: Mutex::new(HashSet::new()),
             #[cfg(test)]
-            stopped: Mutex::new(None),
+            probe: Probe::default(),
         })
     }
 
     /// The time the rate limits count by.
     fn instant(&self) -> Instant {
         #[cfg(test)]
-        if let Some(at) = *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(at) = *self.probe.stopped.lock().unwrap_or_else(|e| e.into_inner()) {
             return at;
         }
         Instant::now()
+    }
+
+    /// Check a password against the stored hash. Slow on purpose: run it
+    /// on a blocking thread, holding a hashing slot.
+    fn check_password(&self, password: &str, stored: &str) -> bool {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.probe.running.fetch_add(1, SeqCst) + 1;
+            self.probe.most_running.fetch_max(now, SeqCst);
+            std::thread::sleep(*self.probe.check_delay.lock().unwrap());
+        }
+        let right = store::verify_password(password, stored);
+        #[cfg(test)]
+        self.probe
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        right
     }
 
     fn limiter(&self) -> std::sync::MutexGuard<'_, Limiter> {
@@ -125,7 +157,7 @@ impl Auth {
     /// Stop the rate limits' clock: no bucket refills from here on.
     #[cfg(test)]
     pub fn stop_clock(&self) {
-        *self.stopped.lock().unwrap() = Some(Instant::now());
+        *self.probe.stopped.lock().unwrap() = Some(Instant::now());
     }
 }
 
@@ -580,11 +612,20 @@ async fn login(
     }
     let checked = stored.clone();
     let right = body.password.len() <= MAX_PASSWORD && {
-        let _slot = state.auth.hashing.acquire().await;
+        let slot = match state.auth.hashing.clone().acquire_owned().await {
+            Ok(slot) => slot,
+            Err(e) => return internal(e),
+        };
         let password = body.password;
-        tokio::task::spawn_blocking(move || store::verify_password(&password, &stored))
-            .await
-            .unwrap_or(false)
+        let s = state.clone();
+        tokio::task::spawn_blocking(move || {
+            // The slot goes with the check: a client that gives up can't
+            // free it while argon2 is still running.
+            let _slot = slot;
+            s.auth.check_password(&password, &stored)
+        })
+        .await
+        .unwrap_or(false)
     };
     let s = state.clone();
     let now = now();
@@ -647,23 +688,22 @@ async fn login_with_token(
     let now = now();
     let traded = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<_, Denied>> {
         let found = check(&s.auth.store, Credentials::Token(token), now)?;
-        match (found.access, found.touch.first()) {
-            (
-                Ok(Access {
-                    device: Some(device),
-                    scope,
-                    ..
-                }),
-                touch,
-            ) => {
+        let stale = !found.touch.is_empty();
+        match found.access {
+            Ok(Access {
+                device: Some(device),
+                scope,
+                ..
+            }) => {
                 let id = s.auth.store.create_device_session(device, scope, now)?;
-                if touch.is_some() {
+                if stale {
                     s.auth.store.touch_device(device, now)?;
                 }
                 Ok(Ok((id, device)))
             }
-            (Ok(_), _) => Ok(Err(Denied::InvalidToken)),
-            (Err(why), _) => Ok(Err(why)),
+            // A token always names its device.
+            Ok(_) => Ok(Err(Denied::InvalidToken)),
+            Err(why) => Ok(Err(why)),
         }
     })
     .await;

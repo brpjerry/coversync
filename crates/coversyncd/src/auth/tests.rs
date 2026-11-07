@@ -15,6 +15,7 @@ use super::*;
 const PASSWORD: &str = "correct horse battery";
 const LAN: &str = "192.168.1.20:50000";
 
+#[derive(Clone)]
 struct App {
     router: Router,
     state: Shared,
@@ -633,6 +634,50 @@ async fn a_session_traded_for_a_token_counts_as_the_device_being_used() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("a request through the traded session didn't note the device's use");
+}
+
+#[tokio::test]
+async fn logins_given_up_on_keep_their_check_slot_until_it_ends() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Duration;
+    let app = App::with_password("slots");
+    let probe = &app.state.auth.probe;
+    *probe.check_delay.lock().unwrap() = Duration::from_millis(400);
+    // Rounds of logins whose clients give up while their passwords are being
+    // checked; each round would take freed slots at once.
+    for round in 0..3 {
+        let logins: Vec<_> = (0..HASHING * 2)
+            .map(|i| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    app.login_from(&format!("10.2.{round}.{i}:1000"), "guess")
+                        .await
+                })
+            })
+            .collect();
+        // The first round fills the slots; later ones would take any freed.
+        if round == 0 {
+            for _ in 0..250 {
+                if probe.running.load(SeqCst) == HASHING {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        for login in logins {
+            login.abort();
+        }
+    }
+    for _ in 0..200 {
+        if probe.running.load(SeqCst) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(probe.running.load(SeqCst), 0);
+    let most = probe.most_running.load(SeqCst);
+    assert_eq!(most, HASHING, "{most} checks ran at once");
 }
 
 #[tokio::test]
