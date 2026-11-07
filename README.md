@@ -183,8 +183,11 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   server-sent events work as in a browser.
 - The server's path prefix stays: `https://n5pro.internal/coversync/` is
   served at `http://127.0.0.1:<port>/coversync/`.
-- Cookies the server sets work through it, so a server's login works as in a
-  browser.
+- The proxy keeps the server's cookies itself, apart for each server, and
+  sends them as a browser would. So a server's login works as in a browser,
+  and one server's cookies never go to another. Persistent ones (a login)
+  are kept in `cookies.json` in the app's config directory, readable only by
+  you.
 - Only the app's window can use it. The window opens the proxy with a secret
   made at each launch, which the proxy trades for a cookie, and requests
   without that cookie are refused.
@@ -194,8 +197,10 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
 
 When no server is set, it can't be reached, or the page crashes, the window
 shows a page bundled with the app, to try again or change the server. A new
-server's address is saved once it answers, in `config.json` in the app's
-config directory (`~/.config/io.github.brpjerry.coversync/` on Linux).
+server's address is saved once it shows coversync's page (a login counts;
+an error, a missing page or a redirect to another address doesn't), in
+`config.json` in the app's config directory
+(`~/.config/io.github.brpjerry.coversync/` on Linux).
 `--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
 saving it.
 

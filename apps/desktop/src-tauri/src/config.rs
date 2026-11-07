@@ -57,7 +57,11 @@ impl Store {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let partial = self.path.with_extension("json.partial");
+        // Its own name for each process, so two runs saving at once can't
+        // mix their writes.
+        let partial = self
+            .path
+            .with_extension(format!("json.{}.partial", std::process::id()));
         fs::write(&partial, json)?;
         fs::rename(&partial, &self.path)
     }
