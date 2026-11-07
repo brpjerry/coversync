@@ -2,18 +2,20 @@
 //!
 //! The UI comes from the server, through a proxy on 127.0.0.1
 //! (`coversync-proxy`) that streams everything both ways and keeps the
-//! server's path prefix. When no server is set, or it can't be reached, the
-//! window shows the bundled fallback page (`../ui`), where the server can be
-//! retried or changed.
+//! server's path prefix. When no server is set, it can't be reached, or the
+//! page crashes, the window shows the bundled fallback page (`../ui`), where
+//! the server can be retried or changed.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+#[cfg(target_os = "linux")]
+mod gstreamer;
 
 use std::error::Error;
 use std::sync::Mutex;
 
-use coversync_proxy::{Proxy, Unreachable, Upstream};
+use coversync_proxy::{Proxy, Unreachable, Upstream, UpstreamError};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tracing_subscriber::EnvFilter;
@@ -33,12 +35,42 @@ struct Shell {
     /// The fallback page's URL.
     fallback: Url,
     /// Why the fallback page is showing, when something went wrong.
-    problem: Mutex<Option<String>>,
+    problem: Mutex<Option<Problem>>,
 }
 
 impl Shell {
-    fn set_problem(&self, problem: Option<String>) {
+    fn set_problem(&self, problem: Option<Problem>) {
         *self.problem.lock().expect("problem lock") = problem;
+    }
+}
+
+/// Something that went wrong, as the fallback page shows it.
+#[derive(Clone, Debug, Serialize)]
+struct Problem {
+    title: String,
+    message: String,
+    /// The error underneath, in small print, when it adds something.
+    detail: Option<String>,
+}
+
+impl Problem {
+    fn new(title: &str, message: impl Into<String>) -> Self {
+        Self {
+            title: title.to_owned(),
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    fn unreachable(unreachable: Unreachable) -> Self {
+        Self {
+            detail: unreachable.detail,
+            ..Self::new("Can't reach the server", unreachable.reason)
+        }
+    }
+
+    fn invalid(err: UpstreamError) -> Self {
+        Self::new("That address won't work", err.to_string())
     }
 }
 
@@ -48,7 +80,7 @@ struct Status {
     /// The server's URL, if one is set.
     server: Option<String>,
     /// Why the server's UI isn't showing.
-    problem: Option<String>,
+    problem: Option<Problem>,
 }
 
 #[tauri::command]
@@ -59,33 +91,41 @@ fn status(shell: State<'_, Shell>) -> Status {
     }
 }
 
-/// Connects to `server` and saves it as the server to use, or with `None`
-/// tries the current one again. Opens the server's UI once it answers.
+/// Connects to `server`, or with `None` tries the current one again, and
+/// opens its UI once it answers. A new server is saved only then, so a typo
+/// can't replace an address that works.
 #[tauri::command]
 async fn connect(
     app: AppHandle,
     shell: State<'_, Shell>,
     server: Option<String>,
-) -> Result<(), String> {
-    let upstream = match server {
-        Some(url) => {
-            let upstream = Upstream::parse(&url).map_err(|err| err.to_string())?;
-            shell
-                .config
-                .update(|config| config.server = Some(upstream.url()))
-                .map_err(|err| format!("Couldn't save the server: {err}"))?;
-            shell.proxy.set_upstream(Some(upstream.clone()));
-            upstream
-        }
-        None => shell.proxy.upstream().ok_or("No server is set.")?,
+) -> Result<(), Problem> {
+    let (upstream, new) = match server {
+        Some(url) => (Upstream::parse(&url).map_err(Problem::invalid)?, true),
+        None => match shell.proxy.upstream() {
+            Some(upstream) => (upstream, false),
+            None => return Err(Problem::new("No server is set", "Enter its address.")),
+        },
     };
     if let Err(unreachable) = shell.proxy.check(&upstream).await {
-        let problem = unreachable.to_string();
-        shell.set_problem(Some(problem.clone()));
+        let problem = Problem::unreachable(unreachable);
+        if !new {
+            shell.set_problem(Some(problem.clone()));
+        }
         return Err(problem);
     }
+    if new {
+        if let Err(err) = shell
+            .config
+            .update(|config| config.server = Some(upstream.url()))
+        {
+            tracing::warn!("couldn't save the server: {err}");
+        }
+        shell.proxy.set_upstream(Some(upstream));
+    }
     shell.set_problem(None);
-    open_ui(&app, &shell.proxy).map_err(|err| err.to_string())
+    open_ui(&app, &shell.proxy)
+        .map_err(|err| Problem::new("Couldn't open the server's UI", err.to_string()))
 }
 
 /// Sends the window through the proxy's entry URL to the server's UI.
@@ -97,18 +137,63 @@ fn open_ui(app: &AppHandle, proxy: &Proxy) -> tauri::Result<()> {
     }
 }
 
-/// Shows the fallback page when a page load can't reach the server.
-fn show_fallback(app: &AppHandle, unreachable: Unreachable) {
-    tracing::warn!("{unreachable}");
+/// Shows the fallback page, saying what went wrong.
+fn show_fallback(app: &AppHandle, problem: Problem) {
     let Some(shell) = app.try_state::<Shell>() else {
         return;
     };
-    shell.set_problem(Some(unreachable.to_string()));
+    shell.set_problem(Some(problem));
     if let Some(window) = app.get_webview_window(WINDOW)
         && let Err(err) = window.navigate(shell.fallback.clone())
     {
         tracing::error!("couldn't show the fallback page: {err}");
     }
+}
+
+/// Watches WebKitGTK's web process, which draws the page: when it crashes,
+/// the window would otherwise keep its last frame and never come back.
+#[cfg(target_os = "linux")]
+fn watch_web_process(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    use webkit2gtk::{WebProcessTerminationReason, WebViewExt};
+
+    let app = window.app_handle().clone();
+    window.with_webview(move |webview| {
+        webview
+            .inner()
+            .connect_web_process_terminated(move |_, reason| {
+                let message = match reason {
+                    WebProcessTerminationReason::Crashed => crash_message(),
+                    WebProcessTerminationReason::ExceededMemoryLimit => {
+                        "The web process that shows the page used too much memory and was \
+                         stopped."
+                            .to_owned()
+                    }
+                    // The app closing its own webview.
+                    _ => return,
+                };
+                tracing::error!("{message}");
+                show_fallback(&app, Problem::new("The page stopped working", message));
+            });
+    })
+}
+
+/// WebView2 and WKWebView aren't watched yet.
+#[cfg(not(target_os = "linux"))]
+fn watch_web_process(_window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn crash_message() -> String {
+    let mut message = String::from("The web process that shows the page crashed.");
+    if gstreamer::autoaudiosink_missing() {
+        message.push_str(
+            " GStreamer's autoaudiosink isn't installed, and WebKitGTK crashes without it \
+             when audio starts playing. Install GStreamer's good plugins (gst-plugins-good \
+             on Arch, gstreamer1.0-plugins-good on Debian and Ubuntu), then try again.",
+        );
+    }
+    message
 }
 
 /// Tauri serves the bundled files from `tauri://localhost`
@@ -138,6 +223,14 @@ fn server_arg() -> Option<String> {
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    if gstreamer::autoaudiosink_missing() {
+        tracing::warn!(
+            "GStreamer's autoaudiosink isn't installed (gst-plugins-good): WebKitGTK crashes \
+             when audio starts playing"
+        );
+    }
+
     let config = Store::open(app.path().app_config_dir()?);
     let saved = config.get();
     let server = server_arg()
@@ -147,7 +240,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     let upstream = match server.as_deref().map(Upstream::parse) {
         Some(Ok(upstream)) => Some(upstream),
         Some(Err(err)) => {
-            problem = Some(err.to_string());
+            problem = Some(Problem::invalid(err));
             None
         }
         None => None,
@@ -158,7 +251,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
         Proxy::builder()
             .upstream(upstream)
             .preferred_port(saved.port)
-            .on_unreachable(move |unreachable| show_fallback(&handle, unreachable))
+            .on_unreachable(move |unreachable| {
+                tracing::warn!("{unreachable}");
+                show_fallback(&handle, Problem::unreachable(unreachable));
+            })
             .start(),
     )?;
     let port = proxy.addr().port();
@@ -181,11 +277,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
         fallback: fallback_url(app)?,
         problem: Mutex::new(problem),
     });
-    WebviewWindowBuilder::new(app, WINDOW, url)
+    let window = WebviewWindowBuilder::new(app, WINDOW, url)
         .title("coversync")
         .inner_size(1280.0, 860.0)
         .min_inner_size(720.0, 480.0)
         .build()?;
+    watch_web_process(&window)?;
     Ok(())
 }
 

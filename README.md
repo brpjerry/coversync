@@ -192,17 +192,20 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   server with a certificate from your own CA (mkcert's, say) works once that
   CA is installed there.
 
-When no server is set, or it can't be reached, the window shows a page
-bundled with the app, to try again or change the server. The server's
-address is saved in `config.json` in the app's config directory
-(`~/.config/io.github.brpjerry.coversync/` on Linux). `--server URL` or
-`COVERSYNC_SERVER=URL` picks a server for one run without saving it.
+When no server is set, it can't be reached, or the page crashes, the window
+shows a page bundled with the app, to try again or change the server. A new
+server's address is saved once it answers, in `config.json` in the app's
+config directory (`~/.config/io.github.brpjerry.coversync/` on Linux).
+`--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
+saving it.
 
 There are no packages for it yet. To build and run it on Arch Linux, you
-need WebKitGTK as well as Rust and pnpm:
+need WebKitGTK as well as Rust and pnpm. Playback also needs GStreamer's good
+plugins: without `autoaudiosink`, WebKitGTK's web process crashes as audio
+starts, and the app says so.
 
 ```sh
-sudo pacman -S --needed webkit2gtk-4.1
+sudo pacman -S --needed webkit2gtk-4.1 gst-plugins-good
 cd apps/desktop
 pnpm install                 # the Tauri CLI
 pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
@@ -233,7 +236,7 @@ tests, and builds the pacman package.
 
 Changes to the desktop app or its proxy also run
 `.github/workflows/desktop.yml`, which builds the app against WebKitGTK and
-runs rustfmt and Clippy on it.
+runs rustfmt, Clippy and its tests.
 
 ### Release
 

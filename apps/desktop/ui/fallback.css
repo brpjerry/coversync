@@ -1,3 +1,16 @@
+/* The web UI's font, Latin only: @fontsource-variable/inter's file, under the
+   SIL Open Font License (fonts/OFL.txt). Other scripts use the system's fonts. */
+@font-face {
+	font-family: 'Inter Variable';
+	font-style: normal;
+	font-display: swap;
+	font-weight: 100 900;
+	src: url('fonts/inter-latin-wght-normal.woff2') format('woff2-variations');
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+		U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 /* The web UI's colors (web/src/app.css), dark and light. */
 :root {
 	color-scheme: dark;
@@ -14,7 +27,7 @@
 	--warn-surface: hsl(40 90% 60% / 0.1);
 	--warn-border: hsl(40 90% 60% / 0.3);
 	--radius-sm: 9px;
-	--font: system-ui, 'Noto Sans CJK JP', sans-serif;
+	--font: 'Inter Variable', system-ui, 'Noto Sans CJK JP', sans-serif;
 }
 
 @media (prefers-color-scheme: light) {
@@ -82,12 +95,20 @@ p {
 }
 
 .problem {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
 	padding: 10px 14px;
 	border: 1px solid var(--warn-border);
 	border-radius: var(--radius-sm);
 	background: var(--warn-surface);
 	color: var(--warn-text);
 	overflow-wrap: anywhere;
+}
+
+.problem .detail {
+	font-size: 12px;
+	opacity: 0.8;
 }
 
 form {

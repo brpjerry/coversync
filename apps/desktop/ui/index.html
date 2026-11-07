@@ -12,7 +12,10 @@
 		<main>
 			<img class="logo" src="logo.svg" alt="" width="56" height="56" />
 			<h1 id="title">coversync</h1>
-			<p id="problem" class="problem" hidden></p>
+			<div id="problem" class="problem" hidden>
+				<p id="message"></p>
+				<p id="detail" class="detail" hidden></p>
+			</div>
 			<div id="retry-row" class="row" hidden>
 				<button id="retry" type="button" class="primary">Try again</button>
 			</div>
@@ -23,7 +26,7 @@
 						id="server"
 						type="text"
 						inputmode="url"
-						placeholder="https://n5pro.internal/coversync/"
+						placeholder="https://coversync.example.com/"
 						autocomplete="url"
 						autocapitalize="off"
 						spellcheck="false"

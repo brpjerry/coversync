@@ -1,11 +1,14 @@
-// The fallback page: shown when no server is set or it can't be reached.
-// Once a server answers, the app moves the window on to its UI.
+// The fallback page: shown when no server is set, it can't be reached, or
+// the page crashed. Once a server answers, the app moves the window on to
+// its UI.
 
 const { invoke } = window.__TAURI__.core;
 
 const $ = (id) => document.getElementById(id);
 const title = $('title');
-const problem = $('problem');
+const problemBox = $('problem');
+const message = $('message');
+const detail = $('detail');
 const retryRow = $('retry-row');
 const retry = $('retry');
 const form = $('form');
@@ -13,23 +16,25 @@ const input = $('server');
 const connectButton = $('connect');
 const busy = $('busy');
 
-/** `status` is the app's (see `status` in src-tauri/src/main.rs). */
-function show(status, message = status.problem) {
-	title.textContent = status.problem
-		? "Can't reach the server"
-		: status.server
-			? 'coversync'
-			: 'Connect to a coversync server';
-	problem.textContent = message ?? '';
-	problem.hidden = !message;
+/**
+ * `status` and `problem` are the app's `Status` and `Problem` (src-tauri/src/main.rs):
+ * the problem is the one the page opened with, or the last attempt's.
+ */
+function show(status, problem = status.problem) {
+	title.textContent =
+		problem?.title ?? (status.server ? 'coversync' : 'Connect to a coversync server');
+	problemBox.hidden = !problem;
+	message.textContent = problem?.message ?? '';
+	detail.textContent = problem?.detail ?? '';
+	detail.hidden = !problem?.detail;
 	retryRow.hidden = !status.server;
 	if (status.server && !input.value) input.value = status.server;
 }
 
-function setBusy(message) {
-	busy.textContent = message ?? '';
-	busy.hidden = !message;
-	for (const control of [retry, input, connectButton]) control.disabled = Boolean(message);
+function setBusy(text) {
+	busy.textContent = text ?? '';
+	busy.hidden = !text;
+	for (const control of [retry, input, connectButton]) control.disabled = Boolean(text);
 }
 
 async function connect(server) {
@@ -39,7 +44,11 @@ async function connect(server) {
 		await invoke('connect', { server });
 	} catch (err) {
 		setBusy(null);
-		show(await invoke('status'), String(err));
+		const problem =
+			typeof err === 'object' && err?.title
+				? err
+				: { title: 'Something went wrong', message: String(err) };
+		show(await invoke('status'), problem);
 	}
 }
 
