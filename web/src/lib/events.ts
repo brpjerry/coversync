@@ -42,21 +42,31 @@ const SILENT_MS = 50_000;
  */
 const RETRY_MIN_MS = 1000;
 const RETRY_MAX_MS = 10_000;
+/**
+ * A page hidden this long closes its stream until it's shown again. Over
+ * HTTP/1.1, browsers allow six connections to a host across all tabs, and
+ * each open stream holds one; a few seconds' grace spares quick tab switches.
+ */
+const HIDDEN_MS = 10_000;
 
 /**
  * Listen for notices until the returned function is called. When the stream
  * drops (the daemon restarted, the network went), it's opened again after a
  * growing delay. `onlive` hears each time the stream comes up or goes down,
  * and `resync` is called whenever it comes back up, as notices sent while it
- * was down are lost.
+ * was down are lost. A hidden page closes the stream without telling
+ * `onlive`, and opens it again (and resyncs) when it's shown.
  */
 export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void): () => void {
 	let source: EventSource | null = null;
 	let retry: ReturnType<typeof setTimeout> | undefined;
 	let watchdog: ReturnType<typeof setTimeout> | undefined;
 	let delay = RETRY_MIN_MS;
+	let away: ReturnType<typeof setTimeout> | undefined;
 	/** It has been down since the page loaded, so notices may have been missed. */
 	let dropped = false;
+	/** Closed while the page is hidden. */
+	let paused = false;
 	let stopped = false;
 
 	function watch() {
@@ -79,6 +89,8 @@ export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void
 
 	function connect() {
 		const es = (source = new EventSource(BASE + '/api/events'));
+		// Also for an attempt that never gets anywhere.
+		watch();
 		es.onopen = () => {
 			watch();
 			onlive(true);
@@ -91,11 +103,15 @@ export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void
 		for (const name of NAMES) on(es, name);
 	}
 
-	function drop() {
+	function close() {
 		source?.close();
 		source = null;
 		clearTimeout(watchdog);
 		clearTimeout(retry);
+	}
+
+	function drop() {
+		close();
 		if (stopped) return;
 		dropped = true;
 		onlive(false);
@@ -103,9 +119,28 @@ export function listen(handlers: NoticeHandlers, onlive: (live: boolean) => void
 		delay = Math.min(delay * 2, RETRY_MAX_MS);
 	}
 
-	connect();
+	function pause() {
+		close();
+		paused = dropped = true;
+	}
+
+	function onvisibility() {
+		clearTimeout(away);
+		if (document.hidden) away = setTimeout(pause, HIDDEN_MS);
+		else if (paused) {
+			paused = false;
+			delay = RETRY_MIN_MS;
+			connect();
+		}
+	}
+
+	document.addEventListener('visibilitychange', onvisibility);
+	if (document.hidden) pause();
+	else connect();
 	return () => {
 		stopped = true;
-		drop();
+		clearTimeout(away);
+		document.removeEventListener('visibilitychange', onvisibility);
+		close();
 	};
 }

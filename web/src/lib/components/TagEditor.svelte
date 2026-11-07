@@ -3,6 +3,7 @@
 	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import Check from '@lucide/svelte/icons/check';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+	import { onDestroy } from 'svelte';
 	import { fly } from 'svelte/transition';
 	import {
 		api,
@@ -25,8 +26,10 @@
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
+		/** Hears whether there are edits not sent yet (a save under way has sent them). */
+		ondraft?: (draft: boolean) => void;
 	}
-	let { detail, allowWrites, onsaved, oncancel, onimport }: Props = $props();
+	let { detail, allowWrites, onsaved, oncancel, onimport, ondraft }: Props = $props();
 
 	type AlbumField = 'album' | 'album_artist' | 'year' | 'genre';
 	type TrackField = 'track_no' | 'disc_no' | 'title' | 'artist';
@@ -74,7 +77,7 @@
 		albumFields.map((f) => [f.key, shared(f.key) === null])
 	) as Record<AlbumField, boolean>;
 	let base = $state({ album: initialAlbum(), tracks: initialTracks() });
-	let form = $state(structuredClone($state.snapshot(base)));
+	let form = $state({ album: initialAlbum(), tracks: initialTracks() });
 	let saving = $state(false);
 
 	const albumChanged = (k: AlbumField) => form.album[k] !== base.album[k];
@@ -103,6 +106,9 @@
 		albumFields.some((f) => invalid(f.key, form.album[f.key])) ||
 			detail.tracks.some((t) => trackFields.some((f) => invalid(f.key, form.tracks[t.id][f.key])))
 	);
+
+	$effect(() => ondraft?.(changes > 0 && !saving));
+	onDestroy(() => ondraft?.(false));
 
 	function revert() {
 		form = structuredClone($state.snapshot(base));
@@ -149,6 +155,8 @@
 				`Saved tags to ${result.files_written} ${result.files_written === 1 ? 'file' : 'files'}`,
 				'success'
 			);
+			// Saved: no longer a draft, while the album is reloaded with them.
+			base = structuredClone($state.snapshot(form));
 			onsaved(result);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);

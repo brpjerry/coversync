@@ -6,8 +6,8 @@
 	import ListMusic from '@lucide/svelte/icons/list-music';
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
-	import { untrack } from 'svelte';
-	import { fade } from 'svelte/transition';
+	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { fade, slide } from 'svelte/transition';
 	import {
 		coverUrl,
 		type Album,
@@ -29,21 +29,26 @@
 		onsaved: (result: TagWriteResult) => void;
 		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
 		onimport?: (edits?: ImportEdits) => void;
+		/** The album changed elsewhere while its tags were being edited here; the sheet shows it as it was. */
+		changed?: boolean;
+		/** Drop the edits and show the album as it is now. */
+		onreload?: () => void;
+		/** Hears whether the tag editor has edits not sent yet. */
+		ondraft?: (draft: boolean) => void;
 	}
-	let { album, detail, allowWrites, onclose, onsaved, onimport }: Props = $props();
+	let {
+		album,
+		detail,
+		allowWrites,
+		onclose,
+		onsaved,
+		onimport,
+		changed = false,
+		onreload,
+		ondraft
+	}: Props = $props();
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
-	let detailId = $derived(detail?.id);
-	/**
-	 * What the tag editor edits: the album as it was when editing began. A
-	 * newer copy of the same album (edited elsewhere) shows in the track list,
-	 * but would reset the editor and lose the edits under way.
-	 */
-	let editing = $derived.by(() => {
-		detailId;
-		mode;
-		return untrack(() => detail);
-	});
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -159,6 +164,15 @@
 		</header>
 
 		<div class="body">
+			{#if changed}
+				<p class="changed" role="status" transition:slide={{ duration: 200 }}>
+					<CircleAlert size={15} strokeWidth={2.2} />
+					<span>This album was changed elsewhere while you were editing it.</span>
+					<button class="link" title="Your edits here are dropped" onclick={() => onreload?.()}>
+						Reload
+					</button>
+				</p>
+			{/if}
 			{#if !detail}
 				<div class="skeleton" aria-busy="true">
 					{#each { length: Math.min(album.track_count, 10) } as _, i (i)}
@@ -199,15 +213,13 @@
 				</div>
 			{:else}
 				<div in:fade={{ duration: 200 }}>
-					{#key editing}
+					{#key detail}
 						<TagEditor
-							detail={editing ?? detail}
+							{detail}
 							{allowWrites}
-							onsaved={(result) => {
-								editing = result.album;
-								onsaved(result);
-							}}
+							{onsaved}
 							{onimport}
+							{ondraft}
 							oncancel={() => (mode = 'tracks')}
 						/>
 					{/key}
@@ -417,6 +429,35 @@
 	.body {
 		padding: 8px 32px 36px;
 		min-height: 200px;
+	}
+	.changed {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 8px 0 14px;
+		padding: 8px 8px 8px 14px;
+		border-radius: 12px;
+		font-size: 13.5px;
+		color: var(--text-2);
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+	}
+	.changed :global(svg) {
+		flex: none;
+		color: var(--warn);
+	}
+	.changed .link {
+		margin-left: auto;
+		padding: 4px 10px;
+		border-radius: 999px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--accent);
+		white-space: nowrap;
+		transition: background 140ms;
+	}
+	.changed .link:hover {
+		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.disc {
 		margin: 18px 16px 6px;
