@@ -4,8 +4,11 @@
 Takes screenshots of the main views and prints browser console errors.
 Needs `geckodriver` and python-websocket-client (for console logs).
 
-    tools/ui_smoke.py http://127.0.0.1:8770/ shots/ [--light] [--save]
+    COVERSYNC_PASSWORD=... tools/ui_smoke.py http://127.0.0.1:8770/ shots/ [--light] [--save]
 
+It signs in with the password in COVERSYNC_PASSWORD, or the one after --password.
+--auth tries the login view instead of the tour: a wrong password, signing in, a
+    session that ends while the app is open (unsaved edits stay), and signing out.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -20,6 +23,7 @@ Needs `geckodriver` and python-websocket-client (for console logs).
 
 import base64
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -46,7 +50,9 @@ class Driver:
     def __init__(self, dark=True):
         self.port = free_port()
         self.proc = subprocess.Popen(
-            ["geckodriver", "--port", str(self.port), "--log", "error"],
+            # A BiDi port of its own, so several smoke tests can run at once.
+            ["geckodriver", "--port", str(self.port), "--websocket-port", str(free_port()),
+             "--log", "error"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -683,6 +689,88 @@ def option(name):
     raise SystemExit(f"{name} needs a value; see the usage at the top of this file.")
 
 
+def password():
+    if "--password" in sys.argv:
+        return option("--password")
+    if os.environ.get("COVERSYNC_PASSWORD"):
+        return os.environ["COVERSYNC_PASSWORD"]
+    raise SystemExit("The UI asks for a password: set COVERSYNC_PASSWORD or pass --password.")
+
+
+LOGIN_FIELD = ".login input[type=password]"
+
+
+def sign_in(d, pw=None):
+    """Sign in on the login view if it's up, and wait for the app."""
+    d.wait("return !!document.querySelector('.login, .page')")
+    if not d.js(f"return !!document.querySelector('{LOGIN_FIELD}')"):
+        if d.js("return !!document.querySelector('.login')"):
+            raise SystemExit("The server has no password yet: run coversyncd set-password.")
+        return
+    d.type(LOGIN_FIELD, pw or password())
+    d.click(".login button[type=submit]")
+    d.wait("return !document.querySelector('.login') && !!document.querySelector('.page')")
+
+
+def auth_flow(d, out, tag):
+    """The login view: a wrong password, signing in, a session that ends under
+    the open app, and signing out. Starts signed out."""
+    text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
+    d.wait(f"return !!document.querySelector('{LOGIN_FIELD}')")
+    time.sleep(0.6)
+    print("login view:", d.js(text, ".login h1"), "|", d.js(text, ".login .card > p"),
+          "| focused:", d.js(f"return document.activeElement === document.querySelector('{LOGIN_FIELD}')"))
+    d.shot(out / f"a1-login-{tag}.png")
+    d.type(LOGIN_FIELD, "not the password")
+    d.click(".login button[type=submit]")
+    d.wait("return !!document.querySelector('.login .problem')")
+    time.sleep(0.4)
+    print("wrong password:", d.js(text, ".login .problem"))
+    d.shot(out / f"a2-wrong-{tag}.png")
+    d.clear_and_type(LOGIN_FIELD, password())
+    d.click(".login button[type=submit]")
+    d.wait("return !document.querySelector('.login') && document.querySelectorAll('.card').length > 0")
+    d.wait("return [...document.querySelectorAll('.card img')]"
+           ".filter(i => i.getBoundingClientRect().top < innerHeight).every(i => i.complete)")
+    covers = ("return [...document.querySelectorAll('.card img')].filter(i => i.complete && i.naturalWidth).length"
+              " + ' of ' + document.querySelectorAll('.card img').length")
+    print("signed in; covers shown:", d.js(covers))
+    d.shot(out / f"a3-signed-in-{tag}.png")
+
+    # An unsaved edit, then the session ends under it (as when another tab signs out).
+    d.open_setup("Appearance")
+    d.wait("return !!document.querySelector('.slider')")
+    d.js("const s = document.querySelector('.slider'); s.value = +s.min;"
+         "s.dispatchEvent(new Event('input', {bubbles: true}))")
+    time.sleep(0.6)
+    unsaved = "return document.querySelector('.savebar .summary')?.textContent.trim() ?? null"
+    before = d.js(unsaved)
+    d.js("fetch(new URL('api/logout', document.baseURI), {method: 'POST'})")
+    started = time.time()
+    d.wait("return !!document.querySelector('.login.over input[type=password]')", 20)
+    print(f"session ended: login view over the app after {time.time() - started:.1f}s:",
+          d.js(text, ".login h1"), "| app inert:", d.js("return !!document.querySelector('.page').closest('[inert]')"),
+          "| error toasts:", d.js("return document.querySelectorAll('.toast.error').length"))
+    time.sleep(0.4)
+    d.shot(out / f"a4-session-ended-{tag}.png")
+    sign_in(d)
+    time.sleep(0.6)
+    print("signed back in; unsaved edit kept:", d.js(unsaved) == before, repr(before))
+    d.click_text("main", "Revert")
+    time.sleep(0.4)
+    d.click(".setup .back")
+    d.wait("return document.querySelectorAll('.card').length > 0")
+
+    # Signing out starts the page afresh, signed out.
+    d.click_xpath("//nav[@aria-label='Setup']//button[normalize-space(.)='Sign out']")
+    d.wait("return !!document.querySelector('.login:not(.over) input[type=password]')")
+    time.sleep(0.6)
+    print("signed out:", d.js(text, ".login h1"), "| app gone:", d.js("return !document.querySelector('.page')"),
+          "| /api/status now:", d.js("const r = new XMLHttpRequest(); r.open('GET', new URL('api/status', document.baseURI), false);"
+                                     "r.send(); return r.status"))
+    d.shot(out / f"a5-signed-out-{tag}.png")
+
+
 def romanize_flow(d, out, tag, album):
     """Scratch daemons with Prefer English on: romanized suggestions, the script switch, and an import."""
     d.open_setup("Inbox setup")
@@ -813,6 +901,10 @@ def main():
     tag = "dark" if dark else "light"
     try:
         d.go(url)
+        if "--auth" in sys.argv:
+            auth_flow(d, out, tag)
+            return
+        sign_in(d)
         d.wait("return document.querySelectorAll('.card').length > 0")
         grid_intro_check(d)
         d.wait("return document.querySelectorAll('.card').length > 0")
