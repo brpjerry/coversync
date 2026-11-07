@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS covers (
     signature TEXT NOT NULL,
     version   TEXT
 );
+-- The highest change counter this installation has seen for each Library
+-- database it attached, so that one restored from an older copy is noticed.
+CREATE TABLE IF NOT EXISTS seen_libraries (
+    id         TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL
+);
 "#;
 
 /// The local database's file name, in the state directory.
@@ -121,10 +127,18 @@ const DATA_COLUMNS: &[&str] = &[
 /// database's those to the Inbox's (and to which Inbox files are hidden). A
 /// counter only goes up. Each transaction that writes raises it by one, and
 /// the rows it writes (and, in the Library, the removals it records) take
-/// the new value as their `generation`, so "what changed since N" is the
-/// rows above N.
+/// the new value as their `generation`, so in the Library "what changed
+/// since N" is the rows above N. The Inbox keeps no removals, and hiding
+/// files writes no track rows.
 const GENERATION: &str = "generation";
 const INBOX_GENERATION: &str = "inbox_generation";
+
+/// Inbox changes an older coversyncd made that leave no stamped track behind
+/// (deleted tracks, files hidden or shown again): triggers set it to one
+/// above the Inbox's counter, which catches up with it when the local
+/// database next opens. This build's own such writes raise the counter to
+/// the same value themselves.
+const INBOX_PENDING: &str = "inbox_pending_generation";
 
 /// The Library database's own id: a random UUID created with its counter.
 /// A different id is a different Library, whose counter means nothing to a
@@ -133,7 +147,8 @@ const INBOX_GENERATION: &str = "inbox_generation";
 /// installation and is too short to be unique everywhere.
 const LIBRARY_ID: &str = "library_id";
 
-/// The value a write takes under `key` in `schema`: one above its counter.
+/// The value a write takes under `key`: one above its counter, in the
+/// settings of the database the trigger using it belongs to.
 fn next_generation_sql(key: &str) -> String {
     format!("COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key = '{key}'), 0) + 1")
 }
@@ -142,8 +157,8 @@ fn next_generation_sql(key: &str) -> String {
 /// was, as an older coversyncd's do (it doesn't know the column): they set
 /// it to one above the counter under `key`, the value this build's own
 /// writes take, so those writes are counted too. The counter itself catches
-/// up with this build's next write, or in the Library, when this build next
-/// attaches the database. A row already above the counter is left alone.
+/// up when this build next opens the local database or attaches the
+/// Library's. A row already above the counter is left alone.
 fn stamp_triggers(schema: &str, key: &str) -> String {
     let next = next_generation_sql(key);
     format!(
@@ -157,16 +172,21 @@ fn stamp_triggers(schema: &str, key: &str) -> String {
 }
 
 /// What the Library database's change counter needs beyond the `generation`
-/// column: indexes for asking what changed since a generation, the removed
-/// tracks (by their path relative to the folder, as the tracks have it), and
-/// triggers that keep both up to date whatever writes or deletes a track.
+/// column: indexes for asking what changed since a generation, a record of
+/// every track removed (its row id and its path relative to the folder, as
+/// the tracks have them), and triggers that keep both up to date whatever
+/// writes or deletes a track. A file back at a removed path is a new track,
+/// with a new id and a later generation; its removal stays recorded, so a
+/// client going through the changes in order sees the old id go before the
+/// new one arrives.
 fn counter_schema(schema: &str) -> String {
     let next = next_generation_sql(GENERATION);
     let stamps = stamp_triggers(schema, GENERATION);
     format!(
         "CREATE INDEX IF NOT EXISTS {schema}.tracks_generation ON tracks (generation);
          CREATE TABLE IF NOT EXISTS {schema}.removed (
-             path       TEXT PRIMARY KEY,
+             track_id   INTEGER NOT NULL,
+             path       TEXT NOT NULL,
              album_id   TEXT NOT NULL,
              generation INTEGER NOT NULL,
              -- Unix seconds.
@@ -175,13 +195,42 @@ fn counter_schema(schema: &str) -> String {
          CREATE INDEX IF NOT EXISTS {schema}.removed_generation ON removed (generation);
          {stamps}
          CREATE TRIGGER IF NOT EXISTS {schema}.tracks_removed AFTER DELETE ON tracks
-            BEGIN INSERT OR REPLACE INTO removed (path, album_id, generation, removed_at)
-                VALUES (OLD.path, OLD.album_id, {next}, CAST(strftime('%s', 'now') AS INTEGER));
-            END;
-         -- A file back at a removed path is listed as a track again, not as removed.
-         CREATE TRIGGER IF NOT EXISTS {schema}.tracks_restored AFTER INSERT ON tracks
-            BEGIN DELETE FROM removed WHERE path = NEW.path; END;"
+            BEGIN INSERT INTO removed (track_id, path, album_id, generation, removed_at)
+                VALUES (OLD.id, OLD.path, OLD.album_id, {next},
+                    CAST(strftime('%s', 'now') AS INTEGER));
+            END;"
     )
+}
+
+/// Triggers that keep an older coversyncd's Inbox changes that leave no
+/// stamped track behind counted (see [`INBOX_PENDING`]).
+fn inbox_pending_triggers() -> String {
+    let next = next_generation_sql(INBOX_GENERATION);
+    let set = format!("UPDATE settings SET value = {next} WHERE key = '{INBOX_PENDING}'");
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS main.tracks_pending_delete AFTER DELETE ON tracks
+            BEGIN {set}; END;
+         CREATE TRIGGER IF NOT EXISTS main.hidden_pending_insert AFTER INSERT ON hidden
+            BEGIN {set}; END;
+         CREATE TRIGGER IF NOT EXISTS main.hidden_pending_delete AFTER DELETE ON hidden
+            BEGIN {set}; END;"
+    )
+}
+
+/// Raise the Inbox's counter past an older coversyncd's changes: tracks it
+/// wrote (stamped one above the counter) and those it left pending.
+fn settle_inbox_generation(conn: &Connection) -> Result<()> {
+    let highest: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(generation), 0) FROM main.tracks",
+        [],
+        |r| r.get(0),
+    )?;
+    let current = generation(conn, "main", INBOX_GENERATION)?;
+    let settled = highest.max(generation(conn, "main", INBOX_PENDING)?);
+    if settled > current {
+        put_setting(conn, "main", INBOX_GENERATION, &settled)?;
+    }
+    Ok(())
 }
 
 /// A random (version 4) UUID, from SQLite's generator, which the operating
@@ -424,10 +473,11 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         // An older coversyncd, opening the folder elsewhere, adds files
         // without a time; date them by their modification time now.
         conn.execute(
-            "UPDATE lib_new.tracks SET added_at = mtime WHERE added_at = 0",
+            "UPDATE lib_new.tracks SET added_at = mtime WHERE added_at = 0 AND mtime != 0",
             [],
         )?;
         settle_generation(conn, "lib_new")?;
+        renew_if_restored(conn, "lib_new")?;
         // SQLite opens a file it can't write read-only without saying so;
         // writing the prefix (again) checks the file and its folder, which
         // holds the journal, take writes.
@@ -446,9 +496,10 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
                 .copied()
                 .collect::<Vec<_>>()
                 .join(", ");
+            let removed = "track_id, path, album_id, generation, removed_at";
             conn.execute_batch(&format!(
                 "INSERT OR IGNORE INTO lib_new.tracks ({cols}) SELECT {cols} FROM lib.tracks;
-                 INSERT OR REPLACE INTO lib_new.removed SELECT * FROM lib.removed;
+                 INSERT INTO lib_new.removed ({removed}) SELECT {removed} FROM lib.removed;
                  INSERT OR REPLACE INTO lib_new.settings
                     SELECT * FROM lib.settings WHERE key IN ('{LIBRARY_ID}', '{GENERATION}');"
             ))?;
@@ -467,7 +518,62 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         "INSERT INTO temp.lib_root (root, prefix, stored) VALUES (?1, ?2, 1)",
         params![dir.to_string_lossy(), prefix],
     )?;
+    remember_library(conn);
     Ok(created)
+}
+
+/// Give the Library database in `schema` a new id if its counter is lower
+/// than this installation has seen it reach. It was restored from an older
+/// copy, so the generations clients saw beyond its counter will be reused
+/// for other changes. Under a new id, clients start over. Raising the
+/// counter instead wouldn't do: the generations between, which clients saw,
+/// would still name other changes than the ones this copy holds.
+fn renew_if_restored(conn: &Connection, schema: &str) -> Result<()> {
+    let Some(id) = get_setting::<String>(conn, schema, LIBRARY_ID)? else {
+        return Ok(());
+    };
+    let seen: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM main.seen_libraries WHERE id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let now = generation(conn, schema, GENERATION)?;
+    if let Some(seen) = seen
+        && seen > now
+    {
+        let new = new_library_id(conn)?;
+        tracing::warn!(
+            old = %id, new = %new, generation = now, seen,
+            "the Library's change counter is behind what this installation saw, as after a restore from an older copy; it gets a new id, so clients start over"
+        );
+        put_setting(conn, schema, LIBRARY_ID, &new)?;
+    }
+    Ok(())
+}
+
+/// Note how far the attached Library's counter has got, if its database is
+/// kept in its folder (see [`renew_if_restored`]). Run after the Library's
+/// writes commit, so it never notes more than the database holds. A failure
+/// only costs noticing a restore, so it is logged rather than returned.
+fn remember_library(conn: &Connection) {
+    let noted = (|| -> Result<()> {
+        if !attached(conn)?.is_some_and(|a| a.stored) {
+            return Ok(());
+        }
+        if let Some(v) = library_version(conn)? {
+            conn.execute(
+                "INSERT INTO main.seen_libraries (id, generation) VALUES (?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET generation = MAX(generation, excluded.generation)",
+                params![v.id, v.generation],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = noted {
+        tracing::warn!("couldn't note the Library's change counter: {e}");
+    }
 }
 
 /// Bring a Library database up to the current schema (its own `user_version`).
@@ -494,7 +600,7 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
         conn.execute_batch(&format!(
             "BEGIN;
              {add}
-             UPDATE {schema}.tracks SET added_at = mtime WHERE added_at = 0;
+             UPDATE {schema}.tracks SET added_at = mtime WHERE added_at = 0 AND mtime != 0;
              PRAGMA {schema}.user_version = 2;
              COMMIT;"
         ))
@@ -603,8 +709,8 @@ const VISIBLE: &str = "path NOT IN (SELECT path FROM hidden)";
 /// the Library is.
 const CHANGED_TRACKS: &str = "SELECT id, path, album_id, generation FROM lib.tracks
     WHERE generation > ?1 ORDER BY generation, id";
-const REMOVED_TRACKS: &str = "SELECT path, album_id, generation, removed_at FROM lib.removed
-    WHERE generation > ?1 ORDER BY generation";
+const REMOVED_TRACKS: &str = "SELECT track_id, path, album_id, generation, removed_at
+    FROM lib.removed WHERE generation > ?1 ORDER BY generation, rowid";
 
 /// A file ready to index: its stat data, album id, album directory and tags.
 pub type IndexedFile = (FileStat, String, PathBuf, TrackTags);
@@ -937,6 +1043,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 6 {
         // v6 counts changes to the Inbox, as the Library database does its
         // own; rows already there start at generation 0, with the counter.
+        // Triggers keep an older coversyncd's changes counted too.
         let has_column = conn
             .prepare("SELECT 1 FROM pragma_table_info('tracks') WHERE name = 'generation'")?
             .exists([])?;
@@ -949,10 +1056,13 @@ fn migrate(conn: &Connection) -> Result<()> {
             "BEGIN;
              {add}
              {}
-             INSERT OR IGNORE INTO settings (key, value) VALUES ('{INBOX_GENERATION}', '0');
+             {}
+             INSERT OR IGNORE INTO settings (key, value)
+                VALUES ('{INBOX_GENERATION}', '0'), ('{INBOX_PENDING}', '0');
              PRAGMA user_version = 6;
              COMMIT;",
-            stamp_triggers("main", INBOX_GENERATION)
+            stamp_triggers("main", INBOX_GENERATION),
+            inbox_pending_triggers()
         ))
         .inspect_err(|_| {
             let _ = conn.execute_batch("ROLLBACK");
@@ -1066,6 +1176,7 @@ impl Library {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        settle_inbox_generation(&conn)?;
         conn.execute_batch(&temp_schema())?;
         attach_memory(&conn, None, None)?;
         Ok(Self {
@@ -1214,10 +1325,11 @@ impl Library {
         let removed = stmt
             .query_map([since], |r| {
                 Ok(RemovedTrack {
-                    path: r.get(0)?,
-                    album_id: r.get(1)?,
-                    generation: r.get(2)?,
-                    removed_at: r.get(3)?,
+                    id: -(a.prefix * ID_SPAN + r.get::<_, i64>(0)?),
+                    path: r.get(1)?,
+                    album_id: r.get(2)?,
+                    generation: r.get(3)?,
+                    removed_at: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1358,6 +1470,9 @@ impl Library {
             put_setting(&tx, "lib", GENERATION, &lib_next)?;
         }
         tx.commit()?;
+        if lib_wrote {
+            remember_library(&conn);
+        }
         Ok(())
     }
 
@@ -1390,6 +1505,9 @@ impl Library {
             [],
         )?;
         tx.commit()?;
+        if lib_gone > 0 {
+            remember_library(&conn);
+        }
         Ok(())
     }
 
@@ -1951,8 +2069,9 @@ mod tests {
     fn migrating_v0_marks_rows_for_rescan() {
         let path = temp_db("migrate");
         let conn = Connection::open(&path).unwrap();
-        // The v0 table had neither tag_keys nor collection.
-        let v0 = SCHEMA
+        // The v0 table had neither tag_keys nor collection, and there was no
+        // record of Libraries seen.
+        let v0 = SCHEMA[..SCHEMA.find("-- The highest change counter").unwrap()]
             .replace(",\n    tag_keys     TEXT NOT NULL DEFAULT ''", "")
             .replace(",\n    collection   TEXT NOT NULL DEFAULT 'inbox'", "")
             .replace(",\n    tag_values   TEXT NOT NULL DEFAULT '{}'", "")
@@ -2497,7 +2616,6 @@ mod tests {
             "DROP TRIGGER tracks_stamp_insert;
              DROP TRIGGER tracks_stamp_update;
              DROP TRIGGER tracks_removed;
-             DROP TRIGGER tracks_restored;
              DROP TABLE removed;
              DROP INDEX tracks_generation;
              ALTER TABLE tracks DROP COLUMN generation;
@@ -2589,18 +2707,30 @@ mod tests {
         );
         assert_eq!(gone.removed[0].generation, 3);
         assert!(gone.removed[0].removed_at > 0);
+        let old_id = gone.removed[0].id;
+        assert!(old_id < -ID_SPAN, "a public track id: {old_id}");
         // Nothing removed, nothing counted.
         lib.remove_paths(&[root.join("A/9.flac"), "/m/b/1.flac".into()])
             .unwrap();
         lib.remove_paths(&[]).unwrap();
         assert_eq!(library_version(&lib).generation, 3);
 
-        // A file back at a removed path is a track again, not a removal.
+        // A file back at a removed path is a new track, after the removal,
+        // which stays: in order, the old id goes and the new one arrives.
         lib.upsert(&[library_file(&root, "A/1.flac", "A", 3)])
             .unwrap();
         assert_eq!(library_version(&lib).generation, 4);
-        assert!(removed(&lib, 0).is_empty());
-        assert_eq!(changed(&lib, 3), [("A/1.flac".into(), 4)]);
+        let back = changes(&lib, 2);
+        assert_eq!(
+            (back.removed[0].id, back.removed[0].generation),
+            (old_id, 3)
+        );
+        assert_eq!(back.tracks.len(), 1);
+        assert_eq!(
+            (back.tracks[0].path.as_str(), back.tracks[0].generation),
+            ("A/1.flac", 4)
+        );
+        assert_ne!(back.tracks[0].id, old_id);
         // Public track ids, as the rest of the API has them.
         let ids: HashSet<i64> = changes(&lib, 0).tracks.iter().map(|t| t.id).collect();
         let listed: HashSet<i64> = lib.album_track_ids(&album).unwrap().into_iter().collect();
@@ -2699,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_library_reports_a_lower_counter() {
+    fn a_restored_library_gets_a_new_id_where_it_was_further_on() {
         let (dir, root, lib) = new_library("librestore");
         lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
             .unwrap();
@@ -2715,13 +2845,97 @@ mod tests {
         assert_eq!(seen.generation, 2);
         drop(lib);
 
+        // The folder, restored from the backup, moved to a fresh server: it
+        // is the same Library, and keeps its id.
+        let moved = dir.join("Moved");
+        std::fs::create_dir_all(moved.join(".coversync")).unwrap();
+        std::fs::copy(&backup, moved.join(LIBRARY_DB)).unwrap();
+        let fresh = Library::open_in(&dir.join("fresh")).unwrap();
+        fresh.set_library_setup(with_folder(&moved, &[])).unwrap();
+        assert_eq!(library_version(&fresh).id, seen.id);
+        assert_eq!(library_version(&fresh).generation, 1);
+        drop(fresh);
+
+        // Restored where it had got further: the generations a client saw
+        // past its counter will name other changes, so it gets a new id.
         std::fs::copy(&backup, root.join(LIBRARY_DB)).unwrap();
         let lib = Library::open_in(&dir.join("state")).unwrap();
         let now = library_version(&lib);
-        // The same Library, further back than the client has been: it can
-        // tell that what it holds may be ahead of the Library.
-        assert_eq!(now.id, seen.id);
-        assert!(now.generation < seen.generation, "{now:?} vs {seen:?}");
+        assert_ne!(now.id, seen.id);
+        assert_eq!((now.id.len(), now.generation), (36, 1));
+        drop(lib);
+        // For good: it is that Library from now on.
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert_eq!(library_version(&lib), now);
+        lib.upsert(&[library_file(&root, "C/1.flac", "C", 1)])
+            .unwrap();
+        drop(lib);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        assert_eq!(library_version(&lib).id, now.id);
+        assert_eq!(library_version(&lib).generation, 2);
+    }
+
+    #[test]
+    fn files_with_no_modification_time_count_nothing_on_reattach() {
+        let (dir, root, lib) = new_library("libzerotime");
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 0)])
+            .unwrap();
+        assert_eq!(library_version(&lib).generation, 1);
+        drop(lib);
+        for _ in 0..3 {
+            let lib = Library::open_in(&dir.join("state")).unwrap();
+            assert_eq!(library_version(&lib).generation, 1);
+            assert!(changed(&lib, 1).is_empty());
+        }
+        // Nor when an older database with such a file is upgraded.
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        as_v2(&own);
+        drop(own);
+        for _ in 0..2 {
+            let lib = Library::open_in(&dir.join("state")).unwrap();
+            assert_eq!(library_version(&lib).generation, 0);
+            assert!(changed(&lib, 0).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_write_counts_nothing() {
+        let (_dir, root, lib) = new_library("libfail");
+        lib.upsert(&[
+            library_file(&root, "A/1.flac", "A", 1),
+            library_file(&root, "A/2.flac", "A", 1),
+        ])
+        .unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();
+        let before = lib.index_versions().unwrap();
+        lib.conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_insert BEFORE INSERT ON lib.tracks
+                    WHEN NEW.path = 'B/2.flac' BEGIN SELECT RAISE(ABORT, 'boom'); END;
+                 CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON lib.tracks
+                    WHEN OLD.path = 'A/2.flac' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        // Rows, stamps, removals and counters go back together.
+        assert!(
+            lib.upsert(&[
+                file("/m/b/1.flac", "b", &[]),
+                library_file(&root, "B/1.flac", "B", 1),
+                library_file(&root, "B/2.flac", "B", 1),
+            ])
+            .is_err()
+        );
+        assert!(
+            lib.remove_paths(&[root.join("A/1.flac"), root.join("A/2.flac")])
+                .is_err()
+        );
+        assert_eq!(lib.index_versions().unwrap(), before);
+        assert_eq!(
+            changed(&lib, 0),
+            [("A/1.flac".into(), 1), ("A/2.flac".into(), 1)]
+        );
+        assert!(removed(&lib, 0).is_empty());
+        assert_eq!(lib.file_stats().unwrap().len(), 3);
     }
 
     #[test]
@@ -2818,6 +3032,53 @@ mod tests {
             .unwrap();
         assert_eq!(generations(&lib), [6]);
         assert_eq!(lib.index_versions().unwrap().library, None);
+    }
+
+    #[test]
+    fn an_older_coversyncds_inbox_changes_count_once_reopened() {
+        let path = temp_db("inboxolder");
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[]), file("/m/a/2.flac", "a", &[])])
+            .unwrap();
+        let inbox = |lib: &Library| lib.index_versions().unwrap().inbox.generation;
+        let mut last = inbox(&lib);
+        assert_eq!(last, 1);
+        drop(lib);
+        // What an older coversyncd does to the local database, each time
+        // before this build opens it again.
+        for (what, sql) in [
+            (
+                "insert",
+                "INSERT INTO tracks (path, root, mtime, size, album_id, album_dir, title, artist,
+                    album, duration_ms, format)
+                 VALUES ('/m/a/3.flac', '/m', 1, 1, 'a', '/m/a', 't', 'a', 'b', 0, 'FLAC')",
+            ),
+            (
+                "update",
+                "UPDATE tracks SET mtime = 2 WHERE path = '/m/a/1.flac'",
+            ),
+            ("delete", "DELETE FROM tracks WHERE path = '/m/a/2.flac'"),
+            (
+                "hide",
+                "INSERT INTO hidden (path, hidden_at) VALUES ('/m/a/1.flac', 1)",
+            ),
+            ("unhide", "DELETE FROM hidden"),
+        ] {
+            let older = Connection::open(&path).unwrap();
+            older.execute_batch(sql).unwrap();
+            drop(older);
+            let lib = Library::open(&path).unwrap();
+            let now = inbox(&lib);
+            assert!(now > last, "{what}: {now}, from {last}");
+            last = now;
+        }
+        // This build's next change counts on from there.
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/4.flac", "a", &[])]).unwrap();
+        assert_eq!(inbox(&lib), last + 1);
+        drop(lib);
+        let lib = Library::open(&path).unwrap();
+        assert_eq!(inbox(&lib), last + 1, "and opening counts nothing more");
     }
 
     #[test]
@@ -3042,7 +3303,10 @@ mod tests {
         assert_eq!(albums[0].added_at, 1);
         assert_eq!(library_version(&lib), version);
         assert_eq!(changed(&lib, 0), [("A/1.flac".into(), 3)]);
-        assert_eq!(removed(&lib, 0), [("A/2.flac".into(), 5)]);
+        assert_eq!(
+            removed(&lib, 0),
+            [("A/1.flac".into(), 2), ("A/2.flac".into(), 5)]
+        );
     }
 
     #[test]

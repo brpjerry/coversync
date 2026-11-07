@@ -216,6 +216,52 @@ fn a_move_import_counts_the_inbox_files_it_takes() {
 }
 
 #[test]
+fn an_import_that_fails_to_index_its_copies_counts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup("importfail");
+    s.lib.prepare_library(&s.root).unwrap();
+    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
+    wav(&s.inbox.join("Rec/2.wav"), "Two", "Record", 2);
+    s.scan();
+    let before = s.lib.index_versions().unwrap();
+    // The files can be copied, but the Library database can't take them:
+    // its folder, which holds the journal, is read-only.
+    let own = s.root.join(".coversync");
+    let mode = |m| fs::set_permissions(&own, fs::Permissions::from_mode(m)).unwrap();
+    mode(0o555);
+    if fs::create_dir(own.join("probe")).is_ok() {
+        return; // Running as root: permissions don't stop writes.
+    }
+    let result = import::execute(
+        &s.lib,
+        &s.covers,
+        &s.inbox_album(),
+        &Edits::new(),
+        None,
+        &s.progress,
+    );
+    mode(0o755);
+    assert!(
+        matches!(result, Err(coversync_core::Error::Db(_))),
+        "{:?}",
+        result.err()
+    );
+    // The copies were made (their folder is left), then taken back out; the
+    // originals stay in the Inbox, shown. Nothing was committed, so nothing
+    // is counted or removed.
+    assert!(s.root.join("Record").is_dir());
+    assert!(!s.root.join("Record/01 - One.wav").exists());
+    assert!(!s.root.join("Record/02 - Two.wav").exists());
+    assert_eq!(s.lib.index_versions().unwrap(), before);
+    assert!(s.changed(-1).is_empty());
+    assert!(s.removed(-1).is_empty());
+    assert_eq!(
+        s.lib.album(&s.inbox_album()).unwrap().unwrap().tracks.len(),
+        2
+    );
+}
+
+#[test]
 fn a_tag_edit_counts_a_change_to_its_tracks_even_when_the_album_id_changes() {
     let s = setup("tags");
     wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);

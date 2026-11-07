@@ -107,11 +107,14 @@ pub struct AlbumDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LibraryVersion {
     /// A random UUID, made with the Library's database. Another id is
-    /// another Library, whose counter says nothing about this one's.
+    /// another Library, whose counter says nothing about this one's. A
+    /// Library restored from an older copy gets a new one from an
+    /// installation that saw its counter get further.
     pub id: String,
     /// The change counter, which goes up with every change to the Library's
     /// tracks. Lower than a client saw before, under the same id, means the
-    /// Library was restored from an older copy.
+    /// Library was restored from an older copy somewhere that didn't know
+    /// the later state.
     pub generation: i64,
 }
 
@@ -140,9 +143,12 @@ pub struct ChangedTrack {
     pub generation: i64,
 }
 
-/// A track that left the Library, at a path no track has now.
+/// A track that left the Library. A file may since have come back at the
+/// same path: that is a new track, with a new id and a later generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedTrack {
+    /// The id the track had.
+    pub id: i64,
     /// Relative to the Library folder.
     pub path: String,
     pub album_id: String,
