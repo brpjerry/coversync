@@ -266,15 +266,13 @@ pub async fn start(
 /// Change the album's job, unless a newer one replaced it. Returns whether
 /// the job was still the album's.
 fn update(state: &Shared, album_id: &str, generation: u64, f: impl FnOnce(&mut Job)) -> bool {
-    let mut jobs = state.identify.lock();
-    let job = jobs
+    state
+        .identify
+        .lock()
         .get_mut(album_id)
-        .filter(|j| j.generation == generation);
-    let current = job.is_some();
-    if let Some(job) = job {
-        f(job);
-    }
-    current
+        .filter(|j| j.generation == generation)
+        .map(f)
+        .is_some()
 }
 
 /// The album's identification job, as it stands.
