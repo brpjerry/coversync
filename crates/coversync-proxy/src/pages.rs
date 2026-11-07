@@ -70,9 +70,14 @@ pub(crate) fn enter(cookie: &str, to: &str) -> Response {
 
 /// What a page load gets when the server can't be reached.
 pub(crate) fn unreachable_page(unreachable: &Unreachable) -> Response {
+    let detail = unreachable
+        .detail
+        .as_deref()
+        .map(|detail| format!("<p><small>{}</small></p>", html_escape(detail)))
+        .unwrap_or_default();
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Can't reach the server</title>\
-         <h1>Can't reach the server</h1><p>{}</p><p><a href=\"\">Try again</a></p>\n",
+         <h1>Can't reach the server</h1><p>{}</p>{detail}<p><a href=\"\">Try again</a></p>\n",
         html_escape(&unreachable.to_string())
     );
     (

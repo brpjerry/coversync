@@ -559,7 +559,9 @@ async fn reports_a_server_that_cant_be_reached() {
     assert_eq!(res.headers()[CONTENT_TYPE], "application/json");
     let body = text(res).await;
     assert!(
-        body.starts_with(&format!("{{\"error\":\"Can't reach {server}: ")),
+        body.starts_with(&format!(
+            "{{\"error\":\"Can't reach {server}. The connection was refused"
+        )),
         "{body}"
     );
     assert!(reports.try_recv().is_err(), "an API call isn't a page load");
@@ -570,10 +572,8 @@ async fn reports_a_server_that_cant_be_reached() {
     assert!(text(res).await.contains("Can't reach the server"));
     let report = reports.try_recv().unwrap();
     assert_eq!(report.server, server);
-    assert!(
-        report.reason.to_lowercase().contains("refused"),
-        "{report:?}"
-    );
+    assert!(report.reason.contains("refused"), "{report:?}");
+    assert_eq!(report.detail, None, "the OS's words add nothing to it");
 
     // Without Sec-Fetch-Dest, a GET that accepts HTML is a page load too.
     let req = window
@@ -622,7 +622,7 @@ async fn reports_a_server_down_behind_its_reverse_proxy() {
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "passed through");
     assert_eq!(
         reports.try_recv().unwrap().reason,
-        "it answered 502 Bad Gateway."
+        "It answered 502 Bad Gateway, so coversync behind it may be stopped."
     );
     assert!(window.proxy.check(&up).await.is_err());
 

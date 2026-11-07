@@ -19,9 +19,9 @@
 
 mod headers;
 mod pages;
+mod unreachable;
 mod upstream;
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -41,86 +41,13 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
 
+pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};
 
 /// How long to wait for a TCP connection to the server.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long [`Proxy::check`] waits for an answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// The server couldn't be reached, or answered the way a reverse proxy does
-/// when the server behind it is down (502, 503 or 504).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unreachable {
-    /// The server's URL.
-    pub server: String,
-    /// What went wrong, for people: `Connection refused (os error 111)`.
-    pub reason: String,
-}
-
-impl fmt::Display for Unreachable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Can't reach {}: {}", self.server, self.reason)
-    }
-}
-
-impl StdError for Unreachable {}
-
-impl Unreachable {
-    fn new(upstream: &Upstream, reason: String) -> Self {
-        Self {
-            server: upstream.url(),
-            reason,
-        }
-    }
-
-    fn from_error(upstream: &Upstream, err: &(dyn StdError + 'static)) -> Self {
-        Self::new(upstream, describe(err))
-    }
-
-    fn from_status(upstream: &Upstream, status: StatusCode) -> Option<Self> {
-        matches!(
-            status,
-            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-        )
-        .then(|| Self::new(upstream, format!("it answered {status}.")))
-    }
-}
-
-/// The innermost cause of a failed request, which says the most
-/// (`Connection refused (os error 111)`), with a hint for a certificate the
-/// system doesn't trust.
-fn describe(err: &(dyn StdError + 'static)) -> String {
-    let mut innermost = err;
-    let mut untrusted = false;
-    let mut cause = Some(err);
-    while let Some(err) = cause {
-        untrusted |= is_certificate_error(err);
-        innermost = err;
-        cause = err.source();
-    }
-    let mut reason = innermost.to_string();
-    if untrusted {
-        reason.push_str(
-            ". The system doesn't trust the server's certificate: install the CA that \
-             signed it in the system's certificate store.",
-        );
-    }
-    reason
-}
-
-fn is_certificate_error(mut err: &(dyn StdError + 'static)) -> bool {
-    // rustls's errors reach hyper inside an io::Error, inside another.
-    loop {
-        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
-            return matches!(tls, rustls::Error::InvalidCertificate(_));
-        }
-        match err.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
-            Some(inner) => err = inner,
-            None => return false,
-        }
-    }
-}
 
 type UnreachableHandler = Arc<dyn Fn(Unreachable) + Send + Sync>;
 
@@ -251,7 +178,7 @@ impl Proxy {
     pub async fn check(&self, upstream: &Upstream) -> Result<(), Unreachable> {
         let uri = upstream
             .uri(&format!("{}/", upstream.prefix()))
-            .ok_or_else(|| Unreachable::new(upstream, "its address isn't valid.".into()))?;
+            .ok_or_else(|| Unreachable::new(upstream, "Its address isn't valid."))?;
         let mut req = Request::get(uri)
             .header(HOST, upstream.host())
             .header(ACCEPT, "text/html")
@@ -265,7 +192,7 @@ impl Proxy {
             Err(_) => Err(Unreachable::new(
                 upstream,
                 format!(
-                    "it didn't answer within {} seconds.",
+                    "It didn't answer within {} seconds.",
                     CHECK_TIMEOUT.as_secs()
                 ),
             )),
@@ -329,7 +256,7 @@ impl Shared {
             }
             Err(err) => {
                 let unreachable = Unreachable::from_error(upstream, &err);
-                tracing::warn!("{unreachable}");
+                tracing::warn!("{unreachable} ({err:?})");
                 if document {
                     let page = pages::unreachable_page(&unreachable);
                     self.report(unreachable);
@@ -427,20 +354,5 @@ mod tests {
         assert_eq!(entry_key(Some("x=1&k=abc")), Some("abc"));
         assert_eq!(entry_key(Some("kk=abc")), None);
         assert_eq!(entry_key(None), None);
-    }
-
-    #[test]
-    fn describes_the_innermost_cause() {
-        let io = io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused");
-        assert_eq!(describe(&io), "Connection refused");
-
-        // As hyper-rustls hands it on.
-        let tls = io::Error::other(io::Error::new(
-            io::ErrorKind::InvalidData,
-            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
-        ));
-        let reason = describe(&tls);
-        assert!(reason.starts_with("invalid peer certificate: UnknownIssuer"));
-        assert!(reason.contains("certificate store"));
     }
 }
