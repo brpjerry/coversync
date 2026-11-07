@@ -199,6 +199,36 @@ fn an_import_counts_one_change_to_each_collection() {
 }
 
 #[test]
+fn a_scan_and_an_import_count_each_batch_they_commit() {
+    let s = setup("batches");
+    // More files than one batch (256) holds.
+    for i in 1..=300 {
+        wav(
+            &s.inbox.join(format!("Rec/{i:03}.wav")),
+            &format!("T{i}"),
+            "Record",
+            i,
+        );
+    }
+    s.scan();
+    assert_eq!(s.inbox_generation(), 2, "two batches");
+    s.import(&s.inbox_album());
+    let mut per_generation = std::collections::BTreeMap::new();
+    for (_, _, g) in s.changed(0) {
+        *per_generation.entry(g).or_insert(0) += 1;
+    }
+    assert_eq!(
+        per_generation.into_iter().collect::<Vec<_>>(),
+        [(1, 256), (2, 44)]
+    );
+    assert_eq!(s.library().generation, 2);
+    // Hiding the 300 originals is one more change to the Inbox.
+    assert_eq!(s.inbox_generation(), 3);
+    s.scan();
+    assert_eq!((s.inbox_generation(), s.library().generation), (3, 2));
+}
+
+#[test]
 fn a_move_import_counts_the_inbox_files_it_takes() {
     let s = setup("importmove");
     let mut setup = s.lib.inbox_setup().unwrap();

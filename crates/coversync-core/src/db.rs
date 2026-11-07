@@ -175,10 +175,10 @@ fn stamp_triggers(schema: &str, key: &str) -> String {
 /// column: indexes for asking what changed since a generation, a record of
 /// every track removed (its row id and its path relative to the folder, as
 /// the tracks have them), and triggers that keep both up to date whatever
-/// writes or deletes a track. A file back at a removed path is a new track
-/// with a later generation, usually under a new id (SQLite can reuse the
-/// highest one); its removal stays recorded, so a client going through the
-/// changes in order sees the old track go before the new one arrives.
+/// writes or deletes a track. A file back at a removed path is a new track,
+/// usually under a new id (SQLite can reuse the highest one); its removal
+/// stays recorded, so a client applying the changes in order (see
+/// [`LibraryChanges`]) sees the old track go before the new one arrives.
 fn counter_schema(schema: &str) -> String {
     let next = next_generation_sql(GENERATION);
     let stamps = stamp_triggers(schema, GENERATION);
@@ -470,6 +470,9 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
     let prepared = (|| -> Result<(i64, bool)> {
         conn.execute_batch(&library_schema("lib_new"))?;
         migrate_library(conn, "lib_new")?;
+        // Before anything raises the counter: an older coversyncd's writes to
+        // a restored copy could take it back up to what was seen.
+        renew_if_restored(conn, "lib_new")?;
         // An older coversyncd, opening the folder elsewhere, adds files
         // without a time; date them by their modification time now.
         conn.execute(
@@ -477,7 +480,6 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
             [],
         )?;
         settle_generation(conn, "lib_new")?;
-        renew_if_restored(conn, "lib_new")?;
         // SQLite opens a file it can't write read-only without saying so;
         // writing the prefix (again) checks the file and its folder, which
         // holds the journal, take writes.
@@ -527,7 +529,10 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
 /// copy, so the generations clients saw beyond its counter will be reused
 /// for other changes. Under a new id, clients start over. Raising the
 /// counter instead wouldn't do: the generations between, which clients saw,
-/// would still name other changes than the ones this copy holds.
+/// would still name other changes than the ones this copy holds. It reads
+/// the counter as stored, so it runs before anything raises it: an older
+/// coversyncd's writes to the copy, stamped one above, could otherwise take
+/// it back up to what was seen.
 fn renew_if_restored(conn: &Connection, schema: &str) -> Result<()> {
     let Some(id) = get_setting::<String>(conn, schema, LIBRARY_ID)? else {
         return Ok(());
@@ -1478,7 +1483,7 @@ impl Library {
 
     /// Forget files, from whichever database holds them. Each database
     /// that loses a row counts one change; the Library's records each file
-    /// it lost as removed then (see [`counter_schema`]).
+    /// it lost as removed then (see `counter_schema`).
     pub fn remove_paths(&self, paths: &[PathBuf]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -2876,6 +2881,71 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_an_older_coversyncd_wrote_to_still_gets_a_new_id() {
+        let (dir, root, lib) = new_library("librestoreolder");
+        for i in 1..=9 {
+            lib.upsert(&[library_file(&root, &format!("A/{i}.flac"), "A", 1)])
+                .unwrap();
+        }
+        assert_eq!(library_version(&lib).generation, 9);
+        drop(lib);
+        let backup = dir.join("backup.sqlite3");
+        std::fs::copy(root.join(LIBRARY_DB), &backup).unwrap();
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.upsert(&[library_file(&root, "B/1.flac", "B", 1)])
+            .unwrap();
+        let seen = library_version(&lib);
+        assert_eq!(seen.generation, 10);
+        drop(lib);
+
+        // Restored at 9, then written to by an older coversyncd, whose row is
+        // stamped 10: settled, the counter is back at what was seen.
+        std::fs::copy(&backup, root.join(LIBRARY_DB)).unwrap();
+        let older = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        older
+            .execute(
+                "INSERT INTO tracks (path, mtime, size, album_id, album_dir, title, artist,
+                    album, duration_ms, format, added_at)
+                 VALUES ('C/1.flac', 5, 1, 'x', 'C', 't', 'a', 'C', 0, 'FLAC', 5)",
+                [],
+            )
+            .unwrap();
+        drop(older);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let now = library_version(&lib);
+        assert_eq!(now.generation, 10);
+        assert_ne!(
+            now.id, seen.id,
+            "the same id and counter for other contents"
+        );
+    }
+
+    #[test]
+    fn a_restore_from_before_a_removal_gets_a_new_id() {
+        let (dir, root, lib) = new_library("librestoreremoval");
+        lib.upsert(&[
+            library_file(&root, "A/1.flac", "A", 1),
+            library_file(&root, "A/2.flac", "A", 1),
+        ])
+        .unwrap();
+        drop(lib);
+        let backup = dir.join("backup.sqlite3");
+        std::fs::copy(root.join(LIBRARY_DB), &backup).unwrap();
+        // The counter last rises through a removal, with no attach after it.
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.remove_paths(&[root.join("A/1.flac")]).unwrap();
+        let seen = library_version(&lib);
+        assert_eq!(seen.generation, 2);
+        drop(lib);
+
+        std::fs::copy(&backup, root.join(LIBRARY_DB)).unwrap();
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let now = library_version(&lib);
+        assert_eq!(now.generation, 1);
+        assert_ne!(now.id, seen.id);
+    }
+
+    #[test]
     fn files_with_no_modification_time_count_nothing_on_reattach() {
         let (dir, root, lib) = new_library("libzerotime");
         lib.upsert(&[library_file(&root, "A/1.flac", "A", 0)])
@@ -3032,6 +3102,33 @@ mod tests {
             .unwrap();
         assert_eq!(generations(&lib), [6]);
         assert_eq!(lib.index_versions().unwrap().library, None);
+    }
+
+    #[test]
+    fn this_builds_own_inbox_changes_count_nothing_more_once_reopened() {
+        let path = temp_db("inboxown");
+        let inbox = |lib: &Library| lib.index_versions().unwrap().inbox.generation;
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[]), file("/m/a/2.flac", "a", &[])])
+            .unwrap();
+        drop(lib);
+        // Hiding, showing and removing set the pending value the triggers
+        // keep for an older coversyncd, at the value they raise the counter
+        // to themselves: reopening finds nothing more to count.
+        for what in ["hide", "unhide", "remove"] {
+            let lib = Library::open(&path).unwrap();
+            let before = inbox(&lib);
+            match what {
+                "hide" => lib.hide_paths(&["/m/a/1.flac".into()], 1).unwrap(),
+                "unhide" => assert_eq!(lib.unhide_all().unwrap(), 1),
+                _ => lib.remove_paths(&["/m/a/2.flac".into()]).unwrap(),
+            }
+            let after = inbox(&lib);
+            assert_eq!(after, before + 1, "{what}");
+            drop(lib);
+            let lib = Library::open(&path).unwrap();
+            assert_eq!(inbox(&lib), after, "{what}, reopened");
+        }
     }
 
     #[test]

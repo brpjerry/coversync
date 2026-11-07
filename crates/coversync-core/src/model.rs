@@ -144,8 +144,8 @@ pub struct ChangedTrack {
 }
 
 /// A track that left the Library. A file may since have come back at the
-/// same path: that is a new track with a later generation, usually under a
-/// new id.
+/// same path: that is a new track, usually under a new id, listed among the
+/// changed tracks (see [`LibraryChanges`] for the order to apply them in).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedTrack {
     /// The id the track had.
@@ -158,7 +158,13 @@ pub struct RemovedTrack {
     pub removed_at: i64,
 }
 
-/// What changed in the Library after a generation, earliest change first.
+/// What changed in the Library after a generation, each list earliest
+/// change first. Apply them in generation order, and within a generation,
+/// the removals before the tracks. A track listed is one still in the
+/// Library, written after any removal of its id or path, and a removal and
+/// a track can share a generation: an older coversyncd stamps all its
+/// changes one above the counter, so its deleting a track and writing one
+/// at the same path, or under the reused highest id, land together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryChanges {
     pub library: LibraryVersion,
