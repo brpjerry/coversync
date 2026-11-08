@@ -13,12 +13,10 @@ import {
 	type TagGroup,
 	type TagKind
 } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
-class SetupStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+class LibrarySetupStore extends SetupStore<SetupResponse> {
 	groups = $state<TagGroup[]>([]);
 	kinds = $state<TagKind[]>([]);
 	essentials = $state<string[]>([]);
@@ -63,61 +61,28 @@ class SetupStore {
 			(this.separator !== this.saved.separator ? 1 : 0)
 	);
 
-	#loading: Promise<void> | null = null;
-	/** Bumped by each read, so only the newest one lands. */
-	#reads = 0;
-	/** Bumped as each save starts and ends, so no read sent before or during one lands. */
-	#saves = 0;
-
-	/** The saved setup, or null when a newer read or a save has overtaken this one. */
-	async #read(): Promise<SetupResponse | null> {
-		const read = ++this.#reads;
-		const saves = this.#saves;
-		const r = await api.setup();
-		return read === this.#reads && saves === this.#saves ? r : null;
+	protected fetch() {
+		return api.setup();
 	}
 
-	/** The first answer, with the tag catalog. */
-	#first(r: SetupResponse) {
-		this.groups = r.groups;
-		this.kinds = r.kinds;
-		this.essentials = r.essentials;
-		this.albumKinds = r.album_kinds;
-		this.notEditable = r.not_editable;
-		this.suggestions = r.suggestions;
-		this.variables = r.variables;
-		this.artFileNames = r.art_file_names;
-		this.#apply(r);
-		this.loaded = true;
-		this.failed = false;
-	}
-
-	load() {
-		this.#loading ??= this.#read()
-			.then((r) => {
-				if (r) this.#first(r);
-				// Overtaken: the newer read applies itself, or a later load asks again.
-				else this.#loading = null;
-			})
-			.catch(() => {
-				this.failed = true;
-				this.#loading = null;
-			});
-		return this.#loading;
-	}
-
-	/** Re-read the saved setup (e.g. before an import), keeping unsaved edits. */
-	async refresh() {
-		try {
-			const r = await this.#read();
-			if (!r) return;
-			if (!this.loaded) this.#first(r);
-			else if (this.changes === 0) this.#apply(r);
-			else {
-				this.folderStatus = r.folder;
-				this.libraryProblem = r.library_problem;
-			}
-		} catch {}
+	protected take(r: SetupResponse, first: boolean) {
+		if (first) {
+			// The tag catalog comes once.
+			this.groups = r.groups;
+			this.kinds = r.kinds;
+			this.essentials = r.essentials;
+			this.albumKinds = r.album_kinds;
+			this.notEditable = r.not_editable;
+			this.suggestions = r.suggestions;
+			this.variables = r.variables;
+			this.artFileNames = r.art_file_names;
+		}
+		if (first || this.changes === 0) this.#apply(r);
+		else {
+			// Keep unsaved edits; refresh only what the daemon owns.
+			this.folderStatus = r.folder;
+			this.libraryProblem = r.library_problem;
+		}
 	}
 
 	async loadCoverage() {
@@ -170,36 +135,30 @@ class SetupStore {
 		this.separator = this.saved.separator;
 	}
 
-	async save() {
-		this.saving = true;
-		this.#saves++;
-		const reads = this.#reads;
-		try {
-			// Send in catalog order; the daemon normalizes the same way.
-			const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
-			const r = await api.saveSetup({
-				rules: {
-					required_tags: ids,
-					art: { ...this.art, file_name: this.art.file_name.trim() },
-					separator: this.separator
-				},
-				folder: this.folder.trim() || null,
-				structure: this.structure.trim()
-			});
-			this.#apply(r);
-			this.version++;
-			if (r.adopted)
-				toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
-			else toast('Library setup saved', 'success');
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
-		} finally {
-			this.saving = false;
-			this.#saves++;
-			// Reads asked for meanwhile (a save elsewhere, say) were dropped: read again.
-			if (this.#reads !== reads) void this.refresh();
-		}
+	save() {
+		return this.write(async () => {
+			try {
+				// Send in catalog order; the daemon normalizes the same way.
+				const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
+				const r = await api.saveSetup({
+					rules: {
+						required_tags: ids,
+						art: { ...this.art, file_name: this.art.file_name.trim() },
+						separator: this.separator
+					},
+					folder: this.folder.trim() || null,
+					structure: this.structure.trim()
+				});
+				this.#apply(r);
+				this.version++;
+				if (r.adopted)
+					toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
+				else toast('Library setup saved', 'success');
+			} catch (e) {
+				toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
+			}
+		});
 	}
 }
 
-export const setup = new SetupStore();
+export const setup = new LibrarySetupStore();

@@ -3,6 +3,7 @@
 // need them; the Appearance screen edits `sorts`, `filters` and `coverSize`.
 
 import { api, ApiError, type AppearanceResponse, type CoverSizes, type Sortable } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
 /** Match the daemon's defaults, so the top bar and sidebar are right before it answers. */
@@ -80,10 +81,7 @@ export class TagList {
 	}
 }
 
-class AppearanceStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+class AppearanceStore extends SetupStore<AppearanceResponse> {
 	sortable = $state<Sortable[]>([]);
 	filterable = $state<Sortable[]>([]);
 	groups = $state<{ id: string; label: string }[]>([]);
@@ -113,35 +111,13 @@ class AppearanceStore {
 		this.savedCoverSize = this.coverSize = r.setup.cover_size;
 	}
 
-	/** Bumped by each read, so only the newest one lands. */
-	#reads = 0;
-	/** Bumped as each save starts and ends, so no read sent before or during one lands. */
-	#saves = 0;
-
-	/** Read the saved setup; with `keep`, not over unsaved edits. */
-	async #read(keep: boolean) {
-		const read = ++this.#reads;
-		const saves = this.#saves;
-		const r = await api.appearance();
-		if (read !== this.#reads || saves !== this.#saves || (keep && this.changes)) return;
-		this.#apply(r);
-		this.loaded = true;
-		this.failed = false;
+	protected fetch() {
+		return api.appearance();
 	}
 
-	async load() {
-		try {
-			await this.#read(false);
-		} catch {
-			this.failed = !this.loaded;
-		}
-	}
-
-	/** Re-read the saved setup (after a save elsewhere), unless there are unsaved edits to keep. */
-	async refresh() {
-		try {
-			await this.#read(true);
-		} catch {}
+	protected take(r: AppearanceResponse, first: boolean) {
+		// Unsaved edits are kept as they are.
+		if (first || !this.changes) this.#apply(r);
 	}
 
 	label(id: string) {
@@ -155,29 +131,23 @@ class AppearanceStore {
 	}
 
 	/** Returns whether it saved; new sorts and filters need fresh album data for their values. */
-	async save(): Promise<boolean> {
-		this.saving = true;
-		this.#saves++;
-		const reads = this.#reads;
-		try {
-			this.#apply(
-				await api.saveAppearance({
-					sort_tabs: this.sorts.items,
-					filter_tags: this.filters.items,
-					cover_size: this.coverSize
-				})
-			);
-			toast('Appearance saved', 'success');
-			return true;
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
-			return false;
-		} finally {
-			this.saving = false;
-			this.#saves++;
-			// Reads asked for meanwhile (a save elsewhere, say) were dropped: read again.
-			if (this.#reads !== reads) void this.refresh();
-		}
+	save(): Promise<boolean> {
+		return this.write(async () => {
+			try {
+				this.#apply(
+					await api.saveAppearance({
+						sort_tabs: this.sorts.items,
+						filter_tags: this.filters.items,
+						cover_size: this.coverSize
+					})
+				);
+				toast('Appearance saved', 'success');
+				return true;
+			} catch (e) {
+				toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
+				return false;
+			}
+		});
 	}
 }
 
