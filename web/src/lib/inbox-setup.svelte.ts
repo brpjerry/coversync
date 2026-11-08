@@ -1,5 +1,5 @@
-// Inbox setup: which folder is scanned, how files are ingested (autofill,
-// smart suggestions), and which are hidden.
+// Inbox setup: which folder is scanned, where uploads go, how files are
+// ingested (autofill, smart suggestions), and which are hidden.
 
 import {
 	api,
@@ -21,6 +21,7 @@ class InboxSetupStore {
 	saved = $state({
 		ingest: 'copy' as IngestMode,
 		folder: '',
+		uploads: '',
 		autofill: null as Autofill | null,
 		suggestions: false,
 		preferEnglish: false,
@@ -29,6 +30,8 @@ class InboxSetupStore {
 	});
 	ingest = $state<IngestMode>('copy');
 	folder = $state('');
+	/** '' means Uploads in the Inbox folder. */
+	uploads = $state('');
 	autofill = $state<Autofill | null>(null);
 	suggestions = $state(false);
 	preferEnglish = $state(false);
@@ -49,6 +52,7 @@ class InboxSetupStore {
 	changes = $derived(
 		(this.ingest === this.saved.ingest ? 0 : 1) +
 			(this.folder.trim() === this.saved.folder ? 0 : 1) +
+			(this.uploads.trim() === this.saved.uploads ? 0 : 1) +
 			Object.keys(this.autofill ?? {}).filter(
 				(k) => this.autofill?.[k as keyof Autofill] !== this.saved.autofill?.[k as keyof Autofill]
 			).length +
@@ -65,6 +69,7 @@ class InboxSetupStore {
 		this.saved = {
 			ingest: r.setup.ingest,
 			folder: r.setup.folder ?? '',
+			uploads: r.setup.uploads ?? '',
 			autofill: r.setup.autofill,
 			suggestions: r.setup.suggestions.enabled,
 			preferEnglish: r.setup.suggestions.prefer_english,
@@ -73,6 +78,7 @@ class InboxSetupStore {
 		};
 		this.ingest = this.saved.ingest;
 		this.folder = this.saved.folder;
+		this.uploads = this.saved.uploads;
 		this.autofill = { ...r.setup.autofill };
 		this.suggestions = this.saved.suggestions;
 		this.preferEnglish = this.saved.preferEnglish;
@@ -112,6 +118,7 @@ class InboxSetupStore {
 	revert() {
 		this.ingest = this.saved.ingest;
 		this.folder = this.saved.folder;
+		this.uploads = this.saved.uploads;
 		this.autofill = this.saved.autofill && { ...this.saved.autofill };
 		this.suggestions = this.saved.suggestions;
 		this.preferEnglish = this.saved.preferEnglish;
@@ -120,16 +127,17 @@ class InboxSetupStore {
 		this.keyDraft = null;
 	}
 
-	/** Returns whether the Inbox folder changed (the daemon rescans then). */
+	/** Returns whether the Inbox or uploads folder changed (the daemon rescans then). */
 	async save(): Promise<boolean> {
 		this.saving = true;
-		const before = this.saved.folder;
+		const before = [this.saved.folder, this.saved.uploads];
 		try {
 			this.#apply(
 				await api.saveInboxSetup(
 					{
 						ingest: this.ingest,
 						folder: this.folder.trim() || null,
+						uploads: this.uploads.trim() || null,
 						autofill: this.autofill!,
 						suggestions: {
 							enabled: this.suggestions,
@@ -143,7 +151,7 @@ class InboxSetupStore {
 			);
 			this.version++;
 			toast('Inbox setup saved', 'success');
-			return this.saved.folder !== before;
+			return this.saved.folder !== before[0] || this.saved.uploads !== before[1];
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 			return false;
