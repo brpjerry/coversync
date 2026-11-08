@@ -14,7 +14,9 @@ class SyncSetupStore {
 	enabled = $state(true);
 
 	changes = $derived(this.enabled === this.savedEnabled ? 0 : 1);
-	/** Bumped by each save, so a load that started before one can't undo it. */
+	/** Bumped by each read, so only the newest one lands. */
+	#reads = 0;
+	/** Bumped as each save starts and ends, so no read sent before or during one lands. */
 	#saves = 0;
 
 	#apply(r: SyncSetupResponse) {
@@ -22,17 +24,18 @@ class SyncSetupStore {
 	}
 
 	async load() {
+		const read = ++this.#reads;
 		const saves = this.#saves;
 		try {
 			const r = await api.syncSetup();
-			if (saves !== this.#saves) return;
+			if (read !== this.#reads || saves !== this.#saves) return;
 			// Keep an unsaved choice.
 			if (this.loaded && this.changes) this.savedEnabled = r.setup.enabled;
 			else this.#apply(r);
 			this.loaded = true;
 			this.failed = false;
 		} catch {
-			this.failed = !this.loaded;
+			if (read === this.#reads) this.failed = !this.loaded;
 		}
 	}
 
@@ -43,6 +46,7 @@ class SyncSetupStore {
 	async save() {
 		this.saving = true;
 		this.#saves++;
+		const reads = this.#reads;
 		const enabled = this.enabled;
 		try {
 			const r = await api.saveSyncSetup({ enabled });
@@ -54,6 +58,9 @@ class SyncSetupStore {
 			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 		} finally {
 			this.saving = false;
+			this.#saves++;
+			// Reads asked for meanwhile (a save elsewhere, say) were dropped: read again.
+			if (this.#reads !== reads) void this.load();
 		}
 	}
 }

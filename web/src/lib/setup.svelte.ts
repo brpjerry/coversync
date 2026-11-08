@@ -64,22 +64,40 @@ class SetupStore {
 	);
 
 	#loading: Promise<void> | null = null;
+	/** Bumped by each read, so only the newest one lands. */
+	#reads = 0;
+	/** Bumped as each save starts and ends, so no read sent before or during one lands. */
+	#saves = 0;
+
+	/** The saved setup, or null when a newer read or a save has overtaken this one. */
+	async #read(): Promise<SetupResponse | null> {
+		const read = ++this.#reads;
+		const saves = this.#saves;
+		const r = await api.setup();
+		return read === this.#reads && saves === this.#saves ? r : null;
+	}
+
+	/** The first answer, with the tag catalog. */
+	#first(r: SetupResponse) {
+		this.groups = r.groups;
+		this.kinds = r.kinds;
+		this.essentials = r.essentials;
+		this.albumKinds = r.album_kinds;
+		this.notEditable = r.not_editable;
+		this.suggestions = r.suggestions;
+		this.variables = r.variables;
+		this.artFileNames = r.art_file_names;
+		this.#apply(r);
+		this.loaded = true;
+		this.failed = false;
+	}
 
 	load() {
-		this.#loading ??= api
-			.setup()
+		this.#loading ??= this.#read()
 			.then((r) => {
-				this.groups = r.groups;
-				this.kinds = r.kinds;
-				this.essentials = r.essentials;
-				this.albumKinds = r.album_kinds;
-				this.notEditable = r.not_editable;
-				this.suggestions = r.suggestions;
-				this.variables = r.variables;
-				this.artFileNames = r.art_file_names;
-				this.#apply(r);
-				this.loaded = true;
-				this.failed = false;
+				if (r) this.#first(r);
+				// Overtaken: the newer read applies itself, or a later load asks again.
+				else this.#loading = null;
 			})
 			.catch(() => {
 				this.failed = true;
@@ -90,10 +108,11 @@ class SetupStore {
 
 	/** Re-read the saved setup (e.g. before an import), keeping unsaved edits. */
 	async refresh() {
-		if (!this.loaded) return this.load();
 		try {
-			const r = await api.setup();
-			if (this.changes === 0) this.#apply(r);
+			const r = await this.#read();
+			if (!r) return;
+			if (!this.loaded) this.#first(r);
+			else if (this.changes === 0) this.#apply(r);
 			else {
 				this.folderStatus = r.folder;
 				this.libraryProblem = r.library_problem;
@@ -153,6 +172,8 @@ class SetupStore {
 
 	async save() {
 		this.saving = true;
+		this.#saves++;
+		const reads = this.#reads;
 		try {
 			// Send in catalog order; the daemon normalizes the same way.
 			const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
@@ -174,6 +195,9 @@ class SetupStore {
 			toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
 		} finally {
 			this.saving = false;
+			this.#saves++;
+			// Reads asked for meanwhile (a save elsewhere, say) were dropped: read again.
+			if (this.#reads !== reads) void this.refresh();
 		}
 	}
 }

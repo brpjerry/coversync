@@ -29,7 +29,7 @@
 		onsaved: (result: TagWriteResult) => void;
 		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
 		onimport?: (edits?: ImportEdits) => void;
-		/** The album changed elsewhere while its tags were being edited here; the sheet shows it as it was. */
+		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
 		changed?: boolean;
 		/** Drop the edits and show the album as it is now. */
 		onreload?: () => void;
@@ -167,7 +167,7 @@
 			{#if changed}
 				<p class="elsewhere" role="status" transition:slide={{ duration: 200 }}>
 					<CircleAlert size={15} strokeWidth={2.2} />
-					<span>This album was changed elsewhere while you were editing it.</span>
+					<span>This album was changed elsewhere.</span>
 					<button class="link" title="Your edits here are dropped" onclick={() => onreload?.()}>
 						Reload
 					</button>

@@ -59,14 +59,14 @@ const RETRY_MAX_MS = 10_000;
 const HIDDEN_MS = 10_000;
 
 /**
- * Listen for notices until told to stop. When the stream
- * drops (the daemon restarted, the network went), it's opened again after a
- * growing delay. `onlive` hears each time the stream comes up or goes down,
- * and `resync` is called whenever it comes back up, as notices sent while it
- * was down are lost. A hidden page closes the stream without telling
- * `onlive`, and opens it again (and resyncs) when it's shown. `onfirst` is
- * called instead of `resync` when the stream first opens: only changes made
- * since the page's first reads were missed, if any.
+ * Listen for notices until told to stop. When the stream drops (the daemon
+ * restarted, the network went), it's opened again after a growing delay.
+ * `onlive` hears each time the stream comes up or goes down, and `resync` is
+ * called whenever it comes back up, as notices sent while it was down are
+ * lost. A hidden page closes the stream without telling `onlive`, and opens
+ * it again (and resyncs) when it's shown. `onfirst` is called instead of
+ * `resync` when the stream first opens, if it hasn't been down before: the
+ * page can start its first reads then.
  */
 export function listen(
 	handlers: NoticeHandlers,
