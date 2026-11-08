@@ -21,6 +21,18 @@ used on a home server.
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
   separator) offer each.
+- **Tag editor** (an album's Edit tags): album-wide fields and each track's.
+  A save is refused, and nothing written, if the album changed after the
+  editor loaded it: saved from another browser or app, or changed on disk
+  and found by a scan, tracks added or removed included. The album then
+  says it was changed elsewhere, as it does when a change arrives while you
+  edit (see Live updates), and shows it as it is now, with the fields that
+  changed marked and your unsaved edits on top: save again to apply them,
+  or Reload to drop them. API clients get the same check by sending back
+  the album's `version`, and its tracks' ids and paths, with a tag save
+  (`PUT /api/albums/{id}/tags`), and a 409 with the album as it is now when
+  it no longer matches; a save without them is written as before. The
+  `album_changed` notice carries the album's new `version`.
 - **Library setup**: required tags; album art rules (a cover file, embedded
   art or both, required or not, and the cover file's name); and the folder
   structure, a template such as
@@ -68,7 +80,8 @@ used on a home server.
   of the API, and ends within 20 seconds of its session ending (signing out,
   a password reset); signed out, the page waits, and opens it again once
   signed back in. Tag edits in progress are kept: if the
-  album changes elsewhere meanwhile, the album says so and offers to reload.
+  album changes elsewhere meanwhile, the album says so and offers to reload,
+  and saving puts the edits on top of the change (see Tag editor).
   Each tab showing coversync holds a connection open for the stream (one
   hidden for a few seconds lets it go). Over plain HTTP/1.1, as at
   <http://127.0.0.1:8770/>, browsers allow six connections to a server

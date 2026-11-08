@@ -61,8 +61,7 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
-	import type { Draft } from '#lib/components/TagEditor.svelte';
-	import { sameJson } from '#lib/same.ts';
+	import type { Draft, TagDraft } from '#lib/components/TagEditor.svelte';
 
 	const SORT_KEY = 'coversync.sort';
 	const SIDEBAR_KEY = 'coversync.sidebar';
@@ -274,7 +273,9 @@
 	 * have moved on. When `changed`, the album changed elsewhere (edited,
 	 * renamed, imported, gone) while its tags had unsaved edits here, and the
 	 * sheet keeps them until the user reloads it. Otherwise the sheet is on its
-	 * way to the album's new id. `next` is the album's id now, if known.
+	 * way to the album's new id. `next` is the album's id now, if known. After
+	 * a save refused for that, the sheet shows the album as it is now, with
+	 * the edits on top (`kept`; see TagEditor).
 	 */
 	let held = $state<{
 		from: string;
@@ -282,6 +283,7 @@
 		album: Album;
 		detail: Detail | null;
 		changed: boolean;
+		kept: TagDraft | null;
 	} | null>(null);
 	let holding = $derived(held?.from === openId ? held : null);
 	/** Counts the sheet's openings (and closings): a Reload belongs to one. */
@@ -473,7 +475,7 @@
 		// sheet stays on it, quietly, until the notice saying where it went.
 		held =
 			holding && !openAlbum && sheetAlbum
-				? { ...holding, album: sheetAlbum, detail: saved, changed: false }
+				? { ...holding, album: sheetAlbum, detail: saved, changed: false, kept: null }
 				: null;
 		const grids = loadAlbums();
 		if (!from || result.album_id === from) return grids;
@@ -484,7 +486,8 @@
 				next: result.album_id,
 				album: sheetAlbum,
 				detail: saved,
-				changed: false
+				changed: false,
+				kept: null
 			};
 		enqueue({ kind: 'moved', from, to: result.album_id }, true);
 		return grids;
@@ -628,7 +631,8 @@
 			next: next ?? holding?.next ?? null,
 			album: sheetAlbum,
 			detail: sheetDetail,
-			changed
+			changed,
+			kept: holding?.kept ?? null
 		};
 	}
 
@@ -641,10 +645,16 @@
 	 */
 	type Job =
 		| { kind: 'open' }
-		| { kind: 'notice'; id: string; previous: string | null }
+		| { kind: 'notice'; id: string; previous: string | null; version?: string | null }
 		| { kind: 'resync' }
 		| { kind: 'moved'; from: string; to: string }
-		| { kind: 'reload'; sheet: string; opening: number };
+		| { kind: 'reload'; sheet: string; opening: number }
+		| {
+				kind: 'refused';
+				saved: string;
+				current: Detail | null;
+				kept: () => TagDraft | null;
+		  };
 	let jobs: Job[] = [];
 	let running = false;
 	let wake: (() => void) | null = null;
@@ -665,8 +675,11 @@
 		running = true;
 		try {
 			while (jobs.length) {
+				// A save's own answers (moved, refused) go on while it's answered.
 				const job =
-					draft === 'saving' ? jobs.find((j) => j.kind === 'open' || j.kind === 'moved') : jobs[0];
+					draft === 'saving'
+						? jobs.find((j) => j.kind === 'open' || j.kind === 'moved' || j.kind === 'refused')
+						: jobs[0];
 				if (!job) {
 					await new Promise<void>((resolve) => (wake = resolve));
 					wake = null;
@@ -706,6 +719,9 @@
 							);
 						return true;
 					}
+					// The sheet shows that version already (a save of this page's,
+					// answered or refused): nothing to show.
+					if (job.version && sheetDetail?.version === job.version) return true;
 					// Held: Reload shows it as it is; a new id is noted for that.
 					if (holding?.changed) {
 						if (job.id !== now) hold(job.id);
@@ -725,6 +741,9 @@
 					return true;
 				case 'reload':
 					await reload(job.sheet, job.opening);
+					return true;
+				case 'refused':
+					refused(job);
 					return true;
 			}
 		} catch (e) {
@@ -763,7 +782,14 @@
 		}
 		// Without, the sheet stays as it is while it moves.
 		if (to !== from)
-			held = { from, next: to, album: sheetAlbum, detail: sheetDetail, changed: false };
+			held = {
+				from,
+				next: to,
+				album: sheetAlbum,
+				detail: sheetDetail,
+				changed: false,
+				kept: null
+			};
 		const before = saves;
 		const [fresh] = await Promise.all([fetchAlbum(to), to !== from ? gridsSettled() : null]);
 		if (openId !== from) return true;
@@ -772,9 +798,9 @@
 		if (renamedLater(to)) return true;
 		// Not known (the daemon away, signed out): a later resync asks again.
 		if (fresh === undefined) return true;
-		const shown = $state.snapshot(sheetDetail);
-		// Unchanged (this page's own save, come back): the editor and its edits are left be.
-		if (fresh && to === from && sameJson(fresh, shown)) return true;
+		// Unchanged (this page's own save, come back): the editor and its edits
+		// are left be. Its version says, as a save's does (see refused).
+		if (fresh && to === from && fresh.version === sheetDetail?.version) return true;
 		if (draft !== 'none') {
 			// A save begun meanwhile says so if it fails (see ondraft).
 			hold(fresh ? to : null, draft === 'draft');
@@ -814,7 +840,10 @@
 		}
 		// A new copy of the album: the editor starts over, without the edits.
 		detail = fresh;
-		held = to === sheet ? null : { from: sheet, next: to, album: h.album, detail, changed: false };
+		held =
+			to === sheet
+				? null
+				: { from: sheet, next: to, album: h.album, detail, changed: false, kept: null };
 		if (openId !== to)
 			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
 	}
@@ -829,17 +858,58 @@
 		wake?.();
 	}
 
+	/**
+	 * A save was refused because the album had changed elsewhere since the
+	 * sheet's copy: `current` is the album as it is now (null: gone), `kept`
+	 * reads the edits from the editor that saved (null once it has closed), and
+	 * `id` is the album's id the save was sent for. It goes through the queue,
+	 * ahead of what came meanwhile, so no notice lands over it.
+	 */
+	function onrefused(current: Detail | null, kept: () => TagDraft | null, id: string) {
+		// The sheet has moved on (closed, or another album): only the toast says so.
+		if (sheetDetail?.id !== id) return;
+		enqueue({ kind: 'refused', saved: id, current, kept }, true);
+	}
+
+	/**
+	 * Hold the sheet on the album as it is now, with the edits of the editor
+	 * that saved on top, as they are now, and the fields changed since marked
+	 * (see TagEditor). That editor closed (the sheet with it, or left for the
+	 * Tracks view), it's moot. Notices about versions the sheet shows from now
+	 * on change nothing. Gone, the sheet stays as it is, held.
+	 */
+	function refused(job: Extract<Job, { kind: 'refused' }>) {
+		if (!openId || sheetDetail?.id !== job.saved) return;
+		const kept = job.kept();
+		if (!kept) return;
+		if (!job.current) return hold(null);
+		held = {
+			from: openId,
+			next: job.current.id === openId ? null : job.current.id,
+			album: job.current,
+			detail: job.current,
+			changed: true,
+			kept
+		};
+		void loadAlbums();
+	}
+
+	/** The tag editor's edits were dropped: those kept from a refused save go too. */
+	function ondiscard() {
+		if (holding?.kept) held = { ...holding, kept: null };
+	}
+
 	/** Drop the held sheet's unsaved edits and show its album as it is now. */
 	function reloadHeld() {
 		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings });
 	}
 
 	/** An album was edited, here or elsewhere: show it as it is now. */
-	function albumChanged({ id, previous_id, collection }: Notices['album_changed']) {
+	function albumChanged({ id, previous_id, collection, version }: Notices['album_changed']) {
 		// The Inbox's tag coverage, which Library setup shows, may have changed.
 		if (collection === 'inbox') dataGeneration++;
 		loadAlbums();
-		enqueue({ kind: 'notice', id, previous: previous_id });
+		enqueue({ kind: 'notice', id, previous: previous_id, version });
 	}
 
 	/** Reload everything: notices were missed, or the stream has just come back. */
@@ -1319,6 +1389,9 @@
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
 		{ondraft}
+		kept={holding?.kept ?? null}
+		{onrefused}
+		{ondiscard}
 	/>
 {/if}
 

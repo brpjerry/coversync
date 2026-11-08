@@ -101,6 +101,11 @@ pub struct AlbumDetail {
     pub album: Album,
     pub dir: String,
     pub tracks: Vec<Track>,
+    /// Changes whenever any of the album's tracks is written, or a track
+    /// joins or leaves it: a digest of its tracks' ids and change counters
+    /// (`generation`), and for a Library album, the Library's id. A tag save
+    /// sends it, to be told when the album has changed since.
+    pub version: String,
 }
 
 /// Which Library an index is of, and how far its changes go.
