@@ -1,6 +1,7 @@
-//! Login state in the local database: the password's hash, browser sessions
-//! and app tokens. It has a connection of its own, so checking a request
-//! never waits for a scan's or an import's work on the index.
+//! Login state in the local database: the password's hash, browser sessions,
+//! paired devices and their tokens, and how devices may pair. It has a
+//! connection of its own, so checking a request never waits for a scan's or
+//! an import's work on the index.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -10,7 +11,7 @@ use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = r#"
@@ -21,6 +22,9 @@ CREATE TABLE IF NOT EXISTS password (
     set_at INTEGER NOT NULL
 );
 -- Apps and devices, each with its own token; only the token's SHA-256 is kept.
+-- A revoked device keeps its entry (and, with SYN-03, its settings) until it
+-- is removed, so pairing again can replace it. The columns after revoked_at
+-- came with pairing; `migrate` adds them to a table made before.
 CREATE TABLE IF NOT EXISTS devices (
     id           INTEGER PRIMARY KEY,
     name         TEXT NOT NULL,
@@ -28,7 +32,15 @@ CREATE TABLE IF NOT EXISTS devices (
     token_hash   BLOB NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL,
     last_seen_at INTEGER,
-    revoked_at   INTEGER
+    revoked_at   INTEGER,
+    -- What the device said about itself when it paired, and since.
+    platform     TEXT,
+    hostname     TEXT,
+    app_version  TEXT,
+    -- The address its token was last used from.
+    last_ip      TEXT,
+    -- When its current token was issued: pairing again replaces it.
+    paired_at    INTEGER
 );
 -- Browser sessions, by their id's SHA-256. One traded for an app's token
 -- names that device; it ends when the device is revoked.
@@ -39,7 +51,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL,
     seen_at    INTEGER NOT NULL
 );
+-- How devices pair: the CA certificate apps are told to trust (the path to
+-- its public certificate), and whether pairing over plain http is allowed.
+CREATE TABLE IF NOT EXISTS pairing_setup (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    ca_path    TEXT,
+    allow_http INTEGER NOT NULL DEFAULT 0
+);
 "#;
+
+/// Columns `devices` gained after SRV-01, which made the table without them.
+const DEVICE_COLUMNS: &[(&str, &str)] = &[
+    ("platform", "TEXT"),
+    ("hostname", "TEXT"),
+    ("app_version", "TEXT"),
+    ("last_ip", "TEXT"),
+    ("paired_at", "INTEGER"),
+];
 
 /// A session ends after this long without a request (90 days).
 pub const SESSION_IDLE: i64 = 90 * 24 * 3600;
@@ -52,7 +80,7 @@ const DEVICE_REFRESH: i64 = 60;
 pub const TOKEN_PREFIX: &str = "cst_";
 
 /// What a device or session may do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     /// Everything a password login can do.
@@ -102,12 +130,8 @@ pub struct Access {
 }
 
 impl Access {
-    /// A password login: the only kind that may add, revoke or re-scope
-    /// devices (SRV-02). Neither a token nor a cookie traded for one is.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "device management (SRV-02) checks it")
-    )]
+    /// A password login: the only kind that may add, change or revoke
+    /// devices. Neither a token nor a cookie traded for one is.
     pub fn password_login(&self) -> bool {
         self.via == Via::Password
     }
@@ -119,7 +143,7 @@ pub fn digest(secret: &str) -> [u8; 32] {
 }
 
 /// 32 random bytes, base64url without padding.
-fn random_secret() -> rusqlite::Result<String> {
+pub fn random_secret() -> rusqlite::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -127,10 +151,6 @@ fn random_secret() -> rusqlite::Result<String> {
 }
 
 /// A new app token: `cst_` and 32 random bytes in base64url.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pairing (SRV-02) issues tokens")
-)]
 pub fn new_token() -> rusqlite::Result<String> {
     Ok(format!("{TOKEN_PREFIX}{}", random_secret()?))
 }
@@ -176,6 +196,67 @@ pub struct Device {
     pub stale: bool,
 }
 
+/// A paired device, as Sync setup lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DeviceInfo {
+    pub id: i64,
+    pub name: String,
+    pub scope: Scope,
+    /// What the device said it runs on ("android", "linux", …).
+    pub platform: Option<String>,
+    pub hostname: Option<String>,
+    pub app_version: Option<String>,
+    pub created_at: i64,
+    /// When its current token was issued.
+    pub paired_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub last_ip: Option<String>,
+    pub revoked_at: Option<i64>,
+}
+
+const DEVICE_INFO: &str = "SELECT id, name, scope, platform, hostname, app_version, created_at,
+        COALESCE(paired_at, created_at), last_seen_at, last_ip, revoked_at FROM devices";
+
+fn device_info(r: &rusqlite::Row) -> rusqlite::Result<DeviceInfo> {
+    Ok(DeviceInfo {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        scope: Scope::parse(&r.get::<_, String>(2)?),
+        platform: r.get(3)?,
+        hostname: r.get(4)?,
+        app_version: r.get(5)?,
+        created_at: r.get(6)?,
+        paired_at: r.get(7)?,
+        last_seen_at: r.get(8)?,
+        last_ip: r.get(9)?,
+        revoked_at: r.get(10)?,
+    })
+}
+
+/// A device pairing with a code: what the browser chose for it, and what it
+/// said about itself.
+pub struct NewDevice<'a> {
+    pub name: &'a str,
+    pub scope: Scope,
+    /// The device whose entry it takes over.
+    pub replace: Option<i64>,
+    pub platform: Option<&'a str>,
+    pub hostname: Option<&'a str>,
+    pub app_version: Option<&'a str>,
+    pub ip: Option<&'a str>,
+}
+
+/// How devices pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingSetup {
+    /// The public certificate of the CA that signed the server's
+    /// certificate, for Android apps to trust; none for a publicly trusted one.
+    pub ca_path: Option<String>,
+    /// Pairing over plain http is allowed, for a network that is encrypted
+    /// already (Tailscale, WireGuard).
+    pub allow_http: bool,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -184,8 +265,9 @@ impl Store {
     /// Open the login tables in the local database at `path`, creating them
     /// if need be.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -352,18 +434,169 @@ impl Store {
             .optional()
     }
 
-    /// Note that a device's token was used.
-    pub fn touch_device(&self, id: i64, now: i64) -> rusqlite::Result<()> {
+    /// Note that a device's token was used, from `ip`; `app_version`, when
+    /// the app sent one, replaces the one noted before.
+    pub fn touch_device(
+        &self,
+        id: i64,
+        now: i64,
+        ip: Option<&str>,
+        app_version: Option<&str>,
+    ) -> rusqlite::Result<()> {
         self.conn().execute(
-            "UPDATE devices SET last_seen_at = ?2
+            "UPDATE devices SET last_seen_at = ?2, last_ip = COALESCE(?3, last_ip),
+                 app_version = COALESCE(?4, app_version)
              WHERE id = ?1 AND (last_seen_at IS NULL OR last_seen_at < ?2)",
-            params![id, now],
+            params![id, now, ip, app_version],
         )?;
         Ok(())
     }
 
-    /// Add a device with a new token, which is returned; only its hash is
-    /// kept. Pairing (SRV-02) issues tokens; until then only tests do.
+    /// Every device: those in use, then the revoked ones, each in the order
+    /// they were added.
+    pub fn devices(&self) -> rusqlite::Result<Vec<DeviceInfo>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "{DEVICE_INFO} ORDER BY revoked_at IS NOT NULL, id"
+        ))?;
+        stmt.query_map([], device_info)?.collect()
+    }
+
+    pub fn device_info(&self, id: i64) -> rusqlite::Result<Option<DeviceInfo>> {
+        self.conn()
+            .query_row(&format!("{DEVICE_INFO} WHERE id = ?1"), [id], device_info)
+            .optional()
+    }
+
+    /// Issue a token to a device that redeemed a pairing code. Returns the
+    /// device's id and the token; only the token's hash is kept. A device
+    /// that replaces another takes over its entry, revoked or not: the id
+    /// and whatever hangs off it stay, while the old token and the sessions
+    /// traded for it end. If that entry has gone meanwhile, the device is
+    /// added as a new one.
+    pub fn pair_device(&self, new: &NewDevice, now: i64) -> rusqlite::Result<(i64, String)> {
+        let token = new_token()?;
+        let hash = &digest(&token)[..];
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut replaced = None;
+        if let Some(id) = new.replace {
+            let found = tx.execute(
+                "UPDATE devices SET name = ?2, scope = ?3, token_hash = ?4, platform = ?5,
+                     hostname = ?6, app_version = ?7, last_ip = ?8, last_seen_at = ?9,
+                     paired_at = ?9, revoked_at = NULL
+                 WHERE id = ?1",
+                params![
+                    id,
+                    new.name,
+                    new.scope.as_str(),
+                    hash,
+                    new.platform,
+                    new.hostname,
+                    new.app_version,
+                    new.ip,
+                    now
+                ],
+            )?;
+            tx.execute("DELETE FROM sessions WHERE device_id = ?1", [id])?;
+            replaced = (found == 1).then_some(id);
+        }
+        let id = match replaced {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO devices (name, scope, token_hash, created_at, platform,
+                         hostname, app_version, last_ip, last_seen_at, paired_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4, ?4)",
+                    params![
+                        new.name,
+                        new.scope.as_str(),
+                        hash,
+                        now,
+                        new.platform,
+                        new.hostname,
+                        new.app_version,
+                        new.ip
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        tx.commit()?;
+        Ok((id, token))
+    }
+
+    /// Revoke a device: its token and the sessions traded for it stop
+    /// working at once. Its entry stays, marked revoked. Returns whether
+    /// there is such a device.
+    pub fn revoke_device(&self, id: i64, now: i64) -> rusqlite::Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let found = tx.execute(
+            "UPDATE devices SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
+            params![id, now],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE device_id = ?1", [id])?;
+        tx.commit()?;
+        Ok(found == 1)
+    }
+
+    /// Forget a device, revoking it if it wasn't. Returns whether there was
+    /// such a device.
+    pub fn remove_device(&self, id: i64) -> rusqlite::Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE device_id = ?1", [id])?;
+        let found = tx.execute("DELETE FROM devices WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(found == 1)
+    }
+
+    /// Rename or re-scope a device. A new scope applies to its token and the
+    /// sessions traded for it from their next request. Returns whether there
+    /// is such a device.
+    pub fn update_device(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        scope: Option<Scope>,
+    ) -> rusqlite::Result<bool> {
+        let found = self.conn().execute(
+            "UPDATE devices SET name = COALESCE(?2, name), scope = COALESCE(?3, scope)
+             WHERE id = ?1",
+            params![id, name, scope.map(Scope::as_str)],
+        )?;
+        Ok(found == 1)
+    }
+
+    pub fn pairing_setup(&self) -> rusqlite::Result<PairingSetup> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT ca_path, allow_http FROM pairing_setup WHERE id = 1",
+                [],
+                |r| {
+                    Ok(PairingSetup {
+                        ca_path: r.get(0)?,
+                        allow_http: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_pairing_setup(&self, setup: &PairingSetup) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO pairing_setup (id, ca_path, allow_http) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET ca_path = excluded.ca_path,
+                 allow_http = excluded.allow_http",
+            params![setup.ca_path, setup.allow_http],
+        )?;
+        Ok(())
+    }
+
+    /// Add a device with a new token, as pairing does, but not used yet.
     #[cfg(test)]
     pub fn add_device(
         &self,
@@ -371,22 +604,18 @@ impl Store {
         scope: Scope,
         now: i64,
     ) -> rusqlite::Result<(i64, String)> {
-        let token = new_token()?;
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO devices (name, scope, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![name, scope.as_str(), &digest(&token)[..], now],
-        )?;
-        Ok((conn.last_insert_rowid(), token))
-    }
-
-    #[cfg(test)]
-    pub fn revoke_device(&self, id: i64, now: i64) -> rusqlite::Result<()> {
-        self.conn().execute(
-            "UPDATE devices SET revoked_at = ?2 WHERE id = ?1",
-            params![id, now],
-        )?;
-        Ok(())
+        let new = NewDevice {
+            name,
+            scope,
+            replace: None,
+            platform: None,
+            hostname: None,
+            app_version: None,
+            ip: None,
+        };
+        let (id, token) = self.pair_device(&new, now)?;
+        self.forget_last_seen(id)?;
+        Ok((id, token))
     }
 
     #[cfg(test)]
@@ -404,15 +633,31 @@ impl Store {
             .execute("UPDATE devices SET last_seen_at = NULL WHERE id = ?1", [id])?;
         Ok(())
     }
+}
 
-    #[cfg(test)]
-    pub fn rescope_device(&self, id: i64, scope: Scope) -> rusqlite::Result<()> {
-        self.conn().execute(
-            "UPDATE devices SET scope = ?2 WHERE id = ?1",
-            params![id, scope.as_str()],
-        )?;
-        Ok(())
+/// Add the [`DEVICE_COLUMNS`] a `devices` table made before them lacks, in
+/// a write transaction, so `set-password` run while the service starts
+/// can't add them twice.
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
+    fn missing(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, &'static str)>> {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('devices')")?;
+        let present: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(DEVICE_COLUMNS
+            .iter()
+            .copied()
+            .filter(|(c, _)| !present.iter().any(|p| p == c))
+            .collect())
     }
+    if missing(conn)?.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (column, kind) in missing(&tx)? {
+        tx.execute_batch(&format!("ALTER TABLE devices ADD COLUMN {column} {kind}"))?;
+    }
+    tx.commit()
 }
 
 #[cfg(test)]
@@ -552,7 +797,7 @@ mod tests {
         assert_eq!(stored, digest(&token));
         let d = s.device(&token, 0).unwrap().unwrap();
         assert_eq!((d.id, d.scope, d.stale), (id, Scope::Manage, true));
-        s.touch_device(id, 5).unwrap();
+        s.touch_device(id, 5, None, None).unwrap();
         assert!(!s.device(&token, 10).unwrap().unwrap().stale);
         assert!(s.device(&token, 5 + DEVICE_REFRESH).unwrap().unwrap().stale);
         s.revoke_device(id, 20).unwrap();
@@ -567,7 +812,7 @@ mod tests {
         let session = s.create_device_session(id, Scope::Manage, 0).unwrap();
         // Using the session counts as using the device.
         assert!(s.session(&session, 1).unwrap().unwrap().device_stale);
-        s.touch_device(id, 1).unwrap();
+        s.touch_device(id, 1, None, None).unwrap();
         assert!(!s.session(&session, 2).unwrap().unwrap().device_stale);
         let found = s.session(&session, 1).unwrap().unwrap().access;
         assert_eq!(
@@ -579,12 +824,173 @@ mod tests {
             }
         );
         assert!(!found.password_login());
-        s.rescope_device(id, Scope::Sync).unwrap();
+        s.update_device(id, None, Some(Scope::Sync)).unwrap();
         assert_eq!(
             s.session(&session, 2).unwrap().unwrap().access.scope,
             Scope::Sync
         );
         s.revoke_device(id, 3).unwrap();
         assert!(s.session(&session, 4).unwrap().is_none());
+    }
+
+    fn phone(replace: Option<i64>) -> NewDevice<'static> {
+        NewDevice {
+            name: "Pixel 8",
+            scope: Scope::Manage,
+            replace,
+            platform: Some("android"),
+            hostname: Some("pixel-8"),
+            app_version: Some("0.1.0"),
+            ip: Some("192.168.1.20"),
+        }
+    }
+
+    #[test]
+    fn pairing_adds_a_device_and_replacing_keeps_its_id() {
+        let s = store("pair");
+        let (id, token) = s.pair_device(&phone(None), 100).unwrap();
+        let d = s.device_info(id).unwrap().unwrap();
+        assert_eq!(
+            d,
+            DeviceInfo {
+                id,
+                name: "Pixel 8".into(),
+                scope: Scope::Manage,
+                platform: Some("android".into()),
+                hostname: Some("pixel-8".into()),
+                app_version: Some("0.1.0".into()),
+                created_at: 100,
+                paired_at: 100,
+                last_seen_at: Some(100),
+                last_ip: Some("192.168.1.20".into()),
+                revoked_at: None,
+            }
+        );
+        let traded = s.create_device_session(id, Scope::Manage, 100).unwrap();
+        let (other, _) = s.add_device("Desktop", Scope::Manage, 100).unwrap();
+
+        // Reinstalled: a new token for the same entry, which ends the old
+        // one and its sessions.
+        let again = NewDevice {
+            name: "Pixel 8 (new)",
+            scope: Scope::Sync,
+            app_version: Some("0.2.0"),
+            ..phone(Some(id))
+        };
+        let (same, new_token) = s.pair_device(&again, 200).unwrap();
+        assert_eq!(same, id);
+        assert_ne!(new_token, token);
+        assert!(s.device(&token, 201).unwrap().is_none());
+        assert!(s.session(&traded, 201).unwrap().is_none());
+        assert_eq!(s.device(&new_token, 201).unwrap().unwrap().id, id);
+        let d = s.device_info(id).unwrap().unwrap();
+        assert_eq!(
+            (d.name.as_str(), d.scope, d.created_at, d.paired_at),
+            ("Pixel 8 (new)", Scope::Sync, 100, 200)
+        );
+        assert_eq!(d.app_version.as_deref(), Some("0.2.0"));
+        // The other device is untouched.
+        assert!(s.device_info(other).unwrap().unwrap().revoked_at.is_none());
+
+        // A revoked device comes back when it's replaced.
+        s.revoke_device(id, 300).unwrap();
+        assert!(s.device(&new_token, 301).unwrap().is_none());
+        let (same, back) = s.pair_device(&phone(Some(id)), 400).unwrap();
+        assert_eq!(same, id);
+        assert!(s.device(&back, 401).unwrap().is_some());
+        assert_eq!(s.device_info(id).unwrap().unwrap().revoked_at, None);
+
+        // One removed meanwhile is added afresh.
+        s.remove_device(id).unwrap();
+        let (fresh, _) = s.pair_device(&phone(Some(id)), 500).unwrap();
+        assert_ne!(fresh, id);
+        assert_eq!(s.devices().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revoked_devices_are_kept_until_removed() {
+        let s = store("revoke");
+        let (a, token) = s.add_device("A", Scope::Manage, 0).unwrap();
+        let (b, _) = s.add_device("B", Scope::Sync, 0).unwrap();
+        let session = s.create_device_session(a, Scope::Manage, 0).unwrap();
+        assert!(s.revoke_device(a, 10).unwrap());
+        assert!(s.device(&token, 11).unwrap().is_none());
+        assert!(s.session(&session, 11).unwrap().is_none());
+        // Revoking again keeps the first time.
+        assert!(s.revoke_device(a, 20).unwrap());
+        assert_eq!(s.device_info(a).unwrap().unwrap().revoked_at, Some(10));
+        // Listed after the ones in use.
+        let ids: Vec<i64> = s.devices().unwrap().iter().map(|d| d.id).collect();
+        assert_eq!(ids, [b, a]);
+        assert!(s.remove_device(a).unwrap());
+        assert!(!s.remove_device(a).unwrap());
+        assert!(!s.revoke_device(a, 30).unwrap());
+        assert!(!s.update_device(a, Some("gone"), None).unwrap());
+        assert!(s.update_device(b, Some("Player"), None).unwrap());
+        let d = s.device_info(b).unwrap().unwrap();
+        assert_eq!((d.name.as_str(), d.scope), ("Player", Scope::Sync));
+    }
+
+    #[test]
+    fn using_a_token_notes_where_from() {
+        let s = store("seen");
+        let (id, _) = s.add_device("Phone", Scope::Manage, 0).unwrap();
+        s.touch_device(id, 10, Some("192.168.1.5"), Some("0.1.0"))
+            .unwrap();
+        // Without a version, the last one stays.
+        s.touch_device(id, 100, Some("10.0.0.7"), None).unwrap();
+        let d = s.device_info(id).unwrap().unwrap();
+        assert_eq!(d.last_seen_at, Some(100));
+        assert_eq!(d.last_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(d.app_version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn pairing_setup_round_trips() {
+        let s = store("pairing-setup");
+        assert_eq!(s.pairing_setup().unwrap(), PairingSetup::default());
+        let setup = PairingSetup {
+            ca_path: Some("/home/me/.local/share/mkcert/rootCA.pem".into()),
+            allow_http: true,
+        };
+        s.set_pairing_setup(&setup).unwrap();
+        assert_eq!(s.pairing_setup().unwrap(), setup);
+        s.set_pairing_setup(&PairingSetup::default()).unwrap();
+        assert_eq!(s.pairing_setup().unwrap(), PairingSetup::default());
+    }
+
+    #[test]
+    fn a_devices_table_from_before_pairing_gets_its_new_columns() {
+        let dir =
+            std::env::temp_dir().join(format!("coversyncd-store-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("inbox.sqlite3");
+        // The table as SRV-01 made it, with a device in it.
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE devices (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK (scope IN ('manage', 'sync')),
+                token_hash BLOB NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+                last_seen_at INTEGER, revoked_at INTEGER);",
+        )
+        .unwrap();
+        let token = new_token().unwrap();
+        old.execute(
+            "INSERT INTO devices (name, scope, token_hash, created_at) VALUES ('Old', 'manage', ?1, 5)",
+            [&digest(&token)[..]],
+        )
+        .unwrap();
+        drop(old);
+        let s = Store::open(&path).unwrap();
+        let d = s.device(&token, 10).unwrap().unwrap();
+        s.touch_device(d.id, 10, Some("192.168.1.9"), None).unwrap();
+        let info = s.device_info(d.id).unwrap().unwrap();
+        assert_eq!((info.paired_at, info.platform), (5, None));
+        assert_eq!(info.last_ip.as_deref(), Some("192.168.1.9"));
+        // Opening it again changes nothing.
+        drop(s);
+        Store::open(&path).unwrap();
     }
 }

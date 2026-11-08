@@ -156,7 +156,11 @@ async fn nothing_is_reachable_before_a_password_is_set() {
 /// source: a route added there is checked here without being listed.
 fn registered_paths() -> Vec<String> {
     let mut paths = Vec::new();
-    for source in [include_str!("../api.rs"), include_str!("mod.rs")] {
+    for source in [
+        include_str!("../api.rs"),
+        include_str!("mod.rs"),
+        include_str!("devices.rs"),
+    ] {
         for (at, _) in source.match_indices(".route(") {
             let Some(rest) = source[at + ".route(".len()..]
                 .trim_start()
@@ -357,9 +361,13 @@ async fn app_tokens_open_the_api_by_scope() {
         .iter()
         .filter(|p| !OPEN.contains(&p.as_str()))
     {
-        let status = app.send(bearer(path, &token)).await.status();
+        let (status, c) = code(app.send(bearer(path, &token)).await).await;
         assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
-        assert_ne!(status, StatusCode::FORBIDDEN, "{path}");
+        // Only managing devices is refused to a token.
+        if status == StatusCode::FORBIDDEN {
+            assert_eq!(c, "password_required", "{path}");
+            assert!(path.starts_with("/api/pairing"), "{path}");
+        }
     }
     let res = app.send(bearer("/api/session", &token)).await;
     assert_eq!(
@@ -736,8 +744,11 @@ fn only_the_open_routes_skip_the_guard() {
         "/api/",
         "/api/status",
         "/api/hello/",
+        "/api/hello/ca/",
         "/api/login/",
-        "/api/hello/ca",
+        "/api/pair/",
+        "/api/pairings",
+        "/api/devices",
     ] {
         assert!(guarded(path), "{path}");
     }
@@ -796,6 +807,8 @@ fn a_password_from_standard_input() {
     assert!(read("short\n").is_err());
     assert!(read(&"x".repeat(MAX_PASSWORD + 1)).is_err());
 }
+
+mod devices;
 
 #[test]
 fn set_password_works_on_a_new_state_directory() {

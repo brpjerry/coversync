@@ -1,18 +1,22 @@
-//! Logging in: the password, browser sessions, app tokens, and the guard in
-//! front of the API.
+//! Logging in: the password, browser sessions, app tokens, pairing devices,
+//! and the guard in front of the API.
 //!
 //! The API is the boundary. Every `/api` route needs a session cookie or an
-//! app token, except the few [`router`] opens: `/api/hello`, logging in and
-//! out, and trading a token for a cookie. The UI's own files stay open (they
-//! are the app's source and hold no data); it shows its login view when the
-//! API answers 401. Covers and streams are loaded by `<img>` and `<audio>`,
-//! which send the cookie, being same-origin.
+//! app token, except the few [`OPEN`] lists: `/api/hello` and the CA
+//! certificate for apps, logging in and out, trading a token for a cookie,
+//! and pairing with a code. The UI's own files stay open (they are the app's
+//! source and hold no data); it shows its login view when the API answers
+//! 401. Covers and streams are loaded by `<img>` and `<audio>`, which send
+//! the cookie, being same-origin.
 //!
 //! The password is set on the server with `coversyncd set-password`, never
 //! from the web. Until it is, the API answers 401 with the code
 //! `no_password`.
 
+mod ca;
+mod devices;
 mod limit;
+mod pairing;
 pub mod store;
 
 use std::collections::HashSet;
@@ -55,14 +59,24 @@ const API_VERSIONS: &[&str] = &["1"];
 /// Routes open without a login. Everything else under `/api` is guarded.
 const OPEN: &[&str] = &[
     "/api/hello",
+    "/api/hello/ca",
     "/api/login",
     "/api/login/token",
     "/api/logout",
+    "/api/pair",
 ];
+
+/// Routes a `sync` token may use besides SYN-04's: checking how it's signed
+/// in.
+const SYNC_OPEN: &[&str] = &["/api/session"];
 
 pub struct Auth {
     store: Store,
     limiter: Mutex<Limiter>,
+    /// Pairing codes waiting for their device.
+    pairings: Mutex<pairing::Pairings>,
+    /// Failed pairing attempts, limited like logins but counted apart.
+    pair_limiter: Mutex<Limiter>,
     /// Slots for password checks. A check holds its slot until argon2 is
     /// done, even if its client has given up.
     hashing: Arc<Semaphore>,
@@ -93,6 +107,8 @@ impl Auth {
         Ok(Auth {
             store: Store::open(&state_dir.join(coversync_core::db::LOCAL_DB))?,
             limiter: Mutex::new(Limiter::new(Instant::now())),
+            pairings: Mutex::new(pairing::Pairings::default()),
+            pair_limiter: Mutex::new(Limiter::new(Instant::now())),
             hashing: Arc::new(Semaphore::new(HASHING)),
             touching: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -149,15 +165,49 @@ impl Auth {
         self.limiter().failed(client, now);
     }
 
+    fn pairings(&self) -> std::sync::MutexGuard<'_, pairing::Pairings> {
+        self.pairings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pair_limiter(&self) -> std::sync::MutexGuard<'_, Limiter> {
+        self.pair_limiter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a pairing attempt for `client`, or say how long until it may try again.
+    fn pair_try(&self, client: limit::Client) -> Result<(), std::time::Duration> {
+        let now = self.instant();
+        self.pair_limiter().take(client, now)
+    }
+
+    /// Give back the attempt of a pairing that succeeded.
+    fn pair_give_back(&self, client: limit::Client) {
+        let now = self.instant();
+        self.pair_limiter().refund(client, now);
+    }
+
+    /// Count a pairing attempt that failed against the overall limit.
+    fn pair_failed(&self, client: limit::Client) {
+        let now = self.instant();
+        self.pair_limiter().failed(client, now);
+    }
+
     #[cfg(test)]
     pub fn store(&self) -> &Store {
         &self.store
     }
 
-    /// Stop the rate limits' clock: no bucket refills from here on.
+    /// Stop the clock that rate limits and pairing codes count by: no bucket
+    /// refills, and no code expires, from here on.
     #[cfg(test)]
     pub fn stop_clock(&self) {
         *self.probe.stopped.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Move the stopped clock on.
+    #[cfg(test)]
+    pub fn advance_clock(&self, by: std::time::Duration) {
+        let mut stopped = self.probe.stopped.lock().unwrap();
+        *stopped = Some(stopped.expect("the clock is stopped first") + by);
     }
 }
 
@@ -363,9 +413,26 @@ fn check(store: &Store, credentials: Credentials, now: i64) -> rusqlite::Result<
     }))
 }
 
+/// What a device's use notes about where it came from.
+#[derive(Clone, Default)]
+struct Seen {
+    ip: Option<String>,
+    /// From the app's `Coversync-App-Version` header.
+    app_version: Option<String>,
+}
+
+impl Seen {
+    fn of(client: Option<IpAddr>, headers: &HeaderMap) -> Self {
+        Seen {
+            ip: client.map(|ip| ip.to_canonical().to_string()),
+            app_version: devices::app_version(headers),
+        }
+    }
+}
+
 /// Note a use in the background: a request never waits for the write, which
 /// can queue behind a scan's.
-fn touch(state: &Shared, touch: Touch, now: i64) {
+fn touch(state: &Shared, touch: Touch, now: i64, seen: Seen) {
     if !state
         .auth
         .touching
@@ -380,7 +447,9 @@ fn touch(state: &Shared, touch: Touch, now: i64) {
         let store = &state.auth.store;
         let result = match touch {
             Touch::Session(hash) => store.touch_session(&hash, now),
-            Touch::Device(id) => store.touch_device(id, now),
+            Touch::Device(id) => {
+                store.touch_device(id, now, seen.ip.as_deref(), seen.app_version.as_deref())
+            }
         };
         if let Err(e) = result {
             tracing::debug!("couldn't note a login's use: {e}");
@@ -395,8 +464,9 @@ fn touch(state: &Shared, touch: Touch, now: i64) {
 }
 
 /// The guard in front of the whole app: a request for a guarded path goes
-/// on only with a valid session cookie or a token with the `manage` scope,
-/// and carries its [`Access`] as an extension.
+/// on only with a valid session cookie or a token with the `manage` scope
+/// (a `sync` one, for the few [`SYNC_OPEN`] routes), and carries its
+/// [`Access`] as an extension.
 pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) -> Response {
     if !guarded(req.uri().path()) {
         return next.run(req).await;
@@ -410,15 +480,24 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
-    for t in checked.touch {
-        touch(&state, t, now);
+    if !checked.touch.is_empty() {
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
+        let seen = Seen::of(client_ip(peer, req.headers()), req.headers());
+        for t in checked.touch {
+            touch(&state, t, now, seen.clone());
+        }
     }
     match checked.access {
-        Ok(access) if access.scope == Scope::Sync => error(
-            StatusCode::FORBIDDEN,
-            "sync_only",
-            "This device may only sync, and syncing isn't available yet.",
-        ),
+        Ok(access) if access.scope == Scope::Sync && !SYNC_OPEN.contains(&req.uri().path()) => {
+            error(
+                StatusCode::FORBIDDEN,
+                "sync_only",
+                "This device may only sync, and syncing isn't available yet.",
+            )
+        }
         Ok(access) => {
             req.extensions_mut().insert(access);
             let mut res = next.run(req).await;
@@ -558,6 +637,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/login/token", post(login_with_token))
         .route("/api/logout", post(logout))
         .route("/api/session", get(session))
+        .merge(devices::router())
 }
 
 #[derive(Serialize)]
@@ -700,6 +780,7 @@ async fn login_with_token(
     }
     let s = state.clone();
     let now = now();
+    let seen = Seen::of(ip, &headers);
     let traded = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<_, Denied>> {
         let found = check(&s.auth.store, Credentials::Token(token), now)?;
         let stale = !found.touch.is_empty();
@@ -711,7 +792,8 @@ async fn login_with_token(
             }) => {
                 let id = s.auth.store.create_device_session(device, scope, now)?;
                 if stale {
-                    s.auth.store.touch_device(device, now)?;
+                    let (ip, version) = (seen.ip.as_deref(), seen.app_version.as_deref());
+                    s.auth.store.touch_device(device, now, ip, version)?;
                 }
                 Ok(Ok((id, device)))
             }
