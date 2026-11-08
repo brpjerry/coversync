@@ -35,7 +35,7 @@
 	}
 	let { onchanged, onrescan, back }: Props = $props();
 
-	inboxSetup.load();
+	inboxSetup.refresh();
 
 	const modes: { id: IngestMode; label: string; icon: typeof Copy; description: string }[] = [
 		{

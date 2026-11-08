@@ -13,12 +13,10 @@ import {
 	type TagGroup,
 	type TagKind
 } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
-class SetupStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+class LibrarySetupStore extends SetupStore<SetupResponse> {
 	groups = $state<TagGroup[]>([]);
 	kinds = $state<TagKind[]>([]);
 	essentials = $state<string[]>([]);
@@ -63,42 +61,26 @@ class SetupStore {
 			(this.separator !== this.saved.separator ? 1 : 0)
 	);
 
-	#loading: Promise<void> | null = null;
-
-	load() {
-		this.#loading ??= api
-			.setup()
-			.then((r) => {
-				this.groups = r.groups;
-				this.kinds = r.kinds;
-				this.essentials = r.essentials;
-				this.albumKinds = r.album_kinds;
-				this.notEditable = r.not_editable;
-				this.suggestions = r.suggestions;
-				this.variables = r.variables;
-				this.artFileNames = r.art_file_names;
-				this.#apply(r);
-				this.loaded = true;
-				this.failed = false;
-			})
-			.catch(() => {
-				this.failed = true;
-				this.#loading = null;
-			});
-		return this.#loading;
+	protected fetch() {
+		return api.setup();
 	}
 
-	/** Re-read the saved setup (e.g. before an import), keeping unsaved edits. */
-	async refresh() {
-		if (!this.loaded) return this.load();
-		try {
-			const r = await api.setup();
-			if (this.changes === 0) this.#apply(r);
-			else {
-				this.folderStatus = r.folder;
-				this.libraryProblem = r.library_problem;
-			}
-		} catch {}
+	protected take(r: SetupResponse, first: boolean) {
+		if (first) {
+			// The tag catalog comes once.
+			this.groups = r.groups;
+			this.kinds = r.kinds;
+			this.essentials = r.essentials;
+			this.albumKinds = r.album_kinds;
+			this.notEditable = r.not_editable;
+			this.suggestions = r.suggestions;
+			this.variables = r.variables;
+			this.artFileNames = r.art_file_names;
+		}
+		// With unsaved edits, the setup as saved (elsewhere, say) still moves
+		// under them, so Revert goes back to it.
+		if (first || this.changes === 0) this.#apply(r);
+		else this.#rebase(r);
 	}
 
 	async loadCoverage() {
@@ -109,8 +91,10 @@ class SetupStore {
 		}
 	}
 
-	#apply(r: SetupResponse) {
+	/** The setup as saved, and what the daemon owns; fields not edited here follow it. */
+	#rebase(r: SetupResponse) {
 		const s = r.setup;
+		const was = this.saved;
 		this.saved = {
 			required: s.rules.required_tags,
 			folder: s.folder ?? '',
@@ -118,14 +102,33 @@ class SetupStore {
 			art: s.rules.art,
 			separator: s.rules.separator
 		};
+		const requiredKept =
+			this.required.size === was.required.length &&
+			was.required.every((id) => this.required.has(id));
+		if (requiredKept) {
+			this.required.clear();
+			for (const id of s.rules.required_tags) this.required.add(id);
+		}
+		if (this.folder.trim() === was.folder) this.folder = this.saved.folder;
+		if (this.structure.trim() === was.structure) this.structure = this.saved.structure;
+		if (this.art.required === was.art.required) this.art.required = s.rules.art.required;
+		if (this.art.placement === was.art.placement) this.art.placement = s.rules.art.placement;
+		if ((this.art.file_name.trim() || 'cover') === was.art.file_name)
+			this.art.file_name = s.rules.art.file_name;
+		if (this.separator === was.separator) this.separator = s.rules.separator;
+		this.folderStatus = r.folder;
+		this.libraryProblem = r.library_problem;
+	}
+
+	#apply(r: SetupResponse) {
+		const s = r.setup;
+		this.#rebase(r);
 		this.required.clear();
 		for (const id of s.rules.required_tags) this.required.add(id);
 		this.folder = this.saved.folder;
 		this.structure = this.saved.structure;
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
-		this.folderStatus = r.folder;
-		this.libraryProblem = r.library_problem;
 	}
 
 	label(id: string) {
@@ -151,31 +154,30 @@ class SetupStore {
 		this.separator = this.saved.separator;
 	}
 
-	async save() {
-		this.saving = true;
-		try {
-			// Send in catalog order; the daemon normalizes the same way.
-			const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
-			const r = await api.saveSetup({
-				rules: {
-					required_tags: ids,
-					art: { ...this.art, file_name: this.art.file_name.trim() },
-					separator: this.separator
-				},
-				folder: this.folder.trim() || null,
-				structure: this.structure.trim()
-			});
-			this.#apply(r);
-			this.version++;
-			if (r.adopted)
-				toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
-			else toast('Library setup saved', 'success');
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
-		} finally {
-			this.saving = false;
-		}
+	save() {
+		return this.write(async () => {
+			try {
+				// Send in catalog order; the daemon normalizes the same way.
+				const ids = this.kinds.map((k) => k.id).filter((id) => this.required.has(id));
+				const r = await api.saveSetup({
+					rules: {
+						required_tags: ids,
+						art: { ...this.art, file_name: this.art.file_name.trim() },
+						separator: this.separator
+					},
+					folder: this.folder.trim() || null,
+					structure: this.structure.trim()
+				});
+				this.#apply(r);
+				this.version++;
+				if (r.adopted)
+					toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
+				else toast('Library setup saved', 'success');
+			} catch (e) {
+				toast(e instanceof ApiError ? e.message : 'Saving the library setup failed', 'error', 6000);
+			}
+		});
 	}
 }
 
-export const setup = new SetupStore();
+export const setup = new LibrarySetupStore();

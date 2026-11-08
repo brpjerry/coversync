@@ -10,12 +10,10 @@ import {
 	type IngestMode,
 	type InboxSetupResponse
 } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
-class InboxSetupStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 	unhiding = $state(false);
 	/** As last saved on the daemon. */
 	saved = $state({
@@ -65,7 +63,9 @@ class InboxSetupStore {
 	/** Move deletes originals, so the Inbox folder must be writable. */
 	canMove = $derived(this.folderStatus?.writable ?? false);
 
-	#apply(r: InboxSetupResponse) {
+	/** The setup as saved, and what the daemon owns, leaving edits be. */
+	#rebase(r: InboxSetupResponse) {
+		const was = this.saved;
 		this.saved = {
 			ingest: r.setup.ingest,
 			folder: r.setup.folder ?? '',
@@ -76,6 +76,23 @@ class InboxSetupStore {
 			familyNameFirst: r.setup.suggestions.family_name_first,
 			saveLookups: r.setup.suggestions.save_lookups
 		};
+		// Fields not edited here follow what's saved.
+		const now = this.saved;
+		if (this.ingest === was.ingest) this.ingest = now.ingest;
+		if (this.folder.trim() === was.folder) this.folder = now.folder;
+		if (this.uploads.trim() === was.uploads) this.uploads = now.uploads;
+		if (this.suggestions === was.suggestions) this.suggestions = now.suggestions;
+		if (this.preferEnglish === was.preferEnglish) this.preferEnglish = now.preferEnglish;
+		if (this.familyNameFirst === was.familyNameFirst) this.familyNameFirst = now.familyNameFirst;
+		if (this.saveLookups === was.saveLookups) this.saveLookups = now.saveLookups;
+		if (this.autofill && now.autofill)
+			for (const key of Object.keys(now.autofill) as (keyof Autofill)[])
+				if (this.autofill[key] === was.autofill?.[key]) this.autofill[key] = now.autofill[key];
+		this.#status(r);
+	}
+
+	#apply(r: InboxSetupResponse) {
+		this.#rebase(r);
 		this.ingest = this.saved.ingest;
 		this.folder = this.saved.folder;
 		this.uploads = this.saved.uploads;
@@ -85,7 +102,6 @@ class InboxSetupStore {
 		this.familyNameFirst = this.saved.familyNameFirst;
 		this.saveLookups = this.saved.saveLookups;
 		this.keyDraft = null;
-		this.#status(r);
 	}
 
 	/** What the daemon owns, refreshed even over unsaved edits. */
@@ -96,23 +112,15 @@ class InboxSetupStore {
 		this.fpcalc = r.suggest.fpcalc;
 	}
 
-	async load() {
-		// Background reads (after a scan) can be overtaken by a save; its response is fresher.
-		const version = this.version;
-		try {
-			const r = await api.inboxSetup();
-			if (this.saving || this.version !== version) return;
-			if (this.loaded && this.changes) {
-				// Keep unsaved choices; refresh only what the daemon owns.
-				this.#status(r);
-			} else {
-				this.#apply(r);
-			}
-			this.loaded = true;
-			this.failed = false;
-		} catch {
-			this.failed = !this.loaded;
-		}
+	protected fetch() {
+		return api.inboxSetup();
+	}
+
+	protected take(r: InboxSetupResponse, first: boolean) {
+		// Keep unsaved choices; what's saved (elsewhere, say) still moves under
+		// them, so Revert goes back to it.
+		if (!first && this.changes) this.#rebase(r);
+		else this.#apply(r);
 	}
 
 	revert() {
@@ -128,45 +136,47 @@ class InboxSetupStore {
 	}
 
 	/** Returns whether the Inbox or uploads folder changed (the daemon rescans then). */
-	async save(): Promise<boolean> {
-		this.saving = true;
+	save(): Promise<boolean> {
 		const before = [this.saved.folder, this.saved.uploads];
-		try {
-			this.#apply(
-				await api.saveInboxSetup(
-					{
-						ingest: this.ingest,
-						folder: this.folder.trim() || null,
-						uploads: this.uploads.trim() || null,
-						autofill: this.autofill!,
-						suggestions: {
-							enabled: this.suggestions,
-							prefer_english: this.preferEnglish,
-							family_name_first: this.familyNameFirst,
-							save_lookups: this.saveLookups
-						}
-					},
-					this.keyDraft?.trim() ?? undefined
-				)
-			);
-			this.version++;
-			toast('Inbox setup saved', 'success');
-			return this.saved.folder !== before[0] || this.saved.uploads !== before[1];
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
-			return false;
-		} finally {
-			this.saving = false;
-		}
+		return this.write(async () => {
+			try {
+				this.#apply(
+					await api.saveInboxSetup(
+						{
+							ingest: this.ingest,
+							folder: this.folder.trim() || null,
+							uploads: this.uploads.trim() || null,
+							autofill: this.autofill!,
+							suggestions: {
+								enabled: this.suggestions,
+								prefer_english: this.preferEnglish,
+								family_name_first: this.familyNameFirst,
+								save_lookups: this.saveLookups
+							}
+						},
+						this.keyDraft?.trim() ?? undefined
+					)
+				);
+				this.version++;
+				toast('Inbox setup saved', 'success');
+				return this.saved.folder !== before[0] || this.saved.uploads !== before[1];
+			} catch (e) {
+				toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
+				return false;
+			}
+		});
 	}
 
 	/** Returns how many files came back, or null if it failed. */
 	async unhideAll(): Promise<number | null> {
 		this.unhiding = true;
 		try {
-			const r = await api.unhideAll();
-			this.hidden = r.hidden;
-			return r.unhidden;
+			// Hidden counts read meanwhile could be from before.
+			return await this.write(async () => {
+				const r = await api.unhideAll();
+				this.hidden = r.hidden;
+				return r.unhidden;
+			}, true);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Unhiding failed', 'error', 6000);
 			return null;

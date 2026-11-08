@@ -12,7 +12,7 @@
 	}
 	let { back }: Props = $props();
 
-	syncSetup.load();
+	syncSetup.refresh();
 </script>
 
 <SetupPane {back} title="Sync setup" description="Copying the Library to your devices.">

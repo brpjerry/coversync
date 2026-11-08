@@ -27,7 +27,7 @@
 	}
 	let { query, onsaved, back, gridWidth, albums }: Props = $props();
 
-	appearance.load();
+	appearance.refresh();
 
 	let sizes = $derived(appearance.coverSizes);
 	let grid = $derived(gridLayout(gridWidth, appearance.coverSize));

@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod events;
 mod suggest;
 mod uploads;
 mod web;
@@ -78,6 +79,8 @@ pub struct AppState {
     pub auth: auth::Auth,
     /// Uploads under way into the Inbox.
     pub uploads: Uploads,
+    /// Change notices for clients listening on `/api/events`.
+    pub events: events::Events,
 }
 
 impl AppState {
@@ -159,6 +162,7 @@ pub fn spawn_scan(state: Shared) {
             return;
         };
         state.rescan.store(false, Ordering::SeqCst);
+        let reporting = tokio::spawn(events::report_scan(state.clone()));
         let s = state.clone();
         let result = tokio::task::spawn_blocking(move || {
             // The Library folder may have appeared (or gone) since the last scan.
@@ -171,11 +175,15 @@ pub fn spawn_scan(state: Shared) {
             Ok(Err(e)) => tracing::error!("scan failed: {e}"),
             Err(e) => tracing::error!("scan panicked: {e}"),
         }
-        state
-            .progress
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .running = false;
+        reporting.abort();
+        // Once it has stopped, no `scan` notice can follow `scan_finished`.
+        let _ = reporting.await;
+        let progress = {
+            let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
+            p.running = false;
+            p.clone()
+        };
+        state.events.publish(events::Notice::ScanFinished(progress));
         release_memory();
         drop(_guard);
         if state.rescan.swap(false, Ordering::SeqCst) {
@@ -254,6 +262,7 @@ async fn run() -> anyhow::Result<()> {
         identify: suggest::Jobs::default(),
         auth,
         uploads: Uploads::default(),
+        events: events::Events::default(),
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
     uploads::follow_folder(&state);
@@ -263,8 +272,9 @@ async fn run() -> anyhow::Result<()> {
     let app = app(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
+    let closing = state.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("SIGTERM handler");
@@ -272,6 +282,8 @@ async fn run() -> anyhow::Result<()> {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
+            // Event streams never end on their own, and would hold up the shutdown.
+            closing.events.close();
         })
         .await?;
     // Where uploads got to, so they carry on from there.
@@ -295,12 +307,41 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),
         uploads: Uploads::default(),
+        events: events::Events::default(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn no_scan_progress_follows_the_end_of_a_scan() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        let state = test_state(&dir);
+        let mut setup = state.lib.inbox_setup().unwrap();
+        setup.folder = Some(dir.join("inbox").display().to_string());
+        state.lib.set_inbox_setup(setup).unwrap();
+        let mut heard = state.events.subscribe();
+        for _ in 0..3 {
+            spawn_scan(state.clone());
+            loop {
+                let notice = tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv())
+                    .await
+                    .expect("the scan ends")
+                    .unwrap();
+                if matches!(notice, events::Notice::ScanFinished(_)) {
+                    break;
+                }
+            }
+            // Past the reporter's next tick: nothing more comes.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            assert!(heard.try_recv().is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_uploads_folder_alone_is_indexed() {

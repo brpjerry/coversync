@@ -348,6 +348,7 @@ dependencies = [
  "base64",
  "clap",
  "coversync-core",
+ "futures-util",
  "getrandom 0.4.3",
  "libc",
  "mime_guess",

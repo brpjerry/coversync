@@ -60,6 +60,20 @@ used on a home server.
 - **Sync** (planned): the sidebar's Sync section will list the devices the
   Library syncs to, each with its own settings. For now it's a placeholder,
   which Sync setup can turn off.
+- **Live updates**: tag edits, imports and saved setups made in one browser,
+  and scans, show in every other open browser as they happen, without
+  reloading. They come from the daemon's event stream, `/api/events`; while
+  it's down (the daemon restarting, say), the page polls instead, and
+  catches up once the stream is back. The stream needs a login like the rest
+  of the API, and ends within 20 seconds of its session ending (signing out,
+  a password reset); signed out, the page waits, and opens it again once
+  signed back in. Tag edits in progress are kept: if the
+  album changes elsewhere meanwhile, the album says so and offers to reload.
+  Each tab showing coversync holds a connection open for the stream (one
+  hidden for a few seconds lets it go). Over plain HTTP/1.1, as at
+  <http://127.0.0.1:8770/>, browsers allow six connections to a server
+  across all tabs, so several tabs side by side can stall each other; a
+  reverse proxy serving HTTPS (HTTP/2) doesn't have that limit.
 
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
@@ -130,7 +144,9 @@ To serve the UI under a path prefix behind a reverse proxy, build it with that
 prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
 as it appears in the URL: ASCII, with anything else percent-encoded
 (`/m%C3%BCsik`, not `/müsik`). The session cookie is then limited to that
-prefix, so other sites on the same host never get it.
+prefix, so other sites on the same host never get it. The proxy has to pass
+`/api/events` on as it comes rather than buffer it: Caddy does by itself, and
+the stream asks nginx to with `X-Accel-Buffering: no`.
 
 ### Signing in
 
