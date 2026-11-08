@@ -26,10 +26,15 @@ pub struct Shell {
     on_unreachable: UnreachableHandler,
     /// A proxy for each server used in this run, by its URL.
     proxies: Mutex<HashMap<String, Proxy>>,
-    /// The server the window shows.
-    current: Mutex<Option<Proxy>>,
+    /// The server the window shows. A proxy's report reaches the window only
+    /// while its server is this one, checked and sent under this lock.
+    current: Arc<Mutex<Option<Proxy>>>,
     /// Why the fallback page is showing, when something went wrong.
     problem: Mutex<Option<Problem>>,
+    /// Held from a connection attempt's check to the window's navigation
+    /// (the fallback page's Connect, another launch's `--server`), so an
+    /// older attempt can't overtake a newer one.
+    pub navigation: tauri::async_runtime::Mutex<()>,
 }
 
 /// Something that went wrong, as the fallback page shows it.
@@ -39,6 +44,8 @@ pub struct Problem {
     pub message: String,
     /// The error underneath, in small print, when it adds something.
     pub detail: Option<String>,
+    /// The address it's about: the page shows it, and puts it in the field.
+    pub server: Option<String>,
 }
 
 impl Problem {
@@ -47,18 +54,23 @@ impl Problem {
             title: title.to_owned(),
             message: message.into(),
             detail: None,
+            server: None,
         }
     }
 
     pub fn unreachable(unreachable: Unreachable) -> Self {
         Self {
             detail: unreachable.detail,
-            ..Self::new("Can't reach the server", unreachable.reason)
+            server: Some(unreachable.server),
+            ..Self::new("Can't open the server", unreachable.reason)
         }
     }
 
-    pub fn invalid(err: UpstreamError) -> Self {
-        Self::new("That address won't work", err.to_string())
+    pub fn invalid(err: UpstreamError, address: &str) -> Self {
+        Self {
+            server: Some(address.to_owned()),
+            ..Self::new("That address won't work", err.to_string())
+        }
     }
 }
 
@@ -83,8 +95,9 @@ impl Shell {
             fallback,
             on_unreachable,
             proxies: Mutex::new(HashMap::new()),
-            current: Mutex::new(None),
+            current: Arc::new(Mutex::new(None)),
             problem: Mutex::new(None),
+            navigation: tauri::async_runtime::Mutex::new(()),
         }
     }
 
@@ -101,25 +114,32 @@ impl Shell {
     }
 
     /// The proxy for `upstream`'s server: the one already running, or a new
-    /// one on the port kept for that server. A server without one gets a
-    /// random port that's no other server's.
+    /// one on the port kept for that server. A server without one, or whose
+    /// port is taken, gets a random port that's no other server's and was
+    /// never anyone's.
     pub async fn proxy_for(&self, upstream: &Upstream) -> std::io::Result<Proxy> {
         let url = upstream.url();
         if let Some(proxy) = self.proxies.lock().expect("proxies lock").get(&url) {
             return Ok(proxy.clone());
         }
-        let ports = self.config.get().ports;
-        let others = ports
-            .iter()
-            .filter(|(server, _)| **server != url)
-            .map(|(_, port)| *port);
-        let on_unreachable = self.on_unreachable.clone();
+        let config = self.config.get();
+        let (current, on_unreachable) = (self.current.clone(), self.on_unreachable.clone());
         let proxy = Proxy::builder()
             .upstream(Some(upstream.clone()))
-            .preferred_port(ports.get(&url).copied())
-            .avoid_ports(others)
+            .preferred_port(config.ports.get(&url).copied())
+            .avoid_ports(config.taken_except(&url))
             .cookies(self.cookies.clone())
-            .on_unreachable(move |unreachable| on_unreachable(unreachable))
+            .on_unreachable(move |unreachable| {
+                // A late failure from a server no longer shown stays quiet.
+                let shown = current.lock().expect("current lock");
+                let is_shown = shown
+                    .as_ref()
+                    .and_then(Proxy::upstream)
+                    .is_some_and(|upstream| upstream.url() == unreachable.server);
+                if is_shown {
+                    on_unreachable(unreachable);
+                }
+            })
             .start()
             .await?;
         Ok(self
@@ -131,38 +151,76 @@ impl Shell {
             .clone())
     }
 
-    /// Shows `proxy`'s server from now on, and keeps its port for it.
+    /// Shows `proxy`'s server from now on, and keeps its port for it. A
+    /// server that drops out of the kept ports loses its cookies too, unless
+    /// a kept server shares its origin.
     pub fn show(&self, proxy: Proxy) {
         if let Some(upstream) = proxy.upstream() {
             let (url, port) = (upstream.url(), proxy.addr().port());
-            if self.config.get().ports.get(&url) != Some(&port)
-                && let Err(err) = self.config.update(|config| {
-                    config.ports.insert(url, port);
-                })
-            {
-                tracing::warn!("couldn't save the server's port: {err}");
+            match self.config.update(|config| config.shown(&url, port)) {
+                Ok(dropped) => self.forget(&dropped),
+                Err(err) => tracing::warn!("couldn't save the server's port: {err}"),
             }
         }
         *self.current.lock().expect("current lock") = Some(proxy);
+    }
+
+    fn forget(&self, dropped: &[String]) {
+        let origin = |server: &String| {
+            Upstream::parse(server)
+                .ok()
+                .map(|up| up.origin().to_owned())
+        };
+        let kept: Vec<String> = self.config.get().ports.keys().filter_map(origin).collect();
+        for server in dropped {
+            if let Some(origin) = origin(server)
+                && !kept.contains(&origin)
+            {
+                tracing::info!("forgetting {server}'s cookies: it hasn't been used in a while");
+                self.cookies.forget(&origin);
+            }
+        }
     }
 
     /// Picks `server`, or with `None` tries the current one again, and checks
     /// that it's a coversync server. Only then is a new server shown (and,
     /// with [`Save::Yes`], saved), so a typo can't replace an address that
     /// works. A failed retry of the current server becomes the page's
-    /// problem.
+    /// problem. Refusals are logged.
     pub async fn switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
+        let address = server.clone();
+        let result = self.try_switch(server, save).await;
+        if let Err(problem) = &result {
+            let address = problem.server.as_ref().or(address.as_ref());
+            tracing::warn!(
+                "not showing {}: {}{}",
+                address.map_or("the server", String::as_str),
+                problem.message,
+                problem
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            );
+        }
+        result
+    }
+
+    async fn try_switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
         let (upstream, new) = match server {
-            Some(url) => (Upstream::parse(&url).map_err(Problem::invalid)?, true),
+            Some(url) => (
+                Upstream::parse(&url).map_err(|err| Problem::invalid(err, &url))?,
+                true,
+            ),
             None => match self.current().and_then(|proxy| proxy.upstream()) {
                 Some(upstream) => (upstream, false),
                 None => return Err(Problem::new("No server is set", "Enter its address.")),
             },
         };
-        let proxy = self
-            .proxy_for(&upstream)
-            .await
-            .map_err(|err| Problem::new("Couldn't start the app's proxy", err.to_string()))?;
+        let proxy = self.proxy_for(&upstream).await.map_err(|err| Problem {
+            server: Some(upstream.url()),
+            ..Problem::new("Couldn't start the app's proxy", err.to_string())
+        })?;
         if let Err(unreachable) = proxy.check(&upstream).await {
             let problem = Problem::unreachable(unreachable);
             if !new {
@@ -218,8 +276,10 @@ mod tests {
                 } else {
                     ""
                 };
+                // Every server sets a cookie, so the jar has something of it.
                 let answer = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Set-Cookie: session=1; Path=/; Max-Age=3600\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
@@ -265,7 +325,7 @@ mod tests {
                 config,
                 Cookies::default(),
                 Url::parse("tauri://localhost/index.html").unwrap(),
-                Arc::new(|_| {}),
+                Arc::new(|unreachable| REPORTS.lock().unwrap().push(unreachable.server)),
             );
             let upstream = Upstream::parse(&url(current)).unwrap();
             let proxy = block(shell.proxy_for(&upstream)).unwrap();
@@ -281,6 +341,9 @@ mod tests {
             self.shell.current().unwrap().upstream().unwrap().url()
         }
     }
+
+    /// What reached the window, from every test's shell.
+    static REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     fn block<F: std::future::Future>(future: F) -> F::Output {
         tauri::async_runtime::block_on(future)
@@ -374,6 +437,109 @@ mod tests {
         assert!(
             !fixture.shell.is_proxied(&other_port),
             "the dev server, say"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_address() {
+        let fixture = Fixture::new("named", server("200 OK"));
+        let typo = url(server("404 Not Found"));
+        let problem = block(fixture.shell.switch(Some(typo.clone()), Save::Yes)).unwrap_err();
+        assert_eq!(problem.server.as_deref(), Some(typo.as_str()));
+        let invalid = block(
+            fixture
+                .shell
+                .switch(Some("not a :// url".into()), Save::Yes),
+        )
+        .unwrap_err();
+        assert_eq!(invalid.server.as_deref(), Some("not a :// url"));
+    }
+
+    #[test]
+    fn servers_long_unused_lose_their_ports_and_cookies() {
+        let fixture = Fixture::new("lru", server("200 OK"));
+        let servers: Vec<SocketAddr> = (0..10).map(|_| server("200 OK")).collect();
+        for addr in &servers {
+            block(fixture.shell.switch(Some(url(*addr)), Save::No)).unwrap();
+        }
+        let config = Store::open(fixture.dir.clone()).get();
+        assert_eq!(config.ports.len(), 1 + crate::config::KEEP_RECENT);
+        let origin = |addr: SocketAddr| format!("http://{addr}");
+        let origins = fixture.shell.cookies.origins();
+        for dropped in &servers[..2] {
+            assert!(!config.ports.contains_key(&url(*dropped)));
+            assert!(!origins.contains(&origin(*dropped)), "its cookies go too");
+        }
+        for kept in &servers[2..] {
+            assert!(config.ports.contains_key(&url(*kept)));
+            assert!(origins.contains(&origin(*kept)));
+        }
+    }
+
+    /// Opens `proxy`'s entry URL, then loads its server's page through it, as
+    /// the window does, over plain sockets.
+    fn page_load(proxy: &Proxy) {
+        let addr = proxy.addr();
+        let entry = proxy.entry_url();
+        let entry = &entry[entry.find("/?k=").unwrap()..];
+        let send = |request: String| {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            answer
+        };
+        let answer = send(format!(
+            "GET {entry} HTTP/1.1
+Host: {addr}
+Connection: close
+
+"
+        ));
+        let cookie = answer
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("set-cookie")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap();
+        let cookie = cookie.split(';').next().unwrap();
+        send(format!(
+            "GET / HTTP/1.1
+Host: {addr}
+Cookie: {cookie}
+             Sec-Fetch-Dest: document
+Accept: text/html
+Connection: close
+
+"
+        ));
+    }
+
+    #[test]
+    fn only_the_shown_server_reaches_the_window() {
+        // A is down; B is up.
+        let (a, b) = (closed(), server("200 OK"));
+        let fixture = Fixture::new("stale", a);
+        let proxy_a = fixture.shell.current().unwrap();
+        let reports_of_a = || {
+            REPORTS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| **s == url(a))
+                .count()
+        };
+
+        page_load(&proxy_a);
+        assert_eq!(reports_of_a(), 1, "while A is shown, its failure shows");
+        block(fixture.shell.switch(Some(url(b)), Save::No)).unwrap();
+        page_load(&proxy_a);
+        assert_eq!(
+            reports_of_a(),
+            1,
+            "once B is shown, A's late failure doesn't"
         );
     }
 }

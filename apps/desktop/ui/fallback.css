@@ -106,6 +106,10 @@ p {
 	overflow-wrap: anywhere;
 }
 
+.problem .address {
+	font-weight: 600;
+}
+
 .problem .detail {
 	font-size: 12px;
 	opacity: 0.8;

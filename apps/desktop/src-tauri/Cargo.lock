@@ -604,6 +604,7 @@ name = "coversync-desktop"
 version = "0.1.0"
 dependencies = [
  "coversync-proxy",
+ "gtk",
  "serde",
  "serde_json",
  "tauri",

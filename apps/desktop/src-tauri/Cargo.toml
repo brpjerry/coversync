@@ -23,7 +23,8 @@ tauri-plugin-single-instance = "2.5.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# The webview itself, to notice when its web process dies. The version is
-# the one Tauri's wry uses.
+# The window and webview themselves (to notice when the web process dies,
+# raise the window, clear the cache). The versions are the ones Tauri uses.
 [target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18.2"
 webkit2gtk = "2.0.2"

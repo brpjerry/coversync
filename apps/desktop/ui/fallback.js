@@ -9,6 +9,7 @@ import { invoke } from './vendor/tauri-api/core.js';
 const $ = (id) => document.getElementById(id);
 const title = $('title');
 const problemBox = $('problem');
+const address = $('address');
 const message = $('message');
 const detail = $('detail');
 const retryRow = $('retry-row');
@@ -19,18 +20,26 @@ const connectButton = $('connect');
 const busy = $('busy');
 
 /**
- * `status` and `problem` are the app's `Status` and `Problem` (src-tauri/src/main.rs):
- * the problem is the one the page opened with, or the last attempt's.
+ * `status` is the app's `Status` (src-tauri/src/main.rs), and `problem` its `Problem`
+ * (src-tauri/src/shell.rs): the one the page opened with, or the last attempt's. A problem
+ * names the address it's about, which goes in the field: a refused new address, not the
+ * server still in use.
  */
 function show(status, problem = status.problem) {
 	title.textContent =
 		problem?.title ?? (status.server ? 'coversync' : 'Connect to a coversync server');
 	problemBox.hidden = !problem;
+	address.textContent = problem?.server ?? '';
+	address.hidden = !problem?.server;
 	message.textContent = problem?.message ?? '';
 	detail.textContent = problem?.detail ?? '';
 	detail.hidden = !problem?.detail;
 	retryRow.hidden = !status.server;
-	if (status.server && !input.value) input.value = status.server;
+	// Retrying opens the server in use, which isn't the one refused.
+	const other = problem?.server && status.server && problem.server !== status.server;
+	retry.textContent = other ? `Back to ${status.server}` : 'Try again';
+	const shown = problem?.server ?? status.server;
+	if (shown) input.value = shown;
 }
 
 function setBusy(text) {

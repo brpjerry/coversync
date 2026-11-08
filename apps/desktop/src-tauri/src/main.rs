@@ -16,7 +16,7 @@ mod gstreamer;
 mod shell;
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use coversync_proxy::{Cookies, Proxy, Upstream};
 use serde::Serialize;
@@ -24,7 +24,7 @@ use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
-use config::Store;
+use config::{ConfigLock, Store};
 use shell::{Problem, Save, Shell};
 
 /// The window's label, which the capabilities name.
@@ -82,6 +82,7 @@ async fn connect(
     server: Option<String>,
 ) -> Result<(), Problem> {
     bundled_only(&webview, &shell)?;
+    let _navigation = shell.navigation.lock().await;
     let proxy = shell.switch(server, Save::Yes).await?;
     open_ui(&app, &proxy)
         .map_err(|err| Problem::new("Couldn't open the server's UI", err.to_string()))
@@ -109,20 +110,35 @@ fn show_fallback(app: &AppHandle, problem: Problem) {
     }
 }
 
+/// Launches that came in before setup finished, to handle once it has.
+#[derive(Default)]
+struct EarlyLaunches {
+    /// Set once the shell is managed; until then, launches wait here.
+    ready: bool,
+    waiting: Vec<Vec<String>>,
+}
+
 /// Another launch of the app: bring the window up, and show the server it
 /// was given with `--server`, if any, for this run.
 fn launched_again(app: &AppHandle, args: Vec<String>) {
-    if let Some(window) = app.get_webview_window(WINDOW) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+    {
+        let early = app.state::<Mutex<EarlyLaunches>>();
+        let mut early = early.lock().expect("early launches lock");
+        if !early.ready {
+            early.waiting.push(args);
+            return;
+        }
     }
+    raise_window(app, activation_token(&args));
     let Some(server) = server_arg(args.into_iter().skip(1)) else {
         return;
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let shell = app.state::<Shell>();
+        let Some(shell) = app.try_state::<Shell>() else {
+            return;
+        };
+        let _navigation = shell.navigation.lock().await;
         match shell.switch(Some(server), Save::No).await {
             Ok(proxy) => {
                 if let Err(err) = open_ui(&app, &proxy) {
@@ -132,6 +148,80 @@ fn launched_again(app: &AppHandle, args: Vec<String>) {
             Err(problem) => show_fallback(&app, problem),
         }
     });
+}
+
+/// The argument main() adds to carry a launch's activation token (see
+/// [`carry_activation_token`]).
+const ACTIVATION_ARG: &str = "--activation-token=";
+
+fn activation_token(args: &[String]) -> Option<String> {
+    args.iter()
+        .find_map(|arg| arg.strip_prefix(ACTIVATION_ARG))
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+/// Brings the window up. With the launch's activation token (Linux), the
+/// compositor can raise and focus it: GNOME and KDE do. Without one, or
+/// where the compositor won't (Hyprland with `focus_on_activate` off), it
+/// may only be marked as wanting attention.
+fn raise_window(app: &AppHandle, token: Option<String>) {
+    let Some(window) = app.get_webview_window(WINDOW) else {
+        return;
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    #[cfg(target_os = "linux")]
+    if let Some(token) = token {
+        let window = window.clone();
+        let shown = app.run_on_main_thread(move || {
+            use gtk::prelude::GtkWindowExt;
+            match window.gtk_window() {
+                Ok(gtk_window) => {
+                    gtk_window.set_startup_id(&token);
+                    gtk_window.present();
+                }
+                Err(err) => tracing::warn!("couldn't raise the window: {err}"),
+            }
+        });
+        if shown.is_ok() {
+            return;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = token;
+    let _ = window.set_focus();
+}
+
+/// The single-instance plugin hands a second launch's arguments to the
+/// running app, but not its environment, where the desktop puts the
+/// launch's activation token (`XDG_ACTIVATION_TOKEN` on Wayland,
+/// `DESKTOP_STARTUP_ID` on X11). Without the token, the running app may not
+/// raise its window. So a launch with a token starts itself again with the
+/// token as an argument too, before anything else runs.
+#[cfg(target_os = "linux")]
+fn carry_activation_token() {
+    use std::os::unix::process::CommandExt;
+
+    let token = std::env::var("XDG_ACTIVATION_TOKEN")
+        .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
+        .ok()
+        .filter(|token| !token.is_empty());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(token) = token else {
+        return;
+    };
+    if activation_token(&args).is_some() {
+        return;
+    }
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    let err = std::process::Command::new(program)
+        .args(&args)
+        .arg(format!("{ACTIVATION_ARG}{token}"))
+        .exec();
+    tracing::warn!("couldn't pass the activation token on: {err}");
 }
 
 /// Watches WebKitGTK's web process, which draws the page: when it crashes,
@@ -217,7 +307,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     }
 
     let config_dir = app.path().app_config_dir()?;
+    // Before anything reads the settings or the cookies.
+    let lock = match ConfigLock::take(&config_dir) {
+        Ok(lock) => lock,
+        Err(message) => {
+            tracing::error!("{message}");
+            show_error(&message);
+            std::process::exit(1);
+        }
+    };
+    app.manage(lock);
     let config = Store::open(config_dir.clone());
+    let clear_cache = config.had_shared_port();
     let saved = config.get();
     let server = server_arg(std::env::args().skip(1))
         .or_else(|| std::env::var(SERVER_ENV).ok().filter(|s| !s.is_empty()))
@@ -233,26 +334,125 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     );
     // Straight to the server's UI when there's a server; the fallback page
     // takes over if it can't be reached.
-    let url = match server.as_deref().map(Upstream::parse) {
-        Some(Ok(upstream)) => {
+    let url = match server.as_deref().map(|url| (url, Upstream::parse(url))) {
+        Some((_, Ok(upstream))) => {
             let proxy = tauri::async_runtime::block_on(shell.proxy_for(&upstream))?;
             shell.show(proxy.clone());
             WebviewUrl::External(Url::parse(&proxy.entry_url())?)
         }
-        Some(Err(err)) => {
-            shell.set_problem(Some(Problem::invalid(err)));
+        Some((address, Err(err))) => {
+            shell.set_problem(Some(Problem::invalid(err, address)));
             WebviewUrl::App(FALLBACK.into())
         }
         None => WebviewUrl::App(FALLBACK.into()),
     };
     app.manage(shell);
-    let window = WebviewWindowBuilder::new(app, WINDOW, url)
+    let first = if clear_cache {
+        WebviewUrl::External(Url::parse("about:blank")?)
+    } else {
+        url.clone()
+    };
+    let window = WebviewWindowBuilder::new(app, WINDOW, first)
         .title("coversync")
         .inner_size(1280.0, 860.0)
         .min_inner_size(720.0, 480.0)
         .build()?;
     watch_web_process(&window)?;
+    if clear_cache {
+        clear_http_cache_then(&window, url);
+    }
+
+    // Launches that arrived while this ran.
+    let waiting = {
+        let early = app.state::<Mutex<EarlyLaunches>>();
+        let mut early = early.lock().expect("early launches lock");
+        early.ready = true;
+        std::mem::take(&mut early.waiting)
+    };
+    for args in waiting {
+        launched_again(app.handle(), args);
+    }
     Ok(())
+}
+
+/// The first builds served every server from one port, so the webview's
+/// HTTP cache may hold several servers' answers under that origin. It's
+/// cleared once, when their settings are read, before the first page loads;
+/// local storage and cookies stay. WebKitGTK only: no other webview ran
+/// those builds.
+fn clear_http_cache_then(window: &tauri::WebviewWindow, url: WebviewUrl) {
+    let go = {
+        let window = window.clone();
+        move || {
+            let target = match &url {
+                WebviewUrl::External(url) => Some(url.clone()),
+                _ => window
+                    .app_handle()
+                    .try_state::<Shell>()
+                    .map(|shell| shell.fallback.clone()),
+            };
+            if let Some(target) = target
+                && let Err(err) = window.navigate(target)
+            {
+                tracing::error!("couldn't open the first page: {err}");
+            }
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use webkit2gtk::{WebViewExt, WebsiteDataManagerExtManual, WebsiteDataTypes};
+
+        let cleared =
+            window.with_webview(
+                move |webview| match webview.inner().website_data_manager() {
+                    Some(manager) => manager.clear(
+                        WebsiteDataTypes::DISK_CACHE | WebsiteDataTypes::MEMORY_CACHE,
+                        webkit2gtk::glib::TimeSpan(0),
+                        None::<&webkit2gtk::gio::Cancellable>,
+                        move |result| {
+                            match result {
+                                Ok(()) => {
+                                    tracing::info!("cleared the HTTP cache the servers shared")
+                                }
+                                Err(err) => tracing::warn!("couldn't clear the HTTP cache: {err}"),
+                            }
+                            go();
+                        },
+                    ),
+                    None => go(),
+                },
+            );
+        if let Err(err) = cleared {
+            tracing::warn!("couldn't clear the HTTP cache: {err}");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    go();
+}
+
+/// Shows `message` in a dialog of its own, before any window: on Linux,
+/// with GTK. Elsewhere it's only logged.
+fn show_error(message: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::{DialogExt, GtkWindowExt};
+
+        let dialog = gtk::MessageDialog::new(
+            None::<&gtk::Window>,
+            gtk::DialogFlags::MODAL,
+            gtk::MessageType::Error,
+            gtk::ButtonsType::Close,
+            message,
+        );
+        dialog.set_title("coversync");
+        dialog.run();
+        dialog.close();
+        while gtk::events_pending() {
+            gtk::main_iteration();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = message;
 }
 
 /// Warnings from everything, with `RUST_LOG`'s directives on top: so
@@ -278,11 +478,14 @@ fn log_filter(rust_log: &str) -> EnvFilter {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    carry_activation_token();
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
         .with_writer(std::io::stderr)
         .init();
     tauri::Builder::default()
+        .manage(Mutex::new(EarlyLaunches::default()))
         // First, so a second launch hands over before setting anything up.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             launched_again(app, args)
@@ -308,6 +511,20 @@ mod tests {
         );
         assert_eq!(filter("debug"), "debug");
         assert_eq!(filter("not a [directive"), "warn");
+    }
+
+    #[test]
+    fn reads_the_activation_token() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            activation_token(&args(&["app", "--server=x", "--activation-token=abc"])).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            activation_token(&args(&["app", "--activation-token="])),
+            None
+        );
+        assert_eq!(activation_token(&args(&["app"])), None);
     }
 
     #[test]
