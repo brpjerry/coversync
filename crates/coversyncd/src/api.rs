@@ -1829,9 +1829,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_scan_waits_for_work_whose_request_was_dropped() {
+        use std::time::{Duration, Instant, SystemTime};
         use tokio::sync::broadcast::error::TryRecvError;
         let (state, inbox) = editing_daemon("cancelled");
         with_library(&state, &inbox);
+        let library = inbox.parent().unwrap().join("library");
         // Enough files that the work outlasts its request by a while.
         for n in 1..=200 {
             track(&inbox, "Big", n);
@@ -1846,41 +1848,73 @@ mod tests {
                 .map(|a| a.track_count)
                 .sum()
         };
+        /// Whether `dir` holds a FLAC file, at any depth.
+        fn any_flac(dir: &FsPath) -> bool {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        any_flac(&p)
+                    } else {
+                        p.extension().is_some_and(|x| x == "flac")
+                    }
+                })
+        }
+        let modified = |p: &FsPath| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         for holder in ["import", "tag write"] {
             let mut heard = state.events.subscribe();
-            let request = match holder {
+            // What the work does first, once it holds the lock: copy a file
+            // into the Library, or write one's tags.
+            let (request, started): (_, Box<dyn Fn() -> bool>) = match holder {
                 "import" => {
                     let request = serde_json::from_value(
                         serde_json::json!({ "album_id": detail(&state, "Big").album.id }),
                     )
                     .unwrap();
                     let s = state.clone();
-                    tokio::spawn(async move {
+                    let request = tokio::spawn(async move {
                         let _ = import_album(State(s), Json(request)).await;
-                    })
+                    });
+                    let library = library.clone();
+                    (request, Box::new(move || any_flac(&library)))
                 }
                 _ => {
-                    let id = state
+                    let album = &state
                         .lib
                         .albums(Collection::Library, &[], &[], "", &[], None)
-                        .unwrap()[0]
-                        .id
-                        .clone();
-                    let s = state.clone();
-                    tokio::spawn(async move {
+                        .unwrap()[0];
+                    let first = state.lib.album(&album.id).unwrap().unwrap().tracks[0].id;
+                    let first = state.lib.track_path(first).unwrap().unwrap();
+                    let before: Option<SystemTime> = modified(&first);
+                    let (s, id) = (state.clone(), album.id.clone());
+                    let request = tokio::spawn(async move {
                         let _ = put(&s, &id, edit(genre("Rock"))).await;
-                    })
+                    });
+                    (request, Box::new(move || modified(&first) != before))
                 }
             };
-            // Its work holds the lock; a scan asked for now waits; then the
-            // request goes (its client hung up).
-            while state.jobs.try_lock().is_ok() {
-                tokio::task::yield_now().await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !started() {
+                assert!(Instant::now() < deadline, "the {holder} never started");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // The work holds the lock: a scan asked for now waits; then the
+            // request goes (its client hung up), while the work goes on.
+            if let Ok(Notice::Imported { .. } | Notice::AlbumChanged { .. }) = heard.try_recv() {
+                panic!("the {holder} was done before its request could be dropped");
             }
             crate::spawn_scan(state.clone());
             request.abort();
+            let deadline = Instant::now() + Duration::from_secs(10);
             let mut done = false;
             loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "the {holder} and the scan after it didn't both end"
+                );
                 match heard.try_recv() {
                     Ok(Notice::Imported { .. } | Notice::AlbumChanged { .. }) => done = true,
                     Ok(Notice::ScanFinished(_)) => {
@@ -1895,7 +1929,7 @@ mod tests {
                     let scanning = state.progress.read().unwrap().running;
                     assert!(!scanning, "a scan ran while the {holder} did");
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
             assert_eq!(library_tracks(&state), 200, "no ghost tracks");
         }
