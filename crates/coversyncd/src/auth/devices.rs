@@ -634,8 +634,8 @@ fn json_code(body: &[u8]) -> Option<String> {
 /// letters and digits, perhaps with a hyphen) in its first [`SEARCHED`]
 /// bytes. Ordinary words can be code-shaped too ("platform", "hostname"),
 /// so none is left out: that could leave out the real code. That's a few
-/// hundred guesses at most, against 40-bit codes, and such requests count
-/// against the pairing limits like failed ones.
+/// hundred guesses at most per request, against 40-bit codes; such
+/// requests also count against the pairing limits like failed ones.
 ///
 /// Sorted, without repeats, for [`pairing::Pairings::cancel_codes`]: found
 /// all at once and sorted once.
@@ -696,18 +696,16 @@ async fn pair(
     let at = state.auth.instant();
     let limited = limit::Client::new(client);
     if !allow_http && !private_transport(peer, &headers) {
-        // Whoever saw the code on the way mustn't get to use it over HTTPS.
-        // Each such request counts as a failed attempt; past the limits, only
-        // its JSON code is looked for, so a code sent in the clear is still
-        // cancelled but a body can't be filled with guesses. Found before the
-        // lock is taken, which is held only to cancel.
-        let codes = match state.auth.pair_try(limited) {
-            Ok(()) => {
-                state.auth.pair_failed(limited);
-                codes_in(&body)
-            }
-            Err(_) => json_code(&body).into_iter().collect(),
-        };
+        // Whoever saw the code on the way mustn't get to use it over HTTPS,
+        // however many attempts its client has made: the codes are looked
+        // for even past the limits, in the first 4 KiB of the body (and its
+        // JSON code), which holds a few hundred guesses at most. Each such
+        // request counts as a failed attempt too. Found before the lock is
+        // taken, which is held only to cancel.
+        if state.auth.pair_try(limited).is_ok() {
+            state.auth.pair_failed(limited);
+        }
+        let codes = codes_in(&body);
         state
             .auth
             .pairings()

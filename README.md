@@ -320,9 +320,11 @@ the others, and only the browser ever sees the password.
   `ssh -R`, some container port forwarders): it adds no headers, so its LAN
   clients look like this machine and would pair over plain http. Anything
   refused gets 403 `https_required`, and every code in it is cancelled, as
-  it may have been seen on the way. Such requests count against the limits
-  on wrong codes; past them, only a JSON `code` is looked for. Sync setup can allow plain http for a
-  network that is encrypted already (Tailscale, WireGuard).
+  it may have been seen on the way: its JSON `code`, and any code-shaped
+  word in its first 4 KiB, however it's written and however many attempts
+  its client has made. Such requests count against the limits on wrong
+  codes. Sync setup can allow plain http for a network that is encrypted
+  already (Tailscale, WireGuard).
 - **CA certificate for apps.** For a server whose certificate a CA of your own
   signed (mkcert's, say), set Sync setup's CA certificate to the path of
   that CA's public certificate, such as `~/.local/share/mkcert/rootCA.pem`.

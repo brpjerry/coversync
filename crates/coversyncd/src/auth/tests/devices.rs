@@ -704,8 +704,8 @@ async fn plain_http_requests_count_against_the_pairing_limits() {
         .pair_from(LOCAL, proxied(&code, "https", "192.168.1.50"))
         .await;
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-    // Past the limits, a JSON code sent in the clear is still cancelled; a
-    // body of words isn't searched.
+    // Past the limits, a code sent in the clear is still cancelled, however
+    // the body is written, and nobody who saw it can use it.
     let (id, code) = app.new_code(&cookie, phone()).await;
     let res = app.pair_from(me, pair(&code)).await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -716,8 +716,14 @@ async fn plain_http_requests_count_against_the_pairing_limits() {
         app.pair_from(me, form).await.status(),
         StatusCode::FORBIDDEN
     );
-    assert_eq!(app.pairing(&cookie, &id).await["state"], "waiting");
+    assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+    let res = app.pair_from(LOCAL, pair(&code)).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::GONE, "code_expired".into())
+    );
     // Another client isn't held up.
+    let (_, code) = app.new_code(&cookie, phone()).await;
     paired(app.pair_from(LOCAL, pair(&code)).await).await;
 }
 

@@ -166,7 +166,9 @@ impl Pairings {
     }
 
     /// Take a waiting code for a device: the code is used up from here on.
-    /// `code` is already [`normalize`]d. Anything else counts as a failure.
+    /// `code` is already [`normalize`]d. A wrong, expired or cancelled code
+    /// counts as a failure; a used one doesn't, as a device trying it again
+    /// (its answer lost on the way) isn't guessing.
     pub fn redeem(&mut self, code: &str, now: Instant) -> Result<Claim, Refused> {
         self.prune(now);
         let found = self.codes.iter_mut().find(|(_, p)| p.code == code);
