@@ -33,7 +33,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, LOCATION};
+use axum::http::header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, LOCATION, ORIGIN};
 use axum::http::{HeaderValue, Method, StatusCode, Version};
 use axum::response::Response;
 use axum::serve::ListenerExt;
@@ -88,10 +88,11 @@ impl Builder {
         self
     }
 
-    /// A port to try first, such as the one the last run used. The UI keeps
-    /// its settings (sort, sidebar) in the webview's local storage, which
-    /// belongs to the origin, port included, so a new port each run would
-    /// lose them. A random port is used when this one is taken.
+    /// A port to try first: the one kept for this server, say. The
+    /// webview's cache and the UI's settings in local storage (sort,
+    /// sidebar) belong to the origin, port included, so a server keeps them
+    /// on its own port. A random port (see [`Builder::avoid_ports`]) is used
+    /// when this one is taken.
     pub fn preferred_port(mut self, port: Option<u16>) -> Self {
         self.port = port;
         self
@@ -122,7 +123,7 @@ impl Builder {
 
     /// Called when loading a page (a navigation, not an API call or a cover)
     /// can't reach the server, gets 502, 503 or 504 from it, or would be sent
-    /// off to another origin. The proxy answers with a short error page of
+    /// outside its origin and prefix. The proxy answers with a short error page of
     /// its own, or passes the server's on; the app can show its fallback
     /// page instead.
     pub fn on_unreachable(mut self, handler: impl Fn(Unreachable) + Send + Sync + 'static) -> Self {
@@ -225,8 +226,9 @@ impl Proxy {
 
     /// Whether `upstream` is a coversync server the app can use: its
     /// `/api/hello` (open without a login) says `"app": "coversync"`.
-    /// Redirects on the server's own origin are followed; one to another
-    /// origin, an error, or anything else is refused, saying why. The
+    /// Redirects within the server's origin and prefix are followed, up to
+    /// five; any other redirect, an error, or anything else is refused,
+    /// saying why. The
     /// server's cookies go with it, and any it sets are kept, as for a page
     /// load. Doesn't change which server the proxy uses.
     pub async fn check(&self, upstream: &Upstream) -> Result<(), Unreachable> {
@@ -241,7 +243,8 @@ impl Proxy {
         let shared = &self.shared;
         let mut url = Url::parse(&format!("{}api/hello", upstream.url()))
             .map_err(|_| Unreachable::new(upstream, "Its address isn't valid."))?;
-        for _ in 0..MAX_REDIRECTS {
+        // The first request, then one for each redirect followed.
+        for _ in 0..=MAX_REDIRECTS {
             let uri = upstream
                 .uri(&url[url::Position::BeforePath..])
                 .ok_or_else(|| Unreachable::new(upstream, "Its address isn't valid."))?;
@@ -274,7 +277,7 @@ impl Proxy {
                     .and_then(|l| l.to_str().ok())
                     .ok_or_else(|| Unreachable::answered(upstream, status))?;
                 upstream
-                    .keeps_origin(&url, location)
+                    .keeps_server(&url, location)
                     .map_err(|to| Unreachable::redirected(upstream, &to))?;
                 url = url
                     .join(location)
@@ -411,7 +414,7 @@ impl Shared {
                 self.report(down);
             } else if parts.status.is_redirection()
                 && let Some(location) = parts.headers.get(LOCATION).and_then(|l| l.to_str().ok())
-                && let Err(to) = upstream.keeps_origin(&url, location)
+                && let Err(to) = upstream.keeps_server(&url, location)
             {
                 return self.unreachable(Unreachable::redirected(upstream, &to), true);
             }
@@ -466,6 +469,12 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
     if !headers::has_own_cookie(req.headers(), &proxy.cookie_name, &proxy.cookie) {
         return pages::forbidden();
     }
+    // Every proxy is on 127.0.0.1, so another proxy's page (another server's
+    // UI) is the same site, and the window sends this proxy's cookie with
+    // its requests here too. Refuse what another origin sends.
+    if from_elsewhere(req.headers(), &proxy.origin) {
+        return pages::forbidden();
+    }
     let Some(upstream) = upstream else {
         return pages::text(StatusCode::SERVICE_UNAVAILABLE, "No server is set.");
     };
@@ -476,6 +485,20 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
         return pages::text(StatusCode::NOT_FOUND, "Not found.");
     }
     proxy.forward(&upstream, req).await
+}
+
+/// Whether a request comes from another origin: an `Origin` that isn't
+/// ours (`null`, from a sandboxed frame, gets no SameSite=Strict cookie
+/// anyway), or Fetch Metadata saying it's from another origin of this site
+/// or another site. Navigations the app starts say `none`.
+fn from_elsewhere(headers: &axum::http::HeaderMap, own: &str) -> bool {
+    let foreign_origin = headers
+        .get(ORIGIN)
+        .is_some_and(|origin| origin != "null" && origin != own);
+    let foreign_site = headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "same-site" || site == "cross-site");
+    foreign_origin || foreign_site
 }
 
 /// The entry URL's `k`.

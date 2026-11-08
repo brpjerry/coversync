@@ -12,8 +12,8 @@ use crate::upstream::Upstream;
 
 /// Why the server's UI can't be shown: the server couldn't be reached,
 /// didn't answer in time, answered the way a reverse proxy does when the
-/// server behind it is down (502, 503 or 504), or sent the page off to
-/// another origin. [`Proxy::check`](crate::Proxy::check) also gets one for an
+/// server behind it is down (502, 503 or 504), or sent the page outside
+/// its origin and prefix. [`Proxy::check`](crate::Proxy::check) also gets one for an
 /// address that isn't a coversync server it can use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreachable {
@@ -84,8 +84,9 @@ impl Unreachable {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::new(
                 upstream,
                 format!(
-                    "It answered {status} for /api/hello, which coversync leaves open: \
-                     something in front of it wants a login this app can't give."
+                    "It answered {status} for /api/hello, which coversync leaves open: a \
+                     login in front of the server blocks the check. To open it anyway, \
+                     start the app with --server or COVERSYNC_SERVER."
                 ),
             ),
             _ => Self::answered(upstream, status),
@@ -101,8 +102,8 @@ impl Unreachable {
         )
     }
 
-    /// The server sends its page on to another origin, `to`, which the
-    /// window would follow out of the proxy.
+    /// The server redirects to `to`, outside the origin and prefix the
+    /// proxy serves it under.
     pub(crate) fn redirected(upstream: &Upstream, to: &str) -> Self {
         Self::new(
             upstream,

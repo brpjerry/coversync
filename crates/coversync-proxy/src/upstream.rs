@@ -167,11 +167,13 @@ impl Upstream {
             .then(|| target[url::Position::BeforePath..].to_owned())
     }
 
-    /// Whether a redirect from the server stays on its origin. `location` is
-    /// resolved against `from`, the URL that answered with it.
-    pub(crate) fn keeps_origin(&self, from: &Url, location: &str) -> Result<(), String> {
+    /// Whether a redirect from the server stays where the proxy serves it:
+    /// on its origin, under its prefix. `location` is resolved against
+    /// `from`, the URL that answered with it. Elsewhere, the window would
+    /// leave the proxy, or get its 404.
+    pub(crate) fn keeps_server(&self, from: &Url, location: &str) -> Result<(), String> {
         let target = from.join(location).map_err(|_| location.to_owned())?;
-        if target.origin() == self.base.origin() {
+        if target.origin() == self.base.origin() && self.serves(target.path()) {
             Ok(())
         } else {
             Err(target.to_string())
@@ -305,10 +307,18 @@ mod tests {
     fn tells_where_redirects_lead() {
         let up_ = up("http://n5pro.internal/coversync/");
         let from = Url::parse(&up_.url()).unwrap();
-        assert_eq!(up_.keeps_origin(&from, "/coversync/login"), Ok(()));
-        assert_eq!(up_.keeps_origin(&from, "//n5pro.internal/x"), Ok(()));
+        assert_eq!(up_.keeps_server(&from, "/coversync/login"), Ok(()));
         assert_eq!(
-            up_.keeps_origin(&from, "https://n5pro.internal/coversync/"),
+            up_.keeps_server(&from, "//n5pro.internal/coversync/x"),
+            Ok(())
+        );
+        assert_eq!(
+            up_.keeps_server(&from, "/elsewhere/"),
+            Err("http://n5pro.internal/elsewhere/".to_owned()),
+            "the same origin, outside the prefix"
+        );
+        assert_eq!(
+            up_.keeps_server(&from, "https://n5pro.internal/coversync/"),
             Err("https://n5pro.internal/coversync/".to_owned())
         );
     }

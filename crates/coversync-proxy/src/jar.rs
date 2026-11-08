@@ -86,6 +86,36 @@ impl Cookies {
         self.save();
     }
 
+    /// The server origins it holds cookies for.
+    pub fn origins(&self) -> Vec<String> {
+        let mut origins: Vec<String> = self
+            .0
+            .stores
+            .lock()
+            .expect("cookie lock")
+            .iter()
+            .filter(|(_, store)| store.iter_unexpired().next().is_some())
+            .map(|(origin, _)| origin.clone())
+            .collect();
+        origins.sort();
+        origins
+    }
+
+    /// Drops every cookie of the server at `origin` (`https://n5pro.internal`),
+    /// and saves.
+    pub fn forget(&self, origin: &str) {
+        let removed = self
+            .0
+            .stores
+            .lock()
+            .expect("cookie lock")
+            .remove(origin)
+            .is_some();
+        if removed {
+            self.save();
+        }
+    }
+
     /// Writes the persistent, unexpired cookies to the file, whole.
     fn save(&self) {
         let Some(file) = &self.0.file else {
@@ -221,6 +251,23 @@ mod tests {
             jar.header("https://other.internal", &url("https://other.internal/")),
             None
         );
+    }
+
+    #[test]
+    fn forgets_a_server() {
+        let dir = std::env::temp_dir().join(format!("coversync-jar-forget-{}", std::process::id()));
+        let file = dir.join("cookies.json");
+        let jar = Cookies::open(Some(file.clone()));
+        set(
+            &jar,
+            "https://n5pro.internal/",
+            &["session=s; Max-Age=3600"],
+        );
+        assert_eq!(jar.origins(), [ORIGIN]);
+        jar.forget(ORIGIN);
+        assert!(jar.origins().is_empty());
+        assert!(Cookies::open(Some(file)).origins().is_empty(), "saved");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

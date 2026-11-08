@@ -701,7 +701,12 @@ async fn check_wants_coversync() {
             "/spa/api/hello" => (StatusCode::OK, "<!doctype html>").into_response(),
             "/old/api/hello" => StatusCode::NOT_FOUND.into_response(),
             "/guarded/api/hello" => StatusCode::UNAUTHORIZED.into_response(),
+            // On its own origin, but outside the prefix the proxy serves.
             "/moved/api/hello" => Redirect::permanent("/coversync/api/hello").into_response(),
+            "/redirected/api/hello" => Redirect::permanent("/redirected/hello").into_response(),
+            "/redirected/hello" => hello().into_response(),
+            // Another app's page, too big to be a hello.
+            "/huge/api/hello" => (StatusCode::OK, vec![b' '; 100 * 1024]).into_response(),
             "/https/api/hello" => {
                 Redirect::permanent(&format!("https://{host}/https/api/hello")).into_response()
             }
@@ -718,14 +723,24 @@ async fn check_wants_coversync() {
 
     assert_eq!(check("/coversync/").await, Ok(()));
     assert_eq!(
-        check("/moved/").await,
+        check("/redirected/").await,
         Ok(()),
-        "a redirect on its own origin is followed"
+        "a redirect under the prefix is followed"
     );
+    let moved = reason("/moved/").await;
+    assert!(
+        moved.contains(&format!("on to http://{addr}/coversync/api/hello")),
+        "a redirect outside the prefix isn't: {moved}"
+    );
+    assert!(reason("/huge/").await.contains("isn't coversync"));
     assert!(reason("/spa/").await.contains("isn't coversync"));
     assert!(reason("/old/").await.contains("too old for this app"));
     assert!(reason("/coversycn/").await.contains("no /api/hello"));
-    assert!(reason("/guarded/").await.contains("wants a login"));
+    let guarded = reason("/guarded/").await;
+    assert!(
+        guarded.contains("login in front of the server") && guarded.contains("--server"),
+        "{guarded}"
+    );
     let upgrade = reason("/https/").await;
     assert!(
         upgrade.contains(&format!("on to https://{addr}/https/api/hello")),
@@ -742,7 +757,12 @@ async fn check_uses_the_servers_cookies() {
             log.record(&req);
             async move {
                 // A server that rotates its session on every answer.
-                ([(SET_COOKIE, "session=rotated; Path=/")], hello()).into_response()
+                let session = if req.uri().path().ends_with("/api/hello") {
+                    "session=from-check; Path=/"
+                } else {
+                    "session=from-page; Path=/"
+                };
+                ([(SET_COOKIE, session)], hello()).into_response()
             }
         }
     });
@@ -752,13 +772,101 @@ async fn check_uses_the_servers_cookies() {
 
     window.get("/coversync/").await;
     assert!(window.proxy.check(&up).await.is_ok());
-    let seen = log.last().headers;
     assert_eq!(
-        seen[COOKIE], "session=rotated",
+        log.last().headers[COOKIE],
+        "session=from-page",
         "the check sends the jar's cookies"
     );
     window.get("/coversync/api/status").await;
-    assert_eq!(log.last().headers[COOKIE], "session=rotated");
+    assert_eq!(
+        log.last().headers[COOKIE],
+        "session=from-check",
+        "and keeps the one its answer set"
+    );
+}
+
+#[tokio::test]
+async fn check_follows_five_redirects_and_no_more() {
+    // /coversync/hop/N redirects to N-1; hop 0 is the hello.
+    let router = Router::new().fallback(|req: Request| async move {
+        let path = req.uri().path().to_owned();
+        if path == "/five/api/hello" {
+            return Redirect::temporary("/five/hop/4").into_response();
+        }
+        if path == "/six/api/hello" {
+            return Redirect::temporary("/six/hop/5").into_response();
+        }
+        let (prefix, hop) = path.rsplit_once("/hop/").unwrap();
+        match hop.parse::<u32>().unwrap() {
+            0 => hello().into_response(),
+            n => Redirect::temporary(&format!("{prefix}/hop/{}", n - 1)).into_response(),
+        }
+    });
+    let addr = serve(router).await;
+    let proxy = Proxy::builder().start().await.unwrap();
+    assert_eq!(proxy.check(&upstream(addr, "/five/")).await, Ok(()));
+    let six = proxy.check(&upstream(addr, "/six/")).await.unwrap_err();
+    assert_eq!(six.reason, "It redirects too many times.");
+}
+
+#[tokio::test]
+async fn another_proxys_page_cant_use_this_one() {
+    // Two servers, a proxy each, in one window: B's page is the same site as
+    // A's proxy, so the window would send A's cookie with B's requests.
+    let log_a = Log::default();
+    let a = serve(echo(log_a.clone())).await;
+    let b = serve(echo(Log::default())).await;
+    let jar = Cookies::default();
+    let open = |addr| {
+        Window::open_with(
+            Proxy::builder()
+                .upstream(Some(upstream(addr, "/coversync/")))
+                .cookies(jar.clone()),
+        )
+    };
+    let (window_a, window_b) = (open(a).await, open(b).await);
+    let post = |origin: Option<&str>, site: Option<&str>| {
+        let mut req = window_a.request(Method::POST, "/coversync/api/rescan");
+        if let Some(origin) = origin {
+            req = req.header(ORIGIN, origin);
+        }
+        if let Some(site) = site {
+            req = req.header("sec-fetch-site", site);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+
+    // B's page posting to A's proxy, with A's cookie.
+    let b_origin = window_b.proxy.origin().to_owned();
+    for (origin, site) in [
+        (Some(b_origin.as_str()), None),
+        (Some(b_origin.as_str()), Some("same-site")),
+        (None, Some("same-site")),
+        (Some("https://elsewhere.example"), Some("cross-site")),
+    ] {
+        let res = window_a.send(post(origin, site)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{origin:?} {site:?}");
+    }
+    assert_eq!(log_a.len(), 0, "none of them reaches A");
+
+    // A's own page, a navigation the app starts, and a sandboxed frame's
+    // null all pass.
+    let a_origin = window_a.proxy.origin().to_owned();
+    for (origin, site) in [
+        (Some(a_origin.as_str()), Some("same-origin")),
+        (None, Some("none")),
+        (Some("null"), None),
+    ] {
+        let res = window_a.send(post(origin, site)).await;
+        assert_eq!(res.status(), StatusCode::OK, "{origin:?} {site:?}");
+    }
+
+    // The entry URL works from anywhere: it carries its own secret.
+    let req = Request::get(window_a.proxy.entry_url())
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(window_a.send(req).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]
