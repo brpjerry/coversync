@@ -615,10 +615,16 @@ impl Upload {
         check_files(&manifest.files)?;
         let folder = check_folder(&manifest.folder)?;
         let root = dir.join(FILES);
-        if !root.is_dir() {
-            return Err(Error::Invalid(
-                "its files are gone (finished already?)".into(),
-            ));
+        // Gone means finished (or never staged); failing to look is storage
+        // trouble, which keeps the upload for later.
+        match fs::metadata(&root) {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+            _ => {
+                return Err(Error::Invalid(
+                    "its files are gone (finished already?)".into(),
+                ));
+            }
         }
         let progress: Progress = fs::read(dir.join(PROGRESS))
             .ok()
@@ -786,6 +792,24 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Flush `parent`, the folder holding the uploads folder. One coversyncd
+/// may go through but not read (an admin's folder, say) can't be opened to
+/// flush: on Linux the whole filesystem is flushed through `uploads`
+/// instead; elsewhere that is only logged.
+fn sync_parent(parent: &Path, uploads: &Path) -> Result<()> {
+    match sync_dir(parent) {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            if cfg!(target_os = "linux") {
+                sync_filesystem(uploads)
+            } else {
+                tracing::warn!(folder = %parent.display(), "can't flush the folder holding the uploads folder: {e}");
+                Ok(())
+            }
+        }
+        result => Ok(result?),
+    }
+}
+
 /// Flush `root` and every folder in it.
 fn sync_folders(root: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(root) {
@@ -898,7 +922,7 @@ impl Uploads {
             // an earlier try) that made them may not have got that far.
             sync_dir(&uploads)?;
             if let Some(parent) = uploads.parent() {
-                sync_dir(parent)?;
+                sync_parent(parent, &uploads)?;
             }
             Ok(())
         });
@@ -1998,6 +2022,56 @@ mod tests {
         let back = later.get(up.id()).unwrap();
         assert_eq!(back.file_status(0).unwrap().received, 0);
         assert!(back.file_status(1).unwrap().complete);
+
+        // Its files can't even be looked at for now (a disk away behind a
+        // link, say): kept too, not taken for gone.
+        let away = folder.with_file_name("Away");
+        fs::create_dir(&away).unwrap();
+        fs::rename(&files, away.join(FILES)).unwrap();
+        std::os::unix::fs::symlink(away.join(FILES), &files).unwrap();
+        let mode = |m| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&away, fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(0o000);
+        let blocked = Uploads::default();
+        blocked.set_folder(Some(folder.clone()));
+        let kept = staged.join(MANIFEST).is_file();
+        mode(0o755);
+        assert!(matches!(blocked.get(up.id()), Err(Error::NotFound)));
+        assert!(kept, "the upload is left as it was");
+        let later = Uploads::default();
+        later.set_folder(Some(folder.clone()));
+        assert!(later.get(up.id()).unwrap().file_status(1).unwrap().complete);
+    }
+
+    #[test]
+    fn an_uploads_folder_in_a_folder_it_cant_read_still_takes_uploads() {
+        use std::os::unix::fs::PermissionsExt;
+        if root() {
+            return;
+        }
+        let (folder, u) = uploads("unreadable-parent");
+        let parent = folder.with_file_name("Shared");
+        let inside = parent.join("Uploads");
+        fs::create_dir_all(&inside).unwrap();
+        u.set_folder(Some(inside.clone()));
+        // Others may go through it, but not list or change it.
+        let mode = |m| fs::set_permissions(&parent, fs::Permissions::from_mode(m)).unwrap();
+        mode(0o100);
+        let started = u.start(new("A", &[("a.flac", 2)]));
+        let finished = started.as_ref().ok().map(|up| {
+            chunk(up, 0, 0, b"ab").unwrap();
+            u.finish(up.id())
+        });
+        mode(0o755);
+        let up = started.unwrap();
+        assert_eq!(
+            finished.unwrap().unwrap().path,
+            inside.join("A").display().to_string()
+        );
+        assert_eq!(fs::read(inside.join("A/a.flac")).unwrap(), b"ab");
+        drop(up);
     }
 
     #[test]
