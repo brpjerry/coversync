@@ -432,6 +432,76 @@ export interface SyncSetupResponse {
 	setup: SyncSetup;
 }
 
+/** What a paired device may do: everything but managing devices, or only syncing. */
+export type Scope = 'manage' | 'sync';
+
+/** A paired app or player, with its own token. Times are Unix seconds. */
+export interface Device {
+	id: number;
+	name: string;
+	scope: Scope;
+	/** What it said it runs on: "android", "linux", … */
+	platform: string | null;
+	hostname: string | null;
+	app_version: string | null;
+	created_at: number;
+	/** When its current token was issued. */
+	paired_at: number;
+	last_seen_at: number | null;
+	last_ip: string | null;
+	revoked_at: number | null;
+}
+
+export interface DevicesResponse {
+	devices: Device[];
+	/** The device this page is signed in as, through its token. */
+	this_device: number | null;
+	/** Signed in with the password: only that may add, change or revoke devices. */
+	can_manage: boolean;
+}
+
+/** A pairing code, just made by Add device. */
+export interface NewPairing {
+	id: string;
+	/** 8 characters, shown as two groups of four. */
+	code: string;
+	expires_in: number;
+	/** The CA certificate's SHA-256 (hex), for the link's `ca=`. */
+	ca: string | null;
+	ca_problem: string | null;
+	allow_http: boolean;
+}
+
+export type PairingStatus =
+	| { state: 'waiting'; expires_in: number }
+	/** A device used it; its token is being issued. */
+	| { state: 'pairing' }
+	| { state: 'paired'; device: Device | null }
+	| { state: 'expired' }
+	| { state: 'cancelled'; why: 'failures' | 'insecure' | 'removed' }
+	| { state: 'failed' };
+
+export interface PairingSetup {
+	/** The public certificate of the CA that signed the server's certificate, for Android apps. */
+	ca_path: string | null;
+	/** Pairing over plain http, for a network that is encrypted already. */
+	allow_http: boolean;
+}
+
+export interface CaInfo {
+	/** SHA-256 in lowercase hex, as in the pairing link. */
+	fingerprint: string;
+	/** As `openssl x509 -noout -fingerprint -sha256` prints it. */
+	sha256: string;
+}
+
+export interface PairingSetupResponse {
+	setup: PairingSetup;
+	ca: CaInfo | null;
+	/** Why the CA certificate can't be used, if it can't. */
+	ca_problem: string | null;
+}
+
 /** How this browser is signed in (`GET /api/session`). */
 export interface Access {
 	/** A password login, an app's token, or a session traded for one. */
@@ -448,6 +518,11 @@ export class ApiError extends Error {
 		public body: Record<string, unknown> = {}
 	) {
 		super(message);
+	}
+
+	/** The API's `code` for it, when it gave one. */
+	get code(): string | undefined {
+		return typeof this.body.code === 'string' ? this.body.code : undefined;
 	}
 }
 
@@ -475,8 +550,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		if (res.status === 401) unauthorized(body.code ?? 'login_required');
 		throw new ApiError(res.status, body.error ?? res.statusText, body);
 	}
-	return res.status === 202 ? (undefined as T) : res.json();
+	return res.status === 202 || res.status === 204 ? (undefined as T) : res.json();
 }
+
+const json = (method: string, body: unknown): RequestInit => ({
+	method,
+	headers: { 'content-type': 'application/json' },
+	body: JSON.stringify(body)
+});
 
 export const api = {
 	session: () => request<Access>('/api/session'),
@@ -563,6 +644,25 @@ export const api = {
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(setup)
 		}),
+	devices: () => request<DevicesResponse>('/api/devices'),
+	/** Rename or re-scope a device (needs a password login). */
+	updateDevice: (id: number, change: { name?: string; scope?: Scope }) =>
+		request<Device>(`/api/devices/${id}`, json('PUT', change)),
+	revokeDevice: (id: number) => request<Device>(`/api/devices/${id}/revoke`, { method: 'POST' }),
+	removeDevice: (id: number) => request<void>(`/api/devices/${id}`, { method: 'DELETE' }),
+	/** Add device: a code for a device to pair with, replacing `replace`'s entry if given. */
+	newPairing: (name: string, scope: Scope, replace: number | null) =>
+		request<NewPairing>('/api/pairings', json('POST', { name, scope, replace })),
+	pairing: (id: string) => request<PairingStatus>(`/api/pairings/${encodeURIComponent(id)}`),
+	/** The dialog closed: its code stops working. */
+	closePairing: (id: string, keepalive = false) =>
+		request<void>(`/api/pairings/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
+	pairingSetup: () => request<PairingSetupResponse>('/api/pairing/setup'),
+	savePairingSetup: (setup: PairingSetup) =>
+		request<PairingSetupResponse>('/api/pairing/setup', json('PUT', setup)),
+	/** Check a CA certificate path as it's typed; null for an empty one. */
+	checkCa: (path: string) =>
+		request<CaInfo | null>(`/api/pairing/check-ca?path=${encodeURIComponent(path)}`),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
 	/** Throws TagConflict when `body.version` is no longer the album's. */

@@ -11,6 +11,15 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
 --auth checks the login view instead of the tour, and stops at the first failure: a
     wrong password, signing in, a session that ends under unsaved tag edits (Escape in
     the login view must keep them), and signing out (asked first while edits are unsaved).
+--devices pairs a device instead of the tour (scratch daemons only: it adds, revokes and
+    removes one): Add device shows a code and a QR code, the script redeems the code at
+    /api/pair as an app would, the dialog shows the device, its token works, and revoking it
+    in Sync setup's list gets the token 401. Then the dialog by keyboard (focus stays in it,
+    Escape closes only it), and New code double-clicked after the device to replace was
+    removed. Stops at the first failure.
+--pairing-link only checks the link Add device makes (its server address with the page's
+    path prefix, and ca= when Sync setup has a CA certificate), and makes no device: for a
+    UI built with BASE_PATH behind a proxy.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -26,11 +35,13 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
 import base64
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -684,6 +695,327 @@ def describe_suggestions(d, label, rows=8):
     print("   rows:", d.js("return [...document.querySelectorAll('.suggest .sugg')].slice(0, arguments[0]).map(r => (r.querySelector('input').checked ? '[x] ' : '[ ] ') + r.textContent.replace(/\\s+/g, ' ').trim())", rows))
 
 
+def api_call(url, token=None, body=None):
+    """An app's request: the status and the JSON answer (None if there isn't one)."""
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def devices_flow(d, out, tag, url):
+    """Pair a device from Sync setup, use its token, and revoke it there.
+    Stops at the first failed check."""
+    text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
+    name = "Smoke test phone"
+    row = f"//li[contains(@class,'device')][.//b[normalize-space(.)='{name}']]"
+    has = "return document.evaluate(arguments[0], document, null, XPathResult.BOOLEAN_TYPE, null).booleanValue"
+    base = url if url.endswith("/") else url + "/"
+
+    d.open_setup("Sync setup")
+    d.wait("return !!document.querySelector('#devices-title')")
+    time.sleep(0.8)
+    d.shot(out / f"10a-devices-{tag}.png")
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", name)
+    time.sleep(0.5)
+    d.shot(out / f"10b-add-device-{tag}.png")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    code = d.js(text, ".dialog .code")
+    check(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}", code or ""), f"code shown: {code}")
+    check(d.js("return (document.querySelector('.dialog .qr path')?.getAttribute('d') ?? '').length > 100"),
+          "QR code drawn")
+    check(d.js(text, ".dialog .server code") == base, f"server address: {base}")
+    check_pairing_link(d)
+    time.sleep(0.6)
+    d.shot(out / f"10c-code-{tag}.png")
+
+    # The app's side: the code as typed, in lowercase.
+    status, paired = api_call(base + "api/pair", body={
+        "code": code.lower(), "platform": "android", "app_version": "0.1.0", "hostname": "smoke-phone"})
+    check(status == 200 and paired["token"].startswith("cst_"), f"/api/pair: {status}")
+    token = paired["token"]
+    check(api_call(base + "api/status", token)[0] == 200, "the token opens /api/status")
+    d.wait("return !!document.querySelector('.dialog .result h3')")
+    shown = d.js(text, ".dialog .result")
+    check("is paired" in shown and "smoke-phone" in shown, f"the dialog shows it: {shown}")
+    time.sleep(0.4)
+    d.shot(out / f"10d-paired-{tag}.png")
+    d.click_text("div[@role='dialog']", "Done")
+    d.wait("return !document.querySelector('.dialog')")
+    d.wait(has, 15.0, row)
+    time.sleep(0.8)
+    print("listed:", d.js("return [...document.querySelectorAll('.device .info')]"
+                          ".map(i => i.textContent.replace(/\\s+/g, ' ').trim())"))
+    d.shot(out / f"10e-device-list-{tag}.png")
+
+    d.click_xpath(row + "//button[normalize-space(.)='Revoke']")
+    d.wait("return !!document.querySelector('.device .confirm')")
+    d.click_xpath(row + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Revoke']")
+    d.wait(has, 15.0, row + "//span[normalize-space(.)='Revoked']")
+    status, body = api_call(base + "api/status", token)
+    check(status == 401 and body["code"] == "invalid_token", f"revoked: /api/status answers {status}")
+    time.sleep(0.6)
+    d.shot(out / f"10f-revoked-{tag}.png")
+    d.click_xpath(row + "//button[normalize-space(.)='Remove']")
+    d.click_xpath(row + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
+    d.wait(f"return !({has.removeprefix('return ')})", 15.0, row)
+    check(True, "removed from the list")
+    add_device_keyboard(d)
+    add_device_new_code(d, out, tag, base)
+    device_edits_keep_newer_ones(d)
+    pairing_setup_follows_saves_elsewhere(d)
+    pairing_save_keeps_later_edits(d)
+
+
+def pairing_setup_follows_saves_elsewhere(d):
+    """Sync setup's Pairing, while another browser saves it: a field left as
+    it was follows the save, and one being edited keeps its draft."""
+    switch = ("return [...document.querySelectorAll('main [role=switch]')]"
+              ".find(s => s.textContent.includes('plain http'))?.getAttribute('aria-checked')")
+    save_elsewhere = """
+        const done = arguments[1];
+        fetch('api/pairing/setup', {method: 'PUT', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({ca_path: null, allow_http: arguments[0]})})
+            .then(r => done(r.status), e => done(String(e)));
+    """
+    d.wait(f"{switch} === 'false'")
+    d.clear_and_type("#ca-path", "~/draft.pem")
+    status = d.s("POST", "/execute/async", {"args": [True], "script": save_elsewhere})
+    check(status == 200, f"saved elsewhere: {status}")
+    # Through the event stream, or the poll while it's down.
+    d.wait(f"{switch} === 'true'", 20.0)
+    check(d.js("return document.querySelector('#ca-path').value") == "~/draft.pem",
+          "the switch followed the save made elsewhere; the CA path draft stayed")
+    d.s("POST", "/execute/async", {"args": [False], "script": save_elsewhere})
+    d.wait(f"{switch} === 'false'", 20.0)
+    d.click_text("main", "Revert")
+    d.wait("return document.querySelector('#ca-path').value === ''")
+
+
+def device_edits_keep_newer_ones(d):
+    """A slow save of one device's name doesn't close another device's editor
+    opened meanwhile."""
+    # Two devices, paired from this machine as an app would.
+    d.s("POST", "/execute/async", {"args": [], "script": """
+        const done = arguments[0];
+        (async () => {
+            for (const name of ['Edit A', 'Edit B']) {
+                const made = await (await fetch('api/pairings', {method: 'POST',
+                    headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({name, scope: 'manage'})})).json();
+                await fetch('api/pair', {method: 'POST', headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({code: made.code})});
+                await fetch('api/pairings/' + made.id, {method: 'DELETE'});
+            }
+        })().then(() => done(true), e => done(String(e)));
+    """})
+    # Load the list afresh.
+    d.click(".setup .back")
+    d.wait("return !document.querySelector('#devices-title')")
+    d.open_setup("Sync setup")
+    row = lambda n: f"//li[contains(@class,'device')][.//b[normalize-space(.)='{n}']]"
+    has = "return document.evaluate(arguments[0], document, null, XPathResult.BOOLEAN_TYPE, null).booleanValue"
+    d.wait(has, 15.0, row("Edit B"))
+    # Device saves answer a second late.
+    d.js("const f = window.fetch; window.fetch = async (u, i) => {"
+         " const r = await f(u, i);"
+         " if (i?.method === 'PUT' && String(u).includes('/api/devices/')) await new Promise(t => setTimeout(t, 1000));"
+         " return r; }")
+    d.click_xpath(row("Edit A") + "//button[normalize-space(.)='Edit']")
+    d.wait("return !!document.querySelector('.device .edit input')")
+    d.clear_and_type(".device .edit input", "Edit A2")
+    d.click_xpath("//li[contains(@class,'device')]//form[contains(@class,'edit')]//button[normalize-space(.)='Save']")
+    d.click_xpath(row("Edit B") + "//button[normalize-space(.)='Edit']")
+    d.wait(has, 15.0, row("Edit A2"))
+    time.sleep(0.3)
+    check(d.js("return document.querySelector('.device .edit input')?.value") == "Edit B",
+          "B's editor stayed open when A's save answered")
+    d.click_xpath("//form[contains(@class,'edit')]//button[normalize-space(.)='Cancel']")
+    for name in ["Edit A2", "Edit B"]:
+        d.click_xpath(row(name) + "//button[normalize-space(.)='Revoke']")
+        d.click_xpath(row(name) + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Revoke']")
+        d.wait(has, 15.0, row(name) + "//span[normalize-space(.)='Revoked']")
+        d.click_xpath(row(name) + "//button[normalize-space(.)='Remove']")
+        d.click_xpath(row(name) + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
+        d.wait(f"return !({has.removeprefix('return ')})", 15.0, row(name))
+    check(True, "both removed")
+
+
+def check_pairing_link(d):
+    """The link in Add device's QR code: the page's own address up to its
+    path prefix, the code, and ca= when Sync setup has a CA certificate."""
+    link = d.js("return document.querySelector('.dialog [data-link]')?.dataset.link")
+    want = d.s("POST", "/execute/async", {"args": [], "script": """
+        const done = arguments[0];
+        fetch('api/pairing/setup').then(r => r.json()).then(s => {
+            const server = location.origin + location.pathname.replace(/[^/]*$/, '');
+            const code = document.querySelector('.dialog .code').textContent.trim().replace('-', '');
+            const ca = s.ca ? s.ca.fingerprint : null;
+            done({server, ca, link: 'coversync://pair?server=' + encodeURIComponent(server)
+                + '&code=' + code + (ca ? '&ca=' + ca : '')});
+        }, e => done({error: String(e)}));
+    """})
+    check(link == want.get("link"), f"the pairing link: {link}")
+    return want
+
+
+def pairing_link_flow(d):
+    d.open_setup("Sync setup")
+    d.wait("return !!document.querySelector('#devices-title')")
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Link check")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    want = check_pairing_link(d)
+    print("server in the link:", want["server"], "| ca=:", want["ca"] or "none (no CA certificate set)")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
+
+
+def pairing_save_keeps_later_edits(d):
+    """A pairing switch put back to its saved value while a save of it is
+    under way stays as it was put, and is left to save."""
+    switch_el = ("[...document.querySelectorAll('main [role=switch]')]"
+                 ".find(s => s.textContent.includes('plain http'))")
+    switch = f"return {switch_el}?.getAttribute('aria-checked')"
+    d.wait(f"{switch} === 'false'")
+    # Pairing setup saves answer a second late.
+    d.js("const f = window.fetch; window.fetch = async (u, i) => {"
+         " const r = await f(u, i);"
+         " if (i?.method === 'PUT' && String(u).includes('/api/pairing/setup')) await new Promise(t => setTimeout(t, 1000));"
+         " return r; }")
+    d.js(f"{switch_el}.click()")
+    d.wait(f"{switch} === 'true'")
+    d.click_text("main", "Save")
+    d.js(f"{switch_el}.click()")
+    d.wait(f"{switch} === 'false'")
+    d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Sync setup saved'))")
+    time.sleep(0.3)
+    summary = "return document.querySelector('.savebar .summary')?.textContent.trim() ?? ''"
+    check(d.js(switch) == "false" and "1" in d.js(summary),
+          f"put back during the save, it stayed off, unsaved: {d.js(summary)!r}")
+    d.click_text("main", "Save")
+    d.wait(f"return !document.querySelector('.savebar .summary')", 15.0)
+    check(d.js(switch) == "false", "saved off again")
+
+
+def press(d, key):
+    """Press a key (a WebDriver key code, such as Tab) wherever focus is."""
+    d.s("POST", "/actions", {"actions": [{
+        "type": "key", "id": "keyboard",
+        "actions": [{"type": "keyDown", "value": key}, {"type": "keyUp", "value": key}],
+    }]})
+    d.s("DELETE", "/actions")
+
+
+TAB, ENTER, ESCAPE = "", "", ""
+
+
+def add_device_keyboard(d):
+    """Add device by keyboard: focus starts in the name, stays in the dialog
+    through each step and around Tab's ends, and Escape closes only the
+    dialog, giving focus back to Add device."""
+    focus_in_dialog = "return !!document.activeElement?.closest('.dialog')"
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Keyboard phone")
+    press(d, ENTER)
+    d.wait("return !!document.querySelector('.dialog .code')")
+    d.wait(focus_in_dialog)
+    check(d.js("return document.activeElement.textContent.trim()") == "Copy link",
+          "after Show code, focus is on Copy link")
+    # Past the last control (Cancel) Tab comes back to the first (Close), and back.
+    d.js("[...document.querySelectorAll('.dialog .foot button')].pop().focus()")
+    press(d, TAB)
+    check(d.js("return document.activeElement.getAttribute('aria-label')") == "Close",
+          "Tab past the last control wraps to the first")
+    d.s("POST", "/actions", {"actions": [{
+        "type": "key", "id": "keyboard",
+        "actions": [{"type": "keyDown", "value": ""}, {"type": "keyDown", "value": TAB},
+                    {"type": "keyUp", "value": TAB}, {"type": "keyUp", "value": ""}],
+    }]})
+    d.s("DELETE", "/actions")
+    check(d.js("return document.activeElement.textContent.trim()") == "Cancel",
+          "Shift+Tab before the first wraps to the last")
+    # Even with focus lost to the page, Escape closes the dialog and nothing else.
+    d.js("document.activeElement.blur()")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
+    check("view=sync-setup" in d.js("return location.search"), "Escape left Sync setup open")
+    check(d.js("return document.activeElement?.textContent.trim()") == "Add device",
+          "focus is back on Add device")
+
+
+def add_device_new_code(d, out, tag, base):
+    """New code once the device to replace is removed: the dialog says why the
+    code ended, a double click asks for one code only, and its failure shows."""
+    text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
+    # A device to replace, paired as an app would.
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Old laptop")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    status, paired = api_call(base + "api/pair", body={"code": d.js(text, ".dialog .code")})
+    check(status == 200, "a device to replace paired")
+    d.wait("return !!document.querySelector('.dialog .result h3')")
+    d.click_text("div[@role='dialog']", "Done")
+    d.wait("return !document.querySelector('.dialog')")
+    d.wait("return [...document.querySelectorAll('.device .name b')].some(b => b.textContent === 'Old laptop')")
+
+    # Count the codes asked for from here on.
+    d.js("window.__codes = 0; const f = window.fetch;"
+         "window.fetch = (u, i) => { if (String(u).endsWith('/api/pairings') && i?.method === 'POST')"
+         " window.__codes++; return f(u, i); }")
+    d.click_text("main", "Add device")
+    d.wait("return !!document.querySelector('.dialog .check input')")
+    d.click(".dialog .check input")
+    d.wait("return !!document.querySelector('.dialog select')")
+    d.js("const s = document.querySelector('.dialog select');"
+         "s.value = [...s.options].find(o => o.text.startsWith('Old laptop')).value;"
+         "s.dispatchEvent(new Event('change', {bubbles: true}))")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    # Removed elsewhere (another tab) while its replacement code waits.
+    d.js("fetch(arguments[0], {method: 'DELETE'})", f"{base}api/devices/{paired['device_id']}")
+    d.wait("return !!document.querySelector('.dialog .result h3')", 15.0)
+    shown = d.js(text, ".dialog .result")
+    check("would replace was removed" in shown, f"the dialog says why: {shown}")
+    d.wait("return ![...document.querySelectorAll('.sidebar .device-name')]"
+           ".some(n => n.textContent === 'Old laptop')")
+    check(True, "the sidebar no longer lists it")
+    # Double-clicked: one request. It's refused, and the form comes back with
+    # why, the device to replace cleared, to choose another or none.
+    d.js("const b = document.querySelector('.dialog .new-code'); b.click(); b.click()")
+    d.wait("return !!document.querySelector('.dialog form .error')")
+    time.sleep(0.5)
+    check(d.js("return window.__codes") == 2, f"codes asked for: {d.js('return window.__codes')} (2 expected)")
+    print("error shown:", d.js(text, ".dialog form .error"))
+    check(d.js("return !document.querySelector('.dialog .check input')?.checked"),
+          "the device to replace is cleared, and Replace unticked")
+    d.shot(out / f"10g-new-code-failed-{tag}.png")
+    # As a new device, a code comes.
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    check(True, "a new code once Replace is unticked")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
+
+
 def option(name):
     """The value given after a flag, e.g. the album after --suggest."""
     if name in sys.argv and sys.argv.index(name) + 1 < len(sys.argv):
@@ -998,6 +1330,12 @@ def main():
             auth_flow(d, out, tag)
             return
         sign_in(d)
+        if "--devices" in sys.argv:
+            devices_flow(d, out, tag, url)
+            return
+        if "--pairing-link" in sys.argv:
+            pairing_link_flow(d)
+            return
         d.wait("return document.querySelectorAll('.card').length > 0")
         grid_intro_check(d)
         d.wait("return document.querySelectorAll('.card').length > 0")

@@ -156,7 +156,12 @@ async fn nothing_is_reachable_before_a_password_is_set() {
 /// source: a route added there is checked here without being listed.
 fn registered_paths() -> Vec<String> {
     let mut paths = Vec::new();
-    for source in [include_str!("../api.rs"), include_str!("mod.rs")] {
+    for source in [
+        include_str!("../api.rs"),
+        include_str!("mod.rs"),
+        include_str!("devices.rs"),
+        include_str!("../uploads.rs"),
+    ] {
         for (at, _) in source.match_indices(".route(") {
             let Some(rest) = source[at + ".route(".len()..]
                 .trim_start()
@@ -357,9 +362,15 @@ async fn app_tokens_open_the_api_by_scope() {
         .iter()
         .filter(|p| !OPEN.contains(&p.as_str()))
     {
-        let status = app.send(bearer(path, &token)).await.status();
+        let res = app.send(bearer(path, &token)).await;
+        let status = res.status();
         assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
-        assert_ne!(status, StatusCode::FORBIDDEN, "{path}");
+        // Only managing devices is refused to a token. (Only a refusal's
+        // body is read: /api/events never ends.)
+        if status == StatusCode::FORBIDDEN {
+            assert_eq!(code(res).await.1, "password_required", "{path}");
+            assert!(path.starts_with("/api/pairing"), "{path}");
+        }
     }
     let res = app.send(bearer("/api/session", &token)).await;
     assert_eq!(
@@ -736,8 +747,11 @@ fn only_the_open_routes_skip_the_guard() {
         "/api/",
         "/api/status",
         "/api/hello/",
+        "/api/hello/ca/",
         "/api/login/",
-        "/api/hello/ca",
+        "/api/pair/",
+        "/api/pairings",
+        "/api/devices",
     ] {
         assert!(guarded(path), "{path}");
     }
@@ -782,6 +796,46 @@ fn the_client_address_comes_from_the_proxy_only_on_loopback() {
 }
 
 #[test]
+fn the_forwarded_scheme_is_the_nearest_proxys() {
+    let https = |lines: &[&str]| {
+        let mut h = HeaderMap::new();
+        for v in lines {
+            h.append("x-forwarded-proto", v.parse().unwrap());
+        }
+        over_https(&h)
+    };
+    assert!(https(&["https"]));
+    assert!(https(&[" HTTPS "]));
+    assert!(!https(&[]));
+    assert!(!https(&["http"]));
+    // A proxy that adds its own value leaves the client's before it.
+    assert!(!https(&["https", "http"]));
+    assert!(https(&["http", "https"]));
+    assert!(!https(&["https, http"]));
+    assert!(https(&["http, https"]));
+    assert!(!https(&["https", "https, http"]));
+}
+
+#[tokio::test]
+async fn a_cookie_is_secure_only_if_the_nearest_proxy_saw_https() {
+    let app = App::with_password("secure");
+    for (lines, secure) in [
+        (&["https", "http"][..], false),
+        (&["https, http"][..], false),
+        (&["http", "https"][..], true),
+    ] {
+        let mut req = login_request(PASSWORD, "/");
+        for v in lines {
+            req.headers_mut()
+                .append("x-forwarded-proto", v.parse().unwrap());
+        }
+        let res = app.send_from("127.0.0.1:40000", req).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(set_cookie(&res).contains("; Secure"), secure, "{lines:?}");
+    }
+}
+
+#[test]
 fn a_password_from_standard_input() {
     let read = |s: &str| password_line(std::io::Cursor::new(s.as_bytes().to_vec()));
     assert_eq!(read("hunter2 hunter2\n").unwrap(), "hunter2 hunter2");
@@ -796,6 +850,8 @@ fn a_password_from_standard_input() {
     assert!(read("short\n").is_err());
     assert!(read(&"x".repeat(MAX_PASSWORD + 1)).is_err());
 }
+
+mod devices;
 
 #[test]
 fn set_password_works_on_a_new_state_directory() {
