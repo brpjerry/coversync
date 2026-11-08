@@ -110,25 +110,57 @@ fn show_fallback(app: &AppHandle, problem: Problem) {
     }
 }
 
-/// Launches that came in before setup finished, to handle once it has.
+/// Launches that came in before the app had started: set up, with its first
+/// page on the way (after the one cache clear, if due; see
+/// [`clear_http_cache_then`]). They're handled once it has.
 #[derive(Default)]
 struct EarlyLaunches {
-    /// Set once the shell is managed; until then, launches wait here.
-    ready: bool,
+    started: bool,
     waiting: Vec<Vec<String>>,
+}
+
+impl EarlyLaunches {
+    /// Keeps `args` for later until the app has started; then hands them
+    /// back.
+    fn hold(&mut self, args: Vec<String>) -> Option<Vec<String>> {
+        if self.started {
+            return Some(args);
+        }
+        self.waiting.push(args);
+        None
+    }
+
+    /// The app has started: the launches held until now.
+    fn release(&mut self) -> Vec<Vec<String>> {
+        self.started = true;
+        std::mem::take(&mut self.waiting)
+    }
+}
+
+/// The app has started (see [`EarlyLaunches`]): handles the launches that
+/// waited for it.
+fn started(app: &AppHandle) {
+    let waiting = app
+        .state::<Mutex<EarlyLaunches>>()
+        .lock()
+        .expect("early launches lock")
+        .release();
+    for args in waiting {
+        launched_again(app, args);
+    }
 }
 
 /// Another launch of the app: bring the window up, and show the server it
 /// was given with `--server`, if any, for this run.
 fn launched_again(app: &AppHandle, args: Vec<String>) {
-    {
-        let early = app.state::<Mutex<EarlyLaunches>>();
-        let mut early = early.lock().expect("early launches lock");
-        if !early.ready {
-            early.waiting.push(args);
-            return;
-        }
-    }
+    let held = app
+        .state::<Mutex<EarlyLaunches>>()
+        .lock()
+        .expect("early launches lock")
+        .hold(args);
+    let Some(args) = held else {
+        return;
+    };
     raise_window(app, activation_token(&args));
     let Some(server) = server_arg(args.into_iter().skip(1)) else {
         return;
@@ -156,8 +188,8 @@ const ACTIVATION_ARG: &str = "--activation-token=";
 
 fn activation_token(args: &[String]) -> Option<String> {
     args.iter()
-        .find_map(|arg| arg.strip_prefix(ACTIVATION_ARG))
-        .filter(|token| !token.is_empty())
+        .filter_map(|arg| arg.strip_prefix(ACTIVATION_ARG))
+        .find(|token| !token.is_empty())
         .map(str::to_owned)
 }
 
@@ -198,7 +230,7 @@ fn raise_window(app: &AppHandle, token: Option<String>) {
 /// launch's activation token (`XDG_ACTIVATION_TOKEN` on Wayland,
 /// `DESKTOP_STARTUP_ID` on X11). Without the token, the running app may not
 /// raise its window. So a launch with a token starts itself again with the
-/// token as an argument too, before anything else runs.
+/// token as an argument too ([`carried`]), before anything else runs.
 #[cfg(target_os = "linux")]
 fn carry_activation_token() {
     use std::os::unix::process::CommandExt;
@@ -218,10 +250,18 @@ fn carry_activation_token() {
         return;
     };
     let err = std::process::Command::new(program)
-        .args(&args)
-        .arg(format!("{ACTIVATION_ARG}{token}"))
+        .args(carried(&token, args))
         .exec();
     tracing::warn!("couldn't pass the activation token on: {err}");
+}
+
+/// The arguments a launch starts itself again with: the token first, so it
+/// can't be taken for the value of a bare `--server` at the end of `args`.
+#[cfg(any(target_os = "linux", test))]
+fn carried(token: &str, args: Vec<String>) -> Vec<String> {
+    std::iter::once(format!("{ACTIVATION_ARG}{token}"))
+        .chain(args)
+        .collect()
 }
 
 /// Watches WebKitGTK's web process, which draws the page: when it crashes,
@@ -318,7 +358,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     };
     app.manage(lock);
     let config = Store::open(config_dir.clone());
-    let clear_cache = config.had_shared_port();
+    let clear_cache = config.get().needs_cache_clear();
     let saved = config.get();
     let server = server_arg(std::env::args().skip(1))
         .or_else(|| std::env::var(SERVER_ENV).ok().filter(|s| !s.is_empty()))
@@ -360,48 +400,51 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     watch_web_process(&window)?;
     if clear_cache {
         clear_http_cache_then(&window, url);
-    }
-
-    // Launches that arrived while this ran.
-    let waiting = {
-        let early = app.state::<Mutex<EarlyLaunches>>();
-        let mut early = early.lock().expect("early launches lock");
-        early.ready = true;
-        std::mem::take(&mut early.waiting)
-    };
-    for args in waiting {
-        launched_again(app.handle(), args);
+    } else {
+        started(app.handle());
     }
     Ok(())
 }
 
 /// The first builds served every server from one port, so the webview's
-/// HTTP cache may hold several servers' answers under that origin. It's
-/// cleared once, when their settings are read, before the first page loads;
-/// local storage and cookies stay. WebKitGTK only: no other webview ran
-/// those builds.
+/// HTTP cache may hold several servers' answers under that origin. Settings
+/// from before [`config::VERSION`] 1 (theirs, and the builds' since that
+/// kept no version) get it cleared before the first page loads; local
+/// storage and cookies stay. Only a clear that succeeds is recorded: one
+/// that fails is tried again at the next start. Either way the first page
+/// opens, and then the launches that waited are handled. WebKitGTK only: no
+/// other webview ran those builds.
 fn clear_http_cache_then(window: &tauri::WebviewWindow, url: WebviewUrl) {
     let go = {
         let window = window.clone();
-        move || {
+        Arc::new(move |cleared: bool| {
+            let app = window.app_handle();
+            let shell = app.try_state::<Shell>();
+            if let Some(shell) = &shell
+                && cleared
+                && let Err(err) = shell
+                    .config
+                    .update(|settings| settings.version = config::VERSION)
+            {
+                tracing::warn!("couldn't record the cleared cache: {err}");
+            }
             let target = match &url {
                 WebviewUrl::External(url) => Some(url.clone()),
-                _ => window
-                    .app_handle()
-                    .try_state::<Shell>()
-                    .map(|shell| shell.fallback.clone()),
+                _ => shell.map(|shell| shell.fallback.clone()),
             };
             if let Some(target) = target
                 && let Err(err) = window.navigate(target)
             {
                 tracing::error!("couldn't open the first page: {err}");
             }
-        }
+            started(app);
+        })
     };
     #[cfg(target_os = "linux")]
     {
         use webkit2gtk::{WebViewExt, WebsiteDataManagerExtManual, WebsiteDataTypes};
 
+        let then = go.clone();
         let cleared =
             window.with_webview(
                 move |webview| match webview.inner().website_data_manager() {
@@ -410,24 +453,30 @@ fn clear_http_cache_then(window: &tauri::WebviewWindow, url: WebviewUrl) {
                         webkit2gtk::glib::TimeSpan(0),
                         None::<&webkit2gtk::gio::Cancellable>,
                         move |result| {
-                            match result {
+                            match &result {
                                 Ok(()) => {
                                     tracing::info!("cleared the HTTP cache the servers shared")
                                 }
                                 Err(err) => tracing::warn!("couldn't clear the HTTP cache: {err}"),
                             }
-                            go();
+                            then(result.is_ok());
                         },
                     ),
-                    None => go(),
+                    None => {
+                        tracing::warn!(
+                            "couldn't clear the HTTP cache: the webview has no data manager"
+                        );
+                        then(false);
+                    }
                 },
             );
         if let Err(err) = cleared {
             tracing::warn!("couldn't clear the HTTP cache: {err}");
+            go(false);
         }
     }
     #[cfg(not(target_os = "linux"))]
-    go();
+    go(true);
 }
 
 /// Shows `message` in a dialog of its own, before any window: on Linux,
@@ -478,12 +527,12 @@ fn log_filter(rust_log: &str) -> EnvFilter {
 }
 
 fn main() {
-    #[cfg(target_os = "linux")]
-    carry_activation_token();
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
         .with_writer(std::io::stderr)
         .init();
+    #[cfg(target_os = "linux")]
+    carry_activation_token();
     tauri::Builder::default()
         .manage(Mutex::new(EarlyLaunches::default()))
         // First, so a second launch hands over before setting anything up.
@@ -524,7 +573,38 @@ mod tests {
             activation_token(&args(&["app", "--activation-token="])),
             None
         );
+        assert_eq!(
+            activation_token(&args(&[
+                "app",
+                "--activation-token=",
+                "--activation-token=abc"
+            ]))
+            .as_deref(),
+            Some("abc"),
+            "an empty one doesn't hide the one carried"
+        );
         assert_eq!(activation_token(&args(&["app"])), None);
+    }
+
+    #[test]
+    fn the_carried_token_isnt_a_servers_value() {
+        let args = carried("abc", vec!["--server".to_owned()]);
+        assert_eq!(activation_token(&args).as_deref(), Some("abc"));
+        assert_eq!(server_arg(args.into_iter()), None);
+        let args = carried("abc", vec!["--server".to_owned(), "https://a/".to_owned()]);
+        assert_eq!(server_arg(args.into_iter()).as_deref(), Some("https://a/"));
+    }
+
+    #[test]
+    fn launches_wait_until_the_app_has_started() {
+        let mut early = EarlyLaunches::default();
+        let launch = |n: &str| vec!["app".to_owned(), format!("--server=http://{n}/")];
+        // While setup or the cache clear runs.
+        assert_eq!(early.hold(launch("a")), None);
+        assert_eq!(early.hold(launch("b")), None);
+        assert_eq!(early.release(), [launch("a"), launch("b")]);
+        assert_eq!(early.hold(launch("c")), Some(launch("c")));
+        assert!(early.release().is_empty());
     }
 
     #[test]

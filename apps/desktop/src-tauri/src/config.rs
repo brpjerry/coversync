@@ -13,9 +13,16 @@ use serde::{Deserialize, Serialize};
 /// How many recently shown servers keep their ports, besides the saved one.
 pub const KEEP_RECENT: usize = 8;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The settings' version. 1: the HTTP cache the first builds' servers
+/// shared (one port, so one origin) has been cleared.
+pub const VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Which of the changes behind [`VERSION`] are done; 0 for settings from
+    /// before it.
+    pub version: u32,
     /// The server's URL, as the fallback page last saved it.
     pub server: Option<String>,
     /// The proxy's port for each server (by its URL), kept so each server
@@ -46,11 +53,13 @@ impl Config {
         }
         self.recent.retain(|server| server != url);
         self.recent.insert(0, url.to_owned());
+        let saved = self.server.as_ref();
         let kept: Vec<&String> = self
             .recent
             .iter()
+            .filter(|server| Some(*server) != saved)
             .take(KEEP_RECENT)
-            .chain(self.server.as_ref())
+            .chain(saved)
             .collect();
         let dropped: Vec<String> = self
             .ports
@@ -85,21 +94,20 @@ impl Config {
         }
     }
 
-    /// Reads the first builds' single `port` into the saved server's, unless
-    /// it has one already; otherwise it's retired. Says whether there was
-    /// one: its origin held every server's cache.
-    fn migrate(&mut self) -> bool {
-        let Some(port) = self.port.take() else {
-            return false;
-        };
-        match &self.server {
-            Some(server) if !self.ports.contains_key(server) => {
-                self.ports.insert(server.clone(), port);
+    /// Reads what earlier builds wrote: the first builds' single `port` goes
+    /// to the saved server, unless it has one already (then it's retired),
+    /// and servers in `ports` that `recent` doesn't list (it came later) go
+    /// at its end, so none is dropped as if unused.
+    fn migrate(&mut self) {
+        if let Some(port) = self.port.take() {
+            match &self.server {
+                Some(server) if !self.ports.contains_key(server) => {
+                    self.ports.insert(server.clone(), port);
+                }
+                _ if self.ports.values().any(|&kept| kept == port) => {}
+                _ => self.retire(port),
             }
-            _ if self.ports.values().any(|&kept| kept == port) => {}
-            _ => self.retire(port),
         }
-        // Servers from builds that kept no order come after the rest.
         let missing: Vec<String> = self
             .ports
             .keys()
@@ -107,14 +115,18 @@ impl Config {
             .cloned()
             .collect();
         self.recent.extend(missing);
-        true
+    }
+
+    /// Whether the webview's HTTP cache still has to be cleared once: the
+    /// settings come from a build before [`VERSION`] 1.
+    pub fn needs_cache_clear(&self) -> bool {
+        self.version < 1
     }
 }
 
 pub struct Store {
     path: PathBuf,
     current: Mutex<Config>,
-    migrated: bool,
 }
 
 impl Store {
@@ -127,29 +139,25 @@ impl Store {
                 tracing::warn!("ignoring {}: {err}", path.display());
                 Config::default()
             }),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Config::default(),
+            // A first run: nothing from earlier builds to deal with.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Config {
+                version: VERSION,
+                ..Config::default()
+            },
             Err(err) => {
                 tracing::warn!("couldn't read {}: {err}", path.display());
                 Config::default()
             }
         };
-        let migrated = current.migrate();
+        current.migrate();
         Self {
             path,
             current: Mutex::new(current),
-            migrated,
         }
     }
 
     pub fn get(&self) -> Config {
         self.current.lock().expect("config lock").clone()
-    }
-
-    /// Whether it held the first builds' single `port`, shared by every
-    /// server: the webview's HTTP cache may hold their answers under one
-    /// origin.
-    pub fn had_shared_port(&self) -> bool {
-        self.migrated
     }
 
     /// Changes the settings and writes them out, replacing the file whole.
@@ -173,28 +181,44 @@ impl Store {
 /// `cookies.json` are each written whole by one process. The single-instance
 /// plugin usually keeps a second process out, but not without a D-Bus
 /// session bus, or with another one.
-pub struct ConfigLock(#[allow(dead_code)] File);
+pub struct ConfigLock(#[allow(dead_code)] Option<File>);
 
 impl ConfigLock {
+    /// Refuses only when another process holds the lock. Where locking
+    /// itself fails (a file system without locks, a directory that can't be
+    /// written), it warns and goes on without, as before the lock existed.
     pub fn take(dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(dir)
-            .map_err(|err| format!("Couldn't create {}: {err}", dir.display()))?;
         let path = dir.join("lock");
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|err| format!("Couldn't open {}: {err}", path.display()))?;
+        let file = fs::create_dir_all(dir).and_then(|()| {
+            File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        });
+        let file = match file {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    "couldn't open {}: {err}; going on without it",
+                    path.display()
+                );
+                return Ok(Self(None));
+            }
+        };
         match file.try_lock() {
-            Ok(()) => Ok(Self(file)),
+            Ok(()) => Ok(Self(Some(file))),
             Err(fs::TryLockError::WouldBlock) => Err(format!(
                 "coversync is already open with the settings in {}. Use that window, or \
                  close it before starting another.",
                 dir.display()
             )),
             Err(fs::TryLockError::Error(err)) => {
-                Err(format!("Couldn't lock {}: {err}", path.display()))
+                tracing::warn!(
+                    "couldn't lock {}: {err}; going on without it",
+                    path.display()
+                );
+                Ok(Self(None))
             }
         }
     }
@@ -258,13 +282,18 @@ mod tests {
     fn reads_the_first_builds_port() {
         // Kept for the saved server.
         let (store, dir) = open_with("legacy", r#"{"server": "http://a/", "port": 4000}"#);
-        assert!(store.had_shared_port());
+        assert!(store.get().needs_cache_clear());
         assert_eq!(store.get().ports.get("http://a/"), Some(&4000));
         assert_eq!(store.get().recent, ["http://a/"]);
         store.update(|_| ()).unwrap();
         let written = fs::read_to_string(dir.join("config.json")).unwrap();
         assert!(!written.contains("\"port\""), "{written}");
-        assert!(!Store::open(dir.clone()).had_shared_port());
+        assert!(
+            Store::open(dir.clone()).get().needs_cache_clear(),
+            "until the clear is recorded"
+        );
+        store.update(|config| config.version = VERSION).unwrap();
+        assert!(!Store::open(dir.clone()).get().needs_cache_clear());
         fs::remove_dir_all(dir).unwrap();
 
         // An entry in `ports` wins, and the old port is retired.
@@ -275,10 +304,48 @@ mod tests {
         assert_eq!(store.get().ports.get("http://a/"), Some(&5000));
         assert_eq!(store.get().retired, [4000]);
         fs::remove_dir_all(dir).unwrap();
+    }
 
-        let (store, dir) = open_with("current", r#"{"server": "http://a/"}"#);
-        assert!(!store.had_shared_port());
+    #[test]
+    fn keeps_every_server_of_a_ports_only_config() {
+        // What the build before `recent` wrote: `ports`, nothing else.
+        let ports: Vec<String> = (1..=4)
+            .map(|n| format!("\"{}\": {}", server(n), 4000 + n))
+            .collect();
+        let json = format!(
+            r#"{{"server": "{}", "ports": {{{}}}}}"#,
+            server(1),
+            ports.join(", ")
+        );
+        let (store, dir) = open_with("ports-only", &json);
+        let mut config = store.get();
+        assert!(config.needs_cache_clear(), "its cache may be shared too");
+        assert_eq!(config.recent.len(), 4);
+        let dropped = config.shown(&server(2), 4002);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(config.ports.len(), 4);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_first_run_has_nothing_to_clear() {
+        let dir = std::env::temp_dir().join(format!("coversync-config-new-{}", std::process::id()));
+        assert!(!Store::open(dir).get().needs_cache_clear());
+    }
+
+    #[test]
+    fn reopening_the_saved_server_keeps_eight_others() {
+        let mut config = Config {
+            server: Some(server(0)),
+            ..Config::default()
+        };
+        for n in 0..=KEEP_RECENT {
+            config.shown(&server(n), 1000 + n as u16);
+        }
+        assert_eq!(config.ports.len(), 1 + KEEP_RECENT);
+        let dropped = config.shown(&server(0), 1000);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(config.ports.len(), 1 + KEEP_RECENT);
     }
 
     #[test]
