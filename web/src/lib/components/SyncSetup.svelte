@@ -43,7 +43,11 @@
 	/** A revoke or remove waiting for its confirmation. */
 	let confirming = $state<{ id: number; action: 'revoke' | 'remove' } | null>(null);
 
+	/** Bumped each time an editor opens, the same device's again included. */
+	let opened = 0;
+
 	function edit(d: Device) {
+		opened++;
 		confirming = null;
 		editing = d.id;
 		draftName = d.name;
@@ -51,16 +55,25 @@
 	}
 
 	async function saveEdit(d: Device) {
+		const mine = opened;
+		const [name, scope] = [draftName, draftScope];
 		const change: { name?: string; scope?: Scope } = {};
-		if (draftName.trim() !== d.name) change.name = draftName;
-		if (draftScope !== d.scope) change.scope = draftScope;
-		if (!Object.keys(change).length || (await devices.update(d.id, change))) editing = null;
+		if (name.trim() !== d.name) change.name = name;
+		if (scope !== d.scope) change.scope = scope;
+		const saved = !Object.keys(change).length || (await devices.update(d.id, change));
+		// Only the editor that was saved closes, and only as it was saved: one
+		// opened since, or edited further meanwhile, stays.
+		const same = mine === opened && editing === d.id;
+		if (saved && same && draftName === name && draftScope === scope) editing = null;
 	}
 
 	async function confirm(d: Device) {
-		const action = confirming?.action;
-		const done = action === 'remove' ? await devices.remove(d.id) : await devices.revoke(d.id);
-		if (done) confirming = null;
+		const asked = confirming;
+		if (!asked || asked.id !== d.id) return;
+		const done =
+			asked.action === 'remove' ? await devices.remove(d.id) : await devices.revoke(d.id);
+		// A confirmation opened meanwhile, for this device or another, stays.
+		if (done && confirming === asked) confirming = null;
 	}
 
 	function icon(d: Device) {

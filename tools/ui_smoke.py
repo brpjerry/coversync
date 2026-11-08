@@ -771,6 +771,56 @@ def devices_flow(d, out, tag, url):
     check(True, "removed from the list")
     add_device_keyboard(d)
     add_device_new_code(d, out, tag, base)
+    device_edits_keep_newer_ones(d)
+
+
+def device_edits_keep_newer_ones(d):
+    """A slow save of one device's name doesn't close another device's editor
+    opened meanwhile."""
+    # Two devices, paired from this machine as an app would.
+    d.s("POST", "/execute/async", {"args": [], "script": """
+        const done = arguments[0];
+        (async () => {
+            for (const name of ['Edit A', 'Edit B']) {
+                const made = await (await fetch('api/pairings', {method: 'POST',
+                    headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({name, scope: 'manage'})})).json();
+                await fetch('api/pair', {method: 'POST', headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({code: made.code})});
+                await fetch('api/pairings/' + made.id, {method: 'DELETE'});
+            }
+        })().then(() => done(true), e => done(String(e)));
+    """})
+    # Load the list afresh.
+    d.click(".setup .back")
+    d.wait("return !document.querySelector('#devices-title')")
+    d.open_setup("Sync setup")
+    row = lambda n: f"//li[contains(@class,'device')][.//b[normalize-space(.)='{n}']]"
+    has = "return document.evaluate(arguments[0], document, null, XPathResult.BOOLEAN_TYPE, null).booleanValue"
+    d.wait(has, 15.0, row("Edit B"))
+    # Device saves answer a second late.
+    d.js("const f = window.fetch; window.fetch = async (u, i) => {"
+         " const r = await f(u, i);"
+         " if (i?.method === 'PUT' && String(u).includes('/api/devices/')) await new Promise(t => setTimeout(t, 1000));"
+         " return r; }")
+    d.click_xpath(row("Edit A") + "//button[normalize-space(.)='Edit']")
+    d.wait("return !!document.querySelector('.device .edit input')")
+    d.clear_and_type(".device .edit input", "Edit A2")
+    d.click_xpath("//li[contains(@class,'device')]//form[contains(@class,'edit')]//button[normalize-space(.)='Save']")
+    d.click_xpath(row("Edit B") + "//button[normalize-space(.)='Edit']")
+    d.wait(has, 15.0, row("Edit A2"))
+    time.sleep(0.3)
+    check(d.js("return document.querySelector('.device .edit input')?.value") == "Edit B",
+          "B's editor stayed open when A's save answered")
+    d.click_xpath("//form[contains(@class,'edit')]//button[normalize-space(.)='Cancel']")
+    for name in ["Edit A2", "Edit B"]:
+        d.click_xpath(row(name) + "//button[normalize-space(.)='Revoke']")
+        d.click_xpath(row(name) + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Revoke']")
+        d.wait(has, 15.0, row(name) + "//span[normalize-space(.)='Revoked']")
+        d.click_xpath(row(name) + "//button[normalize-space(.)='Remove']")
+        d.click_xpath(row(name) + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
+        d.wait(f"return !({has.removeprefix('return ')})", 15.0, row(name))
+    check(True, "both removed")
 
 
 def press(d, key):

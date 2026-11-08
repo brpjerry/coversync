@@ -313,10 +313,14 @@ the others, and only the browser ever sees the password.
   (`X-Forwarded-Proto: https`, believed from loopback only), or that come
   straight from this machine with no proxy in between. A request a proxy
   forwarded over plain http is refused whatever client it names, so the
-  proxy must send `X-Forwarded-Proto` (Caddy does). Anything refused gets
-  403 `https_required`, and its code is cancelled, as it may have been seen
-  on the way. Sync setup can allow plain http for a network that is
-  encrypted already (Tailscale, WireGuard).
+  proxy must send `X-Forwarded-Proto` (Caddy does; the last value is the one
+  believed, as a proxy may add its own after a client's). Don't put a
+  TCP-level forwarder on this machine in front of coversyncd (socat,
+  `ssh -R`, some container port forwarders): it adds no headers, so its LAN
+  clients look like this machine and would pair over plain http. Anything
+  refused gets 403 `https_required`, and every code in it is cancelled, as
+  it may have been seen on the way. Sync setup can allow plain http for a
+  network that is encrypted already (Tailscale, WireGuard).
 - **CA certificate for apps.** For a server whose certificate a CA of your own
   signed (mkcert's, say), set Sync setup's CA certificate to the path of
   that CA's public certificate, such as `~/.local/share/mkcert/rootCA.pem`.
