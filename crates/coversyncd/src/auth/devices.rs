@@ -552,9 +552,11 @@ fn private_transport(peer: Option<IpAddr>, headers: &HeaderMap) -> bool {
     .any(|h| headers.contains_key(*h))
 }
 
+/// What a device says about itself at `/api/pair`, besides its code. It's
+/// read only after the transport check, so that a code sent in the clear is
+/// cancelled however wrong the rest of the request is.
 #[derive(Deserialize)]
-struct PairRequest {
-    code: String,
+struct AboutDevice {
     /// What the device runs on, such as "android" or "linux".
     #[serde(default)]
     platform: Option<String>,
@@ -610,14 +612,20 @@ async fn pair(
     State(state): State<Shared>,
     Peer(peer): Peer,
     headers: HeaderMap,
-    Json(req): Json<PairRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Answer {
-    let code = pairing::normalize(&req.code).ok_or_else(|| {
-        Refusal::bad(
-            "bad_code",
-            "A pairing code has 8 letters and digits, like K7QM-4ZTD.",
-        )
-    })?;
+    // `{"code", "platform"?, "app_version"?, "hostname"?}`, read as plain
+    // JSON: only the code is looked at before the transport check.
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .and_then(pairing::normalize)
+        .ok_or_else(|| {
+            Refusal::bad(
+                "bad_code",
+                "A pairing code has 8 letters and digits, like K7QM-4ZTD.",
+            )
+        })?;
     let client = super::client_ip(peer, &headers);
     let allow_http = db(&state, |s| s.pairing_setup()).await?.allow_http;
     let at = state.auth.instant();
@@ -639,6 +647,12 @@ async fn pair(
     }
     // After the transport check, so a code sent in the clear is cancelled
     // whatever else is wrong with the request.
+    let req: AboutDevice = serde_json::from_value(body).map_err(|e| {
+        Refusal::bad(
+            "bad_request",
+            format!("The platform, app version and host name must be text: {e}."),
+        )
+    })?;
     let platform = about(req.platform.as_deref(), 32, "platform")?;
     let hostname = about(req.hostname.as_deref(), 253, "host name")?;
     let app_version = about(req.app_version.as_deref(), MAX_APP_VERSION, "app version")?;

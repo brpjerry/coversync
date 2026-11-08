@@ -405,16 +405,28 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
 
     // A code sent in the clear is cancelled even when the rest of the
     // request is wrong.
-    let (id, code) = app.new_code(&cookie, phone()).await;
-    let malformed = json!({ "code": code, "platform": "x".repeat(33) });
-    let res = app
-        .pair_from(LAN, request("POST", "/api/pair", None, Some(malformed)))
-        .await;
-    assert_eq!(
-        code_of(res).await,
-        (StatusCode::FORBIDDEN, "https_required".into())
-    );
-    assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+    for malformed in [
+        json!({ "platform": "x".repeat(33) }),
+        json!({ "platform": 123 }),
+        json!({ "app_version": ["1"], "hostname": {} }),
+    ] {
+        let (id, code) = app.new_code(&cookie, phone()).await;
+        let mut body = malformed.clone();
+        body["code"] = json!(code);
+        let res = app
+            .pair_from(LAN, request("POST", "/api/pair", None, Some(body)))
+            .await;
+        assert_eq!(
+            code_of(res).await,
+            (StatusCode::FORBIDDEN, "https_required".into()),
+            "{malformed}"
+        );
+        assert_eq!(
+            app.pairing(&cookie, &id).await["why"],
+            "insecure",
+            "{malformed}"
+        );
+    }
 
     // With the override, for a network that's encrypted already.
     let res = app.pairing_setup(&cookie, None, true).await;
@@ -978,21 +990,40 @@ async fn what_devices_say_about_themselves_is_checked() {
         json!({ "code": code, "platform": "x".repeat(33) }),
         json!({ "code": code, "app_version": "1\n2" }),
         json!({ "code": code, "hostname": "h".repeat(254) }),
+        json!({ "code": code, "platform": 123 }),
+        json!({ "code": code, "app_version": ["1"] }),
     ] {
         let res = app
-            .pair_from(LOCAL, request("POST", "/api/pair", None, Some(body)))
+            .pair_from(
+                LOCAL,
+                request("POST", "/api/pair", None, Some(body.clone())),
+            )
             .await;
         assert_eq!(
             code_of(res).await,
-            (StatusCode::BAD_REQUEST, "bad_request".into())
+            (StatusCode::BAD_REQUEST, "bad_request".into()),
+            "{body}"
         );
     }
-    // None of that used the code; a bare one is fine.
+    // A code that isn't text, or none at all.
+    for body in [json!({ "code": 12345678 }), json!({}), json!(["K7QM4ZTD"])] {
+        let res = app
+            .pair_from(
+                LOCAL,
+                request("POST", "/api/pair", None, Some(body.clone())),
+            )
+            .await;
+        assert_eq!(
+            code_of(res).await,
+            (StatusCode::BAD_REQUEST, "bad_code".into()),
+            "{body}"
+        );
+    }
+    // None of that used the code; a bare one is fine, and nulls are as good
+    // as leaving a field out.
+    let body = json!({ "code": code, "platform": null, "hostname": null });
     let res = app
-        .pair_from(
-            LOCAL,
-            request("POST", "/api/pair", None, Some(json!({ "code": code }))),
-        )
+        .pair_from(LOCAL, request("POST", "/api/pair", None, Some(body)))
         .await;
     let (device, _) = paired(res).await;
     let d = app.state.auth.store().device_info(device).unwrap().unwrap();
