@@ -64,6 +64,7 @@ crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 web/                    SvelteKit / Svelte 5 single-page app
 apps/desktop/           Tauri 2 desktop app, a window onto a server's UI (its own Cargo workspace)
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
+tools/player_stall.py   the player's buffering spinner while audio stalls, in headless Firefox
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
@@ -254,6 +255,9 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   server-sent events work as in a browser.
 - The server's path prefix stays: `https://n5pro.internal/coversync/` is
   served at `http://127.0.0.1:<port>/coversync/`.
+- Each server gets its own port, kept from run to run, so each has an origin
+  of its own in the window: its cached pages and covers, and the UI's
+  settings (sort, sidebar), are its own.
 - The proxy keeps the server's cookies itself, apart for each server, and
   sends them as a browser would. So a server's login works as in a browser,
   and one server's cookies never go to another. Persistent ones (a login)
@@ -268,12 +272,14 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
 
 When no server is set, it can't be reached, or the page crashes, the window
 shows a page bundled with the app, to try again or change the server. A new
-server's address is saved once it shows coversync's page (a login counts;
-an error, a missing page or a redirect to another address doesn't), in
-`config.json` in the app's config directory
-(`~/.config/io.github.brpjerry.coversync/` on Linux).
+server is used and saved only once it's checked: its `/api/hello`, which
+coversync answers without a login, has to say it's coversync. A server too
+old to have it, an error, or a redirect to another address doesn't pass.
+The address and the ports are kept in `config.json` in the app's config
+directory (`~/.config/io.github.brpjerry.coversync/` on Linux).
 `--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
-saving it.
+saving it. One instance of the app runs at a time: launching it again
+brings up its window, and shows the server given with `--server`, if any.
 
 There are no packages for it yet. To build and run it on Arch Linux, you
 need WebKitGTK as well as Rust and pnpm. Playback also needs GStreamer's good
@@ -283,7 +289,7 @@ starts, and the app says so.
 ```sh
 sudo pacman -S --needed webkit2gtk-4.1 gst-plugins-good
 cd apps/desktop
-pnpm install                 # the Tauri CLI
+pnpm install                 # the Tauri CLI, and the API the fallback page uses
 pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
 pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
 ```
@@ -291,7 +297,10 @@ pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
 It runs natively on Wayland. The app has its own Cargo workspace and lockfile
 in `apps/desktop/src-tauri`, apart from the repository's, so building and
 testing the rest doesn't need WebKitGTK. `RUST_LOG=coversync_proxy=debug`
-also logs each request the proxy forwards; warnings show either way.
+also logs each request the proxy forwards; warnings show either way. The
+fallback page has no build step: it imports a copy of `@tauri-apps/api`'s
+module from `ui/vendor`, which `pnpm vendor` refreshes after a version
+change.
 
 ## Develop
 
@@ -300,6 +309,7 @@ also logs each request the proxy forwards; warnings show either way.
 cargo test --workspace && cargo clippy --workspace --all-targets
 (cd web && pnpm check)
 COVERSYNC_PASSWORD=… tools/ui_smoke.py http://127.0.0.1:8770/ shots/   # read-only tour of the UI
+COVERSYNC_PASSWORD=… tools/player_stall.py http://127.0.0.1:8770/       # the player's spinner through stalls
 ```
 
 A scratch daemon gets a password with
