@@ -312,8 +312,7 @@ async fn save_library_setup(
     Json(setup): Json<LibrarySetup>,
 ) -> ApiResult<Json<SetupResponse>> {
     // Switching the Library mustn't happen under a scan, import or tag write.
-    let guard = state.jobs.lock().await;
-    let result = blocking(&state, move |s| {
+    save_exclusively(&state, move |s| {
         let before = s.lib.library_setup()?;
         let setup = setup.normalize()?;
         must_be_folder(setup.folder.as_deref(), "library folder")?;
@@ -336,18 +335,34 @@ async fn save_library_setup(
             moved,
         ))
     })
-    .await;
-    drop(guard);
-    // A scan asked for while this held the lock runs now too.
-    if result.as_ref().is_ok_and(|(_, moved)| *moved)
-        || state
-            .rescan
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        spawn_scan(state.clone());
-    }
-    let (response, _) = result?;
-    Ok(Json(response))
+    .await
+    .map(Json)
+}
+
+/// Run a setup save on a blocking thread, holding the jobs lock: not under
+/// a scan, import or tag write, nor beside another save. It runs in a task
+/// of its own, which holds the lock until the save is done, even if the
+/// request is dropped (its client gone). Then a scan runs if the save moved
+/// a folder (the `bool` it returns), or one was asked for meanwhile.
+async fn save_exclusively<T: Send + 'static>(
+    state: &Shared,
+    save: impl FnOnce(&crate::AppState) -> coversync_core::Result<(T, bool)> + Send + 'static,
+) -> ApiResult<T> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let guard = state.jobs.lock().await;
+        let result = blocking(&state, save).await;
+        drop(guard);
+        if result.as_ref().is_ok_and(|(_, moved)| *moved)
+            || state
+                .rescan
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            spawn_scan(state.clone());
+        }
+        result.map(|(saved, _)| saved)
+    })
+    .await?
 }
 
 async fn inbox_coverage(State(state): State<Shared>) -> ApiResult<Json<TagCoverage>> {
@@ -431,8 +446,7 @@ async fn save_inbox_setup(
         .map(inbox::acoustid_key)
         .transpose()?;
     let setup = body.setup;
-    let guard = state.jobs.lock().await;
-    let result = blocking(&state, move |s| {
+    save_exclusively(&state, move |s| {
         let before = s.lib.inbox_setup()?;
         let setup = setup.normalize()?;
         if let Some(f) = &setup.folder
@@ -463,18 +477,8 @@ async fn save_inbox_setup(
         let moved = before.folder != saved.folder || before.uploads != saved.uploads;
         Ok((inbox_response(s, saved)?, moved))
     })
-    .await;
-    drop(guard);
-    // A scan asked for while this held the lock runs now too.
-    if result.as_ref().is_ok_and(|(_, moved)| *moved)
-        || state
-            .rescan
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        spawn_scan(state.clone());
-    }
-    let (response, _) = result?;
-    Ok(Json(response))
+    .await
+    .map(Json)
 }
 
 #[derive(Serialize)]

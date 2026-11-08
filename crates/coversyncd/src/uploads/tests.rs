@@ -618,3 +618,30 @@ async fn saves_at_once_leave_uploads_going_where_the_last_saved_says() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_save_goes_on_when_its_request_is_dropped() {
+    let app = app("dropped");
+    let elsewhere = app.dir.join("Elsewhere");
+    let body = setup_with_uploads(&app, &elsewhere).await;
+    // A scan holds the lock; the client gives up while the save waits.
+    let scan = app.state.jobs.lock().await;
+    let req = app
+        .request(Method::PUT, "/api/inbox/setup")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let gave_up = tokio::time::timeout(Duration::from_millis(100), app.send(req)).await;
+    assert!(gave_up.is_err());
+    drop(scan);
+    let resolved = coversync_core::inbox::resolved(&elsewhere);
+    for _ in 0..200 {
+        if app.state.uploads.folder() == Some(resolved.clone()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let saved = app.state.lib.inbox_setup().unwrap().uploads;
+    assert_eq!(saved, Some(elsewhere.display().to_string()));
+    assert_eq!(app.state.uploads.folder(), Some(resolved));
+}

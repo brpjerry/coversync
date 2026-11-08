@@ -603,7 +603,9 @@ impl Upload {
         place(&tree, uploads, &self.folder)
     }
 
-    /// An upload staged in `dir` before, or an error if it can't be used.
+    /// An upload staged in `dir` before, or an error: [`Error::Io`] (other
+    /// than a missing manifest) if storage failed while it was read or put
+    /// back together, another if it can't be used.
     /// After a reboot, only files flushed to disk keep their progress: what
     /// wasn't may have been lost. A file that is gone, or shorter than its
     /// progress says, starts over.
@@ -884,19 +886,18 @@ impl Uploads {
             Error::Invalid("Choose an Inbox folder in Inbox setup before uploading.".into())
         })?;
         check_parent(&uploads)?;
-        let made = make_folder(&uploads).map_err(|e| io_error(e, &uploads))?;
+        make_folder(&uploads).map_err(|e| io_error(e, &uploads))?;
         let staging = uploads.join(STAGING);
-        let made_staging = make_folder(&staging).map_err(|e| io_error(e, &uploads))?;
+        make_folder(&staging).map_err(|e| io_error(e, &uploads))?;
         let id = new_id();
         let dir = staging.join(&id);
         let created_at = now();
         let staged = stage(&dir, &folder, &new.files, created_at).and_then(|()| {
-            // The folders made for it are on disk before anything counts as
-            // received in them.
-            if made_staging {
-                sync_dir(&uploads)?;
-            }
-            if made && let Some(parent) = uploads.parent() {
+            // The folders it's in are on disk before anything counts as
+            // received in them: flushed by every start, as another one (or
+            // an earlier try) that made them may not have got that far.
+            sync_dir(&uploads)?;
+            if let Some(parent) = uploads.parent() {
                 sync_dir(parent)?;
             }
             Ok(())
@@ -1158,12 +1159,11 @@ pub fn can_write(uploads: &Path) -> bool {
         .is_some_and(|p| p.is_dir() && crate::import::writable(p))
 }
 
-/// Make a folder whose parent exists, unless it's there. Whether it was made.
-fn make_folder(dir: &Path) -> io::Result<bool> {
+/// Make a folder whose parent exists, unless it's there.
+fn make_folder(dir: &Path) -> io::Result<()> {
     match fs::create_dir(dir) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists && dir.is_dir() => Ok(false),
-        Err(e) => Err(e),
+        Err(e) if e.kind() != ErrorKind::AlreadyExists || !dir.is_dir() => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -1247,6 +1247,12 @@ fn load(staging: &Path, now: i64) -> HashMap<String, Arc<Upload>> {
                 folder = u.folder,
                 "removing an abandoned upload"
             ),
+            // Storage trouble (a full disk, a failing one) while putting it
+            // back together: kept as it is, for a later start to try again.
+            Err(Error::Io(e)) if e.kind() != ErrorKind::NotFound => {
+                tracing::warn!(dir = %dir.display(), "couldn't take an upload back up; leaving it for next time: {e}");
+                continue;
+            }
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), "removing an upload that can't go on: {e}")
             }
@@ -1961,6 +1967,37 @@ mod tests {
             fs::read(Path::new(&done.path).join("b.flac")).unwrap(),
             b"abcd"
         );
+    }
+
+    #[test]
+    fn an_upload_storage_fails_to_put_back_together_is_kept_for_later() {
+        if root() {
+            return;
+        }
+        let (folder, u) = uploads("recover-later");
+        let up = u.start(new("A", &[("a.flac", 4), ("b.flac", 4)])).unwrap();
+        for i in 0..2 {
+            chunk(&up, i, 0, b"abcd").unwrap();
+            assert!(flushed(&up, i));
+        }
+        u.save();
+        let staged = folder.join(STAGING).join(up.id());
+        let files = staged.join(FILES);
+        // A file to make again, where nothing can be made for now.
+        fs::remove_file(files.join("a.flac")).unwrap();
+        read_only(&files, true);
+        let failing = Uploads::default();
+        failing.set_folder(Some(folder.clone()));
+        let kept = staged.join(MANIFEST).is_file() && files.join("b.flac").is_file();
+        read_only(&files, false);
+        assert!(matches!(failing.get(up.id()), Err(Error::NotFound)));
+        assert!(kept, "the upload is left as it was");
+        // Once storage is fine again, the next start takes it back up.
+        let later = Uploads::default();
+        later.set_folder(Some(folder.clone()));
+        let back = later.get(up.id()).unwrap();
+        assert_eq!(back.file_status(0).unwrap().received, 0);
+        assert!(back.file_status(1).unwrap().complete);
     }
 
     #[test]
