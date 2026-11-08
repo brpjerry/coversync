@@ -84,10 +84,13 @@
 		kept?: TagDraft | null;
 		/**
 		 * A save was refused: the album changed elsewhere since `detail`. `current` is
-		 * the album as it is now (null when it's gone), `draft` the edits, and `id` the
-		 * album's id as it was.
+		 * the album as it is now (null when it's gone), and `id` the album's id as it
+		 * was. `draft` reads this editor's edits as they are then, or null once it has
+		 * closed.
 		 */
-		onrefused?: (current: AlbumDetail | null, draft: TagDraft, id: string) => void;
+		onrefused?: (current: AlbumDetail | null, draft: () => TagDraft | null, id: string) => void;
+		/** Revert was pressed: the edits, kept ones included, are dropped. */
+		onrevert?: () => void;
 	}
 	let {
 		detail,
@@ -97,7 +100,8 @@
 		onimport,
 		ondraft,
 		kept = null,
-		onrefused
+		onrefused,
+		onrevert
 	}: Props = $props();
 
 	const albumFields: { key: AlbumField; label: string; wide?: boolean }[] = [
@@ -204,17 +208,27 @@
 		return { album, tracks };
 	}
 
-	/** What a field changed elsewhere says about it: what it was there. */
-	function albumNote(was: string[] | undefined): string | undefined {
-		if (!was) return undefined;
-		if (was.length > 1)
-			return `Changed elsewhere, from mixed values (${was.map((v) => v || 'empty').join(', ')})`;
-		return was[0] ? `Changed elsewhere, from “${was[0]}”` : 'Changed elsewhere, from empty';
+	/** Values as a field's note gives them: one, or several when mixed. */
+	function described(values: string[]): string {
+		if (values.length > 1) return `mixed values (${values.map((v) => v || 'empty').join(', ')})`;
+		return values[0] ? `“${values[0]}”` : 'empty';
 	}
-	function trackNote(was: string | null | undefined): string | undefined {
+	/**
+	 * What a field changed elsewhere says about it: what it was, and what it is
+	 * now (`base`, the album as it is now, under any edits made here).
+	 */
+	function albumNote(k: AlbumField): string | undefined {
+		const was = elsewhere.album[k];
+		if (!was) return undefined;
+		const now = [...new Set(Object.values(base.albumTracks).map((t) => t[k]))].sort();
+		return `Changed elsewhere, from ${described(was)} to ${described(now)}`;
+	}
+	function trackNote(id: number, k: TrackField): string | undefined {
+		const was = elsewhere.tracks[id]?.[k];
 		if (was === undefined) return undefined;
-		if (was === null) return 'Added elsewhere';
-		return was ? `Changed elsewhere, from “${was}”` : 'Changed elsewhere, from empty';
+		const now = described([base.tracks[id][k]]);
+		if (was === null) return `Added elsewhere: ${now}`;
+		return `Changed elsewhere, from ${described([was])} to ${now}`;
 	}
 
 	const mixed = Object.fromEntries(
@@ -261,11 +275,17 @@
 	);
 
 	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 ? 'draft' : 'none'));
-	onDestroy(() => ondraft?.('none'));
+	/** Whether this editor is still open: a refused save's edits are read from it, if so. */
+	let open = true;
+	onDestroy(() => {
+		open = false;
+		ondraft?.('none');
+	});
 
 	function revert() {
 		form = structuredClone($state.snapshot(base));
 		clears = new Set();
+		onrevert?.();
 	}
 
 	/** The edits, kept to put back on the album as it is now. `sent`: the album they were made on. */
@@ -348,7 +368,9 @@
 					'error',
 					8000
 				);
-				onrefused?.(e.album, keep(sent), id);
+				// Read when the refusal is shown, so edits typed till then are kept;
+				// nothing once this editor has closed.
+				onrefused?.(e.album, () => (open ? keep(sent) : null), id);
 			} else toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 		} finally {
 			saving = false;
@@ -373,7 +395,7 @@
 							></i>{/if}{#if f.key in elsewhere.album}<i class="dot warn"></i>{/if}</span
 					>
 					<input
-						title={albumNote(elsewhere.album[f.key])}
+						title={albumNote(f.key)}
 						bind:value={form.album[f.key]}
 						placeholder={mixed[f.key]
 							? clears.has(f.key)
@@ -402,7 +424,7 @@
 							class="cell col-{f.key}"
 							class:changed={trackChanged(t.id, f.key)}
 							class:elsewhere={f.key in (elsewhere.tracks[t.id] ?? {})}
-							title={trackNote(elsewhere.tracks[t.id]?.[f.key])}
+							title={trackNote(t.id, f.key)}
 							class:invalid={invalid(f.key, form.tracks[t.id][f.key])}
 							bind:value={form.tracks[t.id][f.key]}
 							aria-label="{f.label}, track {i + 1}"

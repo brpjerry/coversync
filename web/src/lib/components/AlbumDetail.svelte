@@ -42,7 +42,9 @@
 		 */
 		kept?: TagDraft | null;
 		/** A tag save was refused (see TagEditor). */
-		onrefused?: (current: AlbumDetail | null, draft: TagDraft, id: string) => void;
+		onrefused?: (current: AlbumDetail | null, draft: () => TagDraft | null, id: string) => void;
+		/** The tag editor's edits were dropped (Revert, Done, or the Tracks view): `kept` with them. */
+		ondiscard?: () => void;
 	}
 	let {
 		album,
@@ -55,8 +57,15 @@
 		onreload,
 		ondraft,
 		kept = null,
-		onrefused
+		onrefused,
+		ondiscard
 	}: Props = $props();
+
+	/** Leave the tag editor: its edits go, kept ones included. */
+	function showTracks() {
+		if (mode === 'edit') ondiscard?.();
+		mode = 'tracks';
+	}
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
 	/** The tag editor's edits, for the notice. */
@@ -159,7 +168,7 @@
 							role="tab"
 							aria-selected={mode === 'tracks'}
 							class:on={mode === 'tracks'}
-							onclick={() => (mode = 'tracks')}
+							onclick={showTracks}
 						>
 							<ListMusic size={15} /> Tracks
 						</button>
@@ -245,7 +254,8 @@
 							}}
 							{kept}
 							{onrefused}
-							oncancel={() => (mode = 'tracks')}
+							onrevert={() => ondiscard?.()}
+							oncancel={showTracks}
 						/>
 					{/key}
 				</div>

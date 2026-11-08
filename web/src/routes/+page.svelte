@@ -652,9 +652,8 @@
 		| {
 				kind: 'refused';
 				saved: string;
-				opening: number;
 				current: Detail | null;
-				kept: TagDraft;
+				kept: () => TagDraft | null;
 		  };
 	let jobs: Job[] = [];
 	let running = false;
@@ -862,23 +861,27 @@
 	/**
 	 * A save was refused because the album had changed elsewhere since the
 	 * sheet's copy: `current` is the album as it is now (null: gone), `kept`
-	 * the edits, and `id` the album's id the save was sent for. It goes through
-	 * the queue, ahead of what came meanwhile, so no notice lands over it.
+	 * reads the edits from the editor that saved (null once it has closed), and
+	 * `id` is the album's id the save was sent for. It goes through the queue,
+	 * ahead of what came meanwhile, so no notice lands over it.
 	 */
-	function onrefused(current: Detail | null, kept: TagDraft, id: string) {
+	function onrefused(current: Detail | null, kept: () => TagDraft | null, id: string) {
 		// The sheet has moved on (closed, or another album): only the toast says so.
 		if (sheetDetail?.id !== id) return;
-		enqueue({ kind: 'refused', saved: id, opening: openings, current, kept }, true);
+		enqueue({ kind: 'refused', saved: id, current, kept }, true);
 	}
 
 	/**
-	 * Hold the sheet on the album as it is now, with the refused save's edits
-	 * on top and the fields changed since marked (see TagEditor), at once:
-	 * edits typed meanwhile went into `kept`. Notices about versions it shows
-	 * from now on change nothing. Gone, the sheet stays as it is, held.
+	 * Hold the sheet on the album as it is now, with the edits of the editor
+	 * that saved on top, as they are now, and the fields changed since marked
+	 * (see TagEditor). That editor closed (the sheet with it, or left for the
+	 * Tracks view), it's moot. Notices about versions the sheet shows from now
+	 * on change nothing. Gone, the sheet stays as it is, held.
 	 */
 	function refused(job: Extract<Job, { kind: 'refused' }>) {
-		if (!openId || openings !== job.opening || sheetDetail?.id !== job.saved) return;
+		if (!openId || sheetDetail?.id !== job.saved) return;
+		const kept = job.kept();
+		if (!kept) return;
 		if (!job.current) return hold(null);
 		held = {
 			from: openId,
@@ -886,9 +889,14 @@
 			album: job.current,
 			detail: job.current,
 			changed: true,
-			kept: job.kept
+			kept
 		};
 		void loadAlbums();
+	}
+
+	/** The tag editor's edits were dropped: those kept from a refused save go too. */
+	function ondiscard() {
+		if (holding?.kept) held = { ...holding, kept: null };
 	}
 
 	/** Drop the held sheet's unsaved edits and show its album as it is now. */
@@ -1383,6 +1391,7 @@
 		{ondraft}
 		kept={holding?.kept ?? null}
 		{onrefused}
+		{ondiscard}
 	/>
 {/if}
 
