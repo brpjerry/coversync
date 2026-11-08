@@ -19,6 +19,9 @@ const input = $('server');
 const connectButton = $('connect');
 const busy = $('busy');
 
+// The server in use, which retrying opens: the field may hold another address.
+let current = null;
+
 /**
  * `status` is the app's `Status` (src-tauri/src/main.rs), and `problem` its `Problem`
  * (src-tauri/src/shell.rs): the one the page opened with, or the last attempt's. A problem
@@ -34,6 +37,7 @@ function show(status, problem = status.problem) {
 	message.textContent = problem?.message ?? '';
 	detail.textContent = problem?.detail ?? '';
 	detail.hidden = !problem?.detail;
+	current = status.server ?? null;
 	retryRow.hidden = !status.server;
 	// Retrying opens the server in use, which isn't the one refused.
 	const other = problem?.server && status.server && problem.server !== status.server;
@@ -49,7 +53,7 @@ function setBusy(text) {
 }
 
 async function connect(server) {
-	setBusy(`Connecting to ${server ?? input.value}…`);
+	setBusy(`Connecting to ${server ?? current}…`);
 	try {
 		// On success the app moves the window on to the server's UI.
 		await invoke('connect', { server });
