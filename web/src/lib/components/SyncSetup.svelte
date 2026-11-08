@@ -82,7 +82,13 @@
 
 	// The CA certificate path, checked as it's typed (after a short pause), and
 	// again after signing back in.
-	let caCheck = $state<{ path: string; ca: CaInfo | null; error: string | null } | null>(null);
+	let caCheck = $state<{
+		path: string;
+		ca: CaInfo | null;
+		error: string | null;
+		/** When it was asked, to tell it from a refused save of the same path. */
+		at: number;
+	} | null>(null);
 	let caChecking = $state(false);
 	let seq = 0;
 	$effect(() => {
@@ -96,13 +102,15 @@
 		caChecking = true;
 		const timer = setTimeout(async () => {
 			let result: typeof caCheck;
+			const at = Date.now();
 			try {
-				result = { path, ca: await api.checkCa(path), error: null };
+				result = { path, ca: await api.checkCa(path), error: null, at };
 			} catch (e) {
 				result = {
 					path,
 					ca: null,
-					error: e instanceof ApiError ? e.message : 'Could not check this file'
+					error: e instanceof ApiError ? e.message : 'Could not check this file',
+					at
 				};
 			}
 			if (mine === seq) {
@@ -122,12 +130,14 @@
 				text: "None. Apps trust the server's certificate as their system does."
 			};
 		if (path === syncSetup.savedCaPath) {
-			if (syncSetup.caRefused) return { tone: 'error', text: syncSetup.caRefused };
 			if (syncSetup.ca) return { tone: 'ok', text: 'In use. SHA-256', sha: syncSetup.ca.sha256 };
 			if (syncSetup.caProblem) return { tone: 'error', text: syncSetup.caProblem };
 			return null;
 		}
-		if (caChecking || caCheck?.path !== path) return null;
+		// Why saving refused this path, until a later check of it says otherwise.
+		const refused = syncSetup.caRefused?.path === path ? syncSetup.caRefused : null;
+		if (caChecking || caCheck?.path !== path || (refused && refused.at > caCheck.at))
+			return refused ? { tone: 'error', text: refused.why } : null;
 		if (caCheck.error) return { tone: 'error', text: caCheck.error };
 		if (caCheck.ca)
 			return { tone: 'ok', text: 'A CA certificate. SHA-256', sha: caCheck.ca.sha256 };

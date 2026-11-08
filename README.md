@@ -292,11 +292,14 @@ the others, and only the browser ever sees the password.
 
 - **Replace an existing device** (after reinstalling the app or rebuilding a
   computer) gives that device's entry the new token: its id, and the
-  settings that will hang off it, stay; its old token stops working.
+  settings that will hang off it, stay; its old token, and the cookies
+  traded for it, stop working. Removing the device meanwhile cancels the
+  code. A removed device's id is never given to another.
 - Sync setup lists the devices, with when and where each was last seen and
   its app version (the one it paired with, or the one an app sends in a
   `Coversync-App-Version` header). They can be renamed, re-scoped and
-  revoked; a revoked token gets 401 at once. A revoked device stays listed,
+  revoked; a revoked token gets 401 at once, and a new scope applies at once
+  to the token and the cookies traded for it. A revoked device stays listed,
   so pairing again can replace it, until it is removed.
 - **Only a password login may add, change or revoke devices**, or change the
   pairing setup below. An app's token, or a cookie traded for one, can list
@@ -307,10 +310,13 @@ the others, and only the browser ever sees the password.
   nothing, every waiting code is cancelled.
 - **Tokens never cross the network in plain text.** `/api/pair` only answers
   requests that reached the reverse proxy on this machine over HTTPS
-  (`X-Forwarded-Proto: https`, believed from loopback only) or that come from
-  this machine itself. Anything else gets 403 `https_required`, and its code
-  is cancelled, as it may have been seen on the way. Sync setup can allow
-  plain http for a network that is encrypted already (Tailscale, WireGuard).
+  (`X-Forwarded-Proto: https`, believed from loopback only), or that come
+  straight from this machine with no proxy in between. A request a proxy
+  forwarded over plain http is refused whatever client it names, so the
+  proxy must send `X-Forwarded-Proto` (Caddy does). Anything refused gets
+  403 `https_required`, and its code is cancelled, as it may have been seen
+  on the way. Sync setup can allow plain http for a network that is
+  encrypted already (Tailscale, WireGuard).
 - **CA certificate for apps.** For a server whose certificate a CA of your own
   signed (mkcert's, say), set Sync setup's CA certificate to the path of
   that CA's public certificate, such as `~/.local/share/mkcert/rootCA.pem`.

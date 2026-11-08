@@ -14,7 +14,9 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
 --devices pairs a device instead of the tour (scratch daemons only: it adds, revokes and
     removes one): Add device shows a code and a QR code, the script redeems the code at
     /api/pair as an app would, the dialog shows the device, its token works, and revoking it
-    in Sync setup's list gets the token 401. Stops at the first failure.
+    in Sync setup's list gets the token 401. Then the dialog by keyboard (focus stays in it,
+    Escape closes only it), and New code double-clicked after the device to replace was
+    removed. Stops at the first failure.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -767,6 +769,104 @@ def devices_flow(d, out, tag, url):
     d.click_xpath(row + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
     d.wait(f"return !({has.removeprefix('return ')})", 15.0, row)
     check(True, "removed from the list")
+    add_device_keyboard(d)
+    add_device_new_code(d, out, tag, base)
+
+
+def press(d, key):
+    """Press a key (a WebDriver key code, such as Tab) wherever focus is."""
+    d.s("POST", "/actions", {"actions": [{
+        "type": "key", "id": "keyboard",
+        "actions": [{"type": "keyDown", "value": key}, {"type": "keyUp", "value": key}],
+    }]})
+    d.s("DELETE", "/actions")
+
+
+TAB, ENTER, ESCAPE = "", "", ""
+
+
+def add_device_keyboard(d):
+    """Add device by keyboard: focus starts in the name, stays in the dialog
+    through each step and around Tab's ends, and Escape closes only the
+    dialog, giving focus back to Add device."""
+    focus_in_dialog = "return !!document.activeElement?.closest('.dialog')"
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Keyboard phone")
+    press(d, ENTER)
+    d.wait("return !!document.querySelector('.dialog .code')")
+    d.wait(focus_in_dialog)
+    check(d.js("return document.activeElement.textContent.trim()") == "Copy link",
+          "after Show code, focus is on Copy link")
+    # Past the last control (Cancel) Tab comes back to the first (Close), and back.
+    d.js("[...document.querySelectorAll('.dialog .foot button')].pop().focus()")
+    press(d, TAB)
+    check(d.js("return document.activeElement.getAttribute('aria-label')") == "Close",
+          "Tab past the last control wraps to the first")
+    d.s("POST", "/actions", {"actions": [{
+        "type": "key", "id": "keyboard",
+        "actions": [{"type": "keyDown", "value": ""}, {"type": "keyDown", "value": TAB},
+                    {"type": "keyUp", "value": TAB}, {"type": "keyUp", "value": ""}],
+    }]})
+    d.s("DELETE", "/actions")
+    check(d.js("return document.activeElement.textContent.trim()") == "Cancel",
+          "Shift+Tab before the first wraps to the last")
+    # Even with focus lost to the page, Escape closes the dialog and nothing else.
+    d.js("document.activeElement.blur()")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
+    check("view=sync-setup" in d.js("return location.search"), "Escape left Sync setup open")
+    check(d.js("return document.activeElement?.textContent.trim()") == "Add device",
+          "focus is back on Add device")
+
+
+def add_device_new_code(d, out, tag, base):
+    """New code once the device to replace is removed: the dialog says why the
+    code ended, a double click asks for one code only, and its failure shows."""
+    text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
+    # A device to replace, paired as an app would.
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Old laptop")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    status, paired = api_call(base + "api/pair", body={"code": d.js(text, ".dialog .code")})
+    check(status == 200, "a device to replace paired")
+    d.wait("return !!document.querySelector('.dialog .result h3')")
+    d.click_text("div[@role='dialog']", "Done")
+    d.wait("return !document.querySelector('.dialog')")
+    d.wait("return [...document.querySelectorAll('.device .name b')].some(b => b.textContent === 'Old laptop')")
+
+    # Count the codes asked for from here on.
+    d.js("window.__codes = 0; const f = window.fetch;"
+         "window.fetch = (u, i) => { if (String(u).endsWith('/api/pairings') && i?.method === 'POST')"
+         " window.__codes++; return f(u, i); }")
+    d.click_text("main", "Add device")
+    d.wait("return !!document.querySelector('.dialog .check input')")
+    d.click(".dialog .check input")
+    d.wait("return !!document.querySelector('.dialog select')")
+    d.js("const s = document.querySelector('.dialog select');"
+         "s.value = [...s.options].find(o => o.text.startsWith('Old laptop')).value;"
+         "s.dispatchEvent(new Event('change', {bubbles: true}))")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    # Removed elsewhere (another tab) while its replacement code waits.
+    d.js("fetch(arguments[0], {method: 'DELETE'})", f"{base}api/devices/{paired['device_id']}")
+    d.wait("return !!document.querySelector('.dialog .result h3')", 15.0)
+    shown = d.js(text, ".dialog .result")
+    check("would replace was removed" in shown, f"the dialog says why: {shown}")
+    d.wait("return ![...document.querySelectorAll('.sidebar .device-name')]"
+           ".some(n => n.textContent === 'Old laptop')")
+    check(True, "the sidebar no longer lists it")
+    # Double-clicked: one request, and its refusal shown.
+    d.js("const b = document.querySelector('.dialog .new-code'); b.click(); b.click()")
+    d.wait("return !!document.querySelector('.dialog .result .error')")
+    time.sleep(0.5)
+    check(d.js("return window.__codes") == 2, f"codes asked for: {d.js('return window.__codes')} (2 expected)")
+    print("error shown:", d.js(text, ".dialog .result .error"))
+    d.shot(out / f"10g-new-code-failed-{tag}.png")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
 
 
 def option(name):

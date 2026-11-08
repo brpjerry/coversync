@@ -17,17 +17,24 @@ class DevicesStore {
 	busy = $state<Record<number, boolean>>({});
 
 	active = $derived(this.list.filter((d) => d.revoked_at === null));
+	/**
+	 * Bumped by each load and each change: a load answered after a change
+	 * started may have read the list before it, so it's dropped.
+	 */
+	#version = 0;
 
 	async load() {
+		const version = ++this.#version;
 		try {
 			const r = await api.devices();
+			if (version !== this.#version) return;
 			this.list = r.devices;
 			this.thisDevice = r.this_device;
 			this.canManage = r.can_manage;
 			this.loaded = true;
 			this.failed = false;
 		} catch {
-			this.failed = !this.loaded;
+			if (version === this.#version) this.failed = !this.loaded;
 		}
 	}
 
@@ -40,8 +47,10 @@ class DevicesStore {
 	/** Run a change to one device; says what went wrong, and returns whether it worked. */
 	async #change(id: number, run: () => Promise<Device | void>, failed: string) {
 		this.busy[id] = true;
+		this.#version++;
 		try {
 			const device = await run();
+			this.#version++;
 			if (device) this.#put(device);
 			return true;
 		} catch (e) {
@@ -62,14 +71,15 @@ class DevicesStore {
 		return this.#change(id, () => api.revokeDevice(id), 'Revoking the device failed');
 	}
 
-	async remove(id: number) {
-		const removed = await this.#change(
+	remove(id: number) {
+		return this.#change(
 			id,
-			() => api.removeDevice(id),
+			async () => {
+				await api.removeDevice(id);
+				this.list = this.list.filter((d) => d.id !== id);
+			},
 			'Removing the device failed'
 		);
-		if (removed) this.list = this.list.filter((d) => d.id !== id);
-		return removed;
 	}
 }
 

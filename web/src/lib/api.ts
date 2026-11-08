@@ -476,7 +476,7 @@ export type PairingStatus =
 	| { state: 'waiting'; expires_in: number }
 	| { state: 'paired'; device: Device | null }
 	| { state: 'expired' }
-	| { state: 'cancelled'; why: 'failures' | 'insecure' }
+	| { state: 'cancelled'; why: 'failures' | 'insecure' | 'removed' }
 	| { state: 'failed' };
 
 export interface PairingSetup {

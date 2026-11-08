@@ -28,8 +28,8 @@ class SyncSetupStore {
 	/** The saved certificate, when it can be used; otherwise why not. */
 	ca = $state<CaInfo | null>(null);
 	caProblem = $state<string | null>(null);
-	/** Why saving refused the path typed. */
-	caRefused = $state<string | null>(null);
+	/** The CA path saving refused, and why: shown while that path is typed. */
+	caRefused = $state<{ path: string; why: string; at: number } | null>(null);
 
 	changes = $derived(
 		Number(this.enabled !== this.savedEnabled) +
@@ -80,10 +80,14 @@ class SyncSetupStore {
 	async save() {
 		this.saving = true;
 		this.#saves++;
+		// What's saved is what was on screen at the click: changes made while
+		// saving stay, unsaved.
+		const enabled = this.enabled;
+		const caPath = this.caPath.trim();
+		const allowHttp = this.allowHttp;
 		let ok = true;
 		try {
-			if (this.enabled !== this.savedEnabled) {
-				const enabled = this.enabled;
+			if (enabled !== this.savedEnabled) {
 				try {
 					const r = await api.saveSyncSetup({ enabled });
 					// A choice made while saving stays, unsaved.
@@ -94,20 +98,20 @@ class SyncSetupStore {
 					toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 				}
 			}
-			const caPath = this.caPath.trim();
-			const allowHttp = this.allowHttp;
 			if (caPath !== this.savedCaPath || allowHttp !== this.savedAllowHttp) {
 				try {
 					const r = await api.savePairingSetup({ ca_path: caPath || null, allow_http: allowHttp });
 					if (this.caPath.trim() === caPath) this.caPath = r.setup.ca_path ?? '';
+					if (this.allowHttp === allowHttp) this.allowHttp = r.setup.allow_http;
 					this.savedCaPath = r.setup.ca_path ?? '';
 					this.savedAllowHttp = r.setup.allow_http;
 					this.ca = r.ca;
 					this.caProblem = r.ca_problem;
-					this.caRefused = null;
+					if (this.caRefused?.path === caPath) this.caRefused = null;
 				} catch (e) {
 					ok = false;
-					if (e instanceof ApiError && e.code === 'bad_ca') this.caRefused = e.message;
+					if (e instanceof ApiError && e.code === 'bad_ca')
+						this.caRefused = { path: caPath, why: e.message, at: Date.now() };
 					toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 				}
 			}

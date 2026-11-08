@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import X from '@lucide/svelte/icons/x';
@@ -48,10 +48,25 @@
 	let deadline = $state(0);
 	let now = $state(Date.now());
 	let revoked = $state(false);
+	/** Copying the link failed: it's shown to copy by hand. */
+	let showLink = $state(false);
 
 	/** The address devices reach coversync at: this page's own, with its path prefix. */
 	const server = `${location.origin}${BASE}/`;
-	const loopback = /^(localhost|127(\.\d+){3}|\[::1\])$/i.test(location.hostname);
+
+	/** Whether a host name is this machine, as URLs write it (`[::ffff:7f00:1]` for ::ffff:127.0.0.1). */
+	function isLoopback(host: string) {
+		const h = host.toLowerCase().replace(/\.$/, '');
+		return (
+			h === 'localhost' ||
+			h.endsWith('.localhost') ||
+			/^127(\.\d{1,3}){3}$/.test(h) ||
+			h === '[::1]' ||
+			/^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(h)
+		);
+	}
+	/** Only apps on this computer can reach coversync at this page's address. */
+	const loopback = isLoopback(location.hostname);
 	/** Devices given this page's address would pair over plain http, which the server refuses. */
 	let insecure = $derived(
 		location.protocol === 'http:' && !loopback && !(pairing?.allow_http ?? syncSetup.savedAllowHttp)
@@ -79,6 +94,10 @@
 
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let ticker: ReturnType<typeof setInterval> | undefined;
+	/** The code on the server this dialog holds, until it closes it. */
+	let held: string | null = null;
+	/** Bumped by forget(): a code made for an earlier attempt is closed when it arrives. */
+	let attempt = 0;
 
 	function stop() {
 		clearTimeout(timer);
@@ -86,21 +105,34 @@
 	}
 
 	async function start() {
-		if (!name.trim() || (replacing && replace === null)) return;
+		// One code at a time, however often its buttons are clicked.
+		if (busy || !name.trim() || (replacing && replace === null)) return;
 		busy = true;
 		error = null;
 		forget();
+		const mine = attempt;
 		try {
-			pairing = await api.newPairing(name, scope, replacing ? replace : null);
-			status = { state: 'waiting', expires_in: pairing.expires_in };
-			deadline = Date.now() + pairing.expires_in * 1000;
+			const made = await api.newPairing(name, scope, replacing ? replace : null);
+			if (mine !== attempt) {
+				// The dialog closed meanwhile: nobody would see this code.
+				api.closePairing(made.id, true).catch(() => {});
+				return;
+			}
+			pairing = made;
+			held = made.id;
+			status = { state: 'waiting', expires_in: made.expires_in };
+			deadline = Date.now() + made.expires_in * 1000;
 			now = Date.now();
 			revoked = false;
+			showLink = false;
 			phase = 'code';
 			ticker = setInterval(() => (now = Date.now()), 1000);
 			timer = setTimeout(poll, POLL_MS);
 		} catch (e) {
-			error = e instanceof ApiError ? e.message : 'Could not reach coversyncd.';
+			if (mine === attempt)
+				error = e instanceof ApiError ? e.message : 'Could not reach coversyncd.';
+			// The device to replace is gone: the list should say so too.
+			if (e instanceof ApiError && e.code === 'no_device') devices.load();
 		} finally {
 			busy = false;
 		}
@@ -108,7 +140,7 @@
 
 	async function poll() {
 		const mine = pairing;
-		if (!mine) return;
+		if (!mine || held !== mine.id) return;
 		// Signed out meanwhile: wait for the login view.
 		if (session.state === 'out') {
 			timer = setTimeout(poll, POLL_MS);
@@ -116,7 +148,8 @@
 		}
 		try {
 			const s = await api.pairing(mine.id);
-			if (pairing !== mine) return;
+			// Closed, or a new code made, while this was asked.
+			if (pairing !== mine || held !== mine.id) return;
 			status = s;
 			if (s.state === 'waiting') {
 				// Keep the countdown to the server's clock.
@@ -124,11 +157,13 @@
 			} else {
 				stop();
 				phase = s.state === 'paired' ? 'paired' : 'ended';
-				if (s.state === 'paired') devices.load();
+				// The list changed: a device paired, or the one to replace went.
+				if (s.state === 'paired' || (s.state === 'cancelled' && s.why === 'removed'))
+					devices.load();
 				return;
 			}
 		} catch (e) {
-			if (pairing !== mine) return;
+			if (pairing !== mine || held !== mine.id) return;
 			if (e instanceof ApiError && e.status === 404) {
 				stop();
 				status = { state: 'expired' };
@@ -139,14 +174,15 @@
 		timer = setTimeout(poll, POLL_MS);
 	}
 
-	/** The code stops working, if unused: the dialog is closing, or making a new one. */
+	/**
+	 * The code stops working, if unused, and nothing more is asked about it:
+	 * the dialog is closing, or making a new one. What it shows stays until then.
+	 */
 	function forget(keepalive = false) {
+		attempt++;
 		stop();
-		if (pairing) api.closePairing(pairing.id, keepalive).catch(() => {});
-		if (!keepalive) {
-			pairing = null;
-			status = null;
-		}
+		if (held) api.closePairing(held, keepalive).catch(() => {});
+		held = null;
 	}
 
 	function close() {
@@ -159,7 +195,11 @@
 			await navigator.clipboard.writeText(link);
 			toast('Pairing link copied', 'success');
 		} catch {
-			toast("Couldn't copy the link here; select it and copy it instead", 'error');
+			// No clipboard here (a plain http page, say): show the link to copy by hand.
+			showLink = true;
+			await tick();
+			const text = dialog?.querySelector('.link-text');
+			if (text) getSelection()?.selectAllChildren(text);
 		}
 	}
 
@@ -167,22 +207,72 @@
 		if (paired && (await devices.revoke(paired.id))) revoked = true;
 	}
 
-	function onkeydown(e: KeyboardEvent) {
-		// The page's own Escape would leave Sync setup.
-		e.stopPropagation();
-		if (e.key === 'Escape') close();
+	let dialog = $state<HTMLDivElement>();
+	let closeButton = $state<HTMLButtonElement>();
+	/** What had focus before the dialog opened (Add device), to give it back. */
+	const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+	/** The dialog's controls that take focus, in order. */
+	function controls() {
+		if (!dialog) return [];
+		const all = dialog.querySelectorAll<HTMLElement>(
+			'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])'
+		);
+		return [...all].filter(
+			(el) => !(el as HTMLButtonElement).disabled && el.getClientRects().length > 0
+		);
 	}
 
-	// Leaving the page closes the dialog as well.
-	const onpagehide = () => forget(true);
-	let nameInput = $state<HTMLInputElement>();
+	/** Keep Tab inside the dialog: past its last control back to its first, and the other way. */
+	function trap(e: KeyboardEvent) {
+		const list = controls();
+		if (!list.length) return;
+		const at = list.indexOf(document.activeElement as HTMLElement);
+		if (e.shiftKey ? at <= 0 : at === list.length - 1 || at === -1) {
+			e.preventDefault();
+			(e.shiftKey ? list[list.length - 1] : list[0]).focus();
+		}
+	}
+
+	function onkeydown(e: KeyboardEvent) {
+		// The page's own keys (Escape leaves Sync setup) stay out of it.
+		e.stopPropagation();
+		if (e.key === 'Escape') close();
+		else if (e.key === 'Tab') trap(e);
+	}
+
+	/** Keys pressed with focus outside the dialog belong to it too, but the login view's. */
+	function onwindowkeydown(e: KeyboardEvent) {
+		if (session.state === 'out' || dialog?.contains(e.target as Node)) return;
+		e.stopPropagation();
+		if (e.key === 'Escape') close();
+		else if (e.key === 'Tab') trap(e);
+	}
+
+	// Each step moves focus to a control it has: the one it leaves is gone.
+	$effect(() => {
+		void phase;
+		void revoked;
+		tick().then(() =>
+			(dialog?.querySelector<HTMLElement>('[data-focus]') ?? closeButton)?.focus({
+				preventScroll: true
+			})
+		);
+	});
+
+	// Leaving the page closes the dialog, so a page restored from the
+	// back-forward cache doesn't show a code that no longer works.
+	function onpagehide() {
+		forget(true);
+		onclose();
+	}
 	onMount(() => {
 		document.documentElement.style.overflow = 'hidden';
-		nameInput?.focus();
 	});
 	onDestroy(() => {
 		document.documentElement.style.overflow = '';
 		forget();
+		if (opener?.isConnected) opener.focus({ preventScroll: true });
 	});
 
 	const ended: Record<string, string> = {
@@ -191,6 +281,7 @@
 			'This code was cancelled: too many wrong codes were tried, so every waiting code was.',
 		insecure:
 			'This code was cancelled: a device sent it over plain http, where it could have been seen on the way.',
+		removed: 'The device this would replace was removed, so its code was cancelled.',
 		failed: "The device's token couldn't be issued; coversyncd's log says why."
 	};
 	let endedWhy = $derived(
@@ -206,7 +297,7 @@
 		].filter(Boolean);
 </script>
 
-<svelte:window {onpagehide} />
+<svelte:window {onpagehide} onkeydowncapture={onwindowkeydown} />
 
 <div
 	class="scrim"
@@ -216,6 +307,7 @@
 	transition:fade={{ duration: 200 }}
 >
 	<div
+		bind:this={dialog}
 		class="dialog"
 		role="dialog"
 		aria-modal="true"
@@ -228,7 +320,9 @@
 				<h2 id="add-device-title">Add device</h2>
 				<p>A phone, a computer or a music player, with a token of its own.</p>
 			</div>
-			<button class="icon-btn close" onclick={close} aria-label="Close"><X size={19} /></button>
+			<button bind:this={closeButton} class="icon-btn close" onclick={close} aria-label="Close"
+				><X size={19} /></button
+			>
 		</header>
 
 		{#if phase === 'form'}
@@ -242,7 +336,7 @@
 				<label class="field">
 					<span class="label">Name</span>
 					<input
-						bind:this={nameInput}
+						data-focus
 						bind:value={name}
 						placeholder="Pixel 8"
 						maxlength="64"
@@ -359,10 +453,27 @@
 							<code>https://</code> address.
 						</p>
 					</div>
+				{:else if loopback}
+					<div class="warn wide" role="note">
+						<TriangleAlert size={17} />
+						<p>
+							This address only works on this computer: a phone or another computer can't reach it.
+							To pair one of those, open coversync at the address they use, such as its
+							<code>https://</code> one.
+						</p>
+					</div>
+				{/if}
+				{#if showLink}
+					<div class="link-box wide" in:fade={{ duration: 150 }}>
+						<span class="label">Pairing link (copy it from here)</span>
+						<code class="link-text">{link}</code>
+					</div>
 				{/if}
 			</div>
 			<footer class="foot">
-				<button class="btn sm link-btn" onclick={copyLink}><Copy size={14} /> Copy link</button>
+				<button class="btn sm link-btn" onclick={copyLink} data-focus
+					><Copy size={14} /> Copy link</button
+				>
 				<button class="btn" onclick={close}>Cancel</button>
 			</footer>
 		{:else if phase === 'paired'}
@@ -388,22 +499,33 @@
 						</p>
 					{/if}
 				{/if}
+				{#if error}<p class="error" role="alert"><CircleAlert size={15} /> {error}</p>{/if}
 			</div>
 			<footer class="foot">
-				{#if revoked}<button class="btn" onclick={start}><RefreshCw size={15} /> New code</button
-					>{/if}
-				<button class="btn primary" onclick={close}>Done</button>
+				{#if revoked}
+					<button class="btn new-code" onclick={start} disabled={busy} data-focus>
+						{#if busy}<span class="spin"><LoaderCircle size={15} /></span>{:else}<RefreshCw
+								size={15}
+							/>{/if} New code
+					</button>
+				{/if}
+				<button class="btn primary" onclick={close} data-focus={revoked ? undefined : true}
+					>Done</button
+				>
 			</footer>
 		{:else}
 			<div class="body result" in:fade={{ duration: 200 }}>
 				<span class="result-icon bad"><CircleAlert size={34} strokeWidth={1.6} /></span>
 				<h3>No device paired</h3>
 				<p>{endedWhy}</p>
+				{#if error}<p class="error" role="alert"><CircleAlert size={15} /> {error}</p>{/if}
 			</div>
 			<footer class="foot">
 				<button class="btn" onclick={close}>Close</button>
-				<button class="btn primary" onclick={start} disabled={busy}>
-					<RefreshCw size={15} /> New code
+				<button class="btn primary new-code" onclick={start} disabled={busy} data-focus>
+					{#if busy}<span class="spin"><LoaderCircle size={15} /></span>{:else}<RefreshCw
+							size={15}
+						/>{/if} New code
 				</button>
 			</footer>
 		{/if}
@@ -607,7 +729,7 @@
 		margin: 0;
 		font-size: 13.5px;
 	}
-	.warn.wide {
+	.wide {
 		grid-column: 1 / -1;
 	}
 	code {
@@ -732,6 +854,24 @@
 	}
 	.details {
 		font-variant-numeric: tabular-nums;
+	}
+	.result .error {
+		margin-top: 10px;
+		color: var(--danger);
+	}
+	.link-box {
+		display: grid;
+		gap: 4px;
+	}
+	.link-text {
+		display: block;
+		padding: 8px 10px;
+		border-radius: 10px;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		font-size: 12.5px;
+		overflow-wrap: anywhere;
+		user-select: all;
 	}
 	.not-you {
 		display: flex;
