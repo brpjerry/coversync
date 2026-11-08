@@ -390,6 +390,21 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "{proto:?} {client:?}");
         assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
     }
+    // A client's own "https" before the proxy's "http", on lines of their
+    // own or joined: the proxy's, the last, is the one believed.
+    for lines in [&["https", "http"][..], &["https, http"][..]] {
+        let (id, code) = app.new_code(&cookie, phone()).await;
+        let mut req = pair(&code);
+        for v in lines {
+            req.headers_mut()
+                .append("x-forwarded-proto", v.parse().unwrap());
+        }
+        req.headers_mut()
+            .insert("x-forwarded-for", "192.168.1.20".parse().unwrap());
+        let res = app.pair_from(LOCAL, req).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{lines:?}");
+        assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+    }
     // Through the proxy over HTTPS: fine.
     let (_, code) = app.new_code(&cookie, phone()).await;
     paired(
@@ -452,7 +467,7 @@ type Written = (Option<&'static str>, fn(&str) -> String);
 async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
     let app = App::with_password("http-raw");
     let cookie = app.cookie().await;
-    let bodies: [Written; 6] = [
+    let bodies: [Written; 7] = [
         // A form, with the code as typed.
         (Some("application/x-www-form-urlencoded"), |c| {
             format!("code={}&platform=android", typed(c))
@@ -472,6 +487,14 @@ async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
         // Valid JSON, with the code where it belongs.
         (Some("application/json"), |c| {
             json!({ "code": c }).to_string()
+        }),
+        // Many code-shaped words before the code, in JSON that doesn't parse.
+        (Some("application/json"), |c| {
+            let words: Vec<String> = (1..=12).map(|i| format!("\"2026{i:04}\"")).collect();
+            format!(
+                r#"{{"platform": "releases", "x": [{}], "code": "{c}""#,
+                words.join(", ")
+            )
         }),
     ];
     for (kind, body) in bodies {
@@ -528,9 +551,61 @@ fn code_shaped_words_are_found_in_any_body() {
     assert_eq!(codes_in(br#"{"code": "k7qm-4ztd"}"#), ["K7QM4ZTD"]);
     assert_eq!(codes_in(b"code=K7QM-4ZTD&x=1"), ["K7QM4ZTD"]);
     assert_eq!(codes_in(b"nothing here"), Vec::<String>::new());
-    // Only a few, however many a body holds.
-    let many = (0..1000).map(|i| format!("{i:08} ")).collect::<String>();
-    assert_eq!(codes_in(many.as_bytes()).len(), 8);
+    // Words that look like codes don't push the real one out, however many
+    // come before it.
+    let form = "platform=releases&hostname=desktop1&version=20261107&channel=nightlys\
+                &a=20261101&b=20261102&c=20261103&d=20261104&e=20261105&code=K7QM-4ZTD";
+    let found = codes_in(form.as_bytes());
+    assert!(found.len() > 8, "{found:?}");
+    assert!(found.contains(&"K7QM4ZTD".to_owned()), "{found:?}");
+    // Only the first 64 KiB is read.
+    let long = format!("{}code=K7QM-4ZTD", " ".repeat(64 * 1024));
+    assert!(codes_in(long.as_bytes()).is_empty());
+}
+
+#[tokio::test]
+async fn a_device_hanging_up_mid_pair_still_ends_its_code() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let app = App::with_password("hang-up");
+    let cookie = app.cookie().await;
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    // Keep the token's issue running a while, and hang up during it.
+    *app.state.auth.probe.issue_delay.lock().unwrap() = Duration::from_millis(600);
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let device = {
+        let (app, asked) = (app.clone(), asked.clone());
+        tokio::spawn(async move {
+            asked.store(true, SeqCst);
+            app.pair_from(LOCAL, pair(&code)).await
+        })
+    };
+    // Claimed: a waiting code with no time left on the stopped clock.
+    for _ in 0..250 {
+        if asked.load(SeqCst) && app.pairing(&cookie, &id).await["expires_in"] == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(app.pairing(&cookie, &id).await["expires_in"], 0);
+    device.abort();
+    assert!(device.await.unwrap_err().is_cancelled());
+    // The issue runs to its end, and the dialog learns of the device.
+    for _ in 0..250 {
+        let status = app.pairing(&cookie, &id).await;
+        if status["state"] == "paired" {
+            assert_eq!(status["device"]["name"], "Pixel 8");
+            assert_eq!(
+                app.devices(&cookie).await["devices"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the code stayed claimed after the device hung up");
 }
 
 #[tokio::test]

@@ -95,6 +95,8 @@ struct Probe {
     stopped: Mutex<Option<Instant>>,
     /// Added to each password check, to keep it running a while.
     check_delay: Mutex<std::time::Duration>,
+    /// Added before a paired device's token is issued, likewise.
+    issue_delay: Mutex<std::time::Duration>,
     /// Password checks running now, and the most that ran at once.
     running: std::sync::atomic::AtomicUsize,
     most_running: std::sync::atomic::AtomicUsize,
@@ -549,10 +551,15 @@ fn keep_private(res: &mut Response) {
     res.headers_mut().insert(header::CACHE_CONTROL, policy);
 }
 
-/// The client's address: the connecting peer's, or, when that is a proxy on
-/// this machine (Caddy), the one it forwarded. Loopback itself is never
-/// trusted: every request through the proxy comes from it.
-struct ClientAddr(Option<IpAddr>);
+/// Where a request came from.
+struct ClientAddr {
+    /// The connecting peer: on this machine, a proxy (or a local client).
+    peer: Option<IpAddr>,
+    /// The client: the peer's address, or, when that is a proxy on this
+    /// machine (Caddy), the one it forwarded. Loopback itself is never
+    /// trusted: every request through the proxy comes from it.
+    client: Option<IpAddr>,
+}
 
 impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
     type Rejection = Infallible;
@@ -562,7 +569,10 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0.ip());
-        Ok(ClientAddr(client_ip(peer, &parts.headers)))
+        Ok(ClientAddr {
+            peer,
+            client: client_ip(peer, &parts.headers),
+        })
     }
 }
 
@@ -582,11 +592,17 @@ fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap) -> Option<IpAddr> {
     forwarded.or(peer)
 }
 
-/// The request reached the proxy over HTTPS, so the cookie can be Secure.
+/// The request reached the proxy over HTTPS, so the cookie can be Secure,
+/// and pairing may hand out a token (from a proxy on this machine). The
+/// nearest proxy's value is the last one, as for `X-Forwarded-For`: a proxy
+/// that adds its own rather than replacing it leaves the client's before it.
 fn over_https(headers: &HeaderMap) -> bool {
     headers
-        .get("x-forwarded-proto")
+        .get_all("x-forwarded-proto")
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"))
 }
 
@@ -685,7 +701,7 @@ struct LoginRequest {
 
 async fn login(
     State(state): State<Shared>,
-    ClientAddr(ip): ClientAddr,
+    ClientAddr { client: ip, .. }: ClientAddr,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
@@ -759,7 +775,7 @@ struct PathRequest {
 /// device's scope, and isn't a password login.
 async fn login_with_token(
     State(state): State<Shared>,
-    ClientAddr(ip): ClientAddr,
+    ClientAddr { client: ip, .. }: ClientAddr,
     headers: HeaderMap,
     Json(body): Json<PathRequest>,
 ) -> Response {

@@ -794,6 +794,46 @@ fn the_client_address_comes_from_the_proxy_only_on_loopback() {
 }
 
 #[test]
+fn the_forwarded_scheme_is_the_nearest_proxys() {
+    let https = |lines: &[&str]| {
+        let mut h = HeaderMap::new();
+        for v in lines {
+            h.append("x-forwarded-proto", v.parse().unwrap());
+        }
+        over_https(&h)
+    };
+    assert!(https(&["https"]));
+    assert!(https(&[" HTTPS "]));
+    assert!(!https(&[]));
+    assert!(!https(&["http"]));
+    // A proxy that adds its own value leaves the client's before it.
+    assert!(!https(&["https", "http"]));
+    assert!(https(&["http", "https"]));
+    assert!(!https(&["https, http"]));
+    assert!(https(&["http, https"]));
+    assert!(!https(&["https", "https, http"]));
+}
+
+#[tokio::test]
+async fn a_cookie_is_secure_only_if_the_nearest_proxy_saw_https() {
+    let app = App::with_password("secure");
+    for (lines, secure) in [
+        (&["https", "http"][..], false),
+        (&["https, http"][..], false),
+        (&["http", "https"][..], true),
+    ] {
+        let mut req = login_request(PASSWORD, "/");
+        for v in lines {
+            req.headers_mut()
+                .append("x-forwarded-proto", v.parse().unwrap());
+        }
+        let res = app.send_from("127.0.0.1:40000", req).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(set_cookie(&res).contains("; Secure"), secure, "{lines:?}");
+    }
+}
+
+#[test]
 fn a_password_from_standard_input() {
     let read = |s: &str| password_line(std::io::Cursor::new(s.as_bytes().to_vec()));
     assert_eq!(read("hunter2 hunter2\n").unwrap(), "hunter2 hunter2");

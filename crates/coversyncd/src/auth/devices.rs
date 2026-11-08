@@ -11,11 +11,10 @@
 //! traded for one, can list the devices but not add, change or revoke them,
 //! so a lost phone can't add devices or lock out the others.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
-use axum::http::request::Parts;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -24,13 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use super::pairing::{self, Cancelled, Refused};
 use super::store::{DeviceInfo, NewDevice, PairingSetup, Store};
-use super::{Access, Scope, ca, error, limit, no_store, now};
+use super::{Access, ClientAddr, Scope, ca, error, limit, no_store, now};
 use crate::Shared;
 
 /// Longest device name.
 const MAX_NAME: usize = 64;
 /// Longest app version a device may report.
 const MAX_APP_VERSION: usize = 64;
+/// Longest platform name a device may report ("android", "linux", …).
+const MAX_PLATFORM: usize = 32;
+/// Longest host name a device may report, as DNS allows.
+const MAX_HOSTNAME: usize = 253;
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -514,18 +517,6 @@ async fn serve_ca(State(state): State<Shared>) -> Answer {
     }
 }
 
-/// The address a request came from (not the one a proxy forwarded).
-struct Peer(Option<IpAddr>);
-
-impl<S: Send + Sync> FromRequestParts<S> for Peer {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>();
-        Ok(Peer(peer.map(|c| c.0.ip())))
-    }
-}
-
 /// Whether a token handed over in answer to this request stays off the
 /// network unencrypted. Only two kinds of request qualify, both from a peer
 /// on this machine (coversyncd itself speaks plain http):
@@ -607,13 +598,12 @@ impl From<Refused> for Refusal {
 }
 
 /// Codes a refused request may have carried, found however its body is
-/// written: the JSON `code` if it parses, and code-shaped words (8 letters
-/// and digits, perhaps with a hyphen) anywhere in it. Some words are
-/// code-shaped too ("platform", "hostname"), so a few are taken, but only a
-/// few: a body full of guesses cancels no more codes than a few requests
-/// would.
+/// written: the JSON `code` if it parses, and every code-shaped word (8
+/// letters and digits, perhaps with a hyphen) in its first 64 KiB. Ordinary
+/// words can be code-shaped too ("platform", "hostname"), so none is left
+/// out: that could leave out the real code. Cancelling a few dozen guesses
+/// at 40-bit codes this way gets nowhere, however many requests are sent.
 pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
-    const MOST: usize = 8;
     let mut codes = Vec::new();
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
         && let Some(code) = json
@@ -628,9 +618,6 @@ pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
         .filter_map(pairing::normalize);
     for code in words {
-        if codes.len() == MOST {
-            break;
-        }
         if !codes.contains(&code) {
             codes.push(code);
         }
@@ -656,14 +643,13 @@ fn json_type(headers: &HeaderMap) -> bool {
 /// [`pairing::FAILURES`] failures every waiting code is cancelled.
 async fn pair(
     State(state): State<Shared>,
-    Peer(peer): Peer,
+    ClientAddr { peer, client }: ClientAddr,
     headers: HeaderMap,
     body: Bytes,
 ) -> Answer {
     // The body is taken as it came, and the transport checked first: a code
     // sent in the clear is cancelled however the rest of the request is
     // written, its type and JSON included.
-    let client = super::client_ip(peer, &headers);
     let allow_http = db(&state, |s| s.pairing_setup()).await?.allow_http;
     let at = state.auth.instant();
     if !allow_http && !private_transport(peer, &headers) {
@@ -708,8 +694,8 @@ async fn pair(
             format!("The platform, app version and host name must be text: {e}."),
         )
     })?;
-    let platform = about(req.platform.as_deref(), 32, "platform")?;
-    let hostname = about(req.hostname.as_deref(), 253, "host name")?;
+    let platform = about(req.platform.as_deref(), MAX_PLATFORM, "platform")?;
+    let hostname = about(req.hostname.as_deref(), MAX_HOSTNAME, "host name")?;
     let app_version = about(req.app_version.as_deref(), MAX_APP_VERSION, "app version")?;
     let limited = limit::Client::new(client);
     if let Err(wait) = state.auth.pair_try(limited) {
@@ -724,7 +710,13 @@ async fn pair(
     let ip = client.map(|ip| ip.to_canonical().to_string());
     let name = claim.name.clone();
     let (scope, replace) = (claim.scope, claim.replace);
-    let issued = db(&state, move |s| {
+    let (s, id) = (state.clone(), claim.id.clone());
+    // The token is issued, and the code's state noted, in one task that runs
+    // to its end even if the device hangs up meanwhile: a claimed code always
+    // ends, as paired or failed, and the dialog shows what became of it.
+    let issued = blocking(move || {
+        #[cfg(test)]
+        std::thread::sleep(*s.auth.probe.issue_delay.lock().unwrap());
         let new = NewDevice {
             name: &name,
             scope,
@@ -734,14 +726,20 @@ async fn pair(
             app_version: app_version.as_deref(),
             ip: ip.as_deref(),
         };
-        s.pair_device(&new, now())
+        let issued = s.auth.store.pair_device(&new, now());
+        let mut pairings = s.auth.pairings();
+        match &issued {
+            Ok(Some((device, _))) => pairings.paired(&id, *device),
+            // The device to replace was removed while this one paired: it
+            // doesn't come back.
+            Ok(None) => pairings.replaced_gone(&id),
+            Err(_) => pairings.failed(&id),
+        }
+        issued
     })
-    .await;
-    let issued = issued.inspect_err(|_| state.auth.pairings().failed(&claim.id))?;
+    .await?
+    .map_err(Refusal::failed)?;
     let Some((device, token)) = issued else {
-        // The device to replace was removed while this one paired: it
-        // doesn't come back.
-        state.auth.pairings().replaced_gone(&claim.id);
         state.auth.pair_give_back(limited);
         tracing::warn!(client = ?client, replace, "pairing refused: the device to replace was removed");
         return Err(Refusal::new(
@@ -750,7 +748,6 @@ async fn pair(
             "The device this code would replace was removed. Make a new code in Add device.",
         ));
     };
-    state.auth.pairings().paired(&claim.id, device);
     state.auth.pair_give_back(limited);
     let s = state.clone();
     let library_id = blocking(move || s.lib.index_versions())
