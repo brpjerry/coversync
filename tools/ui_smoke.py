@@ -11,6 +11,10 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
 --auth checks the login view instead of the tour, and stops at the first failure: a
     wrong password, signing in, a session that ends under unsaved tag edits (Escape in
     the login view must keep them), and signing out (asked first while edits are unsaved).
+--devices pairs a device instead of the tour (scratch daemons only: it adds, revokes and
+    removes one): Add device shows a code and a QR code, the script redeems the code at
+    /api/pair as an app would, the dialog shows the device, its token works, and revoking it
+    in Sync setup's list gets the token 401. Stops at the first failure.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -26,11 +30,13 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
 import base64
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -684,6 +690,85 @@ def describe_suggestions(d, label, rows=8):
     print("   rows:", d.js("return [...document.querySelectorAll('.suggest .sugg')].slice(0, arguments[0]).map(r => (r.querySelector('input').checked ? '[x] ' : '[ ] ') + r.textContent.replace(/\\s+/g, ' ').trim())", rows))
 
 
+def api_call(url, token=None, body=None):
+    """An app's request: the status and the JSON answer (None if there isn't one)."""
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def devices_flow(d, out, tag, url):
+    """Pair a device from Sync setup, use its token, and revoke it there.
+    Stops at the first failed check."""
+    text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
+    name = "Smoke test phone"
+    row = f"//li[contains(@class,'device')][.//b[normalize-space(.)='{name}']]"
+    has = "return document.evaluate(arguments[0], document, null, XPathResult.BOOLEAN_TYPE, null).booleanValue"
+    base = url if url.endswith("/") else url + "/"
+
+    d.open_setup("Sync setup")
+    d.wait("return !!document.querySelector('#devices-title')")
+    time.sleep(0.8)
+    d.shot(out / f"10a-devices-{tag}.png")
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", name)
+    time.sleep(0.5)
+    d.shot(out / f"10b-add-device-{tag}.png")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    code = d.js(text, ".dialog .code")
+    check(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}", code or ""), f"code shown: {code}")
+    check(d.js("return (document.querySelector('.dialog .qr path')?.getAttribute('d') ?? '').length > 100"),
+          "QR code drawn")
+    check(d.js(text, ".dialog .server code") == base, f"server address: {base}")
+    time.sleep(0.6)
+    d.shot(out / f"10c-code-{tag}.png")
+
+    # The app's side: the code as typed, in lowercase.
+    status, paired = api_call(base + "api/pair", body={
+        "code": code.lower(), "platform": "android", "app_version": "0.1.0", "hostname": "smoke-phone"})
+    check(status == 200 and paired["token"].startswith("cst_"), f"/api/pair: {status}")
+    token = paired["token"]
+    check(api_call(base + "api/status", token)[0] == 200, "the token opens /api/status")
+    d.wait("return !!document.querySelector('.dialog .result h3')")
+    shown = d.js(text, ".dialog .result")
+    check("is paired" in shown and "smoke-phone" in shown, f"the dialog shows it: {shown}")
+    time.sleep(0.4)
+    d.shot(out / f"10d-paired-{tag}.png")
+    d.click_text("div[@role='dialog']", "Done")
+    d.wait("return !document.querySelector('.dialog')")
+    d.wait(has, 15.0, row)
+    time.sleep(0.8)
+    print("listed:", d.js("return [...document.querySelectorAll('.device .info')]"
+                          ".map(i => i.textContent.replace(/\\s+/g, ' ').trim())"))
+    d.shot(out / f"10e-device-list-{tag}.png")
+
+    d.click_xpath(row + "//button[normalize-space(.)='Revoke']")
+    d.wait("return !!document.querySelector('.device .confirm')")
+    d.click_xpath(row + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Revoke']")
+    d.wait(has, 15.0, row + "//span[normalize-space(.)='Revoked']")
+    status, body = api_call(base + "api/status", token)
+    check(status == 401 and body["code"] == "invalid_token", f"revoked: /api/status answers {status}")
+    time.sleep(0.6)
+    d.shot(out / f"10f-revoked-{tag}.png")
+    d.click_xpath(row + "//button[normalize-space(.)='Remove']")
+    d.click_xpath(row + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
+    d.wait(f"return !({has.removeprefix('return ')})", 15.0, row)
+    check(True, "removed from the list")
+
+
 def option(name):
     """The value given after a flag, e.g. the album after --suggest."""
     if name in sys.argv and sys.argv.index(name) + 1 < len(sys.argv):
@@ -998,6 +1083,9 @@ def main():
             auth_flow(d, out, tag)
             return
         sign_in(d)
+        if "--devices" in sys.argv:
+            devices_flow(d, out, tag, url)
+            return
         d.wait("return document.querySelectorAll('.card').length > 0")
         grid_intro_check(d)
         d.wait("return document.querySelectorAll('.card').length > 0")

@@ -69,9 +69,10 @@ used on a home server.
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
-- **Sync** (planned): the sidebar's Sync section will list the devices the
-  Library syncs to, each with its own settings. For now it's a placeholder,
-  which Sync setup can turn off.
+- **Sync** (planned): devices pair with the server from Sync setup, each with
+  a token of its own (see [Pairing devices](#pairing-devices)), and the
+  sidebar's Sync section lists them. Copying the Library to them comes later.
+  Sync setup can turn the section off.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
@@ -188,14 +189,16 @@ until the command is run on the server.
   reports HTTPS (`X-Forwarded-Proto: https`). It is limited to the UI's path,
   and the session ends after 90 days without use, or with **Sign out** in the
   sidebar. Covers and audio streams work with the cookie alone.
-- **Apps** send a token, `Authorization: Bearer cst_…`. Pairing will issue them,
-  one per device, each with a scope: `manage` (everything a browser can do) or
-  `sync` (syncing only; refused with 403 for now). `POST /api/login/token`
-  trades a token for a session cookie, for an app's web view; that session has
-  the device's scope and isn't a password login.
+- **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
+  (see [Pairing devices](#pairing-devices)), one per device, each with a
+  scope: `manage` (everything a browser can do, except managing devices) or
+  `sync` (syncing only; refused with 403 for now, but for `GET /api/session`).
+  `POST /api/login/token` trades a token for a session cookie, for an app's
+  web view; that session has the device's scope and isn't a password login.
 - **Everything under `/api` needs one or the other**, except `GET /api/hello`
   (the server's name, coversyncd's version and the API versions it speaks, for
-  clients checking a URL) and logging in and out. The UI's own files stay open:
+  clients checking a URL), `GET /api/hello/ca` (the CA certificate for apps),
+  logging in and out, and `POST /api/pair`. The UI's own files stay open:
   they are the app's source and hold no data.
 - **Failed logins are limited.** Each client gets five tries, then one a
   minute; a client with a try left is always checked, so the right password
@@ -268,6 +271,56 @@ changes.
 A reverse proxy in front must let request bodies of the chunk size through
 and stream them. Caddy sets no body limit and streams by default; nginx's
 `client_max_body_size` is 1 MB unless raised.
+
+### Pairing devices
+
+Each app or device gets its own token, which can be revoked without touching
+the others, and only the browser ever sees the password.
+
+1. In Sync setup, **Add device**: its name, and what it may do (**Manage and
+   sync** for the desktop app or a phone, **Sync only** for a music player).
+   The dialog shows a code such as `K7QM-4ZTD` and a QR code holding
+   `coversync://pair?server=<url>&code=<code>[&ca=<sha256>]`, where the server
+   URL is the page's own address (with its path prefix). The code works once,
+   for 10 minutes, and closing the dialog cancels it.
+2. The device checks the URL with `GET /api/hello`, then trades the code for
+   its token: `POST /api/pair` with `{"code", "platform", "app_version",
+   "hostname"}` (all but the code optional). The code may be typed in any
+   case, with or without its hyphen. The answer holds `device_id`, `token`,
+   `name`, `scope`, `server` (its name and version) and `library_id`. The
+   dialog then shows the device, with **Not you? Revoke**.
+
+- **Replace an existing device** (after reinstalling the app or rebuilding a
+  computer) gives that device's entry the new token: its id, and the
+  settings that will hang off it, stay; its old token stops working.
+- Sync setup lists the devices, with when and where each was last seen and
+  its app version (the one it paired with, or the one an app sends in a
+  `Coversync-App-Version` header). They can be renamed, re-scoped and
+  revoked; a revoked token gets 401 at once. A revoked device stays listed,
+  so pairing again can replace it, until it is removed.
+- **Only a password login may add, change or revoke devices**, or change the
+  pairing setup below. An app's token, or a cookie traded for one, can list
+  them but gets 403 `password_required` for the rest, so a lost phone can't
+  add devices or lock out the others.
+- **Wrong codes are limited** like logins (five tries per client, then one a
+  minute, counted apart from logins), and after 10 attempts that paired
+  nothing, every waiting code is cancelled.
+- **Tokens never cross the network in plain text.** `/api/pair` only answers
+  requests that reached the reverse proxy on this machine over HTTPS
+  (`X-Forwarded-Proto: https`, believed from loopback only) or that come from
+  this machine itself. Anything else gets 403 `https_required`, and its code
+  is cancelled, as it may have been seen on the way. Sync setup can allow
+  plain http for a network that is encrypted already (Tailscale, WireGuard).
+- **CA certificate for apps.** For a server whose certificate a CA of your own
+  signed (mkcert's, say), set Sync setup's CA certificate to the path of
+  that CA's public certificate, such as `~/.local/share/mkcert/rootCA.pem`.
+  coversyncd serves it at `GET /api/hello/ca`, and new codes put its SHA-256
+  in the QR code (`ca=`, the fingerprint `openssl x509 -noout -fingerprint
+  -sha256` prints, as lowercase hex), so the Android app can check the
+  certificate and trust it for this server alone. A file holding a private
+  key, such as `rootCA-key.pem` beside it, is refused, as is anything but
+  one PEM certificate. Leave it empty for a publicly trusted certificate;
+  desktop apps use the system's certificates either way.
 
 ### Moving the Library
 
@@ -348,9 +401,10 @@ COVERSYNC_PASSWORD=… tools/upload.py http://127.0.0.1:8770/ ~/Music/Album   # 
 A scratch daemon gets a password with
 `coversyncd set-password --state-dir <scratch state dir>`. The smoke test
 signs in with `COVERSYNC_PASSWORD` (or `--password`); `--auth` tries the login
-page itself. Its other modes (`--save`, `--import`, `--suggest`, …, listed at
-the top of the script) change settings or import albums: run them only against
-a daemon with a scratch `--state-dir` and Library folder.
+page itself. Its other modes (`--save`, `--devices`, `--import`, `--suggest`,
+…, listed at the top of the script) change settings, pair devices or import
+albums: run them only against a daemon with a scratch `--state-dir` and
+Library folder.
 
 For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
 `pnpm lint`, `pnpm check`, rustfmt, Clippy with warnings as errors and the
