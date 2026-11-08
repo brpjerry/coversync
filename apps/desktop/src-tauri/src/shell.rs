@@ -391,7 +391,7 @@ mod tests {
     fn a_failed_retry_becomes_the_problem() {
         let fixture = Fixture::new("retry", closed());
         let problem = block(fixture.shell.switch(None, Save::Yes)).unwrap_err();
-        assert_eq!(problem.title, "Can't reach the server");
+        assert_eq!(problem.title, "Can't open the server");
         assert!(fixture.shell.problem().is_some());
     }
 
@@ -489,13 +489,12 @@ mod tests {
             let _ = stream.read_to_string(&mut answer);
             answer
         };
-        let answer = send(format!(
-            "GET {entry} HTTP/1.1
-Host: {addr}
-Connection: close
-
-"
-        ));
+        let request = |lines: &[String]| format!("{}\r\n\r\n", lines.join("\r\n"));
+        let answer = send(request(&[
+            format!("GET {entry} HTTP/1.1"),
+            format!("Host: {addr}"),
+            "Connection: close".to_owned(),
+        ]));
         let cookie = answer
             .lines()
             .find_map(|line| {
@@ -505,16 +504,14 @@ Connection: close
             })
             .unwrap();
         let cookie = cookie.split(';').next().unwrap();
-        send(format!(
-            "GET / HTTP/1.1
-Host: {addr}
-Cookie: {cookie}
-             Sec-Fetch-Dest: document
-Accept: text/html
-Connection: close
-
-"
-        ));
+        send(request(&[
+            "GET / HTTP/1.1".to_owned(),
+            format!("Host: {addr}"),
+            format!("Cookie: {cookie}"),
+            "Sec-Fetch-Dest: document".to_owned(),
+            "Accept: text/html".to_owned(),
+            "Connection: close".to_owned(),
+        ]));
     }
 
     #[test]
