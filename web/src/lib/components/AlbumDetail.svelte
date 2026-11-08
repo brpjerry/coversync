@@ -19,7 +19,7 @@
 	import { duration, longDuration, quality } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor, { type Draft } from './TagEditor.svelte';
+	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -36,6 +36,13 @@
 		onreload?: () => void;
 		/** Hears what edits the tag editor has. */
 		ondraft?: (draft: Draft) => void;
+		/**
+		 * Edits from a save refused because the album had changed elsewhere, on top
+		 * of `detail`, the album as it is now (see TagEditor). The notice says so.
+		 */
+		kept?: TagDraft | null;
+		/** A tag save was refused (see TagEditor). */
+		onrefused?: (current: AlbumDetail | null, draft: TagDraft, id: string) => void;
 	}
 	let {
 		album,
@@ -46,10 +53,16 @@
 		onimport,
 		changed = false,
 		onreload,
-		ondraft
+		ondraft,
+		kept = null,
+		onrefused
 	}: Props = $props();
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
+	/** The tag editor's edits, for the notice. */
+	let editing = $state<Draft>('none');
+	/** Kept edits for tracks no longer in the album, which couldn't be put back. */
+	let dropped = $derived(kept && detail ? lostTracks(kept, detail) : 0);
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -168,7 +181,13 @@
 			{#if changed}
 				<p class="elsewhere" role="status" transition:slide={{ duration: 200 }}>
 					<CircleAlert size={15} strokeWidth={2.2} />
-					<span>This album was changed elsewhere.</span>
+					<span
+						>This album was changed elsewhere.{kept && editing !== 'none'
+							? ' It shows those changes, marked, with your edits on top: save to apply them.'
+							: ''}{kept && dropped
+							? ` Edits to ${dropped} ${dropped === 1 ? 'track' : 'tracks'} no longer in it were dropped.`
+							: ''}</span
+					>
 					<button class="link" title="Your edits here are dropped" onclick={() => onreload?.()}>
 						Reload
 					</button>
@@ -220,7 +239,12 @@
 							{allowWrites}
 							{onsaved}
 							{onimport}
-							{ondraft}
+							ondraft={(d) => {
+								editing = d;
+								ondraft?.(d);
+							}}
+							{kept}
+							{onrefused}
 							oncancel={() => (mode = 'tracks')}
 						/>
 					{/key}

@@ -12,8 +12,17 @@ export interface Notices {
 	scan_finished: ScanProgress;
 	/** An Inbox album was imported: `album_id` is its id in the Library. */
 	imported: { album_id: string; inbox_id: string };
-	/** An album's tags were edited. `previous_id` is its id before, if the edit changed it. */
-	album_changed: { id: string; previous_id: string | null; collection: Collection };
+	/**
+	 * An album's tags were edited. `previous_id` is its id before, if the edit changed
+	 * it; `version` its version after, as its details give it (null if none of its
+	 * tracks is shown any more).
+	 */
+	album_changed: {
+		id: string;
+		previous_id: string | null;
+		collection: Collection;
+		version: string | null;
+	};
 	/** A setup screen was saved. `inbox` also means its hidden files were shown again. */
 	setup_saved: { setup: 'library' | 'inbox' | 'appearance' | 'sync' };
 	/** A Smart suggestions lookup ended. */
