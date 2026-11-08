@@ -506,8 +506,11 @@ export const api = {
 		),
 	preview: (structure: string) =>
 		request<StructurePreview>(`/api/library/preview?structure=${encodeURIComponent(structure)}`),
-	checkFolder: (path: string) =>
-		request<FolderStatus | null>(`/api/fs/check?path=${encodeURIComponent(path)}`),
+	/** `uploads`: check it as an uploads folder, which only the folder holding it can make. */
+	checkFolder: (path: string, uploads = false) =>
+		request<FolderStatus | null>(
+			`/api/fs/check?path=${encodeURIComponent(path)}${uploads ? '&uploads=true' : ''}`
+		),
 	importPlan: (album_id: string, edits: ImportEdits = {}) =>
 		request<ImportPlan>('/api/import/plan', {
 			method: 'POST',

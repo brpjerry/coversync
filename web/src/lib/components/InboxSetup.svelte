@@ -133,7 +133,9 @@
 				<p class="field-help">
 					Albums uploaded to coversync land here, a folder each, and show up in the Inbox. Leave it
 					empty for Uploads in the Inbox folder, or choose a folder outside it, which is scanned
-					along with it, for an Inbox coversyncd can't write to.
+					along with it, for an Inbox coversyncd can't write to. Albums uploaded to a folder you
+					change away from stay there on disk but leave the Inbox: move them into the new folder, or
+					import them first.
 				</p>
 			</div>
 		</section>

@@ -188,18 +188,26 @@ dropped connection or a restart on either side. Each upload is one new folder
 in the **uploads folder**: `Uploads` in the Inbox folder, unless Inbox setup
 names another. Choose one outside the Inbox folder when coversyncd can't
 write to the Inbox (a synced folder made read-only, say): it is scanned as
-part of the Inbox, and its albums show up there like any other. Uploads only
-add files, never change any, so they need no `--allow-writes`; they need a
-login, like the rest of the API.
+part of the Inbox, and its albums show up there like any other. The first
+upload makes the uploads folder if the folder holding it is there. Uploads
+only add files, never change any, so they need no `--allow-writes`; they
+need a login, like the rest of the API.
+
+Albums uploaded into a folder that is no longer the uploads folder (after
+it's changed in Inbox setup) stay on disk but leave the Inbox at the next
+scan: move them into the new uploads folder, or import them before
+changing it.
 
 1. `POST /api/uploads` with `{"folder": "Album", "files": [{"path":
    "CD1/01 Intro.flac", "size": 12345}, …]}` starts one and answers `201`
    with its `id`. Paths are relative, with `/` between folders, and no
    `.`, `..`, empty or hidden names. Only audio coversync reads, images, cue
    sheets, rip logs and similar files are taken (`GET /api/uploads` lists the
-   extensions), at most 10,000 files. The upload must fit on the disk, beside
-   what the uploads already under way still need: if not, `507`. An uploads
-   folder coversyncd can't write to gives `403`, saying so.
+   extensions), at most 10,000 files. Two paths the disk takes for one
+   (`a.flac` and `A.flac` where case doesn't count) are refused. The upload
+   must fit on the disk, beside what the uploads already under way still
+   need: if not, `507`. An uploads folder coversyncd can't write to gives
+   `403`, saying so.
 2. `PUT /api/uploads/{id}/files/{index}?offset=N` with the bytes as the body
    writes them into file `index` (counting from 0, in the order the files
    were listed) from byte `N`. Chunks
@@ -212,17 +220,21 @@ login, like the rest of the API.
    and starts a scan, so the album appears in the Inbox. If the folder's
    name is taken, it gets a number (`Album (2)`); nothing is ever
    overwritten. While bytes are missing it answers `409`, naming a file.
-   Finishing carries on if the client hangs up, and asking again gives the
-   same answer, for a day (until coversyncd restarts).
+   Finishing carries on if the client hangs up, and asking again, even
+   while it runs, gives the same answer, for a day (until coversyncd
+   restarts).
    `DELETE /api/uploads/{id}` cancels.
 
 Until it's finished, an upload is kept in `.coversync-uploads` in the uploads
 folder, which the scanner skips. Chunks are written straight into the files
 there at their offsets, and finishing is a rename, so nothing is copied
-twice. Progress is saved every few seconds; after a reboot, files not yet
-complete start over, as what was written but not flushed to disk may have
-been lost. An upload no chunk reaches for a day is removed, as are uploads in
-progress when the uploads folder changes.
+twice. Each file's name is flushed to disk when the upload starts, and its
+contents once it's complete; finishing flushes what's left, then the move.
+Progress is saved every few seconds. After a reboot, files not flushed yet
+start over, as what was written to them may have been lost; so does a file
+that's missing or shorter than its progress says. An upload no chunk reaches
+for a day is removed, as are uploads in progress when the uploads folder
+changes.
 
 A reverse proxy in front must let request bodies of the chunk size through
 and stream them. Caddy sets no body limit and streams by default; nginx's

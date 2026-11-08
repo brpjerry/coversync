@@ -107,9 +107,23 @@ impl InboxSetup {
     }
 }
 
-/// `inner` is `outer` or inside it.
-fn within(inner: &str, outer: &str) -> bool {
-    inner == outer || inner.starts_with(&format!("{outer}/"))
+/// A folder as the scan sees it: the part that exists with its links
+/// resolved (as `canonicalize` does), and the rest, which may be created
+/// later, as written, without empty or `.` names. Two spellings of one
+/// folder, through a link or with `//`, come out the same.
+pub fn resolved(path: &Path) -> PathBuf {
+    for existing in path.ancestors() {
+        if let Ok(real) = existing.canonicalize() {
+            let rest = path.strip_prefix(existing).unwrap_or(Path::new(""));
+            return real.join(rest.components().collect::<PathBuf>());
+        }
+    }
+    path.components().collect()
+}
+
+/// `inner` is `outer` or inside it, as resolved paths.
+fn within(inner: &Path, outer: &Path) -> bool {
+    inner.starts_with(outer)
 }
 
 /// The Inbox and Library folders must not contain one another, or each
@@ -118,7 +132,8 @@ pub fn check_folders(inbox: Option<&str>, library: Option<&str>) -> crate::Resul
     let (Some(a), Some(b)) = (inbox, library) else {
         return Ok(());
     };
-    if within(a, b) || within(b, a) {
+    let (a, b) = (resolved(Path::new(a)), resolved(Path::new(b)));
+    if within(&a, &b) || within(&b, &a) {
         return Err(crate::Error::Invalid(
             "The Inbox and Library folders can't be the same or inside one another.".into(),
         ));
@@ -126,19 +141,23 @@ pub fn check_folders(inbox: Option<&str>, library: Option<&str>) -> crate::Resul
     Ok(())
 }
 
-/// An uploads folder set in Inbox setup is part of the Inbox: inside the
-/// Inbox folder, or apart from it and from the Library folder. One holding
-/// the Inbox folder would scan it twice.
+/// The uploads folder (the one set in Inbox setup, or `Uploads` in the
+/// Inbox folder) is part of the Inbox: inside the Inbox folder, or apart
+/// from it and from the Library folder. One holding the Inbox folder would
+/// scan it twice. Links are followed, as the scan follows them.
 pub fn check_uploads(
     uploads: Option<&str>,
     inbox: Option<&str>,
     library: Option<&str>,
 ) -> crate::Result<()> {
-    let Some(u) = uploads else {
+    let uploads = uploads
+        .map(PathBuf::from)
+        .or_else(|| inbox.map(|i| Path::new(i).join(crate::upload::DEFAULT_FOLDER)));
+    let Some(u) = uploads.as_deref().map(resolved) else {
         return Ok(());
     };
-    if let Some(i) = inbox
-        && within(i, u)
+    if let Some(i) = inbox.map(|i| resolved(Path::new(i)))
+        && within(&i, &u)
         && i != u
     {
         return Err(crate::Error::Invalid(
@@ -146,8 +165,8 @@ pub fn check_uploads(
                 .into(),
         ));
     }
-    if let Some(l) = library
-        && (within(u, l) || within(l, u))
+    if let Some(l) = library.map(|l| resolved(Path::new(l)))
+        && (within(&u, &l) || within(&l, &u))
     {
         return Err(crate::Error::Invalid(
             "The uploads folder and the Library folder can't be the same or inside one another."
@@ -249,6 +268,37 @@ mod tests {
         assert!(check_uploads(Some("/m/lib"), inbox, lib).is_err());
         assert!(check_uploads(Some("/m/lib/Up"), inbox, lib).is_err());
         assert!(check_uploads(Some("/m/up"), None, Some("/m/up/lib")).is_err());
+    }
+
+    #[test]
+    fn folders_are_compared_as_the_scan_sees_them() {
+        let dir = std::env::temp_dir().join(format!("coversync-aliases-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["Inbox", "Library"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let s = |p: &Path| p.display().to_string();
+        let (inbox, library) = (s(&dir.join("Inbox")), s(&dir.join("Library")));
+        let link = dir.join("Elsewhere");
+        std::os::unix::fs::symlink(dir.join("Library"), &link).unwrap();
+
+        // Redundant separators, and the part not made yet.
+        assert_eq!(
+            resolved(Path::new(&format!("{}//Inbox/./Up//x", dir.display()))),
+            dir.join("Inbox/Up/x")
+        );
+        // A link to the Library, or a folder in it through one, is the Library.
+        assert_eq!(resolved(&link.join("Up")), dir.join("Library/Up"));
+        let lib = Some(library.as_str());
+        assert!(check_uploads(Some(&s(&link)), Some(&inbox), lib).is_err());
+        assert!(check_uploads(Some(&s(&link.join("Up"))), Some(&inbox), lib).is_err());
+        assert!(check_folders(Some(&s(&link)), lib).is_err());
+        assert!(check_uploads(Some(&s(&dir.join("Uploads"))), Some(&inbox), lib).is_ok());
+        // The default, Uploads in the Inbox folder, is checked too.
+        std::os::unix::fs::symlink(dir.join("Library"), dir.join("Inbox/Uploads")).unwrap();
+        assert!(check_uploads(None, Some(&inbox), lib).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

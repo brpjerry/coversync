@@ -30,7 +30,7 @@ struct App {
 }
 
 fn now() -> i64 {
-    super::now()
+    coversync_core::upload::now()
 }
 
 /// A daemon with an Inbox folder, a password, and an app token that may
@@ -552,4 +552,69 @@ async fn a_read_only_inbox_takes_uploads_in_a_folder_of_their_own() {
         )
         .await;
     assert_eq!(detail["tracks"][0]["rel_path"], "Elsewhere/01.wav");
+}
+
+/// Inbox setup as saved, with `uploads` as its uploads folder.
+async fn setup_with_uploads(app: &App, uploads: &FsPath) -> Value {
+    let (_, setup) = app.call(Method::GET, "/api/inbox/setup", None).await;
+    let mut body = setup["setup"].clone();
+    body["uploads"] = json!(uploads.display().to_string());
+    body
+}
+
+#[tokio::test]
+async fn an_uploads_folder_is_promised_only_where_an_upload_can_make_it() {
+    let app = app("verdict");
+    let away = app.dir.join("Unmounted/Uploads");
+    let check = |uploads: bool| format!("/api/fs/check?path={}&uploads={uploads}", away.display());
+    // The Library is made with the folders above it, an uploads folder not.
+    let (_, library) = app.call(Method::GET, &check(false), None).await;
+    assert_eq!(library["creatable"], true);
+    let (_, uploads) = app.call(Method::GET, &check(true), None).await;
+    assert_eq!(uploads["creatable"], false);
+    // Inbox setup won't take it either.
+    let body = setup_with_uploads(&app, &away).await;
+    let (status, err) = app.call(Method::PUT, "/api/inbox/setup", Some(body)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        err["error"].as_str().unwrap().contains("isn't there"),
+        "{err}"
+    );
+    let body = setup_with_uploads(&app, &app.dir.join("Uploads")).await;
+    let (status, saved) = app.call(Method::PUT, "/api/inbox/setup", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["uploads"]["creatable"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saves_at_once_leave_uploads_going_where_the_last_saved_says() {
+    let app = app("saves");
+    let folders: Vec<PathBuf> = (0..6).map(|i| app.dir.join(format!("Up{i}"))).collect();
+    let mut bodies = Vec::new();
+    for f in &folders {
+        bodies.push(setup_with_uploads(&app, f).await);
+    }
+    for _ in 0..5 {
+        let saves: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                let mut req = app
+                    .request(Method::PUT, "/api/inbox/setup")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(LAN.parse::<SocketAddr>().unwrap()));
+                tokio::spawn(app.router.clone().oneshot(req))
+            })
+            .collect();
+        for save in saves {
+            assert_eq!(save.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        let saved = app.state.lib.inbox_setup().unwrap().uploads.unwrap();
+        assert_eq!(
+            app.state.uploads.folder(),
+            Some(coversync_core::inbox::resolved(FsPath::new(&saved)))
+        );
+    }
 }

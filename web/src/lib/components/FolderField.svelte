@@ -55,7 +55,7 @@
 		checking = true;
 		const timer = setTimeout(async () => {
 			try {
-				const s = await api.checkFolder(path);
+				const s = await api.checkFolder(path, purpose === 'uploads');
 				if (mine === seq) status = s;
 			} catch (e) {
 				if (mine === seq) {
@@ -76,7 +76,7 @@
 			return purpose === 'library'
 				? { tone: 'warn', text: 'Not set. Imports need a library folder.' }
 				: purpose === 'uploads'
-					? { tone: 'warn', text: 'Not set. Uploads need an Inbox folder first.' }
+					? { tone: 'warn', text: 'Not set. Uploads need an Inbox folder or an uploads folder.' }
 					: { tone: 'warn', text: 'Not set. Nothing is scanned.' };
 		if (!status) return null;
 		if (status.exists && !status.dir)
@@ -88,7 +88,7 @@
 					? { tone: 'info', text: "Doesn't exist yet; created by the first upload." }
 					: {
 							tone: 'error',
-							text: "Doesn't exist, and coversyncd can't create it there, so uploads would fail. Choose a folder it can write to."
+							text: "Doesn't exist, and coversyncd can't create it: the folder holding it has to be there, and writable to coversyncd."
 						};
 			return status.creatable
 				? { tone: 'info', text: "Doesn't exist yet; created on the first import." }
@@ -100,7 +100,7 @@
 				: purpose === 'uploads'
 					? {
 							tone: 'error',
-							text: 'Read-only to coversyncd, so uploads would fail. Choose a folder outside the Inbox.'
+							text: 'Read-only to coversyncd, so uploads would fail. Choose a folder it can write to.'
 						}
 					: { tone: 'error', text: 'Read-only to coversyncd; imports would fail.' };
 		if (purpose === 'uploads') return { tone: 'ok', text: 'Ready for uploads.' };

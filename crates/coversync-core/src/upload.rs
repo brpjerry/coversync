@@ -156,6 +156,16 @@ fn check_files(files: &[NewFile]) -> Result<()> {
             "An upload can hold at most {MAX_FILES} files; split it into several."
         )));
     }
+    // Sizes are added up for the space check, and files are written with
+    // pwrite, which takes an i64: a total past that is no real upload.
+    let total = files
+        .iter()
+        .try_fold(0u64, |total, f| total.checked_add(f.size));
+    if total.is_none_or(|t| t > i64::MAX as u64) {
+        return Err(Error::Invalid(
+            "The upload's files add up to more than any disk holds.".into(),
+        ));
+    }
     let mut paths = HashSet::new();
     let mut folders = HashSet::new();
     for f in files {
@@ -255,7 +265,9 @@ struct Progress {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FileState {
     ranges: Ranges,
-    /// Flushed to disk since it was last written to.
+    /// Flushed to disk since it was last written to. Its name was made
+    /// durable when the upload started (see [`stage`]), so its data is all
+    /// a flush has to cover.
     #[serde(default)]
     flushed: bool,
     /// Writes so far, to tell whether one came in during a flush.
@@ -298,6 +310,27 @@ pub struct Upload {
     /// Held shared by each write while it runs, so closing waits for writes
     /// under way, and only for those.
     phase: RwLock<Phase>,
+    /// Held while the progress file is written, so two saves don't write
+    /// it at once. Writes to the files never wait for it.
+    saving: Mutex<()>,
+    /// Held while the upload is finished, so a second request to finish it
+    /// waits for the first, then gives its answer.
+    finishing: Mutex<()>,
+    #[cfg(test)]
+    probe: Probe,
+}
+
+/// What tests steer and watch.
+#[cfg(test)]
+#[derive(Default)]
+struct Probe {
+    /// Finishing tells the first when it starts to move the files, then
+    /// waits for the second.
+    stall: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    /// The flush after the files are moved fails, once.
+    fail_publishing: AtomicBool,
+    /// Descriptors this process had open once finishing checked the files.
+    open_files: Mutex<Option<usize>>,
 }
 
 /// An upload's progress, as the API reports it.
@@ -333,7 +366,7 @@ pub struct FileStatus {
 }
 
 /// A finished upload: the folder it went into, in the uploads folder.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finished {
     /// The folder's name, which has a number added if the name was taken.
     pub folder: String,
@@ -341,20 +374,38 @@ pub struct Finished {
 }
 
 impl Upload {
+    fn new(id: String, dir: PathBuf, folder: String, created_at: i64, files: Vec<Staged>) -> Self {
+        Upload {
+            id,
+            dir,
+            folder,
+            created_at,
+            files,
+            updated_at: AtomicI64::new(created_at),
+            dirty: AtomicBool::new(false),
+            phase: RwLock::new(Phase::Open),
+            saving: Mutex::new(()),
+            finishing: Mutex::new(()),
+            #[cfg(test)]
+            probe: Probe::default(),
+        }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
     fn size(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
+        self.files
+            .iter()
+            .fold(0u64, |total, f| total.saturating_add(f.size))
     }
 
     /// Bytes still to come.
     fn remaining(&self) -> u64 {
-        self.files
-            .iter()
-            .map(|f| f.size - covered(&f.state().ranges))
-            .sum()
+        self.files.iter().fold(0u64, |total, f| {
+            total.saturating_add(f.size - covered(&f.state().ranges))
+        })
     }
 
     fn updated_at(&self) -> i64 {
@@ -377,6 +428,14 @@ impl Upload {
 
     fn staged_path(&self, index: usize) -> PathBuf {
         self.dir.join(FILES).join(&self.files[index].path)
+    }
+
+    /// The uploads folder it goes into.
+    fn uploads_folder(&self) -> &Path {
+        self.dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&self.dir)
     }
 
     /// The size of file `index`.
@@ -405,7 +464,7 @@ impl Upload {
             id: self.id.clone(),
             folder: self.folder.clone(),
             size,
-            received: size - self.remaining(),
+            received: size.saturating_sub(self.remaining()),
             file_count: self.files.len(),
             created_at: self.created_at,
             updated_at,
@@ -429,11 +488,11 @@ impl Upload {
         if *phase != Phase::Open {
             return Err(closed(*phase));
         }
+        // Every file was made when the upload started.
         let file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.staged_path(index))?;
+            .open(self.staged_path(index))
+            .map_err(|e| io_error(e, self.uploads_folder()))?;
         drop(phase);
         Ok(ChunkWriter {
             upload: self.clone(),
@@ -480,6 +539,7 @@ impl Upload {
     /// Save its progress, unless it's finishing or gone: that waits, as
     /// writes do, so the folder isn't removed under the save.
     fn save(&self) -> Result<()> {
+        let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
         let phase = self.phase.read().unwrap_or_else(|e| e.into_inner());
         if *phase != Phase::Open {
             return Ok(());
@@ -492,17 +552,25 @@ impl Upload {
         write_json(&self.dir.join(PROGRESS), &progress, false)
     }
 
-    /// Flush every file, then move them into `uploads` under the upload's
-    /// folder name (or a numbered one). The upload is finishing.
-    fn move_into(&self, uploads: &Path) -> Result<PathBuf> {
+    /// Flush every file and folder, then move them into the uploads folder
+    /// under the upload's folder name (or a numbered one). The upload is
+    /// finishing. Afterwards the move itself still has to be flushed
+    /// ([`flush_publication`]).
+    fn move_into(&self) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some((started, go_on)) = self.probe.stall.lock().unwrap().take() {
+            let _ = started.send(());
+            let _ = go_on.recv();
+        }
+        let uploads = self.uploads_folder();
         let mut unflushed = Vec::new();
         for (i, f) in self.files.iter().enumerate() {
-            let path = self.staged_path(i);
-            let file = match File::open(&path) {
-                Err(e) if e.kind() == ErrorKind::NotFound && f.size == 0 => File::create(&path)?,
-                file => file?,
-            };
-            if file.metadata()?.len() != f.size {
+            // Only looked at, not kept open: an upload can hold more files
+            // than a process may have open.
+            let len = fs::metadata(self.staged_path(i))
+                .map_err(|e| io_error(e, uploads))?
+                .len();
+            if len != f.size {
                 // Changed behind coversyncd's back: it has to come again.
                 *f.state() = FileState::default();
                 self.dirty.store(true, Ordering::Relaxed);
@@ -512,34 +580,40 @@ impl Upload {
                 )));
             }
             if !f.state().flushed {
-                unflushed.push((f, file));
+                unflushed.push(i);
             }
+        }
+        #[cfg(test)]
+        {
+            *self.probe.open_files.lock().unwrap() = open_files();
         }
         // Many small files are flushed together, as one big one would be.
-        if unflushed.len() > FLUSH_ONE_BY_ONE {
+        if cfg!(target_os = "linux") && unflushed.len() > FLUSH_ONE_BY_ONE {
             sync_filesystem(&self.dir)?;
         } else {
-            for (_, file) in &unflushed {
-                file.sync_data()?;
+            for &i in &unflushed {
+                File::open(self.staged_path(i))?.sync_data()?;
             }
         }
-        for (f, _) in unflushed {
-            f.state().flushed = true;
+        for i in unflushed {
+            self.files[i].state().flushed = true;
         }
-        let dest = place(&self.dir.join(FILES), uploads, &self.folder)?;
-        File::open(uploads)?.sync_all()?;
-        Ok(dest)
+        let tree = self.dir.join(FILES);
+        sync_folders(&tree)?;
+        place(&tree, uploads, &self.folder)
     }
 
     /// An upload staged in `dir` before, or an error if it can't be used.
     /// After a reboot, only files flushed to disk keep their progress: what
-    /// wasn't may have been lost.
+    /// wasn't may have been lost. A file that is gone, or shorter than its
+    /// progress says, starts over.
     fn load(dir: &Path, id: &str, boot: &str) -> Result<Upload> {
         let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join(MANIFEST))?)
             .map_err(|e| Error::Invalid(format!("unreadable manifest: {e}")))?;
         check_files(&manifest.files)?;
         let folder = check_folder(&manifest.folder)?;
-        if !dir.join(FILES).is_dir() {
+        let root = dir.join(FILES);
+        if !root.is_dir() {
             return Err(Error::Invalid(
                 "its files are gone (finished already?)".into(),
             ));
@@ -550,33 +624,52 @@ impl Upload {
             .unwrap_or_default();
         let same_boot = !boot.is_empty() && progress.boot == boot;
         let mut saved = progress.files.into_iter();
-        let files = manifest
-            .files
-            .into_iter()
-            .map(|f| {
-                let mut state = saved.next().unwrap_or_default();
-                let valid = state.ranges.iter().all(|(a, b)| a < b && *b <= f.size)
-                    && state.ranges.windows(2).all(|w| w[0].1 < w[1].0);
-                if !valid || !(same_boot || state.flushed) {
+        let mut remade = false;
+        let mut files = Vec::with_capacity(manifest.files.len());
+        for f in manifest.files {
+            let mut state = saved.next().unwrap_or_default();
+            let valid = state.ranges.iter().all(|(a, b)| a < b && *b <= f.size)
+                && state.ranges.windows(2).all(|w| w[0].1 < w[1].0);
+            if !valid || !(same_boot || state.flushed) {
+                state = FileState::default();
+            }
+            let path = root.join(&f.path);
+            let end = state.ranges.last().map_or(0, |r| r.1);
+            match fs::metadata(&path) {
+                Ok(m) if m.len() >= end => {}
+                Ok(_) => state = FileState::default(),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    File::create(&path)?;
+                    remade = true;
                     state = FileState::default();
                 }
-                Staged {
-                    path: f.path,
-                    size: f.size,
-                    state: Mutex::new(state),
-                }
-            })
-            .collect();
-        Ok(Upload {
-            id: id.to_string(),
-            dir: dir.to_path_buf(),
+                Err(e) => return Err(e.into()),
+            }
+            files.push(Staged {
+                path: f.path,
+                size: f.size,
+                state: Mutex::new(state),
+            });
+        }
+        // Their names are made durable, as when the upload started.
+        if remade {
+            sync_folders(&root)?;
+        }
+        let upload = Upload::new(
+            id.to_string(),
+            dir.to_path_buf(),
             folder,
-            created_at: manifest.created_at,
+            manifest.created_at,
             files,
-            updated_at: AtomicI64::new(progress.updated_at.max(manifest.created_at)),
-            dirty: AtomicBool::new(false),
-            phase: RwLock::new(Phase::Open),
-        })
+        );
+        upload.updated_at.store(
+            progress.updated_at.max(manifest.created_at),
+            Ordering::Relaxed,
+        );
+        Ok(upload)
     }
 }
 
@@ -604,7 +697,7 @@ impl ChunkWriter {
             }
             self.file
                 .write_all_at(buf, self.pos)
-                .map_err(|e| out_of_space(e, &self.upload.dir))?;
+                .map_err(|e| io_error(e, self.upload.uploads_folder()))?;
         }
         self.upload.record(self.index, self.pos, end);
         self.pos = end;
@@ -632,7 +725,7 @@ impl ChunkWriter {
 /// chunk's response.
 const FLUSHERS: usize = 16;
 /// Finishing flushes up to this many files one by one, and more by flushing
-/// the whole filesystem once.
+/// the whole filesystem once (on Linux; one by one elsewhere).
 const FLUSH_ONE_BY_ONE: usize = 8;
 
 type FlushJob = (Arc<Upload>, usize, u64);
@@ -666,19 +759,45 @@ fn flush_later(upload: Arc<Upload>, index: usize, writes: u64) {
     let _ = queue.send((upload, index, writes));
 }
 
-/// Flush everything written to the filesystem holding `dir`.
+/// Flush everything written to the filesystem holding `dir`. Only used on
+/// Linux, where `syncfs` flushes files' contents along with the rest.
 fn sync_filesystem(dir: &Path) -> Result<()> {
-    let folder = File::open(dir)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
+        let folder = File::open(dir)?;
         // SAFETY: syncfs only reads the descriptor, which `folder` keeps open.
         if unsafe { libc::syncfs(folder.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
-    folder.sync_all()?;
+    {
+        let _ = dir;
+        Err(Error::Invalid("syncfs is Linux only".into()))
+    }
+}
+
+/// Flush a folder, so the names made or moved in it are on disk.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// Flush `root` and every folder in it.
+fn sync_folders(root: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(io::Error::from)?;
+        if entry.file_type().is_dir() {
+            sync_dir(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Flush the uploads folder after a finished upload moved into it.
+fn flush_publication(uploads: &Path) -> Result<()> {
+    sync_dir(uploads)?;
     Ok(())
 }
 
@@ -696,18 +815,6 @@ fn closed(phase: Phase) -> Error {
     }
 }
 
-/// A full disk as [`Error::NoSpace`].
-fn out_of_space(e: io::Error, dir: &Path) -> Error {
-    if e.kind() == ErrorKind::StorageFull {
-        Error::NoSpace(format!(
-            "The disk holding {} is full.",
-            dir.parent().and_then(Path::parent).unwrap_or(dir).display()
-        ))
-    } else {
-        e.into()
-    }
-}
-
 /// The uploads under way, all in one uploads folder.
 #[derive(Default)]
 pub struct Uploads {
@@ -718,9 +825,19 @@ pub struct Uploads {
 struct Inner {
     folder: Option<PathBuf>,
     uploads: HashMap<String, Arc<Upload>>,
-    /// Uploads finished lately, and when: finishing one again answers the
-    /// same, for a client cut off while it finished.
-    finished: HashMap<String, (Finished, i64)>,
+    /// Uploads finished lately: finishing one again answers the same, for a
+    /// client cut off while it finished.
+    finished: HashMap<String, Published>,
+}
+
+/// An upload moved into the uploads folder.
+#[derive(Clone)]
+struct Published {
+    done: Finished,
+    /// The folder it moved into, whose flush may still have to be retried.
+    uploads: PathBuf,
+    flushed: bool,
+    at: i64,
 }
 
 impl Uploads {
@@ -728,16 +845,19 @@ impl Uploads {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The uploads folder, if there is one.
+    /// The uploads folder, if there is one, as the scan sees it (see
+    /// [`resolved`](crate::inbox::resolved)).
     pub fn folder(&self) -> Option<PathBuf> {
         self.lock().folder.clone()
     }
 
     /// Take uploads into `folder` from now on (`None`: no uploads). Uploads
     /// under way into another folder are cancelled, and the ones staged in
-    /// this folder before are picked up again. Returns how many were
+    /// this folder before are picked up again. Another spelling of the same
+    /// folder (through a link, say) changes nothing. Returns how many were
     /// cancelled.
     pub fn set_folder(&self, folder: Option<PathBuf>) -> usize {
+        let folder = folder.as_deref().map(crate::inbox::resolved);
         let mut inner = self.lock();
         if inner.folder == folder {
             return 0;
@@ -763,36 +883,31 @@ impl Uploads {
         let uploads = self.folder().ok_or_else(|| {
             Error::Invalid("Choose an Inbox folder in Inbox setup before uploading.".into())
         })?;
-        // The uploads folder is made if need be, but not the folders above
-        // it: a missing Inbox folder or disk isn't made up.
-        if !uploads.is_dir() {
-            if !uploads.parent().is_some_and(Path::is_dir) {
-                return Err(Error::Invalid(format!(
-                    "The folder holding the uploads folder {} isn't there. Check the uploads folder in Inbox setup.",
-                    uploads.display()
-                )));
-            }
-            match fs::create_dir(&uploads) {
-                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
-                    return Err(unwritable(e, &uploads));
-                }
-                _ => {}
-            }
-        }
+        check_parent(&uploads)?;
+        let made = make_folder(&uploads).map_err(|e| io_error(e, &uploads))?;
         let staging = uploads.join(STAGING);
-        fs::create_dir_all(&staging).map_err(|e| unwritable(e, &uploads))?;
+        let made_staging = make_folder(&staging).map_err(|e| io_error(e, &uploads))?;
         let id = new_id();
         let dir = staging.join(&id);
         let created_at = now();
-        let staged = stage(&dir, &folder, &new.files, created_at);
+        let staged = stage(&dir, &folder, &new.files, created_at).and_then(|()| {
+            // The folders made for it are on disk before anything counts as
+            // received in them.
+            if made_staging {
+                sync_dir(&uploads)?;
+            }
+            if made && let Some(parent) = uploads.parent() {
+                sync_dir(parent)?;
+            }
+            Ok(())
+        });
         let upload = match staged {
-            Ok(()) => Arc::new(Upload {
-                id: id.clone(),
-                dir: dir.clone(),
+            Ok(()) => Arc::new(Upload::new(
+                id.clone(),
+                dir.clone(),
                 folder,
                 created_at,
-                files: new
-                    .files
+                new.files
                     .into_iter()
                     .map(|f| Staged {
                         path: f.path,
@@ -800,13 +915,13 @@ impl Uploads {
                         state: Mutex::default(),
                     })
                     .collect(),
-                updated_at: AtomicI64::new(created_at),
-                dirty: AtomicBool::new(false),
-                phase: RwLock::new(Phase::Open),
-            }),
+            )),
             Err(e) => {
                 let _ = fs::remove_dir_all(&dir);
-                return Err(e);
+                return Err(match e {
+                    Error::Io(e) => io_error(e, &uploads),
+                    e => e,
+                });
             }
         };
         // The space check and taking the upload on happen together, so two
@@ -817,21 +932,23 @@ impl Uploads {
                 "The uploads folder changed while the upload started; start it again.".into(),
             ))
         } else {
-            let pending: u64 = inner.uploads.values().map(|u| u.remaining()).sum();
+            let pending = inner
+                .uploads
+                .values()
+                .fold(0u64, |total, u| total.saturating_add(u.remaining()));
+            let need = upload.size().saturating_add(pending).saturating_add(SPARE);
             match free_space(&dir) {
-                Ok(free) if free < upload.size() + pending + SPARE => {
-                    Some(Error::NoSpace(format!(
-                        "There isn't room for this upload in {}: it needs {}{}, and {} is free.",
-                        uploads.display(),
-                        bytes(upload.size()),
-                        if pending > 0 {
-                            format!(" besides the {} other uploads still need", bytes(pending))
-                        } else {
-                            String::new()
-                        },
-                        bytes(free.saturating_sub(SPARE)),
-                    )))
-                }
+                Ok(free) if free < need => Some(Error::NoSpace(format!(
+                    "There isn't room for this upload in {}: it needs {}{}, and {} is free.",
+                    uploads.display(),
+                    bytes(upload.size()),
+                    if pending > 0 {
+                        format!(" besides the {} other uploads still need", bytes(pending))
+                    } else {
+                        String::new()
+                    },
+                    bytes(free.saturating_sub(SPARE)),
+                ))),
                 Ok(_) => None,
                 Err(e) => Some(e.into()),
             }
@@ -856,22 +973,26 @@ impl Uploads {
         all
     }
 
+    /// Whether upload `id` was moved into the uploads folder lately, even
+    /// if flushing that move failed: its album is there to be scanned.
+    pub fn published(&self, id: &str) -> bool {
+        self.lock().finished.contains_key(id)
+    }
+
     /// Move a complete upload into the uploads folder. An incomplete one is
     /// refused, and stays as it is for the rest to be sent. One finished
-    /// already (within [`IDLE_LIMIT`], since coversyncd started) gives the
-    /// same answer again.
+    /// already (within [`IDLE_LIMIT`], since coversyncd started), or being
+    /// finished by another request, gives the same answer; if flushing its
+    /// move failed, that is tried again first.
     pub fn finish(&self, id: &str) -> Result<Finished> {
         let upload = match self.get(id) {
-            Err(Error::NotFound) => {
-                return self
-                    .lock()
-                    .finished
-                    .get(id)
-                    .map(|(done, _)| done.clone())
-                    .ok_or(Error::NotFound);
-            }
+            Err(Error::NotFound) => return self.answer_again(id),
             found => found?,
         };
+        let _finishing = upload.finishing.lock().unwrap_or_else(|e| e.into_inner());
+        if self.published(id) {
+            return self.answer_again(id);
+        }
         let unfinished: Vec<&Staged> = upload
             .files
             .iter()
@@ -885,37 +1006,64 @@ impl Uploads {
                 first.path
             )));
         }
-        let uploads = upload
-            .dir
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .ok_or(Error::NotFound)?;
         upload.turn(Phase::Open, Phase::Finishing)?;
-        match upload.move_into(&uploads) {
-            Ok(dest) => {
-                let done = Finished {
-                    folder: dest
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    path: dest.display().to_string(),
-                };
-                let mut inner = self.lock();
-                inner.uploads.remove(id);
-                inner.finished.insert(id.to_string(), (done.clone(), now()));
-                drop(inner);
-                let _ = upload.turn(Phase::Finishing, Phase::Closed);
-                if let Err(e) = fs::remove_dir_all(&upload.dir) {
-                    tracing::warn!(dir = %upload.dir.display(), "couldn't clean up a finished upload: {e}");
-                }
-                Ok(done)
-            }
+        let dest = match upload.move_into() {
+            Ok(dest) => dest,
             Err(e) => {
                 let _ = upload.turn(Phase::Finishing, Phase::Open);
-                Err(e)
+                return Err(e);
+            }
+        };
+        // Moved: from here on it is finished, whatever else fails.
+        let uploads = upload.uploads_folder().to_path_buf();
+        let done = Finished {
+            folder: dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path: dest.display().to_string(),
+        };
+        let mut inner = self.lock();
+        inner.uploads.remove(id);
+        inner.finished.insert(
+            id.to_string(),
+            Published {
+                done: done.clone(),
+                uploads: uploads.clone(),
+                flushed: false,
+                at: now(),
+            },
+        );
+        drop(inner);
+        let _ = upload.turn(Phase::Finishing, Phase::Closed);
+        if let Err(e) = fs::remove_dir_all(&upload.dir) {
+            tracing::warn!(dir = %upload.dir.display(), "couldn't clean up a finished upload: {e}");
+        }
+        #[cfg(test)]
+        if upload.probe.fail_publishing.swap(false, Ordering::Relaxed) {
+            return Err(Error::Io(io::Error::other("the move couldn't be flushed")));
+        }
+        flush_publication(&uploads)?;
+        if let Some(p) = self.lock().finished.get_mut(id) {
+            p.flushed = true;
+        }
+        Ok(done)
+    }
+
+    /// The answer a finished upload gave, flushing its move first if that
+    /// failed before.
+    fn answer_again(&self, id: &str) -> Result<Finished> {
+        let published = self.lock().finished.get(id).cloned();
+        let Some(p) = published else {
+            return Err(Error::NotFound);
+        };
+        if !p.flushed {
+            flush_publication(&p.uploads)?;
+            if let Some(p) = self.lock().finished.get_mut(id) {
+                p.flushed = true;
             }
         }
+        Ok(p.done)
     }
 
     /// Cancel an upload and remove what it staged.
@@ -945,7 +1093,7 @@ impl Uploads {
     pub fn expire(&self, now: i64) -> usize {
         let idle: Vec<Arc<Upload>> = {
             let mut inner = self.lock();
-            inner.finished.retain(|_, (_, at)| *at + IDLE_LIMIT > now);
+            inner.finished.retain(|_, p| p.at + IDLE_LIMIT > now);
             let ids: Vec<String> = inner
                 .uploads
                 .values()
@@ -987,8 +1135,44 @@ fn remove_staged(dir: &Path) -> Result<()> {
     }
 }
 
-/// Create an upload's staging folder: its folders, its empty files, and
-/// last its manifest, so a folder without one is a start that never ended.
+/// An uploads folder is made by the first upload, but not the folders
+/// above it: a missing Inbox folder or an unmounted disk isn't made up.
+pub fn check_parent(uploads: &Path) -> Result<()> {
+    if uploads.is_dir() || uploads.parent().is_some_and(Path::is_dir) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "The folder holding the uploads folder {} isn't there. Check the uploads folder in Inbox setup.",
+        uploads.display()
+    )))
+}
+
+/// Whether uploads can go into `uploads`: it can be written to, or, if it
+/// isn't there yet, the folder holding it can.
+pub fn can_write(uploads: &Path) -> bool {
+    if uploads.exists() {
+        return crate::import::writable(uploads);
+    }
+    uploads
+        .parent()
+        .is_some_and(|p| p.is_dir() && crate::import::writable(p))
+}
+
+/// Make a folder whose parent exists, unless it's there. Whether it was made.
+fn make_folder(dir: &Path) -> io::Result<bool> {
+    match fs::create_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists && dir.is_dir() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create an upload's staging folder: its folders and every file, empty,
+/// and last its manifest, so a folder without one is a start that never
+/// ended. Each file is made new, so two paths the filesystem takes for the
+/// same name (`a.flac` and `A.flac` where case doesn't count) are refused.
+/// The folders are then flushed, so the files' names are on disk before
+/// any of their contents count as received.
 fn stage(dir: &Path, folder: &str, files: &[NewFile], created_at: i64) -> Result<()> {
     let root = dir.join(FILES);
     fs::create_dir(dir)?;
@@ -1001,15 +1185,40 @@ fn stage(dir: &Path, folder: &str, files: &[NewFile], created_at: i64) -> Result
     for f in folders {
         fs::create_dir_all(root.join(f))?;
     }
-    for f in files.iter().filter(|f| f.size == 0) {
-        File::create(root.join(&f.path))?;
-    }
+    create_files(&root, files)?;
     let manifest = Manifest {
         folder: folder.to_string(),
         created_at,
         files: files.to_vec(),
     };
-    write_json(&dir.join(MANIFEST), &manifest, true)
+    write_json(&dir.join(MANIFEST), &manifest, true)?;
+    sync_folders(&root)?;
+    sync_dir(dir)?;
+    if let Some(staging) = dir.parent() {
+        sync_dir(staging)?;
+    }
+    Ok(())
+}
+
+/// Make each file of an upload, empty, under `root`, where none may exist.
+fn create_files(root: &Path, files: &[NewFile]) -> Result<()> {
+    for f in files {
+        let made = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join(&f.path));
+        match made {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                return Err(Error::Invalid(format!(
+                    "“{}” is the same file as another one in the upload, on the uploads folder's disk (are their names the same but for upper and lower case?).",
+                    f.path
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// The uploads staged in `staging`, leaving out (and removing) ones that
@@ -1090,13 +1299,17 @@ fn write_json(path: &Path, value: &impl Serialize, flush: bool) -> Result<()> {
     Ok(())
 }
 
-/// A folder that can't be written to as [`Error::ReadOnly`].
-fn unwritable(e: io::Error, folder: &Path) -> Error {
+/// An error writing into the uploads folder `folder`: one it can't write
+/// to is [`Error::ReadOnly`], and a full disk [`Error::NoSpace`].
+fn io_error(e: io::Error, folder: &Path) -> Error {
     match e.kind() {
         ErrorKind::ReadOnlyFilesystem | ErrorKind::PermissionDenied => Error::ReadOnly(format!(
             "coversyncd can't write to the uploads folder {} ({e}). Choose a folder it can write to as the uploads folder in Inbox setup.",
             folder.display()
         )),
+        ErrorKind::StorageFull => {
+            Error::NoSpace(format!("The disk holding {} is full.", folder.display()))
+        }
         _ => e.into(),
     }
 }
@@ -1140,11 +1353,18 @@ fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn now() -> i64 {
+/// Seconds since the Unix epoch.
+pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// File descriptors this process has open, where that can be told.
+#[cfg(test)]
+fn open_files() -> Option<usize> {
+    fs::read_dir("/proc/self/fd").ok().map(|d| d.count())
 }
 
 #[cfg(test)]
@@ -1157,10 +1377,28 @@ mod tests {
             std::env::temp_dir().join(format!("coversync-upload-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let folder = dir.join("Uploads");
+        let folder = dir.canonicalize().unwrap().join("Uploads");
         let u = Uploads::default();
         assert_eq!(u.set_folder(Some(folder.clone())), 0);
         (folder, u)
+    }
+
+    /// Write `data` to file `index` from 0, without flushing it.
+    fn unflushed(u: &Arc<Upload>, index: usize, data: &[u8]) {
+        let mut w = u.writer(index, 0).unwrap();
+        w.write(data).unwrap();
+    }
+
+    fn read_only(dir: &Path, on: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if on { 0o555 } else { 0o755 };
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Root writes anywhere, so no folder is read-only to it.
+    fn root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
     }
 
     fn new(folder: &str, files: &[(&str, u64)]) -> NewUpload {
@@ -1538,5 +1776,208 @@ mod tests {
         u.set_folder(Some(folder.with_file_name("Fresh")));
         u.start(new("A", &[("a.flac", 1)])).unwrap();
         assert!(folder.with_file_name("Fresh").join(STAGING).is_dir());
+    }
+
+    #[test]
+    fn an_uploads_folder_needs_the_folder_holding_it() {
+        let (folder, _u) = uploads("parent");
+        assert!(check_parent(&folder).is_ok() && can_write(&folder));
+        let away = folder.join("Unmounted/Uploads");
+        assert!(check_parent(&away).is_err());
+        assert!(!can_write(&away), "the first upload wouldn't make it");
+        fs::create_dir_all(&folder).unwrap();
+        assert!(can_write(&folder.join("New")));
+        if !root() {
+            read_only(&folder, true);
+            let writable = can_write(&folder.join("New"));
+            read_only(&folder, false);
+            assert!(!writable);
+        }
+    }
+
+    #[test]
+    fn another_spelling_of_the_folder_keeps_uploads_under_way() {
+        let (folder, u) = uploads("alias");
+        fs::create_dir_all(&folder).unwrap();
+        let up = u.start(new("A", &[("a.flac", 3)])).unwrap();
+        chunk(&up, 0, 0, b"abc").unwrap();
+        let link = folder.with_file_name("Link");
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        let spelled = PathBuf::from(format!("{}//./", link.display()));
+        assert_eq!(u.set_folder(Some(spelled)), 0);
+        assert_eq!(u.folder(), Some(folder.clone()));
+        assert!(folder.join(STAGING).join(up.id()).is_dir());
+        assert_eq!(
+            u.finish(up.id()).unwrap().path,
+            folder.join("A").display().to_string()
+        );
+    }
+
+    #[test]
+    fn sizes_past_what_a_disk_holds_are_refused() {
+        let half = 1u64 << 63;
+        let message = invalid(&[("a.flac", half), ("b.flac", half)]);
+        assert!(message.contains("add up"), "{message}");
+        assert!(invalid(&[("a.flac", i64::MAX as u64 + 1)]).contains("add up"));
+        assert!(invalid(&[("a.flac", u64::MAX), ("b.flac", 2)]).contains("add up"));
+        assert!(check_files(&new("A", &[("a.flac", i64::MAX as u64)]).files).is_ok());
+        // Big uploads' reservations add up without wrapping around.
+        let (_, u) = uploads("huge");
+        for _ in 0..3 {
+            assert!(matches!(
+                u.start(new("A", &[("a.flac", i64::MAX as u64)])),
+                Err(Error::NoSpace(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn names_the_disk_takes_for_one_are_refused() {
+        let (folder, _u) = uploads("case");
+        fs::create_dir_all(&folder).unwrap();
+        // Where case doesn't count, "A.flac" finds "a.flac" made a moment
+        // before; here the file is simply there already.
+        fs::write(folder.join("A.flac"), b"").unwrap();
+        let files = new("A", &[("b.flac", 1), ("A.flac", 1)]).files;
+        match create_files(&folder, &files) {
+            Err(Error::Invalid(m)) => assert!(m.contains("“A.flac”") && m.contains("case"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn finishing_many_files_keeps_few_open() {
+        let (folder, u) = uploads("descriptors");
+        let n = 300;
+        let names: Vec<String> = (0..n).map(|i| format!("{i:03}.flac")).collect();
+        let files: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 2)).collect();
+        let up = u.start(new("Many", &files)).unwrap();
+        for i in 0..n {
+            unflushed(&up, i, b"ab");
+        }
+        let before = open_files();
+        u.finish(up.id()).unwrap();
+        if let (Some(before), Some(during)) = (before, *up.probe.open_files.lock().unwrap()) {
+            assert!(
+                during < before + 32,
+                "{during} open while finishing, {before} before"
+            );
+        }
+        assert_eq!(fs::read_dir(folder.join("Many")).unwrap().count(), n);
+    }
+
+    #[test]
+    fn a_second_finish_waits_for_the_first_and_gets_its_answer() {
+        let (_, u) = uploads("twice");
+        let u = Arc::new(u);
+        let up = u.start(new("A", &[("a.flac", 2)])).unwrap();
+        chunk(&up, 0, 0, b"ab").unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let (go_on, go_on_rx) = mpsc::channel();
+        *up.probe.stall.lock().unwrap() = Some((started_tx, go_on_rx));
+        let finish = |u: &Arc<Uploads>| {
+            let (u, id) = (u.clone(), up.id().to_owned());
+            std::thread::spawn(move || u.finish(&id))
+        };
+        let first = finish(&u);
+        started.recv().unwrap();
+        let second = finish(&u);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!second.is_finished(), "the second waits for the first");
+        go_on.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        assert_eq!(second.join().unwrap().unwrap(), first);
+    }
+
+    #[test]
+    fn a_move_that_couldnt_be_flushed_is_flushed_when_asked_again() {
+        let (folder, u) = uploads("publish");
+        let up = u.start(new("A", &[("a.flac", 2)])).unwrap();
+        chunk(&up, 0, 0, b"ab").unwrap();
+        up.probe.fail_publishing.store(true, Ordering::Relaxed);
+        assert!(matches!(u.finish(up.id()), Err(Error::Io(_))));
+        // The album is in place, and counts as published: the scan goes on.
+        assert_eq!(fs::read(folder.join("A/a.flac")).unwrap(), b"ab");
+        assert!(u.published(up.id()));
+        assert!(!u.lock().finished[up.id()].flushed);
+        let done = u.finish(up.id()).unwrap();
+        assert_eq!(done.path, folder.join("A").display().to_string());
+        assert!(u.lock().finished[up.id()].flushed);
+    }
+
+    #[test]
+    fn progress_saves_never_overlap() {
+        let (folder, u) = uploads("saves");
+        let u = Arc::new(u);
+        let up = u.start(new("A", &[("a.flac", 1 << 16)])).unwrap();
+        let saving: Vec<_> = (0..8)
+            .map(|t| {
+                let (u, up) = (u.clone(), up.clone());
+                std::thread::spawn(move || {
+                    for i in 0..50u64 {
+                        let at = (t * 50 + i) * 16;
+                        chunk(&up, 0, at, &[1; 16]).unwrap();
+                        up.dirty.store(true, Ordering::Relaxed);
+                        u.save();
+                        assert!(up.save().is_ok());
+                    }
+                })
+            })
+            .collect();
+        for t in saving {
+            t.join().unwrap();
+        }
+        let saved = fs::read(folder.join(STAGING).join(up.id()).join(PROGRESS)).unwrap();
+        let progress: Progress = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(progress.files[0].ranges, [(0, 8 * 50 * 16)]);
+    }
+
+    #[test]
+    fn staged_files_lost_or_cut_short_start_over() {
+        let (folder, u) = uploads("recover");
+        let up = u
+            .start(new("A", &[("CD1/a.flac", 4), ("b.flac", 4), ("c.flac", 4)]))
+            .unwrap();
+        for i in 0..3 {
+            chunk(&up, i, 0, b"abcd").unwrap();
+            assert!(flushed(&up, i));
+        }
+        u.save();
+        let files = folder.join(STAGING).join(up.id()).join(FILES);
+        fs::remove_dir_all(files.join("CD1")).unwrap();
+        fs::write(files.join("b.flac"), b"ab").unwrap();
+        let again = Uploads::default();
+        again.set_folder(Some(folder.clone()));
+        let back = again.get(up.id()).unwrap();
+        let received: Vec<u64> = (0..3)
+            .map(|i| back.file_status(i).unwrap().received)
+            .collect();
+        assert_eq!(received, [0, 0, 4]);
+        assert!(files.join("CD1/a.flac").is_file(), "made again, empty");
+        chunk(&back, 0, 0, b"abcd").unwrap();
+        chunk(&back, 1, 0, b"abcd").unwrap();
+        let done = again.finish(up.id()).unwrap();
+        assert_eq!(
+            fs::read(Path::new(&done.path).join("b.flac")).unwrap(),
+            b"abcd"
+        );
+    }
+
+    #[test]
+    fn a_staging_folder_that_turned_read_only_is_refused_clearly() {
+        if root() {
+            return;
+        }
+        let (folder, u) = uploads("staging-ro");
+        u.start(new("A", &[("a.flac", 1)])).unwrap();
+        let staging = folder.join(STAGING);
+        read_only(&staging, true);
+        let refused = u.start(new("B", &[("b.flac", 1)]));
+        read_only(&staging, false);
+        match refused {
+            Err(Error::ReadOnly(m)) => assert!(m.contains("Inbox setup"), "{m}"),
+            other => panic!("{:?}", other.map(|u| u.id().to_owned())),
+        }
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
     }
 }

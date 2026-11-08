@@ -31,7 +31,7 @@ use coversync_core::upload::{self, FileStatus, Finished, NewUpload, UploadStatus
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::api::{ApiError, ApiResult, FolderStatus, blocking, folder_status};
+use crate::api::{ApiError, ApiResult, FolderStatus, blocking, uploads_folder_status};
 use crate::{Shared, spawn_scan};
 
 /// Bytes handed to the disk at a time.
@@ -79,7 +79,7 @@ async fn list(State(state): State<Shared>) -> ApiResult<Json<UploadsResponse>> {
             folder: s
                 .uploads
                 .folder()
-                .map(|f| folder_status(&f.display().to_string())),
+                .map(|f| uploads_folder_status(&f.display().to_string())),
             chunk_size: upload::CHUNK_SIZE,
             extensions: upload::extensions(),
             max_files: upload::MAX_FILES,
@@ -223,12 +223,18 @@ fn past_the_end(size: u64) -> ApiError {
 }
 
 /// Finish an upload, then scan. That goes on even if the client hangs up,
-/// so the album still appears; asking again gives the same answer.
+/// so the album still appears; asking again gives the same answer. The scan
+/// runs whenever the album was moved into place, even if flushing that move
+/// failed (asking again tries the flush again).
 async fn finish(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Finished>> {
     let task = tokio::spawn(async move {
-        let done = blocking(&state, move |s| s.uploads.finish(&id)).await?;
+        let asked = id.clone();
+        let done = blocking(&state, move |s| s.uploads.finish(&asked)).await;
+        if done.is_ok() || state.uploads.published(&id) {
+            spawn_scan(state);
+        }
+        let done = done?;
         tracing::info!(path = done.path, "upload finished");
-        spawn_scan(state);
         Ok(done)
     });
     task.await?.map(Json)
@@ -251,7 +257,7 @@ pub async fn housekeeping(state: Shared) {
         let _ = tokio::task::spawn_blocking(move || {
             s.uploads.save();
             if expire {
-                s.uploads.expire(now());
+                s.uploads.expire(upload::now());
             }
         })
         .await;
@@ -274,10 +280,3 @@ pub fn follow_folder(state: &crate::AppState) {
 
 #[cfg(test)]
 mod tests;
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}

@@ -120,6 +120,8 @@ def main():
     ap.add_argument("--keep", action="store_true", help="send the files but don't finish")
     ap.add_argument("--insecure", action="store_true", help="don't check the TLS certificate")
     args = ap.parse_args()
+    if args.chunk is not None and args.chunk <= 0:
+        ap.error("--chunk must be more than zero")
     if not args.password and not args.token:
         ap.error("set COVERSYNC_PASSWORD or COVERSYNC_TOKEN (or --password / --token)")
 
@@ -140,8 +142,9 @@ def main():
             _, done = client.call("POST", f"/api/uploads/{args.resume}/finish")
             print(f"finished already: {done['path']}")
             return
-        if [f["path"] for f in upload["files"]] != [f[0] for f in files]:
-            sys.exit("that upload holds other files")
+        theirs = [(f["path"], f["size"]) for f in upload["files"]]
+        if theirs != [(rel, size) for rel, _, size in files]:
+            sys.exit("that upload holds other files, or other sizes: resume it with the files it started with")
     else:
         body = {
             "folder": args.name or os.path.basename(folder),
@@ -163,17 +166,19 @@ def main():
 
     def worker():
         conn = client.connect()
-        fds = {}
         try:
             while not errors:
                 try:
                     index, path, offset, length = jobs.get_nowait()
                 except queue.Empty:
                     return
-                fd = fds.get(path)
-                if fd is None:
-                    fd = fds[path] = os.open(path, os.O_RDONLY)
-                data = os.pread(fd, length, offset)
+                # Opened for each chunk: an album can hold more files than
+                # a process may have open.
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    data = os.pread(fd, length, offset)
+                finally:
+                    os.close(fd)
                 route = f"/api/uploads/{upload_id}/files/{index}?offset={offset}"
                 client.call("PUT", route, data, conn=conn, raw=True)
                 with lock:
@@ -182,8 +187,6 @@ def main():
             errors.append(e)
         finally:
             conn.close()
-            for fd in fds.values():
-                os.close(fd)
 
     began = time.monotonic()
     threads = [threading.Thread(target=worker) for _ in range(max(1, args.parallel))]

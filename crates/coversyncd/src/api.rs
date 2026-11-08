@@ -19,7 +19,7 @@ use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
     AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
-    TagEdit, inbox, rules, tags,
+    TagEdit, inbox, rules, tags, upload,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -216,6 +216,15 @@ pub(crate) fn folder_status(path: &str) -> FolderStatus {
     }
 }
 
+/// [`folder_status`] for an uploads folder, which the first upload makes
+/// only if the folder holding it is there (see `upload::check_parent`).
+pub(crate) fn uploads_folder_status(path: &str) -> FolderStatus {
+    FolderStatus {
+        creatable: upload::can_write(std::path::Path::new(path)),
+        ..folder_status(path)
+    }
+}
+
 #[derive(Serialize)]
 struct SetupResponse {
     setup: LibrarySetup,
@@ -379,7 +388,7 @@ fn inbox_response(
         folder: setup.folder.as_deref().map(folder_status),
         uploads: setup
             .uploads_folder()
-            .map(|f| folder_status(&f.display().to_string())),
+            .map(|f| uploads_folder_status(&f.display().to_string())),
         setup,
         hidden: s.lib.hidden_stats()?,
         suggest: SuggestStatus {
@@ -409,6 +418,9 @@ struct SaveInboxSetup {
 
 /// A new Inbox folder must exist; changing it, or the uploads folder,
 /// rescans. A new uploads folder cancels uploads under way into the old one.
+/// Saves take turns with each other and with Library setup, scans, imports
+/// and tag writes, so the folders checked are the folders saved, and the
+/// uploads follow the setup last saved.
 async fn save_inbox_setup(
     State(state): State<Shared>,
     Json(body): Json<SaveInboxSetup>,
@@ -419,7 +431,8 @@ async fn save_inbox_setup(
         .map(inbox::acoustid_key)
         .transpose()?;
     let setup = body.setup;
-    let (response, moved) = blocking(&state, move |s| {
+    let guard = state.jobs.lock().await;
+    let result = blocking(&state, move |s| {
         let before = s.lib.inbox_setup()?;
         let setup = setup.normalize()?;
         if let Some(f) = &setup.folder
@@ -430,6 +443,9 @@ async fn save_inbox_setup(
             )));
         }
         must_be_folder(setup.uploads.as_deref(), "uploads folder")?;
+        if let Some(u) = &setup.uploads {
+            upload::check_parent(std::path::Path::new(u))?;
+        }
         let library = s.lib.library_setup()?.folder;
         inbox::check_folders(setup.folder.as_deref(), library.as_deref())?;
         inbox::check_uploads(
@@ -447,10 +463,17 @@ async fn save_inbox_setup(
         let moved = before.folder != saved.folder || before.uploads != saved.uploads;
         Ok((inbox_response(s, saved)?, moved))
     })
-    .await?;
-    if moved {
+    .await;
+    drop(guard);
+    // A scan asked for while this held the lock runs now too.
+    if result.as_ref().is_ok_and(|(_, moved)| *moved)
+        || state
+            .rescan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
         spawn_scan(state.clone());
     }
+    let (response, _) = result?;
     Ok(Json(response))
 }
 
@@ -533,6 +556,9 @@ async fn save_sync_setup(
 #[derive(Deserialize)]
 struct FolderQuery {
     path: String,
+    /// Checked as an uploads folder (see [`uploads_folder_status`]).
+    #[serde(default)]
+    uploads: bool,
 }
 
 /// Live feedback while a folder path is typed in setup.
@@ -543,7 +569,13 @@ async fn folder_check(
     blocking(&state, move |_| {
         Ok(rules::folder_setting(Some(q.path), "folder")?
             .as_deref()
-            .map(folder_status))
+            .map(|p| {
+                if q.uploads {
+                    uploads_folder_status(p)
+                } else {
+                    folder_status(p)
+                }
+            }))
     })
     .await
     .map(Json)

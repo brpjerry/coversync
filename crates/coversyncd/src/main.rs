@@ -81,38 +81,48 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The folders to index, from the Inbox and Library settings. An
-    /// uploads folder outside the Inbox folder is indexed as part of the
-    /// Inbox; one inside it is anyway.
+    /// The folders to index, from the Inbox and Library settings.
     pub fn roots(&self) -> Vec<(PathBuf, Collection)> {
         let setup = self.lib.inbox_setup().ok();
         let inbox = setup.as_ref().and_then(|s| s.folder.clone());
         let uploads = setup.and_then(|s| s.uploads);
         let library = self.lib.library_setup().ok().and_then(|s| s.folder);
-        let mut roots: Vec<_> = [(inbox, Collection::Inbox), (library, Collection::Library)]
-            .into_iter()
-            .filter_map(|(folder, c)| {
-                let path = PathBuf::from(folder?);
-                match path.canonicalize() {
-                    Ok(p) => Some((p, c)),
-                    Err(e) => {
-                        // A library folder is created on first import.
-                        if c == Collection::Inbox {
-                            tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
-                        }
-                        None
-                    }
-                }
-            })
-            .collect();
-        // Created by the first upload, so it may not exist yet.
-        if let Some(uploads) = uploads.and_then(|u| PathBuf::from(u).canonicalize().ok())
-            && !roots.iter().any(|(r, _)| uploads.starts_with(r))
-        {
-            roots.insert(1, (uploads, Collection::Inbox));
-        }
-        roots
+        index_roots(inbox, uploads, library)
     }
+}
+
+/// The folders to index: the Inbox and Library folders that are there, and
+/// an uploads folder outside the Inbox folder, indexed as part of the Inbox
+/// (one inside it is anyway).
+fn index_roots(
+    inbox: Option<String>,
+    uploads: Option<String>,
+    library: Option<String>,
+) -> Vec<(PathBuf, Collection)> {
+    let mut roots: Vec<_> = [(inbox, Collection::Inbox), (library, Collection::Library)]
+        .into_iter()
+        .filter_map(|(folder, c)| {
+            let path = PathBuf::from(folder?);
+            match path.canonicalize() {
+                Ok(p) => Some((p, c)),
+                Err(e) => {
+                    // A library folder is created on first import.
+                    if c == Collection::Inbox {
+                        tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+    // Created by the first upload, so it may not exist yet; and the Inbox
+    // and Library folders may not be there either.
+    if let Some(uploads) = uploads.and_then(|u| PathBuf::from(u).canonicalize().ok())
+        && !roots.iter().any(|(r, _)| uploads.starts_with(r))
+    {
+        roots.push((uploads, Collection::Inbox));
+    }
+    roots
 }
 
 pub type Shared = Arc<AppState>;
@@ -286,4 +296,40 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         auth: auth::Auth::open(&state_dir).unwrap(),
         uploads: Uploads::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_uploads_folder_alone_is_indexed() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Uploads")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let s = |p: &str| Some(dir.join(p).display().to_string());
+        // The Inbox disk isn't mounted, and nothing was imported yet.
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        assert_eq!(
+            index_roots(None, s("Uploads"), None),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        std::fs::create_dir_all(dir.join("Inbox/Uploads")).unwrap();
+        std::fs::create_dir_all(dir.join("Library")).unwrap();
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [
+                (dir.join("Inbox"), Collection::Inbox),
+                (dir.join("Library"), Collection::Library),
+                (dir.join("Uploads"), Collection::Inbox),
+            ]
+        );
+        // One inside the Inbox folder is indexed with it.
+        assert_eq!(index_roots(s("Inbox"), s("Inbox/Uploads"), None).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
