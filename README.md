@@ -34,8 +34,12 @@ used on a home server.
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never
   written and is hidden from the Inbox afterwards.
-- **Inbox setup**: Copy or Move, and autofill for empty tags that are safe to
-  assume (album artist from artist, track numbers from file names, …).
+- **Inbox setup**: Copy or Move, autofill for empty tags that are safe to
+  assume (album artist from artist, track numbers from file names, …), and
+  the uploads folder (see [Uploading albums](#uploading-albums)).
+- **Uploads**: albums sent to the server through the upload API land in the
+  uploads folder and show up in the Inbox. Uploading from the browser and
+  the desktop app is planned; `tools/upload.py` uploads a folder for now.
 - **Smart suggestions** (optional): the import dialog looks the album up on
   MusicBrainz, by Chromaprint fingerprints on AcoustID where it can, and
   otherwise by the barcode (or UPC) and ISRCs its files are tagged with, or
@@ -62,6 +66,7 @@ crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, Mu
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 web/                    SvelteKit / Svelte 5 single-page app
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
+tools/upload.py         uploads an album folder through the upload API
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
@@ -176,6 +181,51 @@ until the command is run on the server.
 - **Nothing a login is served is kept by shared caches**: API responses are
   `Cache-Control: private`, and `no-cache` unless they set their own policy.
 
+### Uploading albums
+
+Albums can be uploaded into the Inbox over the API, in chunks that survive a
+dropped connection or a restart on either side. Each upload is one new folder
+in the **uploads folder**: `Uploads` in the Inbox folder, unless Inbox setup
+names another. Choose one outside the Inbox folder when coversyncd can't
+write to the Inbox (a synced folder made read-only, say): it is scanned as
+part of the Inbox, and its albums show up there like any other. Uploads only
+add files, never change any, so they need no `--allow-writes`; they need a
+login, like the rest of the API.
+
+1. `POST /api/uploads` with `{"folder": "Album", "files": [{"path":
+   "CD1/01 Intro.flac", "size": 12345}, …]}` starts one and answers `201`
+   with its `id`. Paths are relative, with `/` between folders, and no
+   `.`, `..`, empty or hidden names. Only audio coversync reads, images, cue
+   sheets, rip logs and similar files are taken (`GET /api/uploads` lists the
+   extensions), at most 10,000 files. The upload must fit on the disk, beside
+   what the uploads already under way still need: if not, `507`. An uploads
+   folder coversyncd can't write to gives `403`, saying so.
+2. `PUT /api/uploads/{id}/files/{index}?offset=N` with the bytes as the body
+   writes them into file `index` (counting from 0, in the order the files
+   were listed) from byte `N`. Chunks
+   can be any size (16 MiB is suggested), in any order, and several at once;
+   sending one again is harmless.
+3. `GET /api/uploads/{id}` gives each file's `ranges`, the byte ranges the
+   server has as `[start, end)` pairs, so a client that lost track sends
+   only the rest. A chunk cut short keeps the bytes that arrived.
+4. `POST /api/uploads/{id}/finish` moves the folder into the uploads folder
+   and starts a scan, so the album appears in the Inbox. If the folder's
+   name is taken, it gets a number (`Album (2)`); nothing is ever
+   overwritten. While bytes are missing it answers `409`, naming a file.
+   `DELETE /api/uploads/{id}` cancels.
+
+Until it's finished, an upload is kept in `.coversync-uploads` in the uploads
+folder, which the scanner skips. Chunks are written straight into the files
+there at their offsets, and finishing is a rename, so nothing is copied
+twice. Progress is saved every few seconds; after a reboot, files not yet
+complete start over, as what was written but not flushed to disk may have
+been lost. An upload no chunk reaches for a day is removed, as are uploads in
+progress when the uploads folder changes.
+
+A reverse proxy in front must let request bodies of the chunk size through
+and stream them. Caddy sets no body limit and streams by default; nginx's
+`client_max_body_size` is 1 MB unless raised.
+
 ### Moving the Library
 
 The Library keeps its own database in its folder,
@@ -231,7 +281,8 @@ Restart=on-failure
 StateDirectory=coversync
 CacheDirectory=coversync
 # Optional: a folder coversync must never change, such as an Inbox that
-# another program syncs. Imports from it can then only copy.
+# another program syncs. Imports from it can then only copy, and uploads
+# need an uploads folder outside it.
 #ReadOnlyPaths=/path/to/inbox
 ProtectSystem=full
 PrivateTmp=yes
@@ -248,6 +299,7 @@ WantedBy=default.target
 cargo test --workspace && cargo clippy --workspace --all-targets
 (cd web && pnpm check)
 COVERSYNC_PASSWORD=… tools/ui_smoke.py http://127.0.0.1:8770/ shots/   # read-only tour of the UI
+COVERSYNC_PASSWORD=… tools/upload.py http://127.0.0.1:8770/ ~/Music/Album   # upload a folder
 ```
 
 A scratch daemon gets a password with
