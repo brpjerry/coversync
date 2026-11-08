@@ -19,7 +19,7 @@ use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
     AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
-    TagEdit, inbox, rules, tags,
+    TagEdit, inbox, rules, tags, upload,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -63,7 +63,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -78,6 +78,9 @@ impl From<coversync_core::Error> for ApiError {
             NotFound => StatusCode::NOT_FOUND,
             Tags(_) | Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Remote(_) => StatusCode::BAD_GATEWAY,
+            ReadOnly(_) => StatusCode::FORBIDDEN,
+            NoSpace(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Conflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -189,18 +192,18 @@ struct Variable {
 
 /// What a configured folder looks like on disk, as coversyncd sees it.
 #[derive(Serialize)]
-struct FolderStatus {
+pub(crate) struct FolderStatus {
     path: String,
     exists: bool,
     dir: bool,
     writable: bool,
-    /// Missing folders are created on first import if this is true.
+    /// Missing folders are created on first import (or upload) if this is true.
     creatable: bool,
     /// Tracks in the coversync Library this folder holds, if it holds one.
     library: Option<u64>,
 }
 
-fn folder_status(path: &str) -> FolderStatus {
+pub(crate) fn folder_status(path: &str) -> FolderStatus {
     let p = std::path::Path::new(path);
     let meta = p.metadata().ok();
     FolderStatus {
@@ -210,6 +213,15 @@ fn folder_status(path: &str) -> FolderStatus {
         writable: import::writable(p),
         creatable: import::creatable(p),
         library: coversync_core::Library::library_in(p),
+    }
+}
+
+/// [`folder_status`] for an uploads folder, which the first upload makes
+/// only if the folder holding it is there (see `upload::check_parent`).
+pub(crate) fn uploads_folder_status(path: &str) -> FolderStatus {
+    FolderStatus {
+        creatable: upload::can_write(std::path::Path::new(path)),
+        ..folder_status(path)
     }
 }
 
@@ -300,13 +312,15 @@ async fn save_library_setup(
     Json(setup): Json<LibrarySetup>,
 ) -> ApiResult<Json<SetupResponse>> {
     // Switching the Library mustn't happen under a scan, import or tag write.
-    let guard = state.jobs.lock().await;
-    let result = blocking(&state, move |s| {
+    save_exclusively(&state, move |s| {
         let before = s.lib.library_setup()?;
         let setup = setup.normalize()?;
         must_be_folder(setup.folder.as_deref(), "library folder")?;
-        inbox::check_folders(
-            s.lib.inbox_setup()?.folder.as_deref(),
+        let inbox_setup = s.lib.inbox_setup()?;
+        inbox::check_folders(inbox_setup.folder.as_deref(), setup.folder.as_deref())?;
+        inbox::check_uploads(
+            inbox_setup.uploads.as_deref(),
+            inbox_setup.folder.as_deref(),
             setup.folder.as_deref(),
         )?;
         let saved = s.lib.set_library_setup(setup.clone())?;
@@ -321,18 +335,34 @@ async fn save_library_setup(
             moved,
         ))
     })
-    .await;
-    drop(guard);
-    // A scan asked for while this held the lock runs now too.
-    if result.as_ref().is_ok_and(|(_, moved)| *moved)
-        || state
-            .rescan
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        spawn_scan(state.clone());
-    }
-    let (response, _) = result?;
-    Ok(Json(response))
+    .await
+    .map(Json)
+}
+
+/// Run a setup save on a blocking thread, holding the jobs lock: not under
+/// a scan, import or tag write, nor beside another save. It runs in a task
+/// of its own, which holds the lock until the save is done, even if the
+/// request is dropped (its client gone). Then a scan runs if the save moved
+/// a folder (the `bool` it returns), or one was asked for meanwhile.
+async fn save_exclusively<T: Send + 'static>(
+    state: &Shared,
+    save: impl FnOnce(&crate::AppState) -> coversync_core::Result<(T, bool)> + Send + 'static,
+) -> ApiResult<T> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let guard = state.jobs.lock().await;
+        let result = blocking(&state, save).await;
+        drop(guard);
+        if result.as_ref().is_ok_and(|(_, moved)| *moved)
+            || state
+                .rescan
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            spawn_scan(state.clone());
+        }
+        result.map(|(saved, _)| saved)
+    })
+    .await?
 }
 
 async fn inbox_coverage(State(state): State<Shared>) -> ApiResult<Json<TagCoverage>> {
@@ -348,6 +378,9 @@ async fn inbox_coverage(State(state): State<Shared>) -> ApiResult<Json<TagCovera
 struct InboxSetupResponse {
     setup: InboxSetup,
     folder: Option<FolderStatus>,
+    /// Where uploads go: the uploads folder, or the Inbox folder's
+    /// `Uploads`.
+    uploads: Option<FolderStatus>,
     hidden: HiddenStats,
     suggest: SuggestStatus,
 }
@@ -368,6 +401,9 @@ fn inbox_response(
     let key = s.lib.acoustid_key()?;
     Ok(InboxSetupResponse {
         folder: setup.folder.as_deref().map(folder_status),
+        uploads: setup
+            .uploads_folder()
+            .map(|f| uploads_folder_status(&f.display().to_string())),
         setup,
         hidden: s.lib.hidden_stats()?,
         suggest: SuggestStatus {
@@ -395,7 +431,11 @@ struct SaveInboxSetup {
     acoustid_key: Option<String>,
 }
 
-/// A new Inbox folder must exist; changing it rescans.
+/// A new Inbox folder must exist; changing it, or the uploads folder,
+/// rescans. A new uploads folder cancels uploads under way into the old one.
+/// Saves take turns with each other and with Library setup, scans, imports
+/// and tag writes, so the folders checked are the folders saved, and the
+/// uploads follow the setup last saved.
 async fn save_inbox_setup(
     State(state): State<Shared>,
     Json(body): Json<SaveInboxSetup>,
@@ -406,8 +446,8 @@ async fn save_inbox_setup(
         .map(inbox::acoustid_key)
         .transpose()?;
     let setup = body.setup;
-    let (response, moved) = blocking(&state, move |s| {
-        let before = s.lib.inbox_setup()?.folder;
+    save_exclusively(&state, move |s| {
+        let before = s.lib.inbox_setup()?;
         let setup = setup.normalize()?;
         if let Some(f) = &setup.folder
             && !std::path::Path::new(f).is_dir()
@@ -416,9 +456,16 @@ async fn save_inbox_setup(
                 "The Inbox folder {f} doesn't exist or isn't a folder."
             )));
         }
-        inbox::check_folders(
+        must_be_folder(setup.uploads.as_deref(), "uploads folder")?;
+        if let Some(u) = &setup.uploads {
+            upload::check_parent(std::path::Path::new(u))?;
+        }
+        let library = s.lib.library_setup()?.folder;
+        inbox::check_folders(setup.folder.as_deref(), library.as_deref())?;
+        inbox::check_uploads(
+            setup.uploads.as_deref(),
             setup.folder.as_deref(),
-            s.lib.library_setup()?.folder.as_deref(),
+            library.as_deref(),
         )?;
         if let Some(key) = key {
             s.lib.set_acoustid_key(key.as_deref())?;
@@ -426,14 +473,12 @@ async fn save_inbox_setup(
         let saved = s.lib.set_inbox_setup(setup)?;
         // Suggestions found with the old key (or settings) shouldn't linger.
         s.identify.clear();
-        let moved = before != saved.folder;
+        crate::uploads::follow_folder(s);
+        let moved = before.folder != saved.folder || before.uploads != saved.uploads;
         Ok((inbox_response(s, saved)?, moved))
     })
-    .await?;
-    if moved {
-        spawn_scan(state.clone());
-    }
-    Ok(Json(response))
+    .await
+    .map(Json)
 }
 
 #[derive(Serialize)]
@@ -515,6 +560,9 @@ async fn save_sync_setup(
 #[derive(Deserialize)]
 struct FolderQuery {
     path: String,
+    /// Checked as an uploads folder (see [`uploads_folder_status`]).
+    #[serde(default)]
+    uploads: bool,
 }
 
 /// Live feedback while a folder path is typed in setup.
@@ -525,7 +573,13 @@ async fn folder_check(
     blocking(&state, move |_| {
         Ok(rules::folder_setting(Some(q.path), "folder")?
             .as_deref()
-            .map(folder_status))
+            .map(|p| {
+                if q.uploads {
+                    uploads_folder_status(p)
+                } else {
+                    folder_status(p)
+                }
+            }))
     })
     .await
     .map(Json)

@@ -15,12 +15,25 @@
 		id: string;
 		label: string;
 		placeholder: string;
-		/** Inbox folders must exist; a Library folder can be created on first import. */
-		purpose: 'inbox' | 'library';
+		/**
+		 * Inbox folders must exist; a Library folder can be created on first import, and an
+		 * uploads folder by the first upload.
+		 */
+		purpose: 'inbox' | 'library' | 'uploads';
 		/** The folder as saved, to tell switching to another library from keeping this one. */
 		saved?: string;
+		/** The folder used while the field is empty, checked in its place. */
+		fallback?: string;
 	}
-	let { value = $bindable(), id, label, placeholder, purpose, saved }: Props = $props();
+	let {
+		value = $bindable(),
+		id,
+		label,
+		placeholder,
+		purpose,
+		saved,
+		fallback = ''
+	}: Props = $props();
 
 	let status = $state<FolderStatus | null>(null);
 	let error = $state<string | null>(null);
@@ -31,7 +44,7 @@
 	// again after signing back in (an answer while signed out was a 401).
 	$effect(() => {
 		void session.generation;
-		const path = value.trim();
+		const path = value.trim() || fallback.trim();
 		const mine = ++seq;
 		error = null;
 		if (!path) {
@@ -42,7 +55,7 @@
 		checking = true;
 		const timer = setTimeout(async () => {
 			try {
-				const s = await api.checkFolder(path);
+				const s = await api.checkFolder(path, purpose === 'uploads');
 				if (mine === seq) status = s;
 			} catch (e) {
 				if (mine === seq) {
@@ -59,15 +72,24 @@
 	type Tone = 'ok' | 'info' | 'library' | 'warn' | 'error';
 	let verdict = $derived.by((): { tone: Tone; text: string } | null => {
 		if (error) return { tone: 'error', text: error };
-		if (!value.trim())
+		if (!value.trim() && !fallback.trim())
 			return purpose === 'library'
 				? { tone: 'warn', text: 'Not set. Imports need a library folder.' }
-				: { tone: 'warn', text: 'Not set. Nothing is scanned.' };
+				: purpose === 'uploads'
+					? { tone: 'warn', text: 'Not set. Uploads need an Inbox folder or an uploads folder.' }
+					: { tone: 'warn', text: 'Not set. Nothing is scanned.' };
 		if (!status) return null;
 		if (status.exists && !status.dir)
 			return { tone: 'error', text: "That's a file, not a folder." };
 		if (!status.exists) {
 			if (purpose === 'inbox') return { tone: 'error', text: 'Folder not found.' };
+			if (purpose === 'uploads')
+				return status.creatable
+					? { tone: 'info', text: "Doesn't exist yet; created by the first upload." }
+					: {
+							tone: 'error',
+							text: "Doesn't exist, and coversyncd can't create it: the folder holding it has to be there, and writable to coversyncd."
+						};
 			return status.creatable
 				? { tone: 'info', text: "Doesn't exist yet; created on the first import." }
 				: { tone: 'error', text: "Doesn't exist, and coversyncd can't create it there." };
@@ -75,7 +97,13 @@
 		if (!status.writable)
 			return purpose === 'inbox'
 				? { tone: 'warn', text: 'Found. Read-only to coversyncd, so only Copy works.' }
-				: { tone: 'error', text: 'Read-only to coversyncd; imports would fail.' };
+				: purpose === 'uploads'
+					? {
+							tone: 'error',
+							text: 'Read-only to coversyncd, so uploads would fail. Choose a folder it can write to.'
+						}
+					: { tone: 'error', text: 'Read-only to coversyncd; imports would fail.' };
+		if (purpose === 'uploads') return { tone: 'ok', text: 'Ready for uploads.' };
 		if (purpose === 'library' && status.library !== null && value.trim() !== saved) {
 			const n = status.library;
 			const holds =

@@ -67,6 +67,11 @@
 	});
 	let showInput = $derived(!inboxSetup.keyHint || replacing);
 
+	/** Where uploads go when no uploads folder is set. */
+	let uploadsDefault = $derived(
+		inboxSetup.folder.trim() ? `${inboxSetup.folder.trim().replace(/\/+$/, '')}/Uploads` : ''
+	);
+
 	/** Move deletes originals; a read-only Inbox folder can't allow that. */
 	let moveBlocked = $derived(!!inboxSetup.folderStatus && !inboxSetup.folderStatus.writable);
 	let confirming = $state(false);
@@ -109,7 +114,7 @@
 					</p>
 				</div>
 			</header>
-			<div class="card-body">
+			<div class="card-body folders">
 				<FolderField
 					id="inbox-folder"
 					label="Folder"
@@ -117,6 +122,21 @@
 					purpose="inbox"
 					bind:value={inboxSetup.folder}
 				/>
+				<FolderField
+					id="uploads-folder"
+					label="Uploads folder"
+					placeholder={uploadsDefault || 'Uploads, in the Inbox folder'}
+					purpose="uploads"
+					fallback={uploadsDefault}
+					bind:value={inboxSetup.uploads}
+				/>
+				<p class="field-help">
+					Albums uploaded to coversync land here, a folder each, and show up in the Inbox. Leave it
+					empty for Uploads in the Inbox folder, or choose a folder outside it, which is scanned
+					along with it, for an Inbox coversyncd can't write to. Albums uploaded to a folder you
+					change away from stay there on disk but leave the Inbox: move them into the new folder, or
+					import them first.
+				</p>
 			</div>
 		</section>
 
@@ -614,6 +634,16 @@
 	}
 	.warn p {
 		margin: 0;
+	}
+
+	.folders {
+		display: grid;
+		gap: 16px;
+	}
+	.field-help {
+		margin: -6px 0 0;
+		font-size: 12.5px;
+		color: var(--text-3);
 	}
 
 	.toggles {

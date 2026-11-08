@@ -136,7 +136,7 @@ export interface FolderStatus {
 	exists: boolean;
 	dir: boolean;
 	writable: boolean;
-	/** A missing folder can be created (on first import). */
+	/** A missing folder can be created (on first import or upload). */
 	creatable: boolean;
 	/** Tracks in the coversync library this folder already holds, if it holds one. */
 	library: number | null;
@@ -259,6 +259,8 @@ export interface Autofill {
 export interface InboxSetup {
 	ingest: IngestMode;
 	folder: string | null;
+	/** Where uploads go; null means Uploads in the Inbox folder. */
+	uploads: string | null;
 	autofill: Autofill;
 	suggestions: {
 		enabled: boolean;
@@ -279,6 +281,8 @@ export interface HiddenStats {
 export interface InboxSetupResponse {
 	setup: InboxSetup;
 	folder: FolderStatus | null;
+	/** The folder uploads go to, as set or by default; null without an Inbox folder. */
+	uploads: FolderStatus | null;
 	hidden: HiddenStats;
 	suggest: {
 		/** The saved AcoustID key's last characters; the key itself stays on the server. */
@@ -502,8 +506,11 @@ export const api = {
 		),
 	preview: (structure: string) =>
 		request<StructurePreview>(`/api/library/preview?structure=${encodeURIComponent(structure)}`),
-	checkFolder: (path: string) =>
-		request<FolderStatus | null>(`/api/fs/check?path=${encodeURIComponent(path)}`),
+	/** `uploads`: check it as an uploads folder, which only the folder holding it can make. */
+	checkFolder: (path: string, uploads = false) =>
+		request<FolderStatus | null>(
+			`/api/fs/check?path=${encodeURIComponent(path)}${uploads ? '&uploads=true' : ''}`
+		),
 	importPlan: (album_id: string, edits: ImportEdits = {}) =>
 		request<ImportPlan>('/api/import/plan', {
 			method: 'POST',

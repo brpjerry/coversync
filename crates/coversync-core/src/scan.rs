@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 use crate::cover::CoverCache;
 use crate::db::FileStat;
 use crate::model::{Collection, ScanProgress};
-use crate::{Library, Result, tags};
+use crate::{Library, Result, tags, upload};
 
 const BATCH: usize = 256;
 
@@ -115,6 +115,8 @@ fn walk(roots: &[(PathBuf, Collection)], progress: &Progress) -> Vec<FileStat> {
         for entry in WalkDir::new(root)
             .follow_links(true)
             .into_iter()
+            // Uploads being staged stay out of the Inbox until they're finished.
+            .filter_entry(|e| !(e.file_type().is_dir() && e.file_name() == upload::STAGING))
             .filter_map(|e| e.ok())
         {
             let name = entry.file_name().to_string_lossy();

@@ -3,6 +3,7 @@
 mod api;
 mod auth;
 mod suggest;
+mod uploads;
 mod web;
 
 use std::net::SocketAddr;
@@ -16,6 +17,7 @@ use clap::{Parser, Subcommand};
 use coversync_core::cover::CoverCache;
 use coversync_core::lookups::{self, LookupCache};
 use coversync_core::scan::{self, Progress};
+use coversync_core::upload::Uploads;
 use coversync_core::{Collection, Library, ScanProgress};
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
@@ -74,30 +76,53 @@ pub struct AppState {
     pub identify: suggest::Jobs,
     /// The password, sessions and app tokens.
     pub auth: auth::Auth,
+    /// Uploads under way into the Inbox.
+    pub uploads: Uploads,
 }
 
 impl AppState {
     /// The folders to index, from the Inbox and Library settings.
     pub fn roots(&self) -> Vec<(PathBuf, Collection)> {
-        let inbox = self.lib.inbox_setup().ok().and_then(|s| s.folder);
+        let setup = self.lib.inbox_setup().ok();
+        let inbox = setup.as_ref().and_then(|s| s.folder.clone());
+        let uploads = setup.and_then(|s| s.uploads);
         let library = self.lib.library_setup().ok().and_then(|s| s.folder);
-        [(inbox, Collection::Inbox), (library, Collection::Library)]
-            .into_iter()
-            .filter_map(|(folder, c)| {
-                let path = PathBuf::from(folder?);
-                match path.canonicalize() {
-                    Ok(p) => Some((p, c)),
-                    Err(e) => {
-                        // A library folder is created on first import.
-                        if c == Collection::Inbox {
-                            tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
+        index_roots(inbox, uploads, library)
     }
+}
+
+/// The folders to index: the Inbox and Library folders that are there, and
+/// an uploads folder outside the Inbox folder, indexed as part of the Inbox
+/// (one inside it is anyway).
+fn index_roots(
+    inbox: Option<String>,
+    uploads: Option<String>,
+    library: Option<String>,
+) -> Vec<(PathBuf, Collection)> {
+    let mut roots: Vec<_> = [(inbox, Collection::Inbox), (library, Collection::Library)]
+        .into_iter()
+        .filter_map(|(folder, c)| {
+            let path = PathBuf::from(folder?);
+            match path.canonicalize() {
+                Ok(p) => Some((p, c)),
+                Err(e) => {
+                    // A library folder is created on first import.
+                    if c == Collection::Inbox {
+                        tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+    // Created by the first upload, so it may not exist yet; and the Inbox
+    // and Library folders may not be there either.
+    if let Some(uploads) = uploads.and_then(|u| PathBuf::from(u).canonicalize().ok())
+        && !roots.iter().any(|(r, _)| uploads.starts_with(r))
+    {
+        roots.push((uploads, Collection::Inbox));
+    }
+    roots
 }
 
 pub type Shared = Arc<AppState>;
@@ -105,6 +130,7 @@ pub type Shared = Arc<AppState>;
 /// The API, the login routes and the UI, behind the login guard.
 fn app(state: Shared) -> Router {
     api::router()
+        .merge(uploads::router())
         .merge(auth::router())
         .merge(web::router())
         // Every /api route but the few auth::router opens needs a login.
@@ -227,11 +253,14 @@ async fn run() -> anyhow::Result<()> {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
+        uploads: Uploads::default(),
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
+    uploads::follow_folder(&state);
     spawn_scan(state.clone());
+    tokio::spawn(uploads::housekeeping(state.clone()));
 
-    let app = app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let app = app(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
     axum::serve(listener, app)
@@ -245,6 +274,8 @@ async fn run() -> anyhow::Result<()> {
             }
         })
         .await?;
+    // Where uploads got to, so they carry on from there.
+    tokio::task::spawn_blocking(move || state.uploads.save()).await?;
     Ok(())
 }
 
@@ -263,5 +294,42 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),
+        uploads: Uploads::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_uploads_folder_alone_is_indexed() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Uploads")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let s = |p: &str| Some(dir.join(p).display().to_string());
+        // The Inbox disk isn't mounted, and nothing was imported yet.
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        assert_eq!(
+            index_roots(None, s("Uploads"), None),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        std::fs::create_dir_all(dir.join("Inbox/Uploads")).unwrap();
+        std::fs::create_dir_all(dir.join("Library")).unwrap();
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [
+                (dir.join("Inbox"), Collection::Inbox),
+                (dir.join("Library"), Collection::Library),
+                (dir.join("Uploads"), Collection::Inbox),
+            ]
+        );
+        // One inside the Inbox folder is indexed with it.
+        assert_eq!(index_roots(s("Inbox"), s("Inbox/Uploads"), None).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

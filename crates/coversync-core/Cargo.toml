@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 flate2 = "1.1.10"
+getrandom = "0.4.3"
 libc = "0.2.191"
 lofty = "0.25.5"
 rayon = "1.12.0"
