@@ -8,7 +8,6 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::Unreachable;
-use crate::headers::COOKIE_NAME;
 
 const HTML: &str = "text/html; charset=utf-8";
 
@@ -51,14 +50,14 @@ pub(crate) fn see_other(to: &str) -> Response {
 /// It isn't a 303. The window may have come from the app's bundled page, a
 /// different site, and a browser may then hold back a SameSite=Strict cookie
 /// on the redirect that follows. A navigation this page starts is same-site.
-pub(crate) fn enter(cookie: &str, to: &str) -> Response {
+pub(crate) fn enter(cookie_name: &str, cookie: &str, to: &str) -> Response {
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>coversync</title>\
          <script>location.replace({})</script><a href=\"{}\">Continue</a>\n",
         js_string(to),
         html_escape(to)
     );
-    let cookie = format!("{COOKIE_NAME}={cookie}; Path=/; HttpOnly; SameSite=Strict");
+    let cookie = format!("{cookie_name}={cookie}; Path=/; HttpOnly; SameSite=Strict");
     Response::builder()
         .header(SET_COOKIE, cookie)
         .header(CONTENT_TYPE, HTML)

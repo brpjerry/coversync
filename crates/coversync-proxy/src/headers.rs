@@ -8,9 +8,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::upstream::Upstream;
 
-/// The proxy's own cookie, which proves a request comes from the app's window.
-pub(crate) const COOKIE_NAME: &str = "coversync-app";
-
 /// Headers that describe one connection, not the request or response.
 const HOP_BY_HOP: [&str; 9] = [
     "connection",
@@ -99,10 +96,11 @@ fn cookie_name(pair: &[u8]) -> &[u8] {
     name.trim_ascii()
 }
 
-/// Whether the request carries the proxy's cookie with this value.
-pub(crate) fn has_own_cookie(headers: &HeaderMap, value: &str) -> bool {
+/// Whether the request carries the proxy's cookie, `name`, with this value:
+/// proof that it comes from the app's window.
+pub(crate) fn has_own_cookie(headers: &HeaderMap, name: &str, value: &str) -> bool {
     cookie_pairs(headers).any(|pair| {
-        cookie_name(pair) == COOKIE_NAME.as_bytes()
+        cookie_name(pair) == name.as_bytes()
             && pair
                 .splitn(2, |&b| b == b'=')
                 .nth(1)
@@ -126,12 +124,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(
             COOKIE,
-            HeaderValue::from_static("session=abc; coversync-app=k1"),
+            HeaderValue::from_static("session=abc; coversync-app-1=k1"),
         );
-        headers.append(COOKIE, HeaderValue::from_static("theme=dark"));
-        assert!(has_own_cookie(&headers, "k1"));
-        assert!(!has_own_cookie(&headers, "k2"));
-        assert!(!has_own_cookie(&headers, "k"));
+        headers.append(COOKIE, HeaderValue::from_static("coversync-app-2=k2"));
+        assert!(has_own_cookie(&headers, "coversync-app-1", "k1"));
+        assert!(has_own_cookie(&headers, "coversync-app-2", "k2"));
+        assert!(!has_own_cookie(&headers, "coversync-app-1", "k2"));
+        assert!(!has_own_cookie(&headers, "coversync-app-1", "k"));
     }
 
     #[test]

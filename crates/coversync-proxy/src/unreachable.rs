@@ -10,8 +10,11 @@ use rustls::CertificateError;
 
 use crate::upstream::Upstream;
 
-/// The server couldn't be reached, or answered the way a reverse proxy does
-/// when the server behind it is down (502, 503 or 504).
+/// Why the server's UI can't be shown: the server couldn't be reached,
+/// didn't answer in time, answered the way a reverse proxy does when the
+/// server behind it is down (502, 503 or 504), or sent the page off to
+/// another origin. [`Proxy::check`](crate::Proxy::check) also gets one for an
+/// address that isn't a coversync server it can use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreachable {
     /// The server's URL.
@@ -64,18 +67,38 @@ impl Unreachable {
         })
     }
 
-    /// A check's answer that isn't a UI.
+    /// An error status, or a redirect that says nowhere.
     pub(crate) fn answered(upstream: &Upstream, status: StatusCode) -> Self {
-        Self::from_status(upstream, status).unwrap_or_else(|| {
-            if status == StatusCode::NOT_FOUND {
-                Self::new(
-                    upstream,
-                    "It answered 404 Not Found: there's no coversync at that address.",
-                )
-            } else {
-                Self::new(upstream, format!("It answered {status}."))
-            }
-        })
+        Self::from_status(upstream, status)
+            .unwrap_or_else(|| Self::new(upstream, format!("It answered {status}.")))
+    }
+
+    /// What `/api/hello` answered, when it isn't coversync's hello.
+    pub(crate) fn hello_answered(upstream: &Upstream, status: StatusCode) -> Self {
+        match status {
+            StatusCode::NOT_FOUND => Self::new(
+                upstream,
+                "It has no /api/hello: there's no coversync at that address, or it's a \
+                 coversync too old for this app.",
+            ),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Self::new(
+                upstream,
+                format!(
+                    "It answered {status} for /api/hello, which coversync leaves open: \
+                     something in front of it wants a login this app can't give."
+                ),
+            ),
+            _ => Self::answered(upstream, status),
+        }
+    }
+
+    /// `/api/hello` answered, but not as coversync.
+    pub(crate) fn not_coversync(upstream: &Upstream) -> Self {
+        Self::new(
+            upstream,
+            "Something answers there, but it isn't coversync, or it's a coversync too \
+             old for this app.",
+        )
     }
 
     /// The server sends its page on to another origin, `to`, which the

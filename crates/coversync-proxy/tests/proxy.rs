@@ -11,8 +11,8 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::header::{
     ACCEPT, ACCEPT_RANGES, ALT_SVC, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH,
-    CONTENT_RANGE, CONTENT_TYPE, COOKIE, HOST, IF_RANGE, LOCATION, ORIGIN, PROXY_AUTHORIZATION,
-    RANGE, REFERER, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, ETAG, HOST, IF_NONE_MATCH, IF_RANGE, LOCATION, ORIGIN,
+    PROXY_AUTHORIZATION, RANGE, REFERER, SET_COOKIE, STRICT_TRANSPORT_SECURITY,
 };
 use axum::http::{HeaderValue, Method, Response, StatusCode};
 use axum::response::{IntoResponse, Redirect};
@@ -20,7 +20,7 @@ use bytes::Bytes;
 use common::{
     Log, WAIT, Window, bytes, channel_body, client, echo, pattern, serve, text, upstream,
 };
-use coversync_proxy::{Proxy, Unreachable};
+use coversync_proxy::{Cookies, Proxy, Unreachable};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::net::TcpListener;
@@ -64,7 +64,8 @@ async fn the_entry_url_sets_the_cookie_and_moves_on() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()[CACHE_CONTROL], "no-store");
     let cookie = res.headers()[SET_COOKIE].to_str().unwrap().to_owned();
-    assert!(cookie.starts_with("coversync-app="), "{cookie}");
+    let name = format!("coversync-app-{}=", proxy.addr().port());
+    assert!(cookie.starts_with(&name), "{cookie}");
     for attribute in ["; Path=/", "; HttpOnly", "; SameSite=Strict"] {
         assert!(cookie.contains(attribute), "{cookie}");
     }
@@ -91,7 +92,10 @@ async fn requests_without_the_cookie_are_refused() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN, "no cookie");
 
     let wrong = Request::get(window.url(path))
-        .header(COOKIE, "coversync-app=0000")
+        .header(
+            COOKIE,
+            format!("coversync-app-{}=0000", window.proxy.addr().port()),
+        )
         .body(Body::empty())
         .unwrap();
     assert_eq!(window.send(wrong).await.status(), StatusCode::FORBIDDEN);
@@ -586,9 +590,9 @@ async fn reports_a_server_down_behind_its_reverse_proxy() {
             let down = down.load(Ordering::SeqCst);
             async move {
                 if down {
-                    StatusCode::BAD_GATEWAY
+                    StatusCode::BAD_GATEWAY.into_response()
                 } else {
-                    StatusCode::OK
+                    hello().into_response()
                 }
             }
         }
@@ -679,15 +683,28 @@ async fn keeps_its_port_when_it_can() {
     assert_ne!(second.addr().port(), free);
 }
 
+/// coversync's `/api/hello`.
+fn hello() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/json")],
+        r#"{"app":"coversync","name":"test","version":"0.1.0","api":["1"]}"#,
+    )
+}
+
 #[tokio::test]
-async fn check_wants_a_ui() {
+async fn check_wants_coversync() {
     let router = Router::new().fallback(|req: Request| async move {
         let host = req.headers()[HOST].to_str().unwrap().to_owned();
         match req.uri().path() {
-            "/ui/" => StatusCode::OK.into_response(),
-            "/login/" => StatusCode::UNAUTHORIZED.into_response(),
-            "/same/" => Redirect::permanent("/ui/").into_response(),
-            "/https/" => Redirect::permanent(&format!("https://{host}/https/")).into_response(),
+            "/coversync/api/hello" => hello().into_response(),
+            // Another app's catch-all page.
+            "/spa/api/hello" => (StatusCode::OK, "<!doctype html>").into_response(),
+            "/old/api/hello" => StatusCode::NOT_FOUND.into_response(),
+            "/guarded/api/hello" => StatusCode::UNAUTHORIZED.into_response(),
+            "/moved/api/hello" => Redirect::permanent("/coversync/api/hello").into_response(),
+            "/https/api/hello" => {
+                Redirect::permanent(&format!("https://{host}/https/api/hello")).into_response()
+            }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     });
@@ -697,27 +714,112 @@ async fn check_wants_a_ui() {
         let proxy = proxy.clone();
         async move { proxy.check(&upstream(addr, prefix)).await }
     };
+    let reason = |prefix| async move { check(prefix).await.unwrap_err().reason };
 
-    assert_eq!(check("/ui/").await, Ok(()));
-    assert_eq!(check("/login/").await, Ok(()), "a login page is a UI");
+    assert_eq!(check("/coversync/").await, Ok(()));
     assert_eq!(
-        check("/same/").await,
+        check("/moved/").await,
         Ok(()),
-        "a redirect on its own origin"
+        "a redirect on its own origin is followed"
     );
+    assert!(reason("/spa/").await.contains("isn't coversync"));
+    assert!(reason("/old/").await.contains("too old for this app"));
+    assert!(reason("/coversycn/").await.contains("no /api/hello"));
+    assert!(reason("/guarded/").await.contains("wants a login"));
+    let upgrade = reason("/https/").await;
+    assert!(
+        upgrade.contains(&format!("on to https://{addr}/https/api/hello")),
+        "{upgrade}"
+    );
+}
 
-    let typo = check("/coversycn/").await.unwrap_err();
-    assert!(
-        typo.reason.starts_with("It answered 404 Not Found"),
-        "{typo:?}"
+#[tokio::test]
+async fn check_uses_the_servers_cookies() {
+    let log = Log::default();
+    let router = Router::new().fallback({
+        let log = log.clone();
+        move |req: Request| {
+            log.record(&req);
+            async move {
+                // A server that rotates its session on every answer.
+                ([(SET_COOKIE, "session=rotated; Path=/")], hello()).into_response()
+            }
+        }
+    });
+    let addr = serve(router).await;
+    let up = upstream(addr, "/coversync/");
+    let window = Window::open_with(Proxy::builder().upstream(Some(up.clone()))).await;
+
+    window.get("/coversync/").await;
+    assert!(window.proxy.check(&up).await.is_ok());
+    let seen = log.last().headers;
+    assert_eq!(
+        seen[COOKIE], "session=rotated",
+        "the check sends the jar's cookies"
     );
-    let upgrade = check("/https/").await.unwrap_err();
+    window.get("/coversync/api/status").await;
+    assert_eq!(log.last().headers[COOKIE], "session=rotated");
+}
+
+#[tokio::test]
+async fn an_answer_after_a_switch_keeps_its_cookies_with_its_server() {
+    // Server A answers only when the test lets it, after the switch.
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    let held = Arc::new(Mutex::new(Some(held)));
+    let log_a = Log::default();
+    let a = serve(Router::new().fallback({
+        let (held, log_a) = (held.clone(), log_a.clone());
+        move |req: Request| {
+            log_a.record(&req);
+            let held = held.lock().unwrap().take();
+            async move {
+                if let Some(held) = held {
+                    held.await.unwrap();
+                }
+                ([(SET_COOKIE, "session=a; Path=/")], "late").into_response()
+            }
+        }
+    }))
+    .await;
+    let log_b = Log::default();
+    let b = serve(echo(log_b.clone())).await;
+    let window = Window::open(a, "/coversync/").await;
+
+    let late = tokio::spawn({
+        let window = window.clone();
+        async move { window.get("/coversync/api/slow").await }
+    });
+    // Wait for A to have the request, then switch to B while it's held.
+    while log_a.len() == 0 {
+        tokio::task::yield_now().await;
+    }
+    window.proxy.set_upstream(Some(upstream(b, "/coversync/")));
+    release.send(()).unwrap();
+    let res = late.await.unwrap();
+    assert!(!res.headers().contains_key(SET_COOKIE));
+
+    window.get("/coversync/api/status").await;
     assert!(
-        upgrade
-            .reason
-            .contains(&format!("on to https://{addr}/https/")),
-        "{upgrade:?}"
+        !log_b.last().headers.contains_key(COOKIE),
+        "A's late cookie isn't B's"
     );
+    window.proxy.set_upstream(Some(upstream(a, "/coversync/")));
+    window.get("/coversync/api/status").await;
+    assert_eq!(log_a.last().headers[COOKIE], "session=a");
+}
+
+#[tokio::test]
+async fn a_random_port_avoids_other_servers_ports() {
+    let first = Proxy::builder().start().await.unwrap();
+    let taken: Vec<u16> = (0..200)
+        .map(|i| first.addr().port().wrapping_add(i))
+        .collect();
+    let proxy = Proxy::builder()
+        .avoid_ports(taken.clone())
+        .start()
+        .await
+        .unwrap();
+    assert!(!taken.contains(&proxy.addr().port()));
 }
 
 #[tokio::test]
@@ -787,4 +889,66 @@ async fn a_page_load_sent_off_to_another_origin_is_reported() {
             .contains(&format!("on to https://{addr}/coversync/")),
         "{report:?}"
     );
+}
+
+/// What a webview's HTTP cache does, in short: keeps an answer's `ETag`
+/// under its full URL (the origin, port included), and sends it back as
+/// `If-None-Match` the next time that URL is loaded.
+#[derive(Default)]
+struct BrowserCache(std::collections::HashMap<String, HeaderValue>);
+
+impl BrowserCache {
+    async fn get(&mut self, window: &Window, path: &str) {
+        let url = window.url(path);
+        let mut req = window.request(Method::GET, path);
+        if let Some(etag) = self.0.get(&url) {
+            req = req.header(IF_NONE_MATCH, etag.clone());
+        }
+        let res = window.send(req.body(Body::empty()).unwrap()).await;
+        if let Some(etag) = res.headers().get(ETAG) {
+            self.0.insert(url, etag.clone());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_browser_cache_stays_with_its_server() {
+    // Two servers with the same path, each with its own version of it.
+    let server = |etag: &'static str, log: Log| {
+        Router::new().fallback(move |req: Request| {
+            log.record(&req);
+            async move { ([(ETAG, etag)], "page") }
+        })
+    };
+    let (log_a, log_b) = (Log::default(), Log::default());
+    let a = serve(server("\"from-a\"", log_a.clone())).await;
+    let b = serve(server("\"from-b\"", log_b.clone())).await;
+    let jar = Cookies::default();
+    let open = |addr| {
+        Window::open_with(
+            Proxy::builder()
+                .upstream(Some(upstream(addr, "/coversync/")))
+                .cookies(jar.clone()),
+        )
+    };
+    let mut cache = BrowserCache::default();
+
+    // The app's way: a proxy, so an origin, for each server.
+    let (window_a, window_b) = (open(a).await, open(b).await);
+    cache.get(&window_a, "/coversync/").await;
+    cache.get(&window_a, "/coversync/").await;
+    assert_eq!(log_a.last().headers[IF_NONE_MATCH], "\"from-a\"");
+    cache.get(&window_b, "/coversync/").await;
+    assert!(
+        !log_b.last().headers.contains_key(IF_NONE_MATCH),
+        "B never sees what A's answers left in the cache"
+    );
+
+    // One origin for both, switched from A to B: the cache hands B A's ETag,
+    // and a 304 from B would show A's page.
+    window_a
+        .proxy
+        .set_upstream(Some(upstream(b, "/coversync/")));
+    cache.get(&window_a, "/coversync/").await;
+    assert_eq!(log_b.last().headers[IF_NONE_MATCH], "\"from-a\"");
 }

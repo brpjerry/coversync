@@ -9,10 +9,10 @@
 //! - Paths stay the same. A server at `https://n5pro.internal/coversync/` is
 //!   served at `http://127.0.0.1:<port>/coversync/`, where a UI built with
 //!   `BASE_PATH=/coversync` expects to be.
-//! - The servers' cookies stay in the proxy, apart for each server, and go
-//!   with requests as a browser would send them to the server itself. The
-//!   app's `Authorization` header goes on every request once there is one
-//!   ([`Upstream::with_authorization`]).
+//! - The servers' cookies stay in the proxy ([`Cookies`]), apart for each
+//!   server, and go with requests as a browser would send them to the server
+//!   itself. The app's `Authorization` header goes on every request once
+//!   there is one ([`Upstream::with_authorization`]).
 //! - Only the app's window gets in: any local process can reach a localhost
 //!   port. The window opens [`Proxy::entry_url`], which carries a secret
 //!   made for this launch. The proxy trades it for an HttpOnly cookie and
@@ -27,7 +27,6 @@ mod upstream;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -35,9 +34,10 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, COOKIE, HOST, LOCATION};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Version};
+use axum::http::{HeaderValue, Method, StatusCode, Version};
 use axum::response::Response;
 use axum::serve::ListenerExt;
+use http_body_util::{BodyExt, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -45,7 +45,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
 use url::Url;
 
-use jar::Jar;
+pub use jar::Cookies;
 pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};
 
@@ -61,7 +61,8 @@ type UnreachableHandler = Arc<dyn Fn(Unreachable) + Send + Sync>;
 pub struct Builder {
     upstream: Option<Upstream>,
     port: Option<u16>,
-    cookie_file: Option<PathBuf>,
+    avoid_ports: Vec<u16>,
+    cookies: Option<Cookies>,
     page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
 }
@@ -71,7 +72,8 @@ impl Default for Builder {
         Self {
             upstream: None,
             port: None,
-            cookie_file: None,
+            avoid_ports: Vec::new(),
+            cookies: None,
             page_timeout: PAGE_TIMEOUT,
             on_unreachable: None,
         }
@@ -95,11 +97,18 @@ impl Builder {
         self
     }
 
-    /// Where the servers' persistent cookies are kept between runs (a login,
-    /// say), readable only by the user. Without one, cookies last as long as
-    /// the proxy.
-    pub fn cookie_file(mut self, file: Option<PathBuf>) -> Self {
-        self.cookie_file = file;
+    /// Ports a random port mustn't be: those kept for other servers, whose
+    /// origins (and with them the webview's cache and local storage) are
+    /// theirs alone.
+    pub fn avoid_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.avoid_ports = ports.into_iter().collect();
+        self
+    }
+
+    /// The servers' cookies, which proxies can share. Without one, the proxy
+    /// has its own, kept in memory.
+    pub fn cookies(mut self, cookies: Cookies) -> Self {
+        self.cookies = Some(cookies);
         self
     }
 
@@ -130,14 +139,17 @@ impl Builder {
         };
         let listener = match preferred {
             Some(listener) => listener,
-            None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+            None => random_port(&self.avoid_ports).await?,
         };
         let addr = listener.local_addr()?;
         let shared = Arc::new(Shared {
             client: client()?,
             upstream: RwLock::new(self.upstream.map(Arc::new)),
-            jar: Jar::open(self.cookie_file),
+            jar: self.cookies.unwrap_or_default(),
             secret: random_hex()?,
+            // Cookies belong to a host, not a port: each proxy's has a name
+            // of its own, so proxies on other ports don't overwrite it.
+            cookie_name: format!("coversync-app-{}", addr.port()),
             cookie: random_hex()?,
             origin: format!("http://{addr}"),
             host: HeaderValue::from_str(&addr.to_string()).expect("an address is a valid header"),
@@ -211,56 +223,100 @@ impl Proxy {
         *self.shared.upstream.write().expect("upstream lock") = upstream.map(Arc::new);
     }
 
-    /// Whether `upstream` shows a UI: its page answers with a success, a
-    /// login (401 or 403), or a redirect on its own origin. Doesn't change
-    /// which server the proxy uses.
+    /// Whether `upstream` is a coversync server the app can use: its
+    /// `/api/hello` (open without a login) says `"app": "coversync"`.
+    /// Redirects on the server's own origin are followed; one to another
+    /// origin, an error, or anything else is refused, saying why. The
+    /// server's cookies go with it, and any it sets are kept, as for a page
+    /// load. Doesn't change which server the proxy uses.
     pub async fn check(&self, upstream: &Upstream) -> Result<(), Unreachable> {
-        let url = upstream.url();
-        let page = Url::parse(&url).expect("a server's URL is valid");
-        let uri = upstream
-            .uri(page.path())
-            .ok_or_else(|| Unreachable::new(upstream, "Its address isn't valid."))?;
-        let mut req = Request::get(uri)
-            .header(HOST, upstream.host())
-            .header(ACCEPT, "text/html")
-            .body(Body::empty())
-            .expect("a valid request");
-        if let Some(authorization) = upstream.authorization() {
-            req.headers_mut()
-                .insert(AUTHORIZATION, authorization.clone());
-        }
         let timeout = self.shared.page_timeout;
-        match tokio::time::timeout(timeout, self.shared.client.request(req)).await {
+        match tokio::time::timeout(timeout, self.hello(upstream)).await {
             Err(_) => Err(Unreachable::too_slow(upstream, timeout)),
-            Ok(Err(err)) => Err(Unreachable::from_error(upstream, &err)),
-            Ok(Ok(res)) => check_answer(upstream, &page, res.status(), res.headers()),
+            Ok(answer) => answer,
         }
+    }
+
+    async fn hello(&self, upstream: &Upstream) -> Result<(), Unreachable> {
+        let shared = &self.shared;
+        let mut url = Url::parse(&format!("{}api/hello", upstream.url()))
+            .map_err(|_| Unreachable::new(upstream, "Its address isn't valid."))?;
+        for _ in 0..MAX_REDIRECTS {
+            let uri = upstream
+                .uri(&url[url::Position::BeforePath..])
+                .ok_or_else(|| Unreachable::new(upstream, "Its address isn't valid."))?;
+            let mut req = Request::get(uri)
+                .header(HOST, upstream.host())
+                .header(ACCEPT, "application/json")
+                .body(Body::empty())
+                .expect("a valid request");
+            if let Some(authorization) = upstream.authorization() {
+                req.headers_mut()
+                    .insert(AUTHORIZATION, authorization.clone());
+            }
+            if let Some(cookies) = shared.jar.header(upstream.origin(), &url) {
+                req.headers_mut().insert(COOKIE, cookies);
+            }
+            let res = shared
+                .client
+                .request(req)
+                .await
+                .map_err(|err| Unreachable::from_error(upstream, &err))?;
+            let (mut parts, body) = res.into_parts();
+            shared.jar.take(upstream.origin(), &url, &mut parts.headers);
+            let status = parts.status;
+            if status.is_redirection() {
+                // An http:// address its server sends on to https://, say:
+                // the window would follow it out of the proxy.
+                let location = parts
+                    .headers
+                    .get(LOCATION)
+                    .and_then(|l| l.to_str().ok())
+                    .ok_or_else(|| Unreachable::answered(upstream, status))?;
+                upstream
+                    .keeps_origin(&url, location)
+                    .map_err(|to| Unreachable::redirected(upstream, &to))?;
+                url = url
+                    .join(location)
+                    .map_err(|_| Unreachable::answered(upstream, status))?;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(Unreachable::hello_answered(upstream, status));
+            }
+            let body = Limited::new(body, HELLO_LIMIT)
+                .collect()
+                .await
+                .map(|body| body.to_bytes())
+                .unwrap_or_default();
+            let is_coversync = serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|hello| hello["app"] == "coversync");
+            return if is_coversync {
+                Ok(())
+            } else {
+                Err(Unreachable::not_coversync(upstream))
+            };
+        }
+        Err(Unreachable::new(upstream, "It redirects too many times."))
     }
 }
 
-/// Whether a check's answer shows the UI is there.
-fn check_answer(
-    upstream: &Upstream,
-    page: &Url,
-    status: StatusCode,
-    headers: &HeaderMap,
-) -> Result<(), Unreachable> {
-    if status.is_success() || status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
-    {
-        return Ok(());
+/// Redirects [`Proxy::check`] follows on the server's own origin.
+const MAX_REDIRECTS: usize = 5;
+/// More than `/api/hello` ever says.
+const HELLO_LIMIT: usize = 64 * 1024;
+
+/// A random free port on 127.0.0.1 that isn't one of `avoid`.
+async fn random_port(avoid: &[u16]) -> io::Result<TcpListener> {
+    for _ in 0..32 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        if !avoid.contains(&listener.local_addr()?.port()) {
+            return Ok(listener);
+        }
     }
-    if status.is_redirection() {
-        // An http:// address its server sends on to https://, say: the
-        // window would follow it out of the proxy.
-        let location = headers.get(LOCATION).and_then(|l| l.to_str().ok());
-        return match location {
-            Some(location) => upstream
-                .keeps_origin(page, location)
-                .map_err(|to| Unreachable::redirected(upstream, &to)),
-            None => Err(Unreachable::answered(upstream, status)),
-        };
-    }
-    Err(Unreachable::answered(upstream, status))
+    Err(io::Error::other(
+        "no free port that isn't kept for another server",
+    ))
 }
 
 type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
@@ -268,10 +324,11 @@ type HttpsClient = Client<HttpsConnector<HttpConnector>, Body>;
 struct Shared {
     client: HttpsClient,
     upstream: RwLock<Option<Arc<Upstream>>>,
-    jar: Jar,
+    jar: Cookies,
     /// In the entry URL; traded for the cookie.
     secret: String,
-    /// The value of the proxy's cookie.
+    /// The proxy's cookie: `coversync-app-<port>`.
+    cookie_name: String,
     cookie: String,
     addr: SocketAddr,
     origin: String,
@@ -398,11 +455,15 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
         if req.method() == Method::GET
             && headers::constant_time_eq(key.as_bytes(), proxy.secret.as_bytes())
         {
-            return pages::enter(&proxy.cookie, &start(upstream.as_deref()));
+            return pages::enter(
+                &proxy.cookie_name,
+                &proxy.cookie,
+                &start(upstream.as_deref()),
+            );
         }
         return pages::forbidden();
     }
-    if !headers::has_own_cookie(req.headers(), &proxy.cookie) {
+    if !headers::has_own_cookie(req.headers(), &proxy.cookie_name, &proxy.cookie) {
         return pages::forbidden();
     }
     let Some(upstream) = upstream else {
@@ -453,28 +514,5 @@ mod tests {
         assert_eq!(entry_key(Some("x=1&k=abc")), Some("abc"));
         assert_eq!(entry_key(Some("kk=abc")), None);
         assert_eq!(entry_key(None), None);
-    }
-
-    #[test]
-    fn checks_answers() {
-        let up = Upstream::parse("http://n5pro.internal/coversync/").unwrap();
-        let page = Url::parse(&up.url()).unwrap();
-        let answer = |status: u16, location: Option<&'static str>| {
-            let mut headers = HeaderMap::new();
-            if let Some(location) = location {
-                headers.insert(LOCATION, HeaderValue::from_static(location));
-            }
-            check_answer(&up, &page, StatusCode::from_u16(status).unwrap(), &headers)
-        };
-        for ok in [200, 204, 401, 403] {
-            assert_eq!(answer(ok, None), Ok(()), "{ok}");
-        }
-        assert_eq!(answer(302, Some("/coversync/login")), Ok(()));
-        assert_eq!(answer(308, Some("//n5pro.internal/coversync/x")), Ok(()));
-        assert!(answer(308, Some("https://n5pro.internal/coversync/")).is_err());
-        assert!(answer(302, None).is_err());
-        for refused in [400, 404, 410, 500, 502, 503] {
-            assert!(answer(refused, None).is_err(), "{refused}");
-        }
     }
 }

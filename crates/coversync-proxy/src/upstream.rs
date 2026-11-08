@@ -43,7 +43,7 @@ impl Upstream {
     /// It's read the way a browser reads it, so the prefix is the path the
     /// webview asks for: the scheme's default port goes, dot segments are
     /// resolved, other characters are percent-encoded and an international
-    /// name becomes its `xn--` form. Repeated and trailing slashes go too.
+    /// name becomes its `xn--` form. Trailing slashes go too.
     pub fn parse(input: &str) -> Result<Self, UpstreamError> {
         let input = input.trim();
         if input.is_empty() {
@@ -84,11 +84,7 @@ impl Upstream {
         let host = HeaderValue::from_str(authority.as_str()).map_err(|_| invalid())?;
         let origin = format!("{scheme}://{authority}");
         let base = Url::parse(&origin).map_err(|_| invalid())?;
-        let mut prefix = String::with_capacity(url.path().len());
-        for segment in url.path().split('/').filter(|s| !s.is_empty()) {
-            prefix.push('/');
-            prefix.push_str(segment);
-        }
+        let prefix = url.path().trim_end_matches('/').to_owned();
         Ok(Self {
             scheme,
             authority,
@@ -160,7 +156,9 @@ impl Upstream {
     /// would, so a default port written out (`:443`) or left out matches.
     /// A relative reference (`/coversync/`) needs no change and gives `None`.
     pub(crate) fn own_location(&self, location: &str) -> Option<String> {
-        let absolute = location.starts_with("//") || location.contains("://");
+        // Absolute: a scheme at the start, or scheme-relative. A URL in a
+        // relative reference's query (`login?next=https://…`) isn't.
+        let absolute = location.starts_with("//") || Url::parse(location).is_ok();
         if !absolute {
             return None;
         }
@@ -220,7 +218,12 @@ mod tests {
         // The path the webview asks for: percent-encoded, dot segments resolved.
         assert_eq!(up("https://server/音乐/").prefix(), "/%E9%9F%B3%E4%B9%90");
         assert_eq!(up("https://server/a/../coversync/").prefix(), "/coversync");
-        assert_eq!(up("https://server//coversync//").prefix(), "/coversync");
+        // Slashes inside the path stay, as browsers keep them.
+        assert_eq!(up("https://server//coversync//").prefix(), "//coversync");
+        assert_eq!(
+            up("https://server/team//coversync/").prefix(),
+            "/team//coversync"
+        );
         assert_eq!(
             up("https://Bücher.example/").host(),
             "xn--bcher-kva.example"
@@ -282,6 +285,11 @@ mod tests {
         );
         assert_eq!(own("https://n5pro.internal:8443/"), None, "another port");
         assert_eq!(own("/coversync/"), None, "relative: left as it is");
+        assert_eq!(
+            own("login?next=https://n5pro.internal/coversync/"),
+            None,
+            "a URL in the query doesn't make it absolute"
+        );
 
         // Given with its default port, it still knows locations without one.
         let explicit = up("https://n5pro.internal:443/coversync/");

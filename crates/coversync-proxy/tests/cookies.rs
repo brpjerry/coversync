@@ -11,7 +11,7 @@ use axum::extract::Request;
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{Method, Response};
 use common::{Log, Window, serve, upstream};
-use coversync_proxy::Proxy;
+use coversync_proxy::{Cookies, Proxy};
 
 /// A server that records each request, and sets the cookies its path asks
 /// for: `/coversync/set/<name>=<value>[;attributes]`.
@@ -128,7 +128,7 @@ async fn persistent_cookies_last_across_restarts() {
         Window::open_with(
             Proxy::builder()
                 .upstream(Some(upstream(addr, "/coversync/")))
-                .cookie_file(Some(file.0.clone())),
+                .cookies(Cookies::open(Some(file.0.clone()))),
         )
     };
 
@@ -162,7 +162,7 @@ async fn expired_cookies_are_not_sent() {
     let window = Window::open_with(
         Proxy::builder()
             .upstream(Some(upstream(addr, "/coversync/")))
-            .cookie_file(Some(file.0.clone())),
+            .cookies(Cookies::open(Some(file.0.clone()))),
     )
     .await;
 
@@ -180,9 +180,30 @@ async fn expired_cookies_are_not_sent() {
     let again = Window::open_with(
         Proxy::builder()
             .upstream(Some(upstream(addr, "/coversync/")))
-            .cookie_file(Some(file.0.clone())),
+            .cookies(Cookies::open(Some(file.0.clone()))),
     )
     .await;
     again.get("/coversync/api/status").await;
     assert_eq!(last_cookies(&log), None, "expired in the file");
+}
+
+#[tokio::test]
+async fn proxies_can_share_a_jar() {
+    // The app runs a proxy for each server, on its own port, with one jar.
+    let log = Log::default();
+    let addr = serve(cookie_server(log.clone())).await;
+    let jar = Cookies::default();
+    let open = || {
+        Window::open_with(
+            Proxy::builder()
+                .upstream(Some(upstream(addr, "/coversync/")))
+                .cookies(jar.clone()),
+        )
+    };
+    let (one, two) = (open().await, open().await);
+    assert_ne!(one.proxy.addr(), two.proxy.addr());
+
+    one.get("/coversync/set/session=shared;%20Path=/").await;
+    two.get("/coversync/api/status").await;
+    assert_eq!(last_cookies(&log).as_deref(), Some("session=shared"));
 }

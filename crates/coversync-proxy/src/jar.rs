@@ -11,40 +11,51 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, HeaderValue};
 use cookie_store::{Cookie, CookieStore, RawCookie};
 use url::Url;
 
-pub(crate) struct Jar {
-    /// One store for each server origin.
+/// The servers' cookies: a store for each server origin (scheme, host and
+/// port). Clones share it, so proxies on several ports (one for each
+/// server, say) can use one jar and one file. Only one process should use a
+/// file at a time: each saves its whole jar.
+#[derive(Clone, Default)]
+pub struct Cookies(Arc<Jar>);
+
+#[derive(Default)]
+struct Jar {
     stores: Mutex<HashMap<String, CookieStore>>,
     file: Option<PathBuf>,
     /// Held while saving, so saves land in the order they were taken.
     saving: Mutex<()>,
 }
 
-impl Jar {
-    /// A jar with the cookies saved in `file`, if any. A missing or unreadable
-    /// file starts it empty.
-    pub(crate) fn open(file: Option<PathBuf>) -> Self {
+impl Cookies {
+    /// A jar with the persistent cookies saved in `file`, if any, which it
+    /// saves them to as they change, readable only by the user. A missing or
+    /// unreadable file starts it empty. Without a file, cookies last as long
+    /// as the jar.
+    pub fn open(file: Option<PathBuf>) -> Self {
         let stores = file.as_deref().map(load).unwrap_or_default();
-        Self {
+        Self(Arc::new(Jar {
             stores: Mutex::new(stores),
             file,
             saving: Mutex::new(()),
-        }
+        }))
     }
 
-    /// The `Cookie` header for a request to `url`, on the server at `origin`.
+    /// The `Cookie` header for a request to `url`, on the server at `origin`:
+    /// longer paths first, as browsers send them (RFC 6265, 5.4).
     pub(crate) fn header(&self, origin: &str, url: &Url) -> Option<HeaderValue> {
-        let stores = self.stores.lock().expect("cookie lock");
-        let pairs: Vec<String> = stores
-            .get(origin)?
-            .get_request_values(url)
-            .map(|(name, value)| format!("{name}={value}"))
+        let stores = self.0.stores.lock().expect("cookie lock");
+        let mut cookies = stores.get(origin)?.matches(url);
+        cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
+        let pairs: Vec<String> = cookies
+            .iter()
+            .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
             .collect();
         if pairs.is_empty() {
             return None;
@@ -65,7 +76,8 @@ impl Jar {
             .filter_map(|value| RawCookie::parse(value.to_owned()).ok())
             .collect();
         headers.remove(SET_COOKIE);
-        self.stores
+        self.0
+            .stores
             .lock()
             .expect("cookie lock")
             .entry(origin.to_owned())
@@ -76,12 +88,12 @@ impl Jar {
 
     /// Writes the persistent, unexpired cookies to the file, whole.
     fn save(&self) {
-        let Some(file) = &self.file else {
+        let Some(file) = &self.0.file else {
             return;
         };
-        let _saving = self.saving.lock().expect("cookie save lock");
+        let _saving = self.0.saving.lock().expect("cookie save lock");
         let json = {
-            let stores = self.stores.lock().expect("cookie lock");
+            let stores = self.0.stores.lock().expect("cookie lock");
             let saved: BTreeMap<&str, Vec<&Cookie<'static>>> = stores
                 .iter()
                 .map(|(origin, store)| {
@@ -143,4 +155,89 @@ fn write_private(file: &Path, bytes: &[u8]) -> io::Result<()> {
     out.write_all(bytes)?;
     out.sync_all()?;
     fs::rename(&partial, file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGIN: &str = "https://n5pro.internal";
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    /// Stores what a response from `from` sets.
+    fn set(jar: &Cookies, from: &str, cookies: &[&'static str]) {
+        let mut headers = HeaderMap::new();
+        for cookie in cookies {
+            headers.append(SET_COOKIE, HeaderValue::from_static(cookie));
+        }
+        jar.take(ORIGIN, &url(from), &mut headers);
+        assert!(headers.is_empty(), "Set-Cookie is taken out");
+    }
+
+    fn sent(jar: &Cookies, to: &str) -> Option<String> {
+        jar.header(ORIGIN, &url(to))
+            .map(|h| h.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn secure_cookies_go_only_over_https() {
+        let jar = Cookies::default();
+        set(
+            &jar,
+            "https://n5pro.internal/coversync/login",
+            &[
+                "session=s; Path=/; Secure; HttpOnly",
+                "__Secure-a=1; Path=/; Secure",
+                "__Host-b=2; Path=/; Secure",
+            ],
+        );
+        let over_https = sent(&jar, "https://n5pro.internal/coversync/").unwrap();
+        for cookie in ["session=s", "__Secure-a=1", "__Host-b=2"] {
+            assert!(over_https.contains(cookie), "{over_https}");
+        }
+        assert_eq!(sent(&jar, "http://n5pro.internal/coversync/"), None);
+    }
+
+    #[test]
+    fn a_domain_must_be_the_servers() {
+        let jar = Cookies::default();
+        set(
+            &jar,
+            "https://n5pro.internal/",
+            &[
+                "elsewhere=1; Domain=example.com",
+                "sibling=1; Domain=other.internal",
+                "own=1; Domain=n5pro.internal",
+            ],
+        );
+        assert_eq!(
+            sent(&jar, "https://n5pro.internal/").as_deref(),
+            Some("own=1")
+        );
+        assert_eq!(
+            jar.header("https://other.internal", &url("https://other.internal/")),
+            None
+        );
+    }
+
+    #[test]
+    fn longer_paths_go_first() {
+        let jar = Cookies::default();
+        set(
+            &jar,
+            "https://n5pro.internal/coversync/api/x",
+            &[
+                "session=root; Path=/",
+                "session=api; Path=/coversync/api",
+                "session=ui; Path=/coversync/",
+            ],
+        );
+        assert_eq!(
+            sent(&jar, "https://n5pro.internal/coversync/api/status").as_deref(),
+            Some("session=api; session=ui; session=root")
+        );
+    }
 }

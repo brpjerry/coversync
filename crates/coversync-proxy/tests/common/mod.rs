@@ -95,7 +95,7 @@ pub fn client() -> HttpClient {
 pub struct Window {
     pub proxy: Proxy,
     pub client: HttpClient,
-    /// `coversync-app=<value>`, as the window sends it back.
+    /// `coversync-app-<port>=<value>`, as the window sends it back.
     pub cookie: String,
 }
 
