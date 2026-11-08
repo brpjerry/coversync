@@ -1,5 +1,7 @@
 //! Inbox settings: how files found on disk are brought into the Library.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 /// What happens to an Inbox file when it is ingested into the Library.
@@ -20,6 +22,11 @@ pub struct InboxSetup {
     /// Absolute path of the folder scanned for unmanaged music.
     #[serde(default)]
     pub folder: Option<String>,
+    /// Where uploaded albums go, if not `Uploads` in the Inbox folder: an
+    /// absolute path, inside the Inbox folder or apart from it. One apart is
+    /// scanned as part of the Inbox.
+    #[serde(default)]
+    pub uploads: Option<String>,
     /// Empty tags filled with safe assumptions on import.
     #[serde(default)]
     pub autofill: crate::autofill::Autofill,
@@ -85,8 +92,24 @@ pub fn acoustid_key(key: &str) -> crate::Result<Option<String>> {
 impl InboxSetup {
     pub fn normalize(mut self) -> crate::Result<Self> {
         self.folder = crate::rules::folder_setting(self.folder, "Inbox folder")?;
+        self.uploads = crate::rules::folder_setting(self.uploads, "uploads folder")?;
         Ok(self)
     }
+
+    /// Where uploads go: the uploads folder, or `Uploads` in the Inbox
+    /// folder. None without either.
+    pub fn uploads_folder(&self) -> Option<PathBuf> {
+        self.uploads.as_deref().map(PathBuf::from).or_else(|| {
+            self.folder
+                .as_deref()
+                .map(|f| Path::new(f).join(crate::upload::DEFAULT_FOLDER))
+        })
+    }
+}
+
+/// `inner` is `outer` or inside it.
+fn within(inner: &str, outer: &str) -> bool {
+    inner == outer || inner.starts_with(&format!("{outer}/"))
 }
 
 /// The Inbox and Library folders must not contain one another, or each
@@ -95,11 +118,40 @@ pub fn check_folders(inbox: Option<&str>, library: Option<&str>) -> crate::Resul
     let (Some(a), Some(b)) = (inbox, library) else {
         return Ok(());
     };
-    let within =
-        |inner: &str, outer: &str| inner == outer || inner.starts_with(&format!("{outer}/"));
     if within(a, b) || within(b, a) {
         return Err(crate::Error::Invalid(
             "The Inbox and Library folders can't be the same or inside one another.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// An uploads folder set in Inbox setup is part of the Inbox: inside the
+/// Inbox folder, or apart from it and from the Library folder. One holding
+/// the Inbox folder would scan it twice.
+pub fn check_uploads(
+    uploads: Option<&str>,
+    inbox: Option<&str>,
+    library: Option<&str>,
+) -> crate::Result<()> {
+    let Some(u) = uploads else {
+        return Ok(());
+    };
+    if let Some(i) = inbox
+        && within(i, u)
+        && i != u
+    {
+        return Err(crate::Error::Invalid(
+            "The uploads folder can't hold the Inbox folder. Choose one inside it, or apart from it."
+                .into(),
+        ));
+    }
+    if let Some(l) = library
+        && (within(u, l) || within(l, u))
+    {
+        return Err(crate::Error::Invalid(
+            "The uploads folder and the Library folder can't be the same or inside one another."
+                .into(),
         ));
     }
     Ok(())
@@ -152,6 +204,51 @@ mod tests {
         assert!(check_folders(Some("/m"), Some("/m")).is_err());
         assert!(check_folders(Some("/m"), Some("/music")).is_ok());
         assert!(check_folders(None, Some("/m")).is_ok());
+    }
+
+    #[test]
+    fn uploads_go_in_the_inbox_unless_set_elsewhere() {
+        let mut s = InboxSetup {
+            folder: Some("/data2/Music".into()),
+            uploads: Some(" ".into()),
+            ..Default::default()
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(s.uploads, None);
+        assert_eq!(
+            s.uploads_folder().as_deref(),
+            Some(Path::new("/data2/Music/Uploads"))
+        );
+        s.uploads = Some("/data2/Uploads/".into());
+        let s = s.normalize().unwrap();
+        assert_eq!(
+            s.uploads_folder().as_deref(),
+            Some(Path::new("/data2/Uploads"))
+        );
+        assert_eq!(InboxSetup::default().uploads_folder(), None);
+        let rel = InboxSetup {
+            uploads: Some("Uploads".into()),
+            ..Default::default()
+        };
+        assert!(rel.normalize().is_err());
+        // Saved before uploads existed.
+        let before: InboxSetup = serde_json::from_str(r#"{"folder":"/m"}"#).unwrap();
+        assert_eq!(before.uploads, None);
+    }
+
+    #[test]
+    fn an_uploads_folder_is_inside_the_inbox_or_apart() {
+        let (inbox, lib) = (Some("/m/in"), Some("/m/lib"));
+        assert!(check_uploads(None, inbox, lib).is_ok());
+        assert!(check_uploads(Some("/m/in/Up"), inbox, lib).is_ok());
+        assert!(check_uploads(Some("/m/in"), inbox, lib).is_ok());
+        assert!(check_uploads(Some("/m/up"), inbox, lib).is_ok());
+        assert!(check_uploads(Some("/m/inbox"), inbox, lib).is_ok());
+        assert!(check_uploads(Some("/m"), inbox, None).is_err());
+        assert!(check_uploads(Some("/m/lib"), inbox, lib).is_err());
+        assert!(check_uploads(Some("/m/lib/Up"), inbox, lib).is_err());
+        assert!(check_uploads(Some("/m/up"), None, Some("/m/up/lib")).is_err());
     }
 
     #[test]

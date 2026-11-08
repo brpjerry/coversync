@@ -63,7 +63,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -78,6 +78,9 @@ impl From<coversync_core::Error> for ApiError {
             NotFound => StatusCode::NOT_FOUND,
             Tags(_) | Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Remote(_) => StatusCode::BAD_GATEWAY,
+            ReadOnly(_) => StatusCode::FORBIDDEN,
+            NoSpace(_) => StatusCode::INSUFFICIENT_STORAGE,
+            Conflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(code, e.to_string())
@@ -189,18 +192,18 @@ struct Variable {
 
 /// What a configured folder looks like on disk, as coversyncd sees it.
 #[derive(Serialize)]
-struct FolderStatus {
+pub(crate) struct FolderStatus {
     path: String,
     exists: bool,
     dir: bool,
     writable: bool,
-    /// Missing folders are created on first import if this is true.
+    /// Missing folders are created on first import (or upload) if this is true.
     creatable: bool,
     /// Tracks in the coversync Library this folder holds, if it holds one.
     library: Option<u64>,
 }
 
-fn folder_status(path: &str) -> FolderStatus {
+pub(crate) fn folder_status(path: &str) -> FolderStatus {
     let p = std::path::Path::new(path);
     let meta = p.metadata().ok();
     FolderStatus {
@@ -305,8 +308,11 @@ async fn save_library_setup(
         let before = s.lib.library_setup()?;
         let setup = setup.normalize()?;
         must_be_folder(setup.folder.as_deref(), "library folder")?;
-        inbox::check_folders(
-            s.lib.inbox_setup()?.folder.as_deref(),
+        let inbox_setup = s.lib.inbox_setup()?;
+        inbox::check_folders(inbox_setup.folder.as_deref(), setup.folder.as_deref())?;
+        inbox::check_uploads(
+            inbox_setup.uploads.as_deref(),
+            inbox_setup.folder.as_deref(),
             setup.folder.as_deref(),
         )?;
         let saved = s.lib.set_library_setup(setup.clone())?;
@@ -348,6 +354,9 @@ async fn inbox_coverage(State(state): State<Shared>) -> ApiResult<Json<TagCovera
 struct InboxSetupResponse {
     setup: InboxSetup,
     folder: Option<FolderStatus>,
+    /// Where uploads go: the uploads folder, or the Inbox folder's
+    /// `Uploads`.
+    uploads: Option<FolderStatus>,
     hidden: HiddenStats,
     suggest: SuggestStatus,
 }
@@ -368,6 +377,9 @@ fn inbox_response(
     let key = s.lib.acoustid_key()?;
     Ok(InboxSetupResponse {
         folder: setup.folder.as_deref().map(folder_status),
+        uploads: setup
+            .uploads_folder()
+            .map(|f| folder_status(&f.display().to_string())),
         setup,
         hidden: s.lib.hidden_stats()?,
         suggest: SuggestStatus {
@@ -395,7 +407,8 @@ struct SaveInboxSetup {
     acoustid_key: Option<String>,
 }
 
-/// A new Inbox folder must exist; changing it rescans.
+/// A new Inbox folder must exist; changing it, or the uploads folder,
+/// rescans. A new uploads folder cancels uploads under way into the old one.
 async fn save_inbox_setup(
     State(state): State<Shared>,
     Json(body): Json<SaveInboxSetup>,
@@ -407,7 +420,7 @@ async fn save_inbox_setup(
         .transpose()?;
     let setup = body.setup;
     let (response, moved) = blocking(&state, move |s| {
-        let before = s.lib.inbox_setup()?.folder;
+        let before = s.lib.inbox_setup()?;
         let setup = setup.normalize()?;
         if let Some(f) = &setup.folder
             && !std::path::Path::new(f).is_dir()
@@ -416,9 +429,13 @@ async fn save_inbox_setup(
                 "The Inbox folder {f} doesn't exist or isn't a folder."
             )));
         }
-        inbox::check_folders(
+        must_be_folder(setup.uploads.as_deref(), "uploads folder")?;
+        let library = s.lib.library_setup()?.folder;
+        inbox::check_folders(setup.folder.as_deref(), library.as_deref())?;
+        inbox::check_uploads(
+            setup.uploads.as_deref(),
             setup.folder.as_deref(),
-            s.lib.library_setup()?.folder.as_deref(),
+            library.as_deref(),
         )?;
         if let Some(key) = key {
             s.lib.set_acoustid_key(key.as_deref())?;
@@ -426,7 +443,8 @@ async fn save_inbox_setup(
         let saved = s.lib.set_inbox_setup(setup)?;
         // Suggestions found with the old key (or settings) shouldn't linger.
         s.identify.clear();
-        let moved = before != saved.folder;
+        crate::uploads::follow_folder(s);
+        let moved = before.folder != saved.folder || before.uploads != saved.uploads;
         Ok((inbox_response(s, saved)?, moved))
     })
     .await?;

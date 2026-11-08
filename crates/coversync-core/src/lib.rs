@@ -17,6 +17,7 @@ pub mod scan;
 pub mod sync;
 pub mod tags;
 pub mod template;
+pub mod upload;
 
 pub use db::Library;
 pub use inbox::{HiddenStats, InboxSetup, IngestMode};
@@ -44,6 +45,16 @@ pub enum Error {
     /// A web service (AcoustID, MusicBrainz) failed or couldn't be reached.
     #[error("{0}")]
     Remote(String),
+    /// A folder coversyncd can't write to.
+    #[error("{0}")]
+    ReadOnly(String),
+    /// Not enough free space on the disk.
+    #[error("{0}")]
+    NoSpace(String),
+    /// Not possible in the state things are in, such as finishing an upload
+    /// before all of it has arrived.
+    #[error("{0}")]
+    Conflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
