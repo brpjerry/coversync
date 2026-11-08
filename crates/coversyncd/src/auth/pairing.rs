@@ -35,6 +35,8 @@ pub enum Cancelled {
     Failures,
     /// It was sent over plain http, so it may have been seen on the way.
     Insecure,
+    /// The device it would replace was removed.
+    Removed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +210,14 @@ impl Pairings {
         }
     }
 
+    /// The device that claimed `id` gets no token: the device it would
+    /// replace was removed while it paired.
+    pub fn replaced_gone(&mut self, id: &str) {
+        if let Some(p) = self.codes.get_mut(id) {
+            p.state = State::Cancelled(Cancelled::Removed);
+        }
+    }
+
     /// Cancel a waiting code that was sent where it may have been seen.
     pub fn cancel_code(&mut self, code: &str, why: Cancelled, now: Instant) {
         for p in self.codes.values_mut() {
@@ -219,8 +229,11 @@ impl Pairings {
 
     /// Cancel the waiting codes that would replace `device`, which is gone.
     pub fn forget_device(&mut self, device: i64) {
-        self.codes
-            .retain(|_, p| p.replace != Some(device) || p.state != State::Waiting);
+        for p in self.codes.values_mut() {
+            if p.replace == Some(device) && p.state == State::Waiting {
+                p.state = State::Cancelled(Cancelled::Removed);
+            }
+        }
     }
 
     pub fn status(&mut self, id: &str, now: Instant) -> Option<Status> {
@@ -408,13 +421,33 @@ mod tests {
             })
         );
         assert_eq!(p.redeem(&code, t0), Err(Refused::Expired));
-        // Replacing a device that's removed meanwhile: the code goes.
-        let (r, _) = p
+        // Replacing a device that's removed meanwhile: the code is cancelled,
+        // and the dialog says why.
+        let (r, code) = p
             .create("Laptop".into(), Scope::Manage, Some(3), t0)
             .unwrap()
             .unwrap();
         p.forget_device(3);
-        assert_eq!(p.status(&r, t0), None);
+        assert_eq!(
+            p.status(&r, t0),
+            Some(Status::Cancelled {
+                why: Cancelled::Removed
+            })
+        );
+        assert_eq!(p.redeem(&code, t0), Err(Refused::Expired));
+        // Or, once claimed, when its token can't be issued for that reason.
+        let (r, code) = p
+            .create("Laptop".into(), Scope::Manage, Some(4), t0)
+            .unwrap()
+            .unwrap();
+        assert!(p.redeem(&code, t0).is_ok());
+        p.replaced_gone(&r);
+        assert_eq!(
+            p.status(&r, t0),
+            Some(Status::Cancelled {
+                why: Cancelled::Removed
+            })
+        );
         let mut full = Pairings::default();
         for _ in 0..MAX_WAITING {
             waiting(&mut full, t0);

@@ -368,6 +368,28 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
         .pair_from(LOCAL, proxied(&code, "http", "192.168.1.20"))
         .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    // Anything a proxy forwarded over plain http came over a network, even
+    // naming this machine, a client it couldn't parse, or none at all.
+    for (proto, client) in [
+        (Some("http"), Some("127.0.0.1")),
+        (Some("http"), Some("not an address")),
+        (Some("http"), None),
+        (None, Some("192.168.1.20")),
+    ] {
+        let (id, code) = app.new_code(&cookie, phone()).await;
+        let mut req = pair(&code);
+        if let Some(p) = proto {
+            req.headers_mut()
+                .insert("x-forwarded-proto", p.parse().unwrap());
+        }
+        if let Some(c) = client {
+            req.headers_mut()
+                .insert("x-forwarded-for", c.parse().unwrap());
+        }
+        let res = app.pair_from(LOCAL, req).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{proto:?} {client:?}");
+        assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+    }
     // Through the proxy over HTTPS: fine.
     let (_, code) = app.new_code(&cookie, phone()).await;
     paired(
@@ -375,15 +397,24 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
             .await,
     )
     .await;
-    // From this machine itself, over plain http, directly or through the proxy.
+    // Straight from this machine itself, over plain http.
     let (_, code) = app.new_code(&cookie, phone()).await;
     paired(app.pair_from("[::1]:5000", pair(&code)).await).await;
     let (_, code) = app.new_code(&cookie, phone()).await;
-    paired(
-        app.pair_from(LOCAL, proxied(&code, "http", "127.0.0.1"))
-            .await,
-    )
-    .await;
+    paired(app.pair_from(LOCAL, pair(&code)).await).await;
+
+    // A code sent in the clear is cancelled even when the rest of the
+    // request is wrong.
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    let malformed = json!({ "code": code, "platform": "x".repeat(33) });
+    let res = app
+        .pair_from(LAN, request("POST", "/api/pair", None, Some(malformed)))
+        .await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::FORBIDDEN, "https_required".into())
+    );
+    assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
 
     // With the override, for a network that's encrypted already.
     let res = app.pairing_setup(&cookie, None, true).await;
@@ -609,8 +640,9 @@ async fn replacing_a_device_keeps_its_id() {
         code_of(res).await,
         (StatusCode::NOT_FOUND, "no_device".into())
     );
-    // Removing the device cancels a code that would have replaced it.
-    let (id, _) = app
+    // Removing the device cancels a code that would have replaced it, and
+    // the dialog says why.
+    let (id, code) = app
         .new_code(
             &cookie,
             json!({ "name": "Pixel 8", "scope": "manage", "replace": device }),
@@ -618,10 +650,104 @@ async fn replacing_a_device_keeps_its_id() {
         .await;
     app.call("DELETE", &format!("/api/devices/{device}"), &cookie, None)
         .await;
-    let res = app
-        .call("GET", &format!("/api/pairings/{id}"), &cookie, None)
+    let status = app.pairing(&cookie, &id).await;
+    assert_eq!(status, json!({ "state": "cancelled", "why": "removed" }));
+    let res = app.pair_from(LOCAL, pair(&code)).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::GONE, "code_expired".into())
+    );
+    assert_eq!(app.devices(&cookie).await["devices"], json!([]));
+}
+
+#[tokio::test]
+async fn a_removed_devices_id_never_reaches_another() {
+    let app = App::with_password("reuse");
+    let cookie = app.cookie().await;
+    let (_, code) = app.new_code(&cookie, phone()).await;
+    let (first, _) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    let (_, code) = app.new_code(&cookie, phone()).await;
+    let (second, _) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    // The newest goes, and another pairs: a page still showing the removed
+    // one must not change the new one through its id.
+    app.call("DELETE", &format!("/api/devices/{second}"), &cookie, None)
         .await;
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let (_, code) = app
+        .new_code(&cookie, json!({ "name": "Laptop", "scope": "manage" }))
+        .await;
+    let (third, token) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    assert!(third > second && second > first);
+    for (method, path, body) in [
+        (
+            "PUT",
+            format!("/api/devices/{second}"),
+            Some(json!({ "name": "stale" })),
+        ),
+        ("POST", format!("/api/devices/{second}/revoke"), None),
+        ("DELETE", format!("/api/devices/{second}"), None),
+    ] {
+        let res = app.call(method, &path, &cookie, body).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+    assert_eq!(
+        app.send(bearer("/api/status", &token)).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_cookie_traded_for_a_sync_token_follows_its_devices_scope() {
+    let app = App::with_password("promote");
+    let cookie = app.cookie().await;
+    let (_, code) = app
+        .new_code(&cookie, json!({ "name": "Tablet", "scope": "sync" }))
+        .await;
+    let (device, token) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    let res = app.send(trade(Some(&token), Some("/"))).await;
+    let traded = cookie_of(&res);
+    let res = app.get("/api/albums", Some(&traded)).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::FORBIDDEN, "sync_only".into())
+    );
+    // Promoted: the cookie it already has may manage at once, and back.
+    let path = format!("/api/devices/{device}");
+    for (scope, status) in [("manage", StatusCode::OK), ("sync", StatusCode::FORBIDDEN)] {
+        app.call("PUT", &path, &cookie, Some(json!({ "scope": scope })))
+            .await;
+        let res = app.get("/api/albums", Some(&traded)).await;
+        assert_eq!(res.status(), status, "{scope}");
+    }
+}
+
+#[tokio::test]
+async fn a_token_replaced_can_no_longer_be_traded() {
+    let app = App::with_password("trade-replace");
+    let cookie = app.cookie().await;
+    let (_, code) = app.new_code(&cookie, phone()).await;
+    let (device, old) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    let (_, code) = app
+        .new_code(
+            &cookie,
+            json!({ "name": "Pixel 8", "scope": "manage", "replace": device }),
+        )
+        .await;
+    paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    let res = app.send(trade(Some(&old), Some("/"))).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::UNAUTHORIZED, "invalid_token".into())
+    );
+    // The trade that checked the old token just before the replacement
+    // committed is the store's: `create_device_session` is tried with it.
+    assert!(
+        app.state
+            .auth
+            .store()
+            .create_device_session(&old, now())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -794,6 +920,22 @@ async fn the_ca_setting_refuses_private_keys_and_serves_the_certificate() {
     .await;
     assert_eq!(b["ca"], Value::Null);
     assert!(b["ca_problem"].is_string());
+
+    // The rest of the setup can still be saved with that path unchanged;
+    // the answer says what's wrong with it.
+    let res = app.pairing_setup(&cookie, cert.to_str(), true).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let b = body(res).await;
+    assert_eq!(b["setup"]["allow_http"], true);
+    assert_eq!(b["setup"]["ca_path"], cert.to_str().unwrap());
+    assert!(b["ca_problem"].as_str().unwrap().contains("private key"));
+    assert_eq!(
+        app.get("/api/hello/ca", None).await.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    // A new path is still checked.
+    let res = app.pairing_setup(&cookie, both.to_str(), false).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     // Cleared: back to none.
     let res = app.pairing_setup(&cookie, Some(""), false).await;

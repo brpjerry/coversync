@@ -21,29 +21,8 @@ CREATE TABLE IF NOT EXISTS password (
     hash   TEXT NOT NULL,
     set_at INTEGER NOT NULL
 );
--- Apps and devices, each with its own token; only the token's SHA-256 is kept.
--- A revoked device keeps its entry (and, with SYN-03, its settings) until it
--- is removed, so pairing again can replace it. The columns after revoked_at
--- came with pairing; `migrate` adds them to a table made before.
-CREATE TABLE IF NOT EXISTS devices (
-    id           INTEGER PRIMARY KEY,
-    name         TEXT NOT NULL,
-    scope        TEXT NOT NULL CHECK (scope IN ('manage', 'sync')),
-    token_hash   BLOB NOT NULL UNIQUE,
-    created_at   INTEGER NOT NULL,
-    last_seen_at INTEGER,
-    revoked_at   INTEGER,
-    -- What the device said about itself when it paired, and since.
-    platform     TEXT,
-    hostname     TEXT,
-    app_version  TEXT,
-    -- The address its token was last used from.
-    last_ip      TEXT,
-    -- When its current token was issued: pairing again replaces it.
-    paired_at    INTEGER
-);
 -- Browser sessions, by their id's SHA-256. One traded for an app's token
--- names that device; it ends when the device is revoked.
+-- names that device, has its scope, and ends when the device is revoked.
 CREATE TABLE IF NOT EXISTS sessions (
     id_hash    BLOB PRIMARY KEY,
     device_id  INTEGER,
@@ -60,13 +39,51 @@ CREATE TABLE IF NOT EXISTS pairing_setup (
 );
 "#;
 
-/// Columns `devices` gained after SRV-01, which made the table without them.
-const DEVICE_COLUMNS: &[(&str, &str)] = &[
-    ("platform", "TEXT"),
-    ("hostname", "TEXT"),
-    ("app_version", "TEXT"),
-    ("last_ip", "TEXT"),
-    ("paired_at", "INTEGER"),
+/// The devices table, made as `name`: `devices`, or the copy [`migrate`]
+/// rebuilds an older one in.
+///
+/// Apps and devices, each with its own token; only the token's SHA-256 is
+/// kept. A revoked device keeps its entry (and, with SYN-03, its settings)
+/// until it is removed, so pairing again can replace it. Ids are never
+/// reused (AUTOINCREMENT), so a page or app holding a removed device's id
+/// can't reach another device with it.
+fn devices_table(name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {name} (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            scope        TEXT NOT NULL CHECK (scope IN ('manage', 'sync')),
+            token_hash   BLOB NOT NULL UNIQUE,
+            created_at   INTEGER NOT NULL,
+            last_seen_at INTEGER,
+            revoked_at   INTEGER,
+            -- What the device said about itself when it paired, and since.
+            platform     TEXT,
+            hostname     TEXT,
+            app_version  TEXT,
+            -- The address its token was last used from.
+            last_ip      TEXT,
+            -- When its current token was issued: pairing again replaces it.
+            paired_at    INTEGER
+        );"
+    )
+}
+
+/// The table's columns, in order. SRV-01 made it with the first seven, and
+/// without AUTOINCREMENT.
+const DEVICE_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "scope",
+    "token_hash",
+    "created_at",
+    "last_seen_at",
+    "revoked_at",
+    "platform",
+    "hostname",
+    "app_version",
+    "last_ip",
+    "paired_at",
 ];
 
 /// A session ends after this long without a request (90 days).
@@ -267,6 +284,7 @@ impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(&devices_table("devices"))?;
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -331,26 +349,25 @@ impl Store {
         Ok((inserted == 1).then_some(id))
     }
 
-    /// Start a session traded for a device's token, with its scope. Returns
-    /// the session id for the cookie; only its hash is kept.
-    pub fn create_device_session(
-        &self,
-        device: i64,
-        scope: Scope,
-        now: i64,
-    ) -> rusqlite::Result<String> {
+    /// Start a session traded for a device's token, if `token` still belongs
+    /// to a device that isn't revoked. Checking and inserting in one
+    /// statement orders it against pairing again or revoking: before it,
+    /// they end the session; after it, nothing matches. Returns the session
+    /// id for the cookie; only its hash is kept.
+    pub fn create_device_session(&self, token: &str, now: i64) -> rusqlite::Result<Option<String>> {
         let id = random_secret()?;
         let conn = self.conn();
         conn.execute(
             "DELETE FROM sessions WHERE seen_at <= ?1",
             [now - SESSION_IDLE],
         )?;
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO sessions (id_hash, device_id, scope, created_at, seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![&digest(&id)[..], device, scope.as_str(), now],
+             SELECT ?1, id, scope, ?2, ?2 FROM devices
+             WHERE token_hash = ?3 AND revoked_at IS NULL",
+            params![&digest(&id)[..], now, &digest(token)[..]],
         )?;
-        Ok(id)
+        Ok((inserted == 1).then_some(id))
     }
 
     /// The session with this id, unless it has been idle too long, ended,
@@ -376,11 +393,9 @@ impl Store {
             )
             .optional()?;
         Ok(row.map(|(device, scope, seen, device_scope, device_seen)| {
-            let mut scope = Scope::parse(&scope);
-            // A device re-scoped since the trade takes its sessions along.
-            if device_scope.is_some_and(|s| Scope::parse(&s) == Scope::Sync) {
-                scope = Scope::Sync;
-            }
+            // A session traded for a token has its device's scope as it is
+            // now, so re-scoping the device either way applies at once.
+            let scope = Scope::parse(device_scope.as_deref().unwrap_or(&scope));
             Session {
                 access: Access {
                     via: if device.is_some() {
@@ -472,37 +487,42 @@ impl Store {
     /// device's id and the token; only the token's hash is kept. A device
     /// that replaces another takes over its entry, revoked or not: the id
     /// and whatever hangs off it stay, while the old token and the sessions
-    /// traded for it end. If that entry has gone meanwhile, the device is
-    /// added as a new one.
-    pub fn pair_device(&self, new: &NewDevice, now: i64) -> rusqlite::Result<(i64, String)> {
+    /// traded for it end. `None` if that entry has been removed meanwhile:
+    /// a device removed by hand doesn't come back.
+    pub fn pair_device(
+        &self,
+        new: &NewDevice,
+        now: i64,
+    ) -> rusqlite::Result<Option<(i64, String)>> {
         let token = new_token()?;
         let hash = &digest(&token)[..];
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut replaced = None;
-        if let Some(id) = new.replace {
-            let found = tx.execute(
-                "UPDATE devices SET name = ?2, scope = ?3, token_hash = ?4, platform = ?5,
+        let id = match new.replace {
+            Some(id) => {
+                let found = tx.execute(
+                    "UPDATE devices SET name = ?2, scope = ?3, token_hash = ?4, platform = ?5,
                      hostname = ?6, app_version = ?7, last_ip = ?8, last_seen_at = ?9,
                      paired_at = ?9, revoked_at = NULL
                  WHERE id = ?1",
-                params![
-                    id,
-                    new.name,
-                    new.scope.as_str(),
-                    hash,
-                    new.platform,
-                    new.hostname,
-                    new.app_version,
-                    new.ip,
-                    now
-                ],
-            )?;
-            tx.execute("DELETE FROM sessions WHERE device_id = ?1", [id])?;
-            replaced = (found == 1).then_some(id);
-        }
-        let id = match replaced {
-            Some(id) => id,
+                    params![
+                        id,
+                        new.name,
+                        new.scope.as_str(),
+                        hash,
+                        new.platform,
+                        new.hostname,
+                        new.app_version,
+                        new.ip,
+                        now
+                    ],
+                )?;
+                if found == 0 {
+                    return Ok(None);
+                }
+                tx.execute("DELETE FROM sessions WHERE device_id = ?1", [id])?;
+                id
+            }
             None => {
                 tx.execute(
                     "INSERT INTO devices (name, scope, token_hash, created_at, platform,
@@ -523,7 +543,7 @@ impl Store {
             }
         };
         tx.commit()?;
-        Ok((id, token))
+        Ok(Some((id, token)))
     }
 
     /// Revoke a device: its token and the sessions traded for it stop
@@ -613,7 +633,7 @@ impl Store {
             app_version: None,
             ip: None,
         };
-        let (id, token) = self.pair_device(&new, now)?;
+        let (id, token) = self.pair_device(&new, now)?.expect("a new device is added");
         self.forget_last_seen(id)?;
         Ok((id, token))
     }
@@ -635,27 +655,47 @@ impl Store {
     }
 }
 
-/// Add the [`DEVICE_COLUMNS`] a `devices` table made before them lacks, in
-/// a write transaction, so `set-password` run while the service starts
-/// can't add them twice.
+/// Rebuild a `devices` table SRV-01 made: it lacks the columns pairing added,
+/// and without AUTOINCREMENT a removed device's id could be given to the
+/// next one. Its rows are copied over, ids and all. In one write transaction,
+/// so `set-password` run while the service starts can't do it twice.
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    fn missing(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, &'static str)>> {
+    /// The columns the table has, if it needs rebuilding.
+    fn outdated(conn: &Connection) -> rusqlite::Result<Option<Vec<String>>> {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'devices'",
+            [],
+            |r| r.get(0),
+        )?;
         let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('devices')")?;
         let present: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        Ok(DEVICE_COLUMNS
-            .iter()
-            .copied()
-            .filter(|(c, _)| !present.iter().any(|p| p == c))
-            .collect())
+        let current = sql.to_ascii_uppercase().contains("AUTOINCREMENT")
+            && DEVICE_COLUMNS
+                .iter()
+                .all(|c| present.iter().any(|p| p == c));
+        Ok((!current).then_some(present))
     }
-    if missing(conn)?.is_empty() {
+    if outdated(conn)?.is_none() {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (column, kind) in missing(&tx)? {
-        tx.execute_batch(&format!("ALTER TABLE devices ADD COLUMN {column} {kind}"))?;
+    if let Some(present) = outdated(&tx)? {
+        let columns = DEVICE_COLUMNS
+            .iter()
+            .filter(|c| present.iter().any(|p| p == *c))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS devices_rebuilt;
+             {}
+             INSERT INTO devices_rebuilt ({columns}) SELECT {columns} FROM devices;
+             DROP TABLE devices;
+             ALTER TABLE devices_rebuilt RENAME TO devices;",
+            devices_table("devices_rebuilt")
+        ))?;
     }
     tx.commit()
 }
@@ -688,8 +728,8 @@ mod tests {
         assert!(!s.set_password_hash("$first", 10).unwrap());
         assert_eq!(s.password_hash().unwrap().as_deref(), Some("$first"));
         let browser = s.create_password_session("$first", 20).unwrap().unwrap();
-        let (phone, token) = s.add_device("Phone", Scope::Manage, 20).unwrap();
-        let traded = s.create_device_session(phone, Scope::Manage, 20).unwrap();
+        let (_, token) = s.add_device("Phone", Scope::Manage, 20).unwrap();
+        let traded = s.create_device_session(&token, 20).unwrap().unwrap();
         assert!(s.set_password_hash("$second", 30).unwrap());
         assert_eq!(s.password_hash().unwrap().as_deref(), Some("$second"));
         // A reset signs browsers out, but leaves apps alone.
@@ -808,8 +848,8 @@ mod tests {
     #[test]
     fn traded_sessions_follow_their_device() {
         let s = store("traded");
-        let (id, _) = s.add_device("Phone", Scope::Manage, 0).unwrap();
-        let session = s.create_device_session(id, Scope::Manage, 0).unwrap();
+        let (id, token) = s.add_device("Phone", Scope::Manage, 0).unwrap();
+        let session = s.create_device_session(&token, 0).unwrap().unwrap();
         // Using the session counts as using the device.
         assert!(s.session(&session, 1).unwrap().unwrap().device_stale);
         s.touch_device(id, 1, None, None).unwrap();
@@ -824,13 +864,38 @@ mod tests {
             }
         );
         assert!(!found.password_login());
+        // Re-scoping the device, either way, applies to its sessions at once.
         s.update_device(id, None, Some(Scope::Sync)).unwrap();
         assert_eq!(
             s.session(&session, 2).unwrap().unwrap().access.scope,
             Scope::Sync
         );
+        s.update_device(id, None, Some(Scope::Manage)).unwrap();
+        assert_eq!(
+            s.session(&session, 2).unwrap().unwrap().access.scope,
+            Scope::Manage
+        );
         s.revoke_device(id, 3).unwrap();
         assert!(s.session(&session, 4).unwrap().is_none());
+        // Nor can a session be traded for its token any more.
+        assert!(s.create_device_session(&token, 5).unwrap().is_none());
+        assert!(s.create_device_session("cst_unknown", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_sync_session_is_promoted_with_its_device() {
+        let s = store("promote");
+        let (id, token) = s.add_device("Player", Scope::Sync, 0).unwrap();
+        let session = s.create_device_session(&token, 0).unwrap().unwrap();
+        assert_eq!(
+            s.session(&session, 1).unwrap().unwrap().access.scope,
+            Scope::Sync
+        );
+        s.update_device(id, None, Some(Scope::Manage)).unwrap();
+        assert_eq!(
+            s.session(&session, 1).unwrap().unwrap().access.scope,
+            Scope::Manage
+        );
     }
 
     fn phone(replace: Option<i64>) -> NewDevice<'static> {
@@ -848,7 +913,7 @@ mod tests {
     #[test]
     fn pairing_adds_a_device_and_replacing_keeps_its_id() {
         let s = store("pair");
-        let (id, token) = s.pair_device(&phone(None), 100).unwrap();
+        let (id, token) = s.pair_device(&phone(None), 100).unwrap().unwrap();
         let d = s.device_info(id).unwrap().unwrap();
         assert_eq!(
             d,
@@ -866,7 +931,7 @@ mod tests {
                 revoked_at: None,
             }
         );
-        let traded = s.create_device_session(id, Scope::Manage, 100).unwrap();
+        let traded = s.create_device_session(&token, 100).unwrap().unwrap();
         let (other, _) = s.add_device("Desktop", Scope::Manage, 100).unwrap();
 
         // Reinstalled: a new token for the same entry, which ends the old
@@ -877,11 +942,14 @@ mod tests {
             app_version: Some("0.2.0"),
             ..phone(Some(id))
         };
-        let (same, new_token) = s.pair_device(&again, 200).unwrap();
+        let (same, new_token) = s.pair_device(&again, 200).unwrap().unwrap();
         assert_eq!(same, id);
         assert_ne!(new_token, token);
         assert!(s.device(&token, 201).unwrap().is_none());
         assert!(s.session(&traded, 201).unwrap().is_none());
+        // A trade that checked the old token just before can't start a
+        // session with it now.
+        assert!(s.create_device_session(&token, 201).unwrap().is_none());
         assert_eq!(s.device(&new_token, 201).unwrap().unwrap().id, id);
         let d = s.device_info(id).unwrap().unwrap();
         assert_eq!(
@@ -895,16 +963,30 @@ mod tests {
         // A revoked device comes back when it's replaced.
         s.revoke_device(id, 300).unwrap();
         assert!(s.device(&new_token, 301).unwrap().is_none());
-        let (same, back) = s.pair_device(&phone(Some(id)), 400).unwrap();
+        let (same, back) = s.pair_device(&phone(Some(id)), 400).unwrap().unwrap();
         assert_eq!(same, id);
         assert!(s.device(&back, 401).unwrap().is_some());
         assert_eq!(s.device_info(id).unwrap().unwrap().revoked_at, None);
 
-        // One removed meanwhile is added afresh.
+        // One removed meanwhile stays removed: nothing is added in its place.
         s.remove_device(id).unwrap();
-        let (fresh, _) = s.pair_device(&phone(Some(id)), 500).unwrap();
-        assert_ne!(fresh, id);
-        assert_eq!(s.devices().unwrap().len(), 2);
+        assert!(s.pair_device(&phone(Some(id)), 500).unwrap().is_none());
+        assert_eq!(s.devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ids_of_removed_devices_are_never_reused() {
+        let s = store("reuse");
+        let (a, _) = s.add_device("A", Scope::Manage, 0).unwrap();
+        let (b, _) = s.add_device("B", Scope::Manage, 0).unwrap();
+        // The highest one goes: SQLite would hand its id out again without
+        // AUTOINCREMENT.
+        s.remove_device(b).unwrap();
+        let (c, _) = s.add_device("C", Scope::Manage, 0).unwrap();
+        assert!(c > b && a < b, "{a} {b} {c}");
+        assert!(s.device_info(b).unwrap().is_none());
+        assert!(!s.update_device(b, Some("stale"), None).unwrap());
+        assert_eq!(s.device_info(c).unwrap().unwrap().name, "C");
     }
 
     #[test]
@@ -912,7 +994,7 @@ mod tests {
         let s = store("revoke");
         let (a, token) = s.add_device("A", Scope::Manage, 0).unwrap();
         let (b, _) = s.add_device("B", Scope::Sync, 0).unwrap();
-        let session = s.create_device_session(a, Scope::Manage, 0).unwrap();
+        let session = s.create_device_session(&token, 0).unwrap().unwrap();
         assert!(s.revoke_device(a, 10).unwrap());
         assert!(s.device(&token, 11).unwrap().is_none());
         assert!(s.session(&session, 11).unwrap().is_none());
@@ -960,37 +1042,75 @@ mod tests {
     }
 
     #[test]
-    fn a_devices_table_from_before_pairing_gets_its_new_columns() {
+    fn a_devices_table_from_before_pairing_is_rebuilt_in_place() {
         let dir =
             std::env::temp_dir().join(format!("coversyncd-store-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("inbox.sqlite3");
-        // The table as SRV-01 made it, with a device in it.
+        // The tables as SRV-01 made them, with two devices and a session
+        // traded for the second one's token.
         let old = Connection::open(&path).unwrap();
         old.execute_batch(
             "CREATE TABLE devices (
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                 scope TEXT NOT NULL CHECK (scope IN ('manage', 'sync')),
                 token_hash BLOB NOT NULL UNIQUE, created_at INTEGER NOT NULL,
-                last_seen_at INTEGER, revoked_at INTEGER);",
+                last_seen_at INTEGER, revoked_at INTEGER);
+             CREATE TABLE sessions (
+                id_hash BLOB PRIMARY KEY, device_id INTEGER,
+                scope TEXT NOT NULL CHECK (scope IN ('manage', 'sync')),
+                created_at INTEGER NOT NULL, seen_at INTEGER NOT NULL);",
         )
         .unwrap();
-        let token = new_token().unwrap();
+        let tokens = [new_token().unwrap(), new_token().unwrap()];
+        for (i, token) in tokens.iter().enumerate() {
+            old.execute(
+                "INSERT INTO devices (id, name, scope, token_hash, created_at, last_seen_at)
+                 VALUES (?1, 'Old', 'manage', ?2, 5, 7)",
+                params![i as i64 + 1, &digest(token)[..]],
+            )
+            .unwrap();
+        }
         old.execute(
-            "INSERT INTO devices (name, scope, token_hash, created_at) VALUES ('Old', 'manage', ?1, 5)",
-            [&digest(&token)[..]],
+            "INSERT INTO sessions VALUES (?1, 2, 'manage', 5, 5)",
+            [&digest("traded")[..]],
         )
         .unwrap();
         drop(old);
+
         let s = Store::open(&path).unwrap();
-        let d = s.device(&token, 10).unwrap().unwrap();
-        s.touch_device(d.id, 10, Some("192.168.1.9"), None).unwrap();
-        let info = s.device_info(d.id).unwrap().unwrap();
-        assert_eq!((info.paired_at, info.platform), (5, None));
-        assert_eq!(info.last_ip.as_deref(), Some("192.168.1.9"));
+        let sql: String = s
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'devices'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+        // The rows came along, ids and all.
+        let d = s.device(&tokens[1], 10).unwrap().unwrap();
+        assert_eq!(d.id, 2);
+        let info = s.device_info(2).unwrap().unwrap();
+        assert_eq!(
+            (info.created_at, info.paired_at, info.last_seen_at),
+            (5, 5, Some(7))
+        );
+        assert_eq!(info.platform, None);
+        assert!(s.session("traded", 10).unwrap().is_some());
+        s.touch_device(2, 10, Some("192.168.1.9"), None).unwrap();
+        assert_eq!(
+            s.device_info(2).unwrap().unwrap().last_ip.as_deref(),
+            Some("192.168.1.9")
+        );
+        // From here on, the highest id isn't handed out again.
+        s.remove_device(2).unwrap();
+        let (next, _) = s.add_device("New", Scope::Manage, 20).unwrap();
+        assert_eq!(next, 3);
         // Opening it again changes nothing.
         drop(s);
-        Store::open(&path).unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.devices().unwrap().len(), 2);
     }
 }

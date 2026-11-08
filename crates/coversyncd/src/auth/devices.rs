@@ -28,6 +28,8 @@ use crate::Shared;
 
 /// Longest device name.
 const MAX_NAME: usize = 64;
+/// Longest app version a device may report.
+const MAX_APP_VERSION: usize = 64;
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -157,9 +159,13 @@ fn about(value: Option<&str>, max: usize, what: &str) -> Result<Option<String>, 
 }
 
 /// The app version a request names in `Coversync-App-Version`, if any.
+/// Checked as `/api/pair` checks the field, but one that fails is ignored:
+/// it's no reason to refuse the request.
 pub(super) fn app_version(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get("coversync-app-version")?.to_str().ok()?.trim();
-    (!v.is_empty() && v.len() <= 64).then(|| v.to_owned())
+    let v = headers.get("coversync-app-version")?.to_str().ok()?;
+    about(Some(v), MAX_APP_VERSION, "app version")
+        .ok()
+        .flatten()
 }
 
 #[derive(Serialize)]
@@ -304,6 +310,9 @@ async fn create(
     if !there {
         return Err(Refusal::no_device());
     }
+    // Before the code is made: one made for an answer that then fails
+    // would wait with nobody to show it.
+    let ca = ca_state(&setup).await?;
     let at = state.auth.instant();
     let made = state.auth.pairings().create(name, req.scope, replace, at);
     let Some((id, code)) = made.map_err(Refusal::failed)? else {
@@ -313,7 +322,6 @@ async fn create(
             "Too many pairing codes are waiting. Close other Add device dialogs first.",
         ));
     };
-    let ca = ca_state(&setup).await?;
     tracing::info!(scope = req.scope.as_str(), replace, "made a pairing code");
     Ok(secret(Created {
         id,
@@ -434,14 +442,20 @@ async fn save_setup(
     Json(setup): Json<PairingSetup>,
 ) -> Answer {
     password_only(&access)?;
-    let path = ca::setting(setup.ca_path.as_deref()).map_err(Refusal::bad_ca)?;
-    if let Some(path) = path.clone() {
-        blocking(move || ca::load(&path))
+    let path = ca::setting(setup.ca_path.as_deref())
+        .map_err(Refusal::bad_ca)?
+        .map(|p| p.to_string_lossy().into_owned());
+    // Only a new path is checked here. The saved one is checked wherever
+    // it's used, and the answer's `ca_problem` says if it has gone bad, so
+    // a broken file doesn't stop the rest of the setup from being saved.
+    let saved = db(&state, |s| s.pairing_setup()).await?.ca_path;
+    if let Some(new) = path.clone().filter(|p| saved.as_ref() != Some(p)) {
+        blocking(move || ca::load(std::path::Path::new(&new)))
             .await?
             .map_err(Refusal::bad_ca)?;
     }
     let setup = PairingSetup {
-        ca_path: path.map(|p| p.to_string_lossy().into_owned()),
+        ca_path: path,
         allow_http: setup.allow_http,
     };
     let saved = setup.clone();
@@ -512,12 +526,30 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
 }
 
 /// Whether a token handed over in answer to this request stays off the
-/// network unencrypted: the request reached the proxy on this machine over
-/// HTTPS, or comes from this machine itself. A forwarded scheme is only
-/// believed from a proxy on this machine.
+/// network unencrypted. Only two kinds of request qualify, both from a peer
+/// on this machine (coversyncd itself speaks plain http):
+///
+/// - one the proxy here received over HTTPS (`X-Forwarded-Proto: https`);
+/// - one that came straight from this machine, with no sign of a proxy.
+///
+/// A request a proxy forwarded over plain http is refused, whatever client
+/// it names: it came over a network.
 fn private_transport(peer: Option<IpAddr>, headers: &HeaderMap) -> bool {
-    let local = |ip: Option<IpAddr>| ip.is_some_and(|ip| ip.to_canonical().is_loopback());
-    (local(peer) && super::over_https(headers)) || local(super::client_ip(peer, headers))
+    if !peer.is_some_and(|ip| ip.to_canonical().is_loopback()) {
+        return false;
+    }
+    if super::over_https(headers) {
+        return true;
+    }
+    ![
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "forwarded",
+        "via",
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
 }
 
 #[derive(Deserialize)]
@@ -580,9 +612,6 @@ async fn pair(
     headers: HeaderMap,
     Json(req): Json<PairRequest>,
 ) -> Answer {
-    let platform = about(req.platform.as_deref(), 32, "platform")?;
-    let hostname = about(req.hostname.as_deref(), 253, "host name")?;
-    let app_version = about(req.app_version.as_deref(), 64, "app version")?;
     let code = pairing::normalize(&req.code).ok_or_else(|| {
         Refusal::bad(
             "bad_code",
@@ -608,6 +637,11 @@ async fn pair(
              plain http in Sync setup for a network that is encrypted already.",
         ));
     }
+    // After the transport check, so a code sent in the clear is cancelled
+    // whatever else is wrong with the request.
+    let platform = about(req.platform.as_deref(), 32, "platform")?;
+    let hostname = about(req.hostname.as_deref(), 253, "host name")?;
+    let app_version = about(req.app_version.as_deref(), MAX_APP_VERSION, "app version")?;
     let limited = limit::Client::new(client);
     if let Err(wait) = state.auth.pair_try(limited) {
         tracing::info!(client = ?client, "pairing refused: too many failed attempts");
@@ -634,7 +668,19 @@ async fn pair(
         s.pair_device(&new, now())
     })
     .await;
-    let (device, token) = issued.inspect_err(|_| state.auth.pairings().failed(&claim.id))?;
+    let issued = issued.inspect_err(|_| state.auth.pairings().failed(&claim.id))?;
+    let Some((device, token)) = issued else {
+        // The device to replace was removed while this one paired: it
+        // doesn't come back.
+        state.auth.pairings().replaced_gone(&claim.id);
+        state.auth.pair_give_back(limited);
+        tracing::warn!(client = ?client, replace, "pairing refused: the device to replace was removed");
+        return Err(Refusal::new(
+            StatusCode::NOT_FOUND,
+            "no_device",
+            "The device this code would replace was removed. Make a new code in Add device.",
+        ));
+    };
     state.auth.pairings().paired(&claim.id, device);
     state.auth.pair_give_back(limited);
     let s = state.clone();

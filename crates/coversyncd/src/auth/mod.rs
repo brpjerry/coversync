@@ -782,15 +782,18 @@ async fn login_with_token(
     let now = now();
     let seen = Seen::of(ip, &headers);
     let traded = tokio::task::spawn_blocking(move || -> rusqlite::Result<Result<_, Denied>> {
-        let found = check(&s.auth.store, Credentials::Token(token), now)?;
+        let found = check(&s.auth.store, Credentials::Token(token.clone()), now)?;
         let stale = !found.touch.is_empty();
         match found.access {
             Ok(Access {
                 device: Some(device),
-                scope,
                 ..
             }) => {
-                let id = s.auth.store.create_device_session(device, scope, now)?;
+                // Only while the token is still the device's: pairing again
+                // or revoking may have committed since the check.
+                let Some(id) = s.auth.store.create_device_session(&token, now)? else {
+                    return Ok(Err(Denied::InvalidToken));
+                };
                 if stale {
                     let (ip, version) = (seen.ip.as_deref(), seen.app_version.as_deref());
                     s.auth.store.touch_device(device, now, ip, version)?;

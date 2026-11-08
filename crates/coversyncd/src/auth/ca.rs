@@ -84,15 +84,28 @@ pub fn setting(typed: Option<&str>) -> Result<Option<PathBuf>, String> {
 /// Read and check the certificate at `path`. The error says what's wrong,
 /// for Sync setup.
 pub fn load(path: &Path) -> Result<Certificate, String> {
-    let file = std::fs::File::open(path).map_err(|e| match e.kind() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let unreadable = |e: std::io::Error| match e.kind() {
         std::io::ErrorKind::NotFound => "There's no file at that path.".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
             "coversyncd isn't allowed to read that file.".to_owned()
         }
         _ => format!("That file can't be read: {e}."),
-    })?;
+    };
+    // Checked before opening it: opening a FIFO would wait for a writer.
+    // Opened without blocking too, in case the path changes in between.
+    let not_a_file = || "That path isn't a file.".to_owned();
+    if !std::fs::metadata(path).map_err(unreadable)?.is_file() {
+        return Err(not_a_file());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(unreadable)?;
     if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return Err("That path isn't a file.".into());
+        return Err(not_a_file());
     }
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1)
@@ -315,5 +328,24 @@ mod tests {
         let ca = dir.join("rootCA.pem");
         std::fs::write(&ca, CA).unwrap();
         assert_eq!(load(&ca).unwrap().fingerprint_colons(), OPENSSL);
+    }
+
+    /// Opening a named pipe for reading waits for a writer: it's refused
+    /// before that.
+    #[test]
+    fn a_fifo_is_refused_without_waiting() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-ca-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("rootCA.pem");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo only reads the NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(load(&fifo)).unwrap());
+        let refused = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("checking a FIFO doesn't wait");
+        assert!(refused.unwrap_err().contains("isn't a file"));
     }
 }
