@@ -9,12 +9,16 @@ import {
 	type PairingSetupResponse,
 	type SyncSetupResponse
 } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
-class SyncSetupStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+/** Sync setup's two halves, read together. */
+interface SyncAndPairing {
+	sync: SyncSetupResponse;
+	pairing: PairingSetupResponse;
+}
+
+class SyncSetupStore extends SetupStore<SyncAndPairing> {
 	/** As last saved on the daemon. */
 	savedEnabled = $state(true);
 	/** Being edited. */
@@ -36,61 +40,48 @@ class SyncSetupStore {
 			Number(this.caPath.trim() !== this.savedCaPath) +
 			Number(this.allowHttp !== this.savedAllowHttp)
 	);
-	/** Bumped by each save, so a load that started before one can't undo it. */
-	#saves = 0;
 
-	#applySync(r: SyncSetupResponse, keepEdits: boolean) {
-		if (!keepEdits || this.enabled === this.savedEnabled) this.enabled = r.setup.enabled;
-		this.savedEnabled = r.setup.enabled;
+	protected async fetch() {
+		const [sync, pairing] = await Promise.all([api.syncSetup(), api.pairingSetup()]);
+		return { sync, pairing };
 	}
 
-	#applyPairing(r: PairingSetupResponse, keepEdits: boolean) {
+	/** A field left as it was saved follows the saved setup; an edited one stays. */
+	protected take(r: SyncAndPairing, first: boolean) {
+		if (first || this.enabled === this.savedEnabled) this.enabled = r.sync.setup.enabled;
+		this.savedEnabled = r.sync.setup.enabled;
+		this.#takePairing(r.pairing, first);
+	}
+
+	#takePairing(r: PairingSetupResponse, first: boolean) {
 		const path = r.setup.ca_path ?? '';
-		if (!keepEdits || this.caPath.trim() === this.savedCaPath) this.caPath = path;
-		if (!keepEdits || this.allowHttp === this.savedAllowHttp) this.allowHttp = r.setup.allow_http;
+		if (first || this.caPath.trim() === this.savedCaPath) this.caPath = path;
+		if (first || this.allowHttp === this.savedAllowHttp) this.allowHttp = r.setup.allow_http;
 		this.savedCaPath = path;
 		this.savedAllowHttp = r.setup.allow_http;
 		this.ca = r.ca;
 		this.caProblem = r.ca_problem;
 	}
 
-	async load() {
-		const saves = this.#saves;
-		try {
-			const [sync, pairing] = await Promise.all([api.syncSetup(), api.pairingSetup()]);
-			if (saves !== this.#saves) return;
-			// Keep unsaved choices.
-			this.#applySync(sync, this.loaded);
-			this.#applyPairing(pairing, this.loaded);
-			this.loaded = true;
-			this.failed = false;
-		} catch {
-			this.failed = !this.loaded;
-		}
-	}
-
 	revert() {
 		this.enabled = this.savedEnabled;
 		this.caPath = this.savedCaPath;
 		this.allowHttp = this.savedAllowHttp;
-		this.caRefused = null;
 	}
 
-	/** Save what changed; returns whether all of it was saved. */
-	async save() {
-		this.saving = true;
-		this.#saves++;
-		// What's saved is what was on screen at the click: changes made while
-		// saving stay, unsaved.
+	/**
+	 * Save what changed, as it was on screen at the click (changes made while
+	 * saving stay, unsaved); returns whether all of it was saved.
+	 */
+	save() {
 		const enabled = this.enabled;
 		const caPath = this.caPath.trim();
 		const allowHttp = this.allowHttp;
-		let ok = true;
-		try {
+		return this.write(async () => {
+			let ok = true;
 			if (enabled !== this.savedEnabled) {
 				try {
 					const r = await api.saveSyncSetup({ enabled });
-					// A choice made while saving stays, unsaved.
 					if (this.enabled === enabled) this.enabled = r.setup.enabled;
 					this.savedEnabled = r.setup.enabled;
 				} catch (e) {
@@ -101,12 +92,10 @@ class SyncSetupStore {
 			if (caPath !== this.savedCaPath || allowHttp !== this.savedAllowHttp) {
 				try {
 					const r = await api.savePairingSetup({ ca_path: caPath || null, allow_http: allowHttp });
+					// As for a read, but what was just saved replaces what was sent.
 					if (this.caPath.trim() === caPath) this.caPath = r.setup.ca_path ?? '';
 					if (this.allowHttp === allowHttp) this.allowHttp = r.setup.allow_http;
-					this.savedCaPath = r.setup.ca_path ?? '';
-					this.savedAllowHttp = r.setup.allow_http;
-					this.ca = r.ca;
-					this.caProblem = r.ca_problem;
+					this.#takePairing(r, false);
 					if (this.caRefused?.path === caPath) this.caRefused = null;
 				} catch (e) {
 					ok = false;
@@ -116,10 +105,8 @@ class SyncSetupStore {
 				}
 			}
 			if (ok) toast('Sync setup saved', 'success');
-		} finally {
-			this.saving = false;
-		}
-		return ok;
+			return ok;
+		});
 	}
 }
 

@@ -772,6 +772,32 @@ def devices_flow(d, out, tag, url):
     add_device_keyboard(d)
     add_device_new_code(d, out, tag, base)
     device_edits_keep_newer_ones(d)
+    pairing_setup_follows_saves_elsewhere(d)
+
+
+def pairing_setup_follows_saves_elsewhere(d):
+    """Sync setup's Pairing, while another browser saves it: a field left as
+    it was follows the save, and one being edited keeps its draft."""
+    switch = ("return [...document.querySelectorAll('main [role=switch]')]"
+              ".find(s => s.textContent.includes('plain http'))?.getAttribute('aria-checked')")
+    save_elsewhere = """
+        const done = arguments[1];
+        fetch('api/pairing/setup', {method: 'PUT', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({ca_path: null, allow_http: arguments[0]})})
+            .then(r => done(r.status), e => done(String(e)));
+    """
+    d.wait(f"{switch} === 'false'")
+    d.clear_and_type("#ca-path", "~/draft.pem")
+    status = d.s("POST", "/execute/async", {"args": [True], "script": save_elsewhere})
+    check(status == 200, f"saved elsewhere: {status}")
+    # Through the event stream, or the poll while it's down.
+    d.wait(f"{switch} === 'true'", 20.0)
+    check(d.js("return document.querySelector('#ca-path').value") == "~/draft.pem",
+          "the switch followed the save made elsewhere; the CA path draft stayed")
+    d.s("POST", "/execute/async", {"args": [False], "script": save_elsewhere})
+    d.wait(f"{switch} === 'false'", 20.0)
+    d.click_text("main", "Revert")
+    d.wait("return document.querySelector('#ca-path').value === ''")
 
 
 def device_edits_keep_newer_ones(d):
