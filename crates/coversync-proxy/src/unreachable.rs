@@ -13,8 +13,8 @@ use crate::upstream::Upstream;
 /// Why the server's UI can't be shown: the server couldn't be reached,
 /// didn't answer in time, answered the way a reverse proxy does when the
 /// server behind it is down (502, 503 or 504), or sent the page outside
-/// its origin and prefix. [`Proxy::check`](crate::Proxy::check) also gets one for an
-/// address that isn't a coversync server it can use.
+/// its origin and prefix. [`Proxy::check`](crate::Proxy::check) also gets
+/// one for an address that isn't a coversync server it can use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreachable {
     /// The server's URL.

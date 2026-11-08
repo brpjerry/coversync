@@ -122,10 +122,10 @@ impl Builder {
     }
 
     /// Called when loading a page (a navigation, not an API call or a cover)
-    /// can't reach the server, gets 502, 503 or 504 from it, or would be sent
-    /// outside its origin and prefix. The proxy answers with a short error page of
-    /// its own, or passes the server's on; the app can show its fallback
-    /// page instead.
+    /// can't reach the server, gets 502, 503 or 504 from it, or would be
+    /// sent outside its origin and prefix. The proxy answers with a short
+    /// error page of its own, or passes the server's on; the app can show
+    /// its fallback page instead.
     pub fn on_unreachable(mut self, handler: impl Fn(Unreachable) + Send + Sync + 'static) -> Self {
         self.on_unreachable = Some(Arc::new(handler));
         self
@@ -228,9 +228,8 @@ impl Proxy {
     /// `/api/hello` (open without a login) says `"app": "coversync"`.
     /// Redirects within the server's origin and prefix are followed, up to
     /// five; any other redirect, an error, or anything else is refused,
-    /// saying why. The
-    /// server's cookies go with it, and any it sets are kept, as for a page
-    /// load. Doesn't change which server the proxy uses.
+    /// saying why. The server's cookies go with it, and any it sets are
+    /// kept, as for a page load. Doesn't change which server the proxy uses.
     pub async fn check(&self, upstream: &Upstream) -> Result<(), Unreachable> {
         let timeout = self.shared.page_timeout;
         match tokio::time::timeout(timeout, self.hello(upstream)).await {
@@ -304,7 +303,7 @@ impl Proxy {
     }
 }
 
-/// Redirects [`Proxy::check`] follows on the server's own origin.
+/// Redirects [`Proxy::check`] follows within the server's origin and prefix.
 const MAX_REDIRECTS: usize = 5;
 /// More than `/api/hello` ever says.
 const HELLO_LIMIT: usize = 64 * 1024;
