@@ -5,9 +5,11 @@
 	"license": "AGPL-3.0-or-later",
 	"type": "module",
 	"scripts": {
-		"tauri": "tauri"
+		"tauri": "tauri",
+		"vendor": "node vendor.mjs"
 	},
 	"devDependencies": {
+		"@tauri-apps/api": "^2.12.4",
 		"@tauri-apps/cli": "^2.12.4"
 	}
 }

@@ -2,7 +2,9 @@
 // the page crashed. Once a server answers, the app moves the window on to
 // its UI.
 
-const { invoke } = window.__TAURI__.core;
+// @tauri-apps/api's own module, copied into ui/vendor (see vendor.mjs): the app
+// doesn't put the API in a global, so pages served through its proxies don't get it.
+import { invoke } from './vendor/tauri-api/core.js';
 
 const $ = (id) => document.getElementById(id);
 const title = $('title');

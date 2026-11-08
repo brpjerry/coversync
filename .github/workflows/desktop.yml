@@ -56,6 +56,12 @@ jobs:
 
       - name: Install the Tauri CLI
         run: pnpm install --frozen-lockfile
+      # The fallback page's copy of @tauri-apps/api must match the locked one.
+      - name: Check ui/vendor
+        run: |
+          pnpm vendor
+          git diff --exit-code -- ui/vendor
+          test -z "$(git status --porcelain -- ui/vendor)"
       - name: rustfmt
         working-directory: apps/desktop/src-tauri
         run: cargo fmt --check
