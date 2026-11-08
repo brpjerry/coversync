@@ -436,6 +436,103 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
     paired(app.pair_from("100.64.0.7:5000", pair(&code)).await).await;
 }
 
+/// `POST /api/pair` with a body as it is, of the type given.
+fn raw_pair(content_type: Option<&str>, body: String) -> Request<Body> {
+    let mut req = Request::post("/api/pair");
+    if let Some(t) = content_type {
+        req = req.header(header::CONTENT_TYPE, t);
+    }
+    req.body(Body::from(body)).unwrap()
+}
+
+/// A body's content type, and the body made from a code.
+type Written = (Option<&'static str>, fn(&str) -> String);
+
+#[tokio::test]
+async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
+    let app = App::with_password("http-raw");
+    let cookie = app.cookie().await;
+    let bodies: [Written; 6] = [
+        // A form, with the code as typed.
+        (Some("application/x-www-form-urlencoded"), |c| {
+            format!("code={}&platform=android", typed(c))
+        }),
+        // JSON, but not said to be.
+        (Some("text/plain"), |c| json!({ "code": c }).to_string()),
+        // No type at all, and the code alone.
+        (None, |c| c.to_owned()),
+        // JSON cut short, with other fields first.
+        (Some("application/json"), |c| {
+            format!(r#"{{"platform": "android", "hostname": "pixel-8", "code": "{c}""#)
+        }),
+        // Not even text around it.
+        (Some("application/octet-stream"), |c| {
+            format!("\u{0}\u{1}{}\u{2}", typed(c))
+        }),
+        // Valid JSON, with the code where it belongs.
+        (Some("application/json"), |c| {
+            json!({ "code": c }).to_string()
+        }),
+    ];
+    for (kind, body) in bodies {
+        let (id, code) = app.new_code(&cookie, phone()).await;
+        let res = app.pair_from(LAN, raw_pair(kind, body(&code))).await;
+        let what = format!("{kind:?} {:?}", body(&code));
+        assert_eq!(
+            code_of(res).await,
+            (StatusCode::FORBIDDEN, "https_required".into()),
+            "{what}"
+        );
+        assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure", "{what}");
+    }
+
+    // Over HTTPS the same bodies are refused strictly, and leave the code be.
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    let res = app
+        .pair_from(
+            LOCAL,
+            raw_pair(Some("text/plain"), json!({ "code": code }).to_string()),
+        )
+        .await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_request".into())
+    );
+    let res = app
+        .pair_from(
+            LOCAL,
+            raw_pair(Some("application/json"), format!(r#"{{"code": "{code}""#)),
+        )
+        .await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::BAD_REQUEST, "bad_request".into())
+    );
+    assert_eq!(app.pairing(&cookie, &id).await["state"], "waiting");
+    // A type with parameters is JSON all the same.
+    let res = app
+        .pair_from(
+            LOCAL,
+            raw_pair(
+                Some("application/json; charset=utf-8"),
+                json!({ "code": code }).to_string(),
+            ),
+        )
+        .await;
+    paired(res).await;
+}
+
+#[test]
+fn code_shaped_words_are_found_in_any_body() {
+    use super::super::devices::codes_in;
+    assert_eq!(codes_in(br#"{"code": "k7qm-4ztd"}"#), ["K7QM4ZTD"]);
+    assert_eq!(codes_in(b"code=K7QM-4ZTD&x=1"), ["K7QM4ZTD"]);
+    assert_eq!(codes_in(b"nothing here"), Vec::<String>::new());
+    // Only a few, however many a body holds.
+    let many = (0..1000).map(|i| format!("{i:08} ")).collect::<String>();
+    assert_eq!(codes_in(many.as_bytes()).len(), 8);
+}
+
 #[tokio::test]
 async fn a_sync_only_token_gets_403_on_management_routes() {
     let app = App::with_password("sync-scope");

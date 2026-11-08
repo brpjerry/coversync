@@ -13,6 +13,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -605,6 +606,51 @@ impl From<Refused> for Refusal {
     }
 }
 
+/// Codes a refused request may have carried, found however its body is
+/// written: the JSON `code` if it parses, and code-shaped words (8 letters
+/// and digits, perhaps with a hyphen) anywhere in it. Some words are
+/// code-shaped too ("platform", "hostname"), so a few are taken, but only a
+/// few: a body full of guesses cancels no more codes than a few requests
+/// would.
+pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
+    const MOST: usize = 8;
+    let mut codes = Vec::new();
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(code) = json
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .and_then(pairing::normalize)
+    {
+        codes.push(code);
+    }
+    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]);
+    let words = text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter_map(pairing::normalize);
+    for code in words {
+        if codes.len() == MOST {
+            break;
+        }
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    codes
+}
+
+/// Whether the request says its body is JSON, as axum's `Json` would check.
+fn json_type(headers: &HeaderMap) -> bool {
+    let Some(kind) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+    else {
+        return false;
+    };
+    let kind = kind.trim().to_ascii_lowercase();
+    kind == "application/json" || (kind.starts_with("application/") && kind.ends_with("+json"))
+}
+
 /// Open to all: a device trades a pairing code for its own token. It creates
 /// nothing without a waiting code, and is rate-limited like logins; after
 /// [`pairing::FAILURES`] failures every waiting code is cancelled.
@@ -612,10 +658,40 @@ async fn pair(
     State(state): State<Shared>,
     Peer(peer): Peer,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Answer {
-    // `{"code", "platform"?, "app_version"?, "hostname"?}`, read as plain
-    // JSON: only the code is looked at before the transport check.
+    // The body is taken as it came, and the transport checked first: a code
+    // sent in the clear is cancelled however the rest of the request is
+    // written, its type and JSON included.
+    let client = super::client_ip(peer, &headers);
+    let allow_http = db(&state, |s| s.pairing_setup()).await?.allow_http;
+    let at = state.auth.instant();
+    if !allow_http && !private_transport(peer, &headers) {
+        // Whoever saw the code on the way mustn't get to use it over HTTPS.
+        let mut pairings = state.auth.pairings();
+        for code in codes_in(&body) {
+            pairings.cancel_code(&code, Cancelled::Insecure, at);
+        }
+        drop(pairings);
+        tracing::warn!(client = ?client, "pairing refused: plain http");
+        return Err(Refusal::new(
+            StatusCode::FORBIDDEN,
+            "https_required",
+            "Pairing over plain http:// is refused, as the token would cross the network \
+             unencrypted, and this code is cancelled. Use the server's https:// address, or allow \
+             plain http in Sync setup for a network that is encrypted already.",
+        ));
+    }
+    // Now strictly: `{"code", "platform"?, "app_version"?, "hostname"?}`.
+    if !json_type(&headers) {
+        return Err(Refusal::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "bad_request",
+            "Send the request as JSON, with Content-Type: application/json.",
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Refusal::bad("bad_request", format!("The request isn't valid JSON: {e}.")))?;
     let code = body
         .get("code")
         .and_then(serde_json::Value::as_str)
@@ -626,27 +702,6 @@ async fn pair(
                 "A pairing code has 8 letters and digits, like K7QM-4ZTD.",
             )
         })?;
-    let client = super::client_ip(peer, &headers);
-    let allow_http = db(&state, |s| s.pairing_setup()).await?.allow_http;
-    let at = state.auth.instant();
-    if !allow_http && !private_transport(peer, &headers) {
-        // The code crossed the network unencrypted: whoever saw it mustn't
-        // get to use it over HTTPS instead.
-        state
-            .auth
-            .pairings()
-            .cancel_code(&code, Cancelled::Insecure, at);
-        tracing::warn!(client = ?client, "pairing refused: plain http");
-        return Err(Refusal::new(
-            StatusCode::FORBIDDEN,
-            "https_required",
-            "Pairing over plain http:// is refused, as the token would cross the network \
-             unencrypted, and this code is cancelled. Use the server's https:// address, or allow \
-             plain http in Sync setup for a network that is encrypted already.",
-        ));
-    }
-    // After the transport check, so a code sent in the clear is cancelled
-    // whatever else is wrong with the request.
     let req: AboutDevice = serde_json::from_value(body).map_err(|e| {
         Refusal::bad(
             "bad_request",
