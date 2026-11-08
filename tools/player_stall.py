@@ -3,28 +3,41 @@
 
     COVERSYNC_PASSWORD=... tools/player_stall.py http://127.0.0.1:8770/
 
-Puts a small proxy that can stall a track's stream in front of the daemon at
-the URL, opens the UI through it (signing in as tools/ui_smoke.py does), and
-plays the first album four times. Each time, the page itself notes the
-spinner, the play button's label and the time every 100 ms, and the run
-stops at the first check that fails:
+Puts a small proxy in front of the daemon at the URL and opens the UI through
+it (signing in as tools/ui_smoke.py does). The proxy answers every track's
+stream itself, with five minutes of generated 16-bit PCM WAV at a fixed
+bitrate, so where a time lies in the file is known whatever the library
+holds; it can hold a stream back, or stop it for good. Everything else goes
+to the daemon. The first album's first track is played four times. Each
+time, the page itself notes the spinner, the play button's label and the
+time every 100 ms, and the run stops at the first check that fails:
 
-1. A stall before playback starts: the spinner shows while nothing plays,
-   and goes once the audio does.
+1. A stall before any playable data: the stream's first bytes are held back
+   for 4 s. The spinner shows while nothing plays, and goes once the audio
+   does.
 2. A seek into audio that arrives: a second later there's no spinner, and the
    time moves on from where it landed.
-3. A seek whose request stalls: the spinner stays while the time doesn't move.
+3. A seek beyond the bytes supplied: the stream stops for good after 10 s of
+   audio, and the seek, 2 minutes on, needs a request of its own, held back
+   for 5 s. (Firefox waits for the stream it has instead, rather than asking
+   again, for a seek less than about 1 MiB past it.) Once that request is
+   seen, the spinner stays while it waits and the time doesn't move.
 4. Pausing: the spinner goes, and the button reads Play.
 
 Read-only: it only plays. Like ui_smoke.py, it needs geckodriver.
 """
 
+import array
 import contextlib
 import importlib.util
+import io
+import math
+import re
 import sys
 import threading
 import time
 import urllib.parse
+import wave
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,36 +46,104 @@ spec = importlib.util.spec_from_file_location("ui_smoke", Path(__file__).with_na
 ui_smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ui_smoke)
 
+RATE = 16_000
+BYTES_PER_SECOND = RATE * 2  # mono, 16-bit
+LENGTH = 300  # seconds
+HEADER = 44  # a plain WAV header
+
+
+def tone():
+    """LENGTH seconds of a quiet 400 Hz tone, as a WAV file."""
+    period = RATE // 400
+    one = array.array("h", (int(3000 * math.sin(2 * math.pi * i / period)) for i in range(period)))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(one.tobytes() * (RATE * LENGTH // period))
+    data = out.getvalue()
+    assert len(data) == HEADER + BYTES_PER_SECOND * LENGTH
+    return data
+
+
+def offset(seconds):
+    """Where `seconds` into the audio lies in the file."""
+    return HEADER + seconds * BYTES_PER_SECOND
+
 
 class Stalls:
-    """How the proxy stalls streams; the checks change it as they go."""
+    """How the proxy serves streams, and the stream requests it has had. The
+    checks change it as they go."""
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.requests = []
         self.set()
 
-    def set(self, start_after=None, start_for=0.0, seek_for=0.0):
-        """A stream from its start pauses `start_for` seconds after `start_after`
-        bytes; one from elsewhere (a seek) waits `seek_for` seconds first."""
+    def set(self, hold_start=0.0, supply=None, hold_seek=0.0):
+        """A stream request from the start waits `hold_start` seconds before its
+        first byte, and stops for good after `supply` bytes (None: it doesn't);
+        one from elsewhere (a seek) waits `hold_seek` seconds first."""
         with self.lock:
-            self.start_after, self.start_for, self.seek_for = start_after, start_for, seek_for
+            self.hold_start, self.supply, self.hold_seek = hold_start, supply, hold_seek
 
-    def get(self):
+    def take(self, start):
+        """A stream request from byte `start`: records it, and says how to serve it."""
         with self.lock:
-            return self.start_after, self.start_for, self.seek_for
+            hold = self.hold_start if start == 0 else self.hold_seek
+            self.requests.append((time.monotonic(), start, hold))
+            return hold, self.supply if start == 0 else None
+
+    def seen(self, since):
+        """The stream requests since `since` (time.monotonic()): [(start, held)]."""
+        with self.lock:
+            return [(start, hold) for t, start, hold in self.requests if t >= since]
 
 
-def stalling_proxy(upstream, stalls):
-    """Serves on a free port, forwarding to `upstream` (host, port)."""
+STREAM = re.compile(r"/api/tracks/\d+/stream(\?|$)")
+RANGE = re.compile(r"bytes=(\d+)-(\d*)$")
+
+
+def stalling_proxy(upstream, stalls, audio):
+    """Serves on a free port: streams from `audio`, the rest from `upstream` (host, port)."""
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def stream(self):
+            start, end = 0, len(audio) - 1
+            if m := RANGE.match(self.headers.get("Range", "")):
+                start = int(m[1])
+                end = min(int(m[2]), end) if m[2] else end
+            hold, supply = stalls.take(start)
+            self.send_response(206 if "Range" in self.headers else 200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end + 1 - start))
+            if "Range" in self.headers:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(audio)}")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(hold)
+            stop = end + 1 if supply is None else min(end + 1, supply)
+            try:
+                for at in range(start, stop, 64 * 1024):
+                    self.wfile.write(audio[at : min(at + 64 * 1024, stop)])
+                self.wfile.flush()
+                if stop <= end:
+                    # Stopped for good: the connection stays open, with nothing on it.
+                    time.sleep(120)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
 
         def forward(self, method):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else None
             conn = HTTPConnection(*upstream)
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in ("connection",)}
+            headers = {k: v for k, v in self.headers.items() if k.lower() != "connection"}
             conn.request(method, self.path, body=body, headers=headers)
             res = conn.getresponse()
             self.send_response(res.status)
@@ -71,27 +152,18 @@ def stalling_proxy(upstream, stalls):
                     self.send_header(k, v)
             self.send_header("Connection", "close")
             self.end_headers()
-            stream = "/stream" in self.path
-            from_start = self.headers.get("Range", "bytes=0-").startswith("bytes=0-")
-            start_after, start_for, seek_for = stalls.get()
-            if stream and not from_start and seek_for:
-                self.wfile.flush()
-                time.sleep(seek_for)
-            sent, paused = 0, False
             try:
                 while chunk := res.read(64 * 1024):
                     self.wfile.write(chunk)
-                    sent += len(chunk)
-                    if stream and from_start and start_after is not None and not paused and sent >= start_after:
-                        self.wfile.flush()
-                        paused = True
-                        time.sleep(start_for)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             self.close_connection = True
 
         def do_GET(self):
-            self.forward("GET")
+            if STREAM.search(self.path):
+                self.stream()
+            else:
+                self.forward("GET")
 
         def do_POST(self):
             self.forward("POST")
@@ -130,10 +202,12 @@ def seconds(clock):
 
 
 class Run:
-    """One play of the first album, with the page noting what the player shows."""
+    """One play of the first album's first track, with the page noting what the
+    player shows."""
 
     def __init__(self, d, url):
         self.d = d
+        self.marks = {}
         d.go(url)
         ui_smoke.sign_in(d)
         d.wait("return document.querySelectorAll('.card').length > 0")
@@ -146,6 +220,8 @@ class Run:
         d.js("document.querySelector('.actions .btn.primary').click()")
 
     def mark(self, what):
+        """Notes `what` in the page's samples, and when it was here."""
+        self.marks[what] = time.monotonic()
         self.d.js("window.__mark(arguments[0])", what)
 
     def seek(self, ahead):
@@ -202,15 +278,18 @@ def main():
     url = sys.argv[1]
     parts = urllib.parse.urlsplit(url)
     stalls = Stalls()
-    port = stalling_proxy((parts.hostname, parts.port or 80), stalls)
+    port = stalling_proxy((parts.hostname, parts.port or 80), stalls, tone())
     via = urllib.parse.urlunsplit(("http", f"127.0.0.1:{port}", parts.path or "/", "", ""))
     try:
-        # 1. Nothing to play for 4 s.
-        stalls.set(start_after=256 * 1024, start_for=4)
+        # 1. The stream's first bytes held back for 4 s.
+        stalls.set(hold_start=4)
         with fresh() as d:
             run = Run(d, via)
             time.sleep(7)
-            run.show("a stall before playback starts")
+            run.show("a stall before any playable data")
+            seen = stalls.seen(run.marks["play"])
+            print(f"   stream requests (from byte, held for): {seen}")
+            check((0, 4) in seen, "the stream's first request was held back")
             start = run.at("play")
             stalled = run.between(start + 0.5, start + 3.5)
             check(any(s[1] for s in stalled) and all(s[3] == "0:00" for s in stalled),
@@ -218,7 +297,7 @@ def main():
             last = run.samples()[-1]
             check(not last[1] and seconds(last[3]) > 0, "it goes once the audio plays")
 
-        # 2. No stalls; seek 30 s ahead.
+        # 2. Nothing held back; seek 30 s ahead.
         stalls.set()
         with fresh() as d:
             run = Run(d, via)
@@ -233,16 +312,22 @@ def main():
                   "a second after the seek, there's no spinner")
             check(seconds(run.samples()[-1][3]) > before + 30, "the time moves on past the seek")
 
-        # 3. The first request hangs after 2 MB; the seek's waits 5 s.
-        stalls.set(start_after=2 * 1024 * 1024, start_for=60, seek_for=5)
+        # 3. 10 s of audio, then nothing; the seek, 2 minutes on (3.6 MB past what
+        # was supplied), waits 5 s for its own request.
+        supplied = offset(10)
+        stalls.set(supply=supplied, hold_seek=5)
         with fresh() as d:
             run = Run(d, via)
             time.sleep(3)
-            run.seek(30)
+            run.seek(120)
             time.sleep(4)
             run.pause()
             time.sleep(1)
-            run.show("a seek whose request stalls, then a pause")
+            run.show("a seek beyond the bytes supplied, then a pause")
+            seen = stalls.seen(run.marks["seek"])
+            print(f"   stream requests since the seek (from byte, held for): {seen}")
+            check(any(start > supplied and held == 5 for start, held in seen),
+                  f"the seek asked for bytes beyond the {supplied} supplied, and was held back")
             seek, pause = run.at("seek"), run.at("pause")
             waiting = run.between(seek + 0.5, pause - 0.2)
             check(bool(waiting) and all(s[1] for s in waiting),
@@ -266,6 +351,7 @@ def fresh():
         yield d
     finally:
         d.quit()
+
 
 if __name__ == "__main__":
     main()
