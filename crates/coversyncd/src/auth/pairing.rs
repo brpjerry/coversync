@@ -77,6 +77,8 @@ pub enum Status {
         /// Seconds left.
         expires_in: u64,
     },
+    /// A device redeemed it, and its token is being issued.
+    Pairing,
     /// A device redeemed it.
     Paired {
         device: i64,
@@ -184,6 +186,11 @@ impl Pairings {
             },
             None => Refused::Wrong,
         };
+        // A code that was used was right: a device trying it again (its
+        // answer lost on the way, say) isn't guessing.
+        if refused == Refused::Used {
+            return Err(refused);
+        }
         self.failures += 1;
         if self.failures >= FAILURES {
             self.failures = 0;
@@ -246,8 +253,7 @@ impl Pairings {
             State::Waiting => Status::Waiting {
                 expires_in: (LIFETIME - now.saturating_duration_since(p.made)).as_secs(),
             },
-            // The token is being written: a moment more.
-            State::Claimed => Status::Waiting { expires_in: 0 },
+            State::Claimed => Status::Pairing,
             State::Paired(device) => Status::Paired { device },
             State::Cancelled(why) => Status::Cancelled { why },
             State::Failed => Status::Failed,
@@ -395,7 +401,22 @@ mod tests {
             let _ = p.redeem("00000000", t0);
         }
         assert!(p.redeem(&code_c, t0).is_ok());
-        assert!(matches!(p.status(&c, t0), Some(Status::Waiting { .. })));
+        assert_eq!(p.status(&c, t0), Some(Status::Pairing));
+    }
+
+    #[test]
+    fn trying_a_used_code_again_is_no_guess() {
+        let t0 = Instant::now();
+        let mut p = Pairings::default();
+        let (id, used) = waiting(&mut p, t0);
+        p.redeem(&used, t0).unwrap();
+        p.paired(&id, 1);
+        let (other, _) = waiting(&mut p, t0);
+        // A device whose answer was lost tries its code again, and again.
+        for _ in 0..FAILURES * 2 {
+            assert_eq!(p.redeem(&used, t0), Err(Refused::Used));
+        }
+        assert!(matches!(p.status(&other, t0), Some(Status::Waiting { .. })));
     }
 
     #[test]

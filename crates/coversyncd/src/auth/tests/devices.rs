@@ -405,10 +405,11 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
         assert_eq!(res.status(), StatusCode::FORBIDDEN, "{lines:?}");
         assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
     }
-    // Through the proxy over HTTPS: fine.
+    // Through the proxy over HTTPS: fine. (Another client: each refusal so
+    // far counted against 192.168.1.20's tries.)
     let (_, code) = app.new_code(&cookie, phone()).await;
     paired(
-        app.pair_from(LOCAL, proxied(&code, "https", "192.168.1.20"))
+        app.pair_from(LOCAL, proxied(&code, "https", "192.168.1.21"))
             .await,
     )
     .await;
@@ -497,9 +498,12 @@ async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
             )
         }),
     ];
-    for (kind, body) in bodies {
+    // Each from a client of its own, with its tries left: past the limits,
+    // only a JSON code is looked for.
+    for (i, (kind, body)) in bodies.into_iter().enumerate() {
         let (id, code) = app.new_code(&cookie, phone()).await;
-        let res = app.pair_from(LAN, raw_pair(kind, body(&code))).await;
+        let client = format!("192.168.2.{i}:1000");
+        let res = app.pair_from(&client, raw_pair(kind, body(&code))).await;
         let what = format!("{kind:?} {:?}", body(&code));
         assert_eq!(
             code_of(res).await,
@@ -550,23 +554,35 @@ async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
 #[test]
 fn thousands_of_code_shaped_words_are_found_fast() {
     use super::super::devices::codes_in;
+    use super::super::pairing::{Cancelled, Pairings};
     let words: Vec<String> = (0..7000).map(|i| format!("{:08}", i * 7919)).collect();
+    // A 63 KiB body of them: only the first 4 KiB's are taken.
     let body = words.join(" ");
-    assert!(body.len() <= 64 * 1024);
     let started = std::time::Instant::now();
     let found = codes_in(body.as_bytes());
     let took = started.elapsed();
-    assert_eq!(found.len(), 7000);
+    assert_eq!(found.len(), 4096 / 9, "the words whole in the first 4 KiB");
     assert!(
         found.windows(2).all(|w| w[0] < w[1]),
         "sorted, without repeats"
     );
-    assert!(took < Duration::from_millis(250), "{took:?}");
-    // And cancelling them all looks each waiting code up once.
-    let mut pairings = super::super::pairing::Pairings::default();
-    let at = std::time::Instant::now();
+    assert!(took < Duration::from_millis(100), "{took:?}");
+    // Cancelling thousands looks each waiting code up once.
+    let mut sorted = words.clone();
+    sorted.sort();
+    let mut pairings = Pairings::default();
+    for _ in 0..16 {
+        pairings
+            .create(
+                "Phone".into(),
+                Scope::Manage,
+                None,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+    }
     let started = std::time::Instant::now();
-    pairings.cancel_codes(&found, super::super::pairing::Cancelled::Insecure, at);
+    pairings.cancel_codes(&sorted, Cancelled::Insecure, std::time::Instant::now());
     assert!(started.elapsed() < Duration::from_millis(50));
 }
 
@@ -638,9 +654,71 @@ fn code_shaped_words_are_found_in_any_body() {
     let found = codes_in(form.as_bytes());
     assert!(found.len() > 8, "{found:?}");
     assert!(found.contains(&"K7QM4ZTD".to_owned()), "{found:?}");
-    // Only the first 64 KiB is read.
-    let long = format!("{}code=K7QM-4ZTD", " ".repeat(64 * 1024));
+    // Only the first 4 KiB is searched for words...
+    let long = format!("{}code=K7QM-4ZTD", " ".repeat(4 * 1024));
     assert!(codes_in(long.as_bytes()).is_empty());
+    let near = format!("{}code=K7QM-4ZTD", " ".repeat(4 * 1024 - 20));
+    assert_eq!(codes_in(near.as_bytes()), ["K7QM4ZTD"]);
+    // ...but a JSON code is found wherever it is.
+    let padded = format!(
+        r#"{{"x": "{}", "code": "K7QM-4ZTD"}}"#,
+        " ".repeat(64 * 1024)
+    );
+    assert_eq!(codes_in(padded.as_bytes()), ["K7QM4ZTD"]);
+}
+
+#[tokio::test]
+async fn a_panic_while_issuing_a_token_fails_the_code() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let app = App::with_password("issue-panic");
+    let cookie = app.cookie().await;
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    app.state.auth.probe.issue_panics.store(true, SeqCst);
+    let res = app.pair_from(LOCAL, pair(&code)).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal".into())
+    );
+    // Not left pairing: the dialog says it failed.
+    assert_eq!(
+        app.pairing(&cookie, &id).await,
+        json!({ "state": "failed" })
+    );
+    app.state.auth.probe.issue_panics.store(false, SeqCst);
+    assert_eq!(app.devices(&cookie).await["devices"], json!([]));
+}
+
+#[tokio::test]
+async fn plain_http_requests_count_against_the_pairing_limits() {
+    let app = App::with_password("http-limit");
+    let cookie = app.cookie().await;
+    let me = "192.168.1.50:1000";
+    for _ in 0..5 {
+        let (_, code) = app.new_code(&cookie, phone()).await;
+        let res = app.pair_from(me, pair(&code)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+    // The same client through the proxy over HTTPS now waits, right code or not.
+    let (_, code) = app.new_code(&cookie, phone()).await;
+    let res = app
+        .pair_from(LOCAL, proxied(&code, "https", "192.168.1.50"))
+        .await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Past the limits, a JSON code sent in the clear is still cancelled; a
+    // body of words isn't searched.
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    let res = app.pair_from(me, pair(&code)).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    let form = raw_pair(Some("text/plain"), format!("code={}", typed(&code)));
+    assert_eq!(
+        app.pair_from(me, form).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.pairing(&cookie, &id).await["state"], "waiting");
+    // Another client isn't held up.
+    paired(app.pair_from(LOCAL, pair(&code)).await).await;
 }
 
 #[tokio::test]
@@ -659,14 +737,17 @@ async fn a_device_hanging_up_mid_pair_still_ends_its_code() {
             app.pair_from(LOCAL, pair(&code)).await
         })
     };
-    // Claimed: a waiting code with no time left on the stopped clock.
+    // Claimed: the dialog sees it pairing.
     for _ in 0..250 {
-        if asked.load(SeqCst) && app.pairing(&cookie, &id).await["expires_in"] == 0 {
+        if asked.load(SeqCst) && app.pairing(&cookie, &id).await["state"] == "pairing" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(app.pairing(&cookie, &id).await["expires_in"], 0);
+    assert_eq!(
+        app.pairing(&cookie, &id).await,
+        json!({ "state": "pairing" })
+    );
     device.abort();
     assert!(device.await.unwrap_err().is_cancelled());
     // The issue runs to its end, and the dialog learns of the device.
@@ -1103,6 +1184,12 @@ async fn the_ca_setting_refuses_private_keys_and_serves_the_certificate() {
     // None yet.
     let res = app.get("/api/hello/ca", None).await;
     assert_eq!(code_of(res).await, (StatusCode::NOT_FOUND, "no_ca".into()));
+    // Checking nothing is answered as the API answers.
+    let res = app.get("/api/pairing/check-ca", Some(&cookie)).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::BAD_REQUEST, "bad_request".into())
+    );
 
     for path in [&key, &both] {
         let res = app.pairing_setup(&cookie, path.to_str(), false).await;

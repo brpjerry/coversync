@@ -97,6 +97,8 @@ struct Probe {
     check_delay: Mutex<std::time::Duration>,
     /// Added before a paired device's token is issued, likewise.
     issue_delay: Mutex<std::time::Duration>,
+    /// Issuing a paired device's token panics.
+    issue_panics: std::sync::atomic::AtomicBool,
     /// Password checks running now, and the most that ran at once.
     running: std::sync::atomic::AtomicUsize,
     most_running: std::sync::atomic::AtomicUsize,

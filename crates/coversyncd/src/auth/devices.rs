@@ -348,6 +348,8 @@ enum PairingStatus {
     Waiting {
         expires_in: u64,
     },
+    /// A device redeemed it, and its token is being issued.
+    Pairing,
     /// The device that redeemed it; null if it has since been removed.
     Paired {
         device: Option<DeviceInfo>,
@@ -377,6 +379,7 @@ async fn status(
             ));
         }
         Some(pairing::Status::Waiting { expires_in }) => PairingStatus::Waiting { expires_in },
+        Some(pairing::Status::Pairing) => PairingStatus::Pairing,
         Some(pairing::Status::Paired { device }) => PairingStatus::Paired {
             device: db(&state, move |s| s.device_info(device)).await?,
         },
@@ -481,13 +484,17 @@ async fn save_setup(
 
 #[derive(Deserialize)]
 struct CheckQuery {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// Sync setup checks the CA certificate path as it's typed.
 async fn check_ca(Extension(access): Extension<Access>, Query(q): Query<CheckQuery>) -> Answer {
     password_only(&access)?;
-    let Some(path) = ca::setting(Some(&q.path)).map_err(Refusal::bad_ca)? else {
+    let typed = q
+        .path
+        .ok_or_else(|| Refusal::bad("bad_request", "Give the path to check, as ?path=."))?;
+    let Some(path) = ca::setting(Some(&typed)).map_err(Refusal::bad_ca)? else {
         return Ok(Json(None::<CaInfo>).into_response());
     };
     let cert = blocking(move || ca::load(&path))
@@ -608,26 +615,33 @@ impl From<Refused> for Refusal {
     }
 }
 
+/// How much of a body refused for plain http is searched for code-shaped
+/// words. A real request is far shorter, and its JSON `code` is found
+/// wherever it is.
+const SEARCHED: usize = 4 * 1024;
+
+/// The JSON `code` of a body, if it parses and has one.
+fn json_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("code")?
+        .as_str()
+        .and_then(pairing::normalize)
+}
+
 /// Codes a refused request may have carried, found however its body is
 /// written: the JSON `code` if it parses, and every code-shaped word (8
-/// letters and digits, perhaps with a hyphen) in its first 64 KiB. Ordinary
-/// words can be code-shaped too ("platform", "hostname"), so none is left
-/// out: that could leave out the real code. Cancelling a few dozen guesses
-/// at 40-bit codes this way gets nowhere, however many requests are sent.
+/// letters and digits, perhaps with a hyphen) in its first [`SEARCHED`]
+/// bytes. Ordinary words can be code-shaped too ("platform", "hostname"),
+/// so none is left out: that could leave out the real code. That's a few
+/// hundred guesses at most, against 40-bit codes, and such requests count
+/// against the pairing limits like failed ones.
 ///
 /// Sorted, without repeats, for [`pairing::Pairings::cancel_codes`]: found
-/// all at once and sorted once, as a body may hold thousands.
+/// all at once and sorted once.
 pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
-    let mut codes = Vec::new();
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
-        && let Some(code) = json
-            .get("code")
-            .and_then(serde_json::Value::as_str)
-            .and_then(pairing::normalize)
-    {
-        codes.push(code);
-    }
-    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]);
+    let mut codes: Vec<String> = json_code(body).into_iter().collect();
+    let text = String::from_utf8_lossy(&body[..body.len().min(SEARCHED)]);
     codes.extend(
         text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
             .filter_map(pairing::normalize),
@@ -650,6 +664,22 @@ fn json_type(headers: &HeaderMap) -> bool {
     kind == "application/json" || (kind.starts_with("application/") && kind.ends_with("+json"))
 }
 
+/// Marks a claimed code failed unless what became of it was noted first: a
+/// panic while its token is issued doesn't leave it claimed.
+struct Unsettled<'a> {
+    state: &'a Shared,
+    id: &'a str,
+    settled: bool,
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.state.auth.pairings().failed(self.id);
+        }
+    }
+}
+
 /// Open to all: a device trades a pairing code for its own token. It creates
 /// nothing without a waiting code, and is rate-limited like logins; after
 /// [`pairing::FAILURES`] failures every waiting code is cancelled.
@@ -664,10 +694,20 @@ async fn pair(
     // written, its type and JSON included.
     let allow_http = db(&state, |s| s.pairing_setup()).await?.allow_http;
     let at = state.auth.instant();
+    let limited = limit::Client::new(client);
     if !allow_http && !private_transport(peer, &headers) {
         // Whoever saw the code on the way mustn't get to use it over HTTPS.
-        // Found before the lock is taken, which is held only to cancel.
-        let codes = codes_in(&body);
+        // Each such request counts as a failed attempt; past the limits, only
+        // its JSON code is looked for, so a code sent in the clear is still
+        // cancelled but a body can't be filled with guesses. Found before the
+        // lock is taken, which is held only to cancel.
+        let codes = match state.auth.pair_try(limited) {
+            Ok(()) => {
+                state.auth.pair_failed(limited);
+                codes_in(&body)
+            }
+            Err(_) => json_code(&body).into_iter().collect(),
+        };
         state
             .auth
             .pairings()
@@ -710,7 +750,6 @@ async fn pair(
     let platform = about(req.platform.as_deref(), MAX_PLATFORM, "platform")?;
     let hostname = about(req.hostname.as_deref(), MAX_HOSTNAME, "host name")?;
     let app_version = about(req.app_version.as_deref(), MAX_APP_VERSION, "app version")?;
-    let limited = limit::Client::new(client);
     if let Err(wait) = state.auth.pair_try(limited) {
         tracing::info!(client = ?client, "pairing refused: too many failed attempts");
         return Ok(super::too_many(wait));
@@ -728,8 +767,22 @@ async fn pair(
     // to its end even if the device hangs up meanwhile: a claimed code always
     // ends, as paired or failed, and the dialog shows what became of it.
     let issued = blocking(move || {
+        let mut unsettled = Unsettled {
+            state: &s,
+            id: &id,
+            settled: false,
+        };
         #[cfg(test)]
-        std::thread::sleep(*s.auth.probe.issue_delay.lock().unwrap());
+        {
+            std::thread::sleep(*s.auth.probe.issue_delay.lock().unwrap());
+            if s.auth
+                .probe
+                .issue_panics
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("a test's panic while a token is issued");
+            }
+        }
         let new = NewDevice {
             name: &name,
             scope,
@@ -748,6 +801,7 @@ async fn pair(
             Ok(None) => pairings.replaced_gone(&id),
             Err(_) => pairings.failed(&id),
         }
+        unsettled.settled = true;
         issued
     })
     .await?
