@@ -222,11 +222,16 @@ fn past_the_end(size: u64) -> ApiError {
     )
 }
 
+/// Finish an upload, then scan. That goes on even if the client hangs up,
+/// so the album still appears; asking again gives the same answer.
 async fn finish(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Finished>> {
-    let done = blocking(&state, move |s| s.uploads.finish(&id)).await?;
-    tracing::info!(path = done.path, "upload finished");
-    spawn_scan(state.clone());
-    Ok(Json(done))
+    let task = tokio::spawn(async move {
+        let done = blocking(&state, move |s| s.uploads.finish(&id)).await?;
+        tracing::info!(path = done.path, "upload finished");
+        spawn_scan(state);
+        Ok(done)
+    });
+    task.await?.map(Json)
 }
 
 async fn cancel(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {

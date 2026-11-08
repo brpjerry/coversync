@@ -14,11 +14,12 @@
 //!   after coversyncd restarts.
 //! - `files/`: the files, at their paths. Chunks are written in place at
 //!   their offsets, in any order and several at once, and a file is flushed
-//!   to disk once, when its last byte is written.
+//!   to disk once, in the background, when its last byte is written.
 //!
-//! Finishing renames `files/` into the uploads folder under the upload's
-//! folder name, or `Name (2)`, `Name (3)`… when that is taken. Nothing is
-//! ever overwritten, and the album appears whole or not at all.
+//! Finishing flushes what is left, then renames `files/` into the uploads
+//! folder under the upload's folder name, or `Name (2)`, `Name (3)`… when
+//! that is taken. Nothing is ever overwritten, and the album appears whole or
+//! not at all.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -26,7 +27,7 @@ use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -452,6 +453,30 @@ impl Upload {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// Flush file `index` to disk, unless the upload is finishing (which
+    /// flushes what's left) or gone. It counts as flushed if nothing was
+    /// written to it since it had `writes` writes.
+    fn flush(&self, index: usize, writes: u64) {
+        let phase = self.phase.read().unwrap_or_else(|e| e.into_inner());
+        if *phase != Phase::Open {
+            return;
+        }
+        match File::open(self.staged_path(index)).and_then(|f| f.sync_data()) {
+            Ok(()) => {
+                let mut state = self.files[index].state();
+                if state.writes == writes {
+                    state.flushed = true;
+                    self.dirty.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(e) => tracing::warn!(
+                upload = self.id,
+                index,
+                "couldn't flush an uploaded file: {e}"
+            ),
+        }
+    }
+
     /// Save its progress, unless it's finishing or gone: that waits, as
     /// writes do, so the folder isn't removed under the save.
     fn save(&self) -> Result<()> {
@@ -470,6 +495,7 @@ impl Upload {
     /// Flush every file, then move them into `uploads` under the upload's
     /// folder name (or a numbered one). The upload is finishing.
     fn move_into(&self, uploads: &Path) -> Result<PathBuf> {
+        let mut unflushed = Vec::new();
         for (i, f) in self.files.iter().enumerate() {
             let path = self.staged_path(i);
             let file = match File::open(&path) {
@@ -486,9 +512,19 @@ impl Upload {
                 )));
             }
             if !f.state().flushed {
-                file.sync_data()?;
-                f.state().flushed = true;
+                unflushed.push((f, file));
             }
+        }
+        // Many small files are flushed together, as one big one would be.
+        if unflushed.len() > FLUSH_ONE_BY_ONE {
+            sync_filesystem(&self.dir)?;
+        } else {
+            for (_, file) in &unflushed {
+                file.sync_data()?;
+            }
+        }
+        for (f, _) in unflushed {
+            f.state().flushed = true;
         }
         let dest = place(&self.dir.join(FILES), uploads, &self.folder)?;
         File::open(uploads)?.sync_all()?;
@@ -575,8 +611,9 @@ impl ChunkWriter {
         Ok(())
     }
 
-    /// Done with the chunk. A file this completed is flushed to disk now,
-    /// while other chunks keep coming, so finishing has little left to do.
+    /// Done with the chunk. A file this completed is flushed to disk in the
+    /// background while other chunks keep coming, so finishing has little
+    /// left to do. The response doesn't wait for it.
     pub fn close(self) -> Result<FileStatus> {
         let staged = &self.upload.files[self.index];
         let due = {
@@ -584,16 +621,65 @@ impl ChunkWriter {
             (!state.flushed && complete(&state.ranges, staged.size)).then_some(state.writes)
         };
         if let Some(writes) = due {
-            self.file.sync_data()?;
-            let mut state = staged.state();
-            // Unless another chunk wrote to it meanwhile.
-            if state.writes == writes {
-                state.flushed = true;
-                self.upload.dirty.store(true, Ordering::Relaxed);
-            }
+            flush_later(self.upload.clone(), self.index, writes);
         }
         self.upload.file_status(self.index)
     }
+}
+
+/// Threads flushing complete files to disk, for all uploads. Flushes run
+/// several at once, which the filesystem can batch, and never hold up a
+/// chunk's response.
+const FLUSHERS: usize = 16;
+/// Finishing flushes up to this many files one by one, and more by flushing
+/// the whole filesystem once.
+const FLUSH_ONE_BY_ONE: usize = 8;
+
+type FlushJob = (Arc<Upload>, usize, u64);
+
+/// Have file `index` of `upload` flushed in the background.
+fn flush_later(upload: Arc<Upload>, index: usize, writes: u64) {
+    static QUEUE: OnceLock<mpsc::Sender<FlushJob>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<FlushJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..FLUSHERS {
+            let rx = rx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("upload-flush".into())
+                .spawn(move || {
+                    loop {
+                        let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((upload, index, writes)) = job else {
+                            return;
+                        };
+                        upload.flush(index, writes);
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("couldn't start a thread to flush uploads: {e}");
+            }
+        }
+        tx
+    });
+    // Without a thread to take it, finishing flushes the file instead.
+    let _ = queue.send((upload, index, writes));
+}
+
+/// Flush everything written to the filesystem holding `dir`.
+fn sync_filesystem(dir: &Path) -> Result<()> {
+    let folder = File::open(dir)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: syncfs only reads the descriptor, which `folder` keeps open.
+        if unsafe { libc::syncfs(folder.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    folder.sync_all()?;
+    Ok(())
 }
 
 fn beyond(f: &Staged) -> Error {
@@ -632,6 +718,9 @@ pub struct Uploads {
 struct Inner {
     folder: Option<PathBuf>,
     uploads: HashMap<String, Arc<Upload>>,
+    /// Uploads finished lately, and when: finishing one again answers the
+    /// same, for a client cut off while it finished.
+    finished: HashMap<String, (Finished, i64)>,
 }
 
 impl Uploads {
@@ -674,6 +763,22 @@ impl Uploads {
         let uploads = self.folder().ok_or_else(|| {
             Error::Invalid("Choose an Inbox folder in Inbox setup before uploading.".into())
         })?;
+        // The uploads folder is made if need be, but not the folders above
+        // it: a missing Inbox folder or disk isn't made up.
+        if !uploads.is_dir() {
+            if !uploads.parent().is_some_and(Path::is_dir) {
+                return Err(Error::Invalid(format!(
+                    "The folder holding the uploads folder {} isn't there. Check the uploads folder in Inbox setup.",
+                    uploads.display()
+                )));
+            }
+            match fs::create_dir(&uploads) {
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                    return Err(unwritable(e, &uploads));
+                }
+                _ => {}
+            }
+        }
         let staging = uploads.join(STAGING);
         fs::create_dir_all(&staging).map_err(|e| unwritable(e, &uploads))?;
         let id = new_id();
@@ -752,9 +857,21 @@ impl Uploads {
     }
 
     /// Move a complete upload into the uploads folder. An incomplete one is
-    /// refused, and stays as it is for the rest to be sent.
+    /// refused, and stays as it is for the rest to be sent. One finished
+    /// already (within [`IDLE_LIMIT`], since coversyncd started) gives the
+    /// same answer again.
     pub fn finish(&self, id: &str) -> Result<Finished> {
-        let upload = self.get(id)?;
+        let upload = match self.get(id) {
+            Err(Error::NotFound) => {
+                return self
+                    .lock()
+                    .finished
+                    .get(id)
+                    .map(|(done, _)| done.clone())
+                    .ok_or(Error::NotFound);
+            }
+            found => found?,
+        };
         let unfinished: Vec<&Staged> = upload
             .files
             .iter()
@@ -777,18 +894,22 @@ impl Uploads {
         upload.turn(Phase::Open, Phase::Finishing)?;
         match upload.move_into(&uploads) {
             Ok(dest) => {
-                self.lock().uploads.remove(id);
-                let _ = upload.turn(Phase::Finishing, Phase::Closed);
-                if let Err(e) = fs::remove_dir_all(&upload.dir) {
-                    tracing::warn!(dir = %upload.dir.display(), "couldn't clean up a finished upload: {e}");
-                }
-                Ok(Finished {
+                let done = Finished {
                     folder: dest
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     path: dest.display().to_string(),
-                })
+                };
+                let mut inner = self.lock();
+                inner.uploads.remove(id);
+                inner.finished.insert(id.to_string(), (done.clone(), now()));
+                drop(inner);
+                let _ = upload.turn(Phase::Finishing, Phase::Closed);
+                if let Err(e) = fs::remove_dir_all(&upload.dir) {
+                    tracing::warn!(dir = %upload.dir.display(), "couldn't clean up a finished upload: {e}");
+                }
+                Ok(done)
             }
             Err(e) => {
                 let _ = upload.turn(Phase::Finishing, Phase::Open);
@@ -824,6 +945,7 @@ impl Uploads {
     pub fn expire(&self, now: i64) -> usize {
         let idle: Vec<Arc<Upload>> = {
             let mut inner = self.lock();
+            inner.finished.retain(|_, (_, at)| *at + IDLE_LIMIT > now);
             let ids: Vec<String> = inner
                 .uploads
                 .values()
@@ -1063,6 +1185,17 @@ mod tests {
         w.close()
     }
 
+    /// Whether file `index` gets flushed, waiting a while for it.
+    fn flushed(u: &Upload, index: usize) -> bool {
+        for _ in 0..500 {
+            if u.files[index].state().flushed {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     fn bytes_of(n: usize, seed: u8) -> Vec<u8> {
         (0..n)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
@@ -1150,7 +1283,10 @@ mod tests {
         assert_eq!(s.ranges, [(0, 40), (60, 100)]);
         let s = chunk(&up, 0, 30, &one[30..70]).unwrap();
         assert!(s.complete && s.received == 100);
-        assert!(up.files[0].state().flushed, "a complete file is flushed");
+        assert!(
+            flushed(&up, 0),
+            "a complete file is flushed in the background"
+        );
         chunk(&up, 1, 0, &two).unwrap();
         let status = up.status(true);
         assert_eq!(
@@ -1161,6 +1297,10 @@ mod tests {
 
         let done = u.finish(up.id()).unwrap();
         assert_eq!(done.folder, "Album");
+        // A client cut off while it finished asks again.
+        assert_eq!(u.finish(up.id()).unwrap().path, done.path);
+        u.expire(now() + IDLE_LIMIT);
+        assert!(matches!(u.finish(up.id()), Err(Error::NotFound)));
         let album = folder.join("Album");
         assert_eq!(done.path, album.display().to_string());
         assert_eq!(fs::read(album.join("CD1/01.flac")).unwrap(), one);
@@ -1191,6 +1331,29 @@ mod tests {
             fs::read(Path::new(&done.path).join("a.flac")).unwrap(),
             data
         );
+    }
+
+    #[test]
+    fn finishing_flushes_what_is_left_many_at_once() {
+        let (folder, u) = uploads("flushleft");
+        let names: Vec<String> = (0..FLUSH_ONE_BY_ONE + 4)
+            .map(|i| format!("{i:02}.flac"))
+            .collect();
+        let files: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 3)).collect();
+        let up = u.start(new("Many", &files)).unwrap();
+        for i in 0..files.len() {
+            // Written, but not yet flushed in the background.
+            let mut w = up.writer(i, 0).unwrap();
+            w.write(&[i as u8; 3]).unwrap();
+        }
+        assert!(up.files.iter().all(|f| !f.state().flushed));
+        u.finish(up.id()).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                fs::read(folder.join("Many").join(name)).unwrap(),
+                [i as u8; 3]
+            );
+        }
     }
 
     #[test]
@@ -1283,6 +1446,7 @@ mod tests {
         let up = u.start(new("A", &[("a.flac", 10), ("b.flac", 4)])).unwrap();
         chunk(&up, 0, 0, &[7; 6]).unwrap();
         chunk(&up, 1, 0, &[8; 4]).unwrap();
+        assert!(flushed(&up, 1));
         u.save();
         let progress = folder.join(STAGING).join(up.id()).join(PROGRESS);
         assert!(progress.is_file());
@@ -1363,5 +1527,16 @@ mod tests {
         assert!(u.list().is_empty());
         assert_eq!(u.folder(), Some(other));
         assert_eq!(u.set_folder(None), 0);
+        // The uploads folder is made by the first upload, but not the
+        // folders above it, such as a disk that isn't mounted.
+        let away = folder.with_file_name("Unmounted").join("Uploads");
+        u.set_folder(Some(away.clone()));
+        assert!(
+            matches!(u.start(new("A", &[("a.flac", 1)])), Err(Error::Invalid(m)) if m.contains("isn't there"))
+        );
+        assert!(!away.parent().unwrap().exists());
+        u.set_folder(Some(folder.with_file_name("Fresh")));
+        u.start(new("A", &[("a.flac", 1)])).unwrap();
+        assert!(folder.with_file_name("Fresh").join(STAGING).is_dir());
     }
 }

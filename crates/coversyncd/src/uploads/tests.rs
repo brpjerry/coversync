@@ -390,6 +390,11 @@ async fn an_album_uploads_in_chunks_resumes_and_appears_in_the_inbox() {
         .call(Method::GET, &format!("/api/uploads/{id}"), None)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // A client cut off while it finished asks again, and gets the same answer.
+    assert_eq!(
+        app.call(Method::POST, &finish, None).await,
+        (StatusCode::OK, done)
+    );
 }
 
 #[tokio::test]

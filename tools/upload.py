@@ -133,7 +133,13 @@ def main():
     chunk = args.chunk or info["chunk_size"]
 
     if args.resume:
-        _, upload = client.call("GET", f"/api/uploads/{args.resume}")
+        try:
+            _, upload = client.call("GET", f"/api/uploads/{args.resume}")
+        except RuntimeError:
+            # Finished already, if this was cut off while it finished.
+            _, done = client.call("POST", f"/api/uploads/{args.resume}/finish")
+            print(f"finished already: {done['path']}")
+            return
         if [f["path"] for f in upload["files"]] != [f[0] for f in files]:
             sys.exit("that upload holds other files")
     else:

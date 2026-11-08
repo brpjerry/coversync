@@ -212,6 +212,8 @@ login, like the rest of the API.
    and starts a scan, so the album appears in the Inbox. If the folder's
    name is taken, it gets a number (`Album (2)`); nothing is ever
    overwritten. While bytes are missing it answers `409`, naming a file.
+   Finishing carries on if the client hangs up, and asking again gives the
+   same answer, for a day (until coversyncd restarts).
    `DELETE /api/uploads/{id}` cancels.
 
 Until it's finished, an upload is kept in `.coversync-uploads` in the uploads

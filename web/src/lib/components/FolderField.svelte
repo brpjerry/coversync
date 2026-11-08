@@ -83,9 +83,15 @@
 			return { tone: 'error', text: "That's a file, not a folder." };
 		if (!status.exists) {
 			if (purpose === 'inbox') return { tone: 'error', text: 'Folder not found.' };
-			const first = purpose === 'uploads' ? 'upload' : 'import';
+			if (purpose === 'uploads')
+				return status.creatable
+					? { tone: 'info', text: "Doesn't exist yet; created by the first upload." }
+					: {
+							tone: 'error',
+							text: "Doesn't exist, and coversyncd can't create it there, so uploads would fail. Choose a folder it can write to."
+						};
 			return status.creatable
-				? { tone: 'info', text: `Doesn't exist yet; created by the first ${first}.` }
+				? { tone: 'info', text: "Doesn't exist yet; created on the first import." }
 				: { tone: 'error', text: "Doesn't exist, and coversyncd can't create it there." };
 		}
 		if (!status.writable)
