@@ -257,7 +257,10 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   served at `http://127.0.0.1:<port>/coversync/`.
 - Each server gets its own port, kept from run to run, so each has an origin
   of its own in the window: its cached pages and covers, and the UI's
-  settings (sort, sidebar), are its own.
+  settings (sort, sidebar), are its own. Ports are kept for the saved server
+  and the 8 most recently used; a server that drops out of those loses its
+  cookies too, and its port never goes to another server. One server's
+  pages can't send requests through another's proxy.
 - The proxy keeps the server's cookies itself, apart for each server, and
   sends them as a browser would. So a server's login works as in a browser,
   and one server's cookies never go to another. Persistent ones (a login)
@@ -274,12 +277,17 @@ When no server is set, it can't be reached, or the page crashes, the window
 shows a page bundled with the app, to try again or change the server. A new
 server is used and saved only once it's checked: its `/api/hello`, which
 coversync answers without a login, has to say it's coversync. A server too
-old to have it, an error, or a redirect to another address doesn't pass.
-The address and the ports are kept in `config.json` in the app's config
-directory (`~/.config/io.github.brpjerry.coversync/` on Linux).
+old to have it, an error, or a redirect outside its address doesn't pass.
+Neither does a server behind a login of its own in front (HTTP basic auth on
+its reverse proxy, say), which answers 401 for `/api/hello`; `--server` or
+`COVERSYNC_SERVER` still opens it, without the check. The address and the
+ports are kept in `config.json` in the app's config directory
+(`~/.config/io.github.brpjerry.coversync/` on Linux).
 `--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
 saving it. One instance of the app runs at a time: launching it again
 brings up its window, and shows the server given with `--server`, if any.
+A lock in the config directory keeps a second process off its settings
+even where that handover can't work (without a D-Bus session bus).
 
 There are no packages for it yet. To build and run it on Arch Linux, you
 need WebKitGTK as well as Rust and pnpm. Playback also needs GStreamer's good

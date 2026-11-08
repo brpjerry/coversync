@@ -11,7 +11,7 @@ stops at the first check that fails:
 
 1. A stall before playback starts: the spinner shows while nothing plays,
    and goes once the audio does.
-2. A seek into audio that arrives: the spinner goes within a second, and the
+2. A seek into audio that arrives: a second later there's no spinner, and the
    time moves on from where it landed.
 3. A seek whose request stalls: the spinner stays while the time doesn't move.
 4. Pausing: the spinner goes, and the button reads Play.
@@ -171,6 +171,11 @@ class Run:
     def at(self, mark):
         return next(t for t, s, _, _ in self.samples() if s == mark)
 
+    def state_at(self, t):
+        """What the player showed at `t`: the last change before it."""
+        states = [s for s in self.samples() if s[2] is not None and s[0] <= t]
+        return states[-1] if states else None
+
     def between(self, start, end):
         """What the player showed from `start` to `end`: the state it was in at
         `start` (the page notes only changes), then each change."""
@@ -223,8 +228,9 @@ def main():
             time.sleep(3)
             run.show("a seek into audio that arrives")
             seek = run.at("seek")
-            check(any(not s[1] for s in run.between(seek, seek + 1.0)),
-                  "the spinner goes within a second")
+            at = run.state_at(seek + 1.0)
+            check(at is not None and at[0] > seek and not at[1],
+                  "a second after the seek, there's no spinner")
             check(seconds(run.samples()[-1][3]) > before + 30, "the time moves on past the seek")
 
         # 3. The first request hangs after 2 MB; the seek's waits 5 s.
