@@ -26,7 +26,8 @@
 		detail: AlbumDetail | null;
 		allowWrites: boolean;
 		onclose: () => void;
-		onsaved: (result: TagWriteResult) => void;
+		/** A save of the album's tags, answered; `id` is the album's id as it was. */
+		onsaved: (result: TagWriteResult, id: string) => void;
 		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
 		onimport?: (edits?: ImportEdits) => void;
 		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */

@@ -27,7 +27,8 @@
 		detail: AlbumDetail;
 		/** Whether these files may be saved in place; Save is hidden otherwise. */
 		allowWrites: boolean;
-		onsaved: (result: TagWriteResult) => void;
+		/** A save, answered; `id` is the album's id as it was. */
+		onsaved: (result: TagWriteResult, id: string) => void;
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
@@ -154,15 +155,16 @@
 			if (Object.keys(edit).length) tracks[t.id] = edit;
 		}
 		saving = true;
+		const id = detail.id;
 		try {
-			const result = await api.writeTags(detail.id, { album, tracks });
+			const result = await api.writeTags(id, { album, tracks });
 			toast(
 				`Saved tags to ${result.files_written} ${result.files_written === 1 ? 'file' : 'files'}`,
 				'success'
 			);
 			// Saved: no longer a draft, while the album is reloaded with them.
 			base = structuredClone($state.snapshot(form));
-			onsaved(result);
+			onsaved(result, id);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 		} finally {

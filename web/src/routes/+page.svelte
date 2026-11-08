@@ -290,14 +290,15 @@
 		void openId;
 		openings++;
 	});
+	// `detail` is the open sheet's: once it closes, or another album opens, it's
+	// dropped, and the next opening reads the album again. Moving on to the
+	// album's new id (a rename, Reload) keeps what was read for it.
 	$effect(() => {
-		if (!held || held.from === openId) return;
-		// The sheet closed (or another album opened) while held: what it kept of
-		// the album may be out of date, so the next opening reads it again.
-		// Moving on to the album's new id keeps it.
-		const kept = untrack(() => detail?.id);
-		if (openId !== held.next && (kept === held.from || kept === held.next)) detail = null;
-		held = null;
+		const id = openId;
+		untrack(() => {
+			if (detail && detail.id !== id) detail = null;
+			if (held && held.from !== id) held = null;
+		});
 	});
 	/** What the album sheet shows. */
 	let sheetAlbum = $derived(holding?.album ?? openAlbum);
@@ -455,12 +456,15 @@
 		}
 	}
 
-	function onsaved(result: TagWriteResult) {
+	function onsaved(result: TagWriteResult, id: string) {
 		const from = openId;
 		// Saved over whatever changed elsewhere: the sheet shows the album as
 		// saved at once, so edits begun after Save stay. What came meanwhile is
 		// checked after it (see enqueue).
 		saves++;
+		// Answered once the sheet that saved has closed (or shows another album):
+		// only the grids show it.
+		if (sheetDetail?.id !== id) return loadAlbums();
 		// One object for the answer wherever the sheet shows it: the editor is
 		// keyed on it, and starting over would lose edits made since.
 		if (result.album) detail = result.album;
@@ -648,17 +652,6 @@
 	let saves = 0;
 
 	function enqueue(job: Job, first = false) {
-		// Tracks kept from an album no longer open are out of date once it
-		// changed (or notices were missed): opening it, or playing it, asks again.
-		const kept = detail?.id;
-		if (
-			kept &&
-			kept !== openId &&
-			kept !== holding?.next &&
-			(job.kind === 'resync' ||
-				(job.kind === 'notice' && (kept === job.id || kept === job.previous)))
-		)
-			detail = null;
 		// A later resync, reload or open makes one still waiting moot.
 		if (job.kind === 'resync' || job.kind === 'reload' || job.kind === 'open')
 			jobs = jobs.filter((j) => j.kind !== job.kind);
