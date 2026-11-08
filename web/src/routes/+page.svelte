@@ -284,6 +284,12 @@
 		changed: boolean;
 	} | null>(null);
 	let holding = $derived(held?.from === openId ? held : null);
+	/** Counts the sheet's openings (and closings): a Reload belongs to one. */
+	let openings = 0;
+	$effect(() => {
+		void openId;
+		openings++;
+	});
 	$effect(() => {
 		if (held && held.from !== openId) held = null;
 	});
@@ -476,11 +482,19 @@
 		try {
 			const [inbox, managed] = await Promise.all([api.albums('inbox'), api.albums('library')]);
 			// The open album has left the grids (renamed, imported or removed
-			// elsewhere) while its tags have unsaved edits: the sheet stays on it.
+			// elsewhere) while its tags have unsaved edits, or while a notice
+			// saying where it went waits its turn: the sheet stays on it.
 			const gone = (id: string) =>
 				!inbox.some((a) => a.id === id) && !managed.some((a) => a.id === id);
-			// During a save it stays without a word: the save may be what moved it.
-			if (openId && draft !== 'none' && !holding && openId !== importingHere && gone(openId))
+			const moving = !!openId && renamedLater(openId);
+			// During a save, or when moving, it stays without a word.
+			if (
+				openId &&
+				(draft !== 'none' || moving) &&
+				!holding &&
+				openId !== importingHere &&
+				gone(openId)
+			)
 				hold(null, draft === 'draft');
 			[albums, library] = [inbox, managed];
 			lastAlbums = Date.now();
@@ -613,7 +627,7 @@
 		| { kind: 'notice'; id: string; previous: string | null }
 		| { kind: 'resync' }
 		| { kind: 'moved'; from: string; to: string }
-		| { kind: 'reload'; sheet: string };
+		| { kind: 'reload'; sheet: string; opening: number };
 	let jobs: Job[] = [];
 	let running = false;
 	let wake: (() => void) | null = null;
@@ -666,8 +680,15 @@
 					return true;
 				case 'notice':
 					if (now === null || (now !== job.id && now !== job.previous)) return true;
-					// A later notice says where the album went: that one shows it.
-					if (renamedLater(job.id)) return true;
+					// A later notice says where the album went: that one shows it, and
+					// now matches the sheet as this one would have.
+					if (renamedLater(job.id)) {
+						if (job.id !== now)
+							jobs = jobs.map((j) =>
+								j.kind === 'notice' && j.previous === job.id ? { ...j, previous: now } : j
+							);
+						return true;
+					}
 					// Held: Reload shows it as it is; a new id is noted for that.
 					if (holding?.changed) {
 						if (job.id !== now) hold(job.id);
@@ -676,7 +697,7 @@
 					return await check(job.id);
 				case 'resync':
 					if (now === null || holding?.changed || renamedLater(now)) return true;
-					return await check(now);
+					return await check(now, true);
 				case 'moved':
 					// The sheet moves once the grids have the new id.
 					if (openId !== job.from) return true;
@@ -685,7 +706,7 @@
 						await goto(page.url.href, { state: { album: job.to }, shallow: true, replace: true });
 					return true;
 				case 'reload':
-					await reload(job.sheet);
+					await reload(job.sheet, job.opening);
 					return true;
 			}
 		} catch (e) {
@@ -710,9 +731,11 @@
 	 * show it, under the new id once the grids have it; with some, keep them
 	 * and say it changed, if it did. An answer that couldn't be had changes
 	 * nothing. Returns false if a save of this page's was answered meanwhile,
-	 * as the album may have been read before it.
+	 * as the album may have been read before it. `settle`: a resync, with no
+	 * notice to come; otherwise a new id already gone has been renamed again,
+	 * and the notice saying so moves the sheet on.
 	 */
-	async function check(to: string): Promise<boolean> {
+	async function check(to: string, settle = false): Promise<boolean> {
 		const from = openId;
 		if (!from || !sheetAlbum) return true;
 		// A new id is a change: with edits, say so at once.
@@ -727,6 +750,8 @@
 		const [fresh] = await Promise.all([fetchAlbum(to), to !== from ? gridsSettled() : null]);
 		if (openId !== from) return true;
 		if (saves !== before) return false;
+		// A notice waiting renames it again: that one shows it.
+		if (renamedLater(to)) return true;
 		// Not known (the daemon away, signed out): a later resync asks again.
 		if (fresh === undefined) return true;
 		const shown = $state.snapshot(sheetDetail);
@@ -738,7 +763,7 @@
 			return true;
 		}
 		if (!fresh) {
-			hold(null);
+			if (settle || to === from) hold(null);
 			return true;
 		}
 		if (to === from) held = null;
@@ -749,13 +774,16 @@
 	}
 
 	/** Reload, pressed on the sheet opened as `sheet`: drop its edits, and show the album as it is now. */
-	async function reload(sheet: string) {
+	async function reload(sheet: string, opening: number) {
 		const h = holding;
-		// Closed, or another album opened, since.
-		if (openId !== sheet || !h) return;
+		const before = saves;
+		// The sheet it was asked on, still held, or it's moot: closed (or
+		// reopened) since, or saved over.
+		const current = () => openId === sheet && openings === opening && holding === h;
+		if (!h || !current()) return;
 		const to = h.next ?? sheet;
 		const [fresh] = await Promise.all([fetchAlbum(to), loadAlbums()]);
-		if (openId !== sheet) return;
+		if (!current() || saves !== before) return;
 		if (fresh === undefined) {
 			toast('Couldn’t reload the album. Try again in a moment.', 'error');
 			return;
@@ -788,7 +816,7 @@
 
 	/** Drop the held sheet's unsaved edits and show its album as it is now. */
 	function reloadHeld() {
-		if (openId) enqueue({ kind: 'reload', sheet: openId });
+		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings });
 	}
 
 	/** An album was edited, here or elsewhere: show it as it is now. */
@@ -829,9 +857,13 @@
 			// Copies hide the Inbox files, which Inbox setup counts.
 			inboxSetup.refresh();
 			inboxChanged();
-			// The Inbox album open moves to the Library; a Library album open
-			// may have more tracks. An import made here closes its sheet itself.
-			if (inbox_id !== importingHere) enqueue({ kind: 'notice', id: album_id, previous: inbox_id });
+			// The Inbox album open moves to the Library (an import made here
+			// closes its sheet itself); a Library album open may have more tracks.
+			enqueue({
+				kind: 'notice',
+				id: album_id,
+				previous: inbox_id === importingHere ? null : inbox_id
+			});
 		},
 		album_changed: albumChanged,
 		setup_saved({ setup: saved }) {

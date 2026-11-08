@@ -32,6 +32,10 @@ export abstract class SetupStore<R> {
 	load(): Promise<void> {
 		if (this.loaded) return Promise.resolve();
 		this.#loading ??= this.#read()
+			.then(() => {
+				// Asked again while it loaded: its answer may be from before that.
+				if (this.#again && !this.#writing) this.#rerun();
+			})
 			.catch(() => {
 				this.failed = !this.loaded;
 			})
@@ -44,7 +48,12 @@ export abstract class SetupStore<R> {
 	 * unsaved edits; the first load if there hasn't been one.
 	 */
 	refresh(): Promise<void> {
-		if (!this.loaded) return this.load();
+		if (!this.loaded) {
+			// A first load under way may have been answered before what this
+			// was asked about: it reads again once it lands.
+			if (this.#loading) this.#again = true;
+			return this.load();
+		}
 		return this.#read().catch(() => {});
 	}
 
