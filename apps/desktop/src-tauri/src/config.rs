@@ -1,6 +1,8 @@
 //! The app's settings, in `config.json` in the app's config directory
-//! (`~/.config/io.github.brpjerry.coversync/` on Linux).
+//! (`~/.config/io.github.brpjerry.coversync/` on Linux). One instance of the
+//! app runs at a time, so one process writes it.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -13,9 +15,14 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// The server's URL, as the fallback page last saved it.
     pub server: Option<String>,
-    /// The proxy's port in the last run, to keep it (and with it the UI's
-    /// settings in local storage) when it's free.
-    pub port: Option<u16>,
+    /// The proxy's port for each server (by its URL), kept so each server
+    /// has an origin of its own, the same in every run: its cache and the
+    /// UI's settings in local storage are its own.
+    pub ports: BTreeMap<String, u16>,
+    /// The one port earlier builds kept, read into `ports` for the saved
+    /// server.
+    #[serde(skip_serializing)]
+    port: Option<u16>,
 }
 
 pub struct Store {
@@ -28,7 +35,7 @@ impl Store {
     /// defaults.
     pub fn open(dir: PathBuf) -> Self {
         let path = dir.join("config.json");
-        let current = match fs::read(&path) {
+        let mut current: Config = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
                 tracing::warn!("ignoring {}: {err}", path.display());
                 Config::default()
@@ -39,6 +46,9 @@ impl Store {
                 Config::default()
             }
         };
+        if let (Some(port), Some(server)) = (current.port.take(), current.server.clone()) {
+            current.ports.entry(server).or_insert(port);
+        }
         Self {
             path,
             current: Mutex::new(current),

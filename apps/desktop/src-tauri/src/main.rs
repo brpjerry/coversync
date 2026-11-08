@@ -2,26 +2,30 @@
 //!
 //! The UI comes from the server, through a proxy on 127.0.0.1
 //! (`coversync-proxy`) that streams everything both ways and keeps the
-//! server's path prefix. When no server is set, it can't be reached, or the
-//! page crashes, the window shows the bundled fallback page (`../ui`), where
-//! the server can be retried or changed.
+//! server's path prefix; each server gets its own (see [`shell`]). When no
+//! server is set, it can't be reached, or the page crashes, the window shows
+//! the bundled fallback page (`../ui`), where the server can be retried or
+//! changed. One instance runs at a time: launching it again brings its
+//! window up.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
 #[cfg(target_os = "linux")]
 mod gstreamer;
+mod shell;
 
 use std::error::Error;
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use coversync_proxy::{Proxy, Unreachable, Upstream, UpstreamError};
+use coversync_proxy::{Cookies, Proxy, Upstream};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use config::Store;
+use shell::{Problem, Save, Shell};
 
 /// The window's label, which the capabilities name.
 const WINDOW: &str = "main";
@@ -29,102 +33,6 @@ const WINDOW: &str = "main";
 const FALLBACK: &str = "index.html";
 /// A server for this run only, like `--server`. Neither is saved.
 const SERVER_ENV: &str = "COVERSYNC_SERVER";
-
-struct Shell {
-    proxy: Proxy,
-    config: Store,
-    /// The fallback page's URL.
-    fallback: Url,
-    /// Why the fallback page is showing, when something went wrong.
-    problem: Mutex<Option<Problem>>,
-}
-
-impl Shell {
-    fn set_problem(&self, problem: Option<Problem>) {
-        *self.problem.lock().expect("problem lock") = problem;
-    }
-
-    /// What `connect` does short of moving the window: picks `server`, or
-    /// with `None` the current one, and checks that it shows a UI. A new
-    /// server is saved and used only then, so a typo can't replace an
-    /// address that works. A failed retry of the current server becomes the
-    /// page's problem.
-    async fn switch(&self, server: Option<String>) -> Result<(), Problem> {
-        let (upstream, new) = match server {
-            Some(url) => (Upstream::parse(&url).map_err(Problem::invalid)?, true),
-            None => match self.proxy.upstream() {
-                Some(upstream) => (upstream, false),
-                None => return Err(Problem::new("No server is set", "Enter its address.")),
-            },
-        };
-        if let Err(unreachable) = self.proxy.check(&upstream).await {
-            let problem = Problem::unreachable(unreachable);
-            if !new {
-                self.set_problem(Some(problem.clone()));
-            }
-            return Err(problem);
-        }
-        if new {
-            if let Err(err) = self
-                .config
-                .update(|config| config.server = Some(upstream.url()))
-            {
-                tracing::warn!("couldn't save the server: {err}");
-            }
-            self.proxy.set_upstream(Some(upstream));
-        }
-        self.set_problem(None);
-        Ok(())
-    }
-
-    /// The commands are for the bundled pages. Tauri already treats the
-    /// proxy's origin as remote and the capability lists no remote URLs, so
-    /// the server's UI can't call them; this refuses them there regardless,
-    /// whatever the build.
-    fn bundled_only(&self, webview: &tauri::Webview) -> Result<(), Problem> {
-        let url = webview
-            .url()
-            .map_err(|err| Problem::new("Couldn't tell which page asked", err.to_string()))?;
-        let proxy = Url::parse(self.proxy.origin()).expect("the proxy's origin is a URL");
-        if url.origin() == proxy.origin() {
-            return Err(Problem::new(
-                "Not allowed",
-                "The server's pages can't use the app's own commands.",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Something that went wrong, as the fallback page shows it.
-#[derive(Clone, Debug, Serialize)]
-struct Problem {
-    title: String,
-    message: String,
-    /// The error underneath, in small print, when it adds something.
-    detail: Option<String>,
-}
-
-impl Problem {
-    fn new(title: &str, message: impl Into<String>) -> Self {
-        Self {
-            title: title.to_owned(),
-            message: message.into(),
-            detail: None,
-        }
-    }
-
-    fn unreachable(unreachable: Unreachable) -> Self {
-        Self {
-            detail: unreachable.detail,
-            ..Self::new("Can't reach the server", unreachable.reason)
-        }
-    }
-
-    fn invalid(err: UpstreamError) -> Self {
-        Self::new("That address won't work", err.to_string())
-    }
-}
 
 /// What the fallback page shows.
 #[derive(Serialize)]
@@ -135,17 +43,37 @@ struct Status {
     problem: Option<Problem>,
 }
 
+/// The commands are for the bundled pages. Tauri already treats the
+/// proxies' origins as remote and the capability lists no remote URLs, so a
+/// server's UI can't call them; this refuses them there regardless, whatever
+/// the build.
+fn bundled_only(webview: &tauri::Webview, shell: &Shell) -> Result<(), Problem> {
+    let page = webview
+        .url()
+        .map_err(|err| Problem::new("Couldn't tell which page asked", err.to_string()))?;
+    if shell.is_proxied(&page) {
+        return Err(Problem::new(
+            "Not allowed",
+            "A server's pages can't use the app's own commands.",
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn status(webview: tauri::Webview, shell: State<'_, Shell>) -> Result<Status, Problem> {
-    shell.bundled_only(&webview)?;
+    bundled_only(&webview, &shell)?;
     Ok(Status {
-        server: shell.proxy.upstream().map(|upstream| upstream.url()),
-        problem: shell.problem.lock().expect("problem lock").clone(),
+        server: shell
+            .current()
+            .and_then(|proxy| proxy.upstream())
+            .map(|upstream| upstream.url()),
+        problem: shell.problem(),
     })
 }
 
 /// Connects to `server`, or with `None` tries the current one again, and
-/// opens its UI once it answers (see [`Shell::switch`]).
+/// opens its UI once it's checked (see [`Shell::switch`]).
 #[tauri::command]
 async fn connect(
     app: AppHandle,
@@ -153,13 +81,13 @@ async fn connect(
     shell: State<'_, Shell>,
     server: Option<String>,
 ) -> Result<(), Problem> {
-    shell.bundled_only(&webview)?;
-    shell.switch(server).await?;
-    open_ui(&app, &shell.proxy)
+    bundled_only(&webview, &shell)?;
+    let proxy = shell.switch(server, Save::Yes).await?;
+    open_ui(&app, &proxy)
         .map_err(|err| Problem::new("Couldn't open the server's UI", err.to_string()))
 }
 
-/// Sends the window through the proxy's entry URL to the server's UI.
+/// Sends the window through the proxy's entry URL to its server's UI.
 fn open_ui(app: &AppHandle, proxy: &Proxy) -> tauri::Result<()> {
     let url = Url::parse(&proxy.entry_url()).expect("the entry URL is valid");
     match app.get_webview_window(WINDOW) {
@@ -179,6 +107,31 @@ fn show_fallback(app: &AppHandle, problem: Problem) {
     {
         tracing::error!("couldn't show the fallback page: {err}");
     }
+}
+
+/// Another launch of the app: bring the window up, and show the server it
+/// was given with `--server`, if any, for this run.
+fn launched_again(app: &AppHandle, args: Vec<String>) {
+    if let Some(window) = app.get_webview_window(WINDOW) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let Some(server) = server_arg(args.into_iter().skip(1)) else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let shell = app.state::<Shell>();
+        match shell.switch(Some(server), Save::No).await {
+            Ok(proxy) => {
+                if let Err(err) = open_ui(&app, &proxy) {
+                    tracing::error!("couldn't open the server's UI: {err}");
+                }
+            }
+            Err(problem) => show_fallback(&app, problem),
+        }
+    });
 }
 
 /// Watches WebKitGTK's web process, which draws the page: when it crashes,
@@ -269,48 +222,30 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     let server = server_arg(std::env::args().skip(1))
         .or_else(|| std::env::var(SERVER_ENV).ok().filter(|s| !s.is_empty()))
         .or(saved.server);
-    let mut problem = None;
-    let upstream = match server.as_deref().map(Upstream::parse) {
-        Some(Ok(upstream)) => Some(upstream),
-        Some(Err(err)) => {
-            problem = Some(Problem::invalid(err));
-            None
-        }
-        None => None,
-    };
 
     let handle = app.handle().clone();
-    let proxy = tauri::async_runtime::block_on(
-        Proxy::builder()
-            .upstream(upstream)
-            .preferred_port(saved.port)
-            .cookie_file(Some(config_dir.join("cookies.json")))
-            // The proxy logs it.
-            .on_unreachable(move |unreachable| {
-                show_fallback(&handle, Problem::unreachable(unreachable));
-            })
-            .start(),
-    )?;
-    let port = proxy.addr().port();
-    if saved.port != Some(port)
-        && let Err(err) = config.update(|config| config.port = Some(port))
-    {
-        tracing::warn!("couldn't save the proxy's port: {err}");
-    }
-
+    let shell = Shell::new(
+        config,
+        Cookies::open(Some(config_dir.join("cookies.json"))),
+        fallback_url(app)?,
+        // The proxy logs it.
+        Arc::new(move |unreachable| show_fallback(&handle, Problem::unreachable(unreachable))),
+    );
     // Straight to the server's UI when there's a server; the fallback page
     // takes over if it can't be reached.
-    let url = if proxy.upstream().is_some() {
-        WebviewUrl::External(Url::parse(&proxy.entry_url())?)
-    } else {
-        WebviewUrl::App(FALLBACK.into())
+    let url = match server.as_deref().map(Upstream::parse) {
+        Some(Ok(upstream)) => {
+            let proxy = tauri::async_runtime::block_on(shell.proxy_for(&upstream))?;
+            shell.show(proxy.clone());
+            WebviewUrl::External(Url::parse(&proxy.entry_url())?)
+        }
+        Some(Err(err)) => {
+            shell.set_problem(Some(Problem::invalid(err)));
+            WebviewUrl::App(FALLBACK.into())
+        }
+        None => WebviewUrl::App(FALLBACK.into()),
     };
-    app.manage(Shell {
-        proxy,
-        config,
-        fallback: fallback_url(app)?,
-        problem: Mutex::new(problem),
-    });
+    app.manage(shell);
     let window = WebviewWindowBuilder::new(app, WINDOW, url)
         .title("coversync")
         .inner_size(1280.0, 860.0)
@@ -348,6 +283,10 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
     tauri::Builder::default()
+        // First, so a second launch hands over before setting anything up.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            launched_again(app, args)
+        }))
         .invoke_handler(tauri::generate_handler![status, connect])
         .setup(setup)
         .run(tauri::generate_context!())
@@ -356,9 +295,6 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener};
-
     use super::*;
 
     #[test]
@@ -392,110 +328,5 @@ mod tests {
         assert_eq!(args(&["--server"]), None, "no value");
         assert_eq!(args(&["--serverx=y", "https://d/"]), None);
         assert_eq!(args(&[]), None);
-    }
-
-    /// A server that answers every request with `status`.
-    fn server(status: &'static str) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut request = [0; 4096];
-                let _ = stream.read(&mut request);
-                let answer =
-                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                let _ = stream.write_all(answer.as_bytes());
-            }
-        });
-        addr
-    }
-
-    /// A port nothing listens on.
-    fn closed() -> SocketAddr {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    }
-
-    struct Fixture {
-        shell: Shell,
-        dir: std::path::PathBuf,
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    fn shell(name: &str, current: SocketAddr) -> Fixture {
-        let dir = std::env::temp_dir().join(format!("coversync-app-{name}-{}", std::process::id()));
-        let config = Store::open(dir.clone());
-        let current = format!("http://{current}/");
-        config
-            .update(|config| config.server = Some(current.clone()))
-            .unwrap();
-        let proxy = tauri::async_runtime::block_on(
-            Proxy::builder()
-                .upstream(Some(Upstream::parse(&current).unwrap()))
-                .start(),
-        )
-        .unwrap();
-        let shell = Shell {
-            proxy,
-            config,
-            fallback: Url::parse("tauri://localhost/index.html").unwrap(),
-            problem: Mutex::new(None),
-        };
-        Fixture { shell, dir }
-    }
-
-    fn saved(fixture: &Fixture) -> Option<String> {
-        Store::open(fixture.dir.clone()).get().server
-    }
-
-    #[test]
-    fn saves_a_new_server_once_it_answers() {
-        let (old, new) = (server("200 OK"), server("200 OK"));
-        let fixture = shell("switch", old);
-        let new_url = format!("http://{new}/");
-        tauri::async_runtime::block_on(fixture.shell.switch(Some(new_url.clone()))).unwrap();
-        assert_eq!(saved(&fixture), Some(new_url.clone()));
-        assert_eq!(fixture.shell.proxy.upstream().unwrap().url(), new_url);
-    }
-
-    #[test]
-    fn keeps_the_old_server_when_the_new_one_fails() {
-        let old = server("200 OK");
-        let fixture = shell("keep", old);
-        let old_url = format!("http://{old}/");
-        for bad in [
-            format!("http://{}/", closed()),
-            format!("http://{}/", server("404 Not Found")),
-            "not a :// url".to_owned(),
-        ] {
-            let problem = tauri::async_runtime::block_on(fixture.shell.switch(Some(bad.clone())))
-                .unwrap_err();
-            assert!(!problem.message.is_empty(), "{bad}");
-            assert_eq!(saved(&fixture), Some(old_url.clone()), "{bad}");
-            assert_eq!(
-                fixture.shell.proxy.upstream().unwrap().url(),
-                old_url,
-                "{bad}"
-            );
-            assert!(
-                fixture.shell.problem.lock().unwrap().is_none(),
-                "a new server's failure is shown, not kept"
-            );
-        }
-    }
-
-    #[test]
-    fn a_failed_retry_becomes_the_problem() {
-        let fixture = shell("retry", closed());
-        let problem = tauri::async_runtime::block_on(fixture.shell.switch(None)).unwrap_err();
-        assert_eq!(problem.title, "Can't reach the server");
-        assert!(fixture.shell.problem.lock().unwrap().is_some());
     }
 }
