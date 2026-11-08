@@ -307,7 +307,8 @@ the others, and only the browser ever sees the password.
   add devices or lock out the others.
 - **Wrong codes are limited** like logins (five tries per client, then one a
   minute, counted apart from logins), and after 10 attempts that paired
-  nothing, every waiting code is cancelled.
+  nothing, every waiting code is cancelled. A code that was used, tried
+  again (by a device whose answer was lost), isn't counted as a guess.
 - **Tokens never cross the network in plain text.** `/api/pair` only answers
   requests that reached the reverse proxy on this machine over HTTPS
   (`X-Forwarded-Proto: https`, believed from loopback only), or that come
@@ -319,7 +320,8 @@ the others, and only the browser ever sees the password.
   `ssh -R`, some container port forwarders): it adds no headers, so its LAN
   clients look like this machine and would pair over plain http. Anything
   refused gets 403 `https_required`, and every code in it is cancelled, as
-  it may have been seen on the way. Sync setup can allow plain http for a
+  it may have been seen on the way. Such requests count against the limits
+  on wrong codes; past them, only a JSON `code` is looked for. Sync setup can allow plain http for a
   network that is encrypted already (Tailscale, WireGuard).
 - **CA certificate for apps.** For a server whose certificate a CA of your own
   signed (mkcert's, say), set Sync setup's CA certificate to the path of

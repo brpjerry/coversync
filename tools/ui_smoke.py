@@ -17,6 +17,9 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
     in Sync setup's list gets the token 401. Then the dialog by keyboard (focus stays in it,
     Escape closes only it), and New code double-clicked after the device to replace was
     removed. Stops at the first failure.
+--pairing-link only checks the link Add device makes (its server address with the page's
+    path prefix, and ca= when Sync setup has a CA certificate), and makes no device: for a
+    UI built with BASE_PATH behind a proxy.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -735,6 +738,7 @@ def devices_flow(d, out, tag, url):
     check(d.js("return (document.querySelector('.dialog .qr path')?.getAttribute('d') ?? '').length > 100"),
           "QR code drawn")
     check(d.js(text, ".dialog .server code") == base, f"server address: {base}")
+    check_pairing_link(d)
     time.sleep(0.6)
     d.shot(out / f"10c-code-{tag}.png")
 
@@ -773,6 +777,7 @@ def devices_flow(d, out, tag, url):
     add_device_new_code(d, out, tag, base)
     device_edits_keep_newer_ones(d)
     pairing_setup_follows_saves_elsewhere(d)
+    pairing_save_keeps_later_edits(d)
 
 
 def pairing_setup_follows_saves_elsewhere(d):
@@ -847,6 +852,66 @@ def device_edits_keep_newer_ones(d):
         d.click_xpath(row(name) + "//div[contains(@class,'confirm')]//button[normalize-space(.)='Remove']")
         d.wait(f"return !({has.removeprefix('return ')})", 15.0, row(name))
     check(True, "both removed")
+
+
+def check_pairing_link(d):
+    """The link in Add device's QR code: the page's own address up to its
+    path prefix, the code, and ca= when Sync setup has a CA certificate."""
+    link = d.js("return document.querySelector('.dialog [data-link]')?.dataset.link")
+    want = d.s("POST", "/execute/async", {"args": [], "script": """
+        const done = arguments[0];
+        fetch('api/pairing/setup').then(r => r.json()).then(s => {
+            const server = location.origin + location.pathname.replace(/[^/]*$/, '');
+            const code = document.querySelector('.dialog .code').textContent.trim().replace('-', '');
+            const ca = s.ca ? s.ca.fingerprint : null;
+            done({server, ca, link: 'coversync://pair?server=' + encodeURIComponent(server)
+                + '&code=' + code + (ca ? '&ca=' + ca : '')});
+        }, e => done({error: String(e)}));
+    """})
+    check(link == want.get("link"), f"the pairing link: {link}")
+    return want
+
+
+def pairing_link_flow(d):
+    d.open_setup("Sync setup")
+    d.wait("return !!document.querySelector('#devices-title')")
+    d.click_text("main", "Add device")
+    d.wait("return document.activeElement === document.querySelector('.dialog .field input')")
+    d.type(".dialog .field input", "Link check")
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    want = check_pairing_link(d)
+    check(want["ca"] is not None, f"Sync setup has a CA certificate, so ca= is there ({want['ca']})")
+    print("server in the link:", want["server"])
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.dialog')")
+
+
+def pairing_save_keeps_later_edits(d):
+    """A pairing switch put back to its saved value while a save of it is
+    under way stays as it was put, and is left to save."""
+    switch_el = ("[...document.querySelectorAll('main [role=switch]')]"
+                 ".find(s => s.textContent.includes('plain http'))")
+    switch = f"return {switch_el}?.getAttribute('aria-checked')"
+    d.wait(f"{switch} === 'false'")
+    # Pairing setup saves answer a second late.
+    d.js("const f = window.fetch; window.fetch = async (u, i) => {"
+         " const r = await f(u, i);"
+         " if (i?.method === 'PUT' && String(u).includes('/api/pairing/setup')) await new Promise(t => setTimeout(t, 1000));"
+         " return r; }")
+    d.js(f"{switch_el}.click()")
+    d.wait(f"{switch} === 'true'")
+    d.click_text("main", "Save")
+    d.js(f"{switch_el}.click()")
+    d.wait(f"{switch} === 'false'")
+    d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Sync setup saved'))")
+    time.sleep(0.3)
+    summary = "return document.querySelector('.savebar .summary')?.textContent.trim() ?? ''"
+    check(d.js(switch) == "false" and "1" in d.js(summary),
+          f"put back during the save, it stayed off, unsaved: {d.js(summary)!r}")
+    d.click_text("main", "Save")
+    d.wait(f"return !document.querySelector('.savebar .summary')", 15.0)
+    check(d.js(switch) == "false", "saved off again")
 
 
 def press(d, key):
@@ -934,13 +999,20 @@ def add_device_new_code(d, out, tag, base):
     d.wait("return ![...document.querySelectorAll('.sidebar .device-name')]"
            ".some(n => n.textContent === 'Old laptop')")
     check(True, "the sidebar no longer lists it")
-    # Double-clicked: one request, and its refusal shown.
+    # Double-clicked: one request. It's refused, and the form comes back with
+    # why, the device to replace cleared, to choose another or none.
     d.js("const b = document.querySelector('.dialog .new-code'); b.click(); b.click()")
-    d.wait("return !!document.querySelector('.dialog .result .error')")
+    d.wait("return !!document.querySelector('.dialog form .error')")
     time.sleep(0.5)
     check(d.js("return window.__codes") == 2, f"codes asked for: {d.js('return window.__codes')} (2 expected)")
-    print("error shown:", d.js(text, ".dialog .result .error"))
+    print("error shown:", d.js(text, ".dialog form .error"))
+    check(d.js("return !document.querySelector('.dialog .check input')?.checked"),
+          "the device to replace is cleared, and Replace unticked")
     d.shot(out / f"10g-new-code-failed-{tag}.png")
+    # As a new device, a code comes.
+    d.click_text("div[@role='dialog']", "Show code")
+    d.wait("return !!document.querySelector('.dialog .code')")
+    check(True, "a new code once Replace is unticked")
     press(d, ESCAPE)
     d.wait("return !document.querySelector('.dialog')")
 
@@ -1261,6 +1333,9 @@ def main():
         sign_in(d)
         if "--devices" in sys.argv:
             devices_flow(d, out, tag, url)
+            return
+        if "--pairing-link" in sys.argv:
+            pairing_link_flow(d)
             return
         d.wait("return document.querySelectorAll('.card').length > 0")
         grid_intro_check(d)

@@ -474,6 +474,8 @@ export interface NewPairing {
 
 export type PairingStatus =
 	| { state: 'waiting'; expires_in: number }
+	/** A device used it; its token is being issued. */
+	| { state: 'pairing' }
 	| { state: 'paired'; device: Device | null }
 	| { state: 'expired' }
 	| { state: 'cancelled'; why: 'failures' | 'insecure' | 'removed' }

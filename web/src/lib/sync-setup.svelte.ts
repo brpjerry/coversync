@@ -92,10 +92,15 @@ class SyncSetupStore extends SetupStore<SyncAndPairing> {
 			if (caPath !== this.savedCaPath || allowHttp !== this.savedAllowHttp) {
 				try {
 					const r = await api.savePairingSetup({ ca_path: caPath || null, allow_http: allowHttp });
-					// As for a read, but what was just saved replaces what was sent.
+					// A field left as it was sent shows what was saved; one changed
+					// meanwhile (even back to the old value) stays as it was set.
+					// Only then does the saved baseline move, without a read's merge.
 					if (this.caPath.trim() === caPath) this.caPath = r.setup.ca_path ?? '';
 					if (this.allowHttp === allowHttp) this.allowHttp = r.setup.allow_http;
-					this.#takePairing(r, false);
+					this.savedCaPath = r.setup.ca_path ?? '';
+					this.savedAllowHttp = r.setup.allow_http;
+					this.ca = r.ca;
+					this.caProblem = r.ca_problem;
 					if (this.caRefused?.path === caPath) this.caRefused = null;
 				} catch (e) {
 					ok = false;

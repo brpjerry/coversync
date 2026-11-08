@@ -131,8 +131,17 @@
 		} catch (e) {
 			if (mine === attempt)
 				error = e instanceof ApiError ? e.message : 'Could not reach coversyncd.';
-			// The device to replace is gone: the list should say so too.
-			if (e instanceof ApiError && e.code === 'no_device') devices.load();
+			// The device to replace is gone: the list says so too, and the form
+			// comes back without it, to pair as a new device or to choose
+			// another one to replace (if any is left).
+			if (e instanceof ApiError && e.code === 'no_device') {
+				devices.load();
+				if (mine === attempt) {
+					replace = null;
+					replacing = false;
+					phase = 'form';
+				}
+			}
 		} finally {
 			busy = false;
 		}
@@ -153,8 +162,8 @@
 			status = s;
 			if (s.state === 'waiting') {
 				// Keep the countdown to the server's clock.
-				if (s.expires_in > 0) deadline = Date.now() + s.expires_in * 1000;
-			} else {
+				deadline = Date.now() + s.expires_in * 1000;
+			} else if (s.state !== 'pairing') {
 				stop();
 				phase = s.state === 'paired' ? 'paired' : 'ended';
 				// The list changed: a device paired, or the one to replace went.
@@ -412,7 +421,7 @@
 			</form>
 		{:else if phase === 'code' && pairing}
 			<div class="body code-view" in:fade={{ duration: 200 }}>
-				<div class="qr-box">
+				<div class="qr-box" data-link={link}>
 					<QrCode text={link} label="Pairing QR code for {name}" />
 				</div>
 				<div class="code-side">
@@ -420,8 +429,12 @@
 					<p class="code tabular" aria-label="Pairing code {shown.split('').join(' ')}">
 						{shown}
 					</p>
-					<p class="expires tabular" class:soon={left < 60}>
-						{left > 0 ? `Expires in ${clock(left)}` : 'Expiring…'}
+					<p class="expires tabular" class:soon={left < 60 && status?.state !== 'pairing'}>
+						{#if status?.state === 'pairing'}
+							Used just now
+						{:else}
+							{left > 0 ? `Expires in ${clock(left)}` : 'Expiring…'}
+						{/if}
 					</p>
 					<ul class="steps">
 						<li><b>Phone:</b> scan the QR code.</li>
@@ -434,7 +447,8 @@
 						<code>{server}</code>
 					</div>
 					<p class="waiting">
-						<span class="spin"><LoaderCircle size={14} /></span> Waiting for {name} to pair…
+						<span class="spin"><LoaderCircle size={14} /></span>
+						{status?.state === 'pairing' ? 'Pairing…' : `Waiting for ${name} to pair…`}
 					</p>
 				</div>
 				{#if pairing.ca_problem}
@@ -459,7 +473,8 @@
 						<p>
 							This address only works on this computer: a phone or another computer can't reach it.
 							To pair one of those, open coversync at the address they use, such as its
-							<code>https://</code> one.
+							<code>https://</code> one. Apps on this computer can use it only if it reaches
+							coversyncd directly, not through a proxy over plain <code>http://</code>.
 						</p>
 					</div>
 				{/if}

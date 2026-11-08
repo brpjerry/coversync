@@ -2,6 +2,7 @@
 // and in Sync setup, where they're added, renamed, re-scoped and revoked.
 // Changes are made at once, not through the save bar.
 
+import { createSubscriber } from 'svelte/reactivity';
 import { api, ApiError, type Device, type Scope } from './api';
 import { toast } from './toast.svelte';
 
@@ -95,7 +96,11 @@ const PLATFORMS: Record<string, string> = {
 };
 
 /** "Android" for "android"; anything else as the device said it. */
-export const platformName = (p: string) => PLATFORMS[p.toLowerCase()] ?? p;
+export function platformName(p: string) {
+	const key = p.toLowerCase();
+	// Only the names listed: not "constructor" or "__proto__" from the object itself.
+	return Object.hasOwn(PLATFORMS, key) ? PLATFORMS[key] : p;
+}
 
 export const SCOPES: Record<Scope, { label: string; description: string }> = {
 	manage: {
@@ -109,9 +114,20 @@ export const SCOPES: Record<Scope, { label: string; description: string }> = {
 	}
 };
 
+/**
+ * A minute's tick for relative times: one timer, running only while some
+ * effect or template is reading one.
+ */
+const minutes = createSubscriber((update) => {
+	const timer = setInterval(update, 60_000);
+	return () => clearInterval(timer);
+});
+
 /** "just now", "5 minutes ago", "3 days ago", or the date for older ones. */
-export function ago(seconds: number, now = Date.now() / 1000) {
-	const d = Math.max(0, now - seconds);
+export function ago(seconds: number) {
+	// Shown again each minute, while anything shows one.
+	minutes();
+	const d = Math.max(0, Date.now() / 1000 - seconds);
 	if (d < 60) return 'just now';
 	const unit = (n: number, what: string) => `${n} ${what}${n === 1 ? '' : 's'} ago`;
 	if (d < 3600) return unit(Math.floor(d / 60), 'minute');
