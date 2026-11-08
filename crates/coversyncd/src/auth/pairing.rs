@@ -218,10 +218,12 @@ impl Pairings {
         }
     }
 
-    /// Cancel a waiting code that was sent where it may have been seen.
-    pub fn cancel_code(&mut self, code: &str, why: Cancelled, now: Instant) {
+    /// Cancel the waiting codes among `codes`, sent where they may have been
+    /// seen. `codes` is sorted: each waiting code is looked up in it once,
+    /// however many there are.
+    pub fn cancel_codes(&mut self, codes: &[String], why: Cancelled, now: Instant) {
         for p in self.codes.values_mut() {
-            if p.code == code && p.waiting(now) {
+            if p.waiting(now) && codes.binary_search(&p.code).is_ok() {
                 p.state = State::Cancelled(why);
             }
         }
@@ -413,7 +415,10 @@ mod tests {
         let t0 = Instant::now();
         let mut p = Pairings::default();
         let (id, code) = waiting(&mut p, t0);
-        p.cancel_code(&code, Cancelled::Insecure, t0);
+        let (other, _) = waiting(&mut p, t0);
+        let mut sent = vec!["00000000".to_owned(), code.clone(), "ZZZZZZZZ".to_owned()];
+        sent.sort();
+        p.cancel_codes(&sent, Cancelled::Insecure, t0);
         assert_eq!(
             p.status(&id, t0),
             Some(Status::Cancelled {
@@ -421,6 +426,8 @@ mod tests {
             })
         );
         assert_eq!(p.redeem(&code, t0), Err(Refused::Expired));
+        // Only the ones sent.
+        assert!(matches!(p.status(&other, t0), Some(Status::Waiting { .. })));
         // Replacing a device that's removed meanwhile: the code is cancelled,
         // and the dialog says why.
         let (r, code) = p

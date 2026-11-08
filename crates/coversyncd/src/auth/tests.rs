@@ -362,11 +362,13 @@ async fn app_tokens_open_the_api_by_scope() {
         .iter()
         .filter(|p| !OPEN.contains(&p.as_str()))
     {
-        let (status, c) = code(app.send(bearer(path, &token)).await).await;
+        let res = app.send(bearer(path, &token)).await;
+        let status = res.status();
         assert_ne!(status, StatusCode::UNAUTHORIZED, "{path}");
-        // Only managing devices is refused to a token.
+        // Only managing devices is refused to a token. (Only a refusal's
+        // body is read: /api/events never ends.)
         if status == StatusCode::FORBIDDEN {
-            assert_eq!(c, "password_required", "{path}");
+            assert_eq!(code(res).await.1, "password_required", "{path}");
             assert!(path.starts_with("/api/pairing"), "{path}");
         }
     }

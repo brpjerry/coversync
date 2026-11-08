@@ -545,6 +545,86 @@ async fn a_code_sent_in_the_clear_is_cancelled_however_the_body_is_written() {
     paired(res).await;
 }
 
+/// A body as big as is read, all of it distinct code-shaped words: found
+/// at once, as they're sorted once rather than checked against each other.
+#[test]
+fn thousands_of_code_shaped_words_are_found_fast() {
+    use super::super::devices::codes_in;
+    let words: Vec<String> = (0..7000).map(|i| format!("{:08}", i * 7919)).collect();
+    let body = words.join(" ");
+    assert!(body.len() <= 64 * 1024);
+    let started = std::time::Instant::now();
+    let found = codes_in(body.as_bytes());
+    let took = started.elapsed();
+    assert_eq!(found.len(), 7000);
+    assert!(
+        found.windows(2).all(|w| w[0] < w[1]),
+        "sorted, without repeats"
+    );
+    assert!(took < Duration::from_millis(250), "{took:?}");
+    // And cancelling them all looks each waiting code up once.
+    let mut pairings = super::super::pairing::Pairings::default();
+    let at = std::time::Instant::now();
+    let started = std::time::Instant::now();
+    pairings.cancel_codes(&found, super::super::pairing::Cancelled::Insecure, at);
+    assert!(started.elapsed() < Duration::from_millis(50));
+}
+
+#[tokio::test]
+async fn event_streams_end_with_their_devices() {
+    let app = App::with_password("streams");
+    let cookie = app.cookie().await;
+    let (_, code) = app.new_code(&cookie, phone()).await;
+    let (device, token) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    let traded = cookie_of(&app.send(trade(Some(&token), Some("/"))).await);
+    let bearer_of = |t: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {t}").parse().unwrap(),
+        );
+        h
+    };
+    let cookie_header = |c: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, c.parse().unwrap());
+        h
+    };
+    let (by_token, by_cookie) = (bearer_of(&token), cookie_header(&traded));
+    // A device's app can listen, through its token or its web view's cookie.
+    let res = app.send(bearer("/api/events", &token)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    drop(res);
+    assert!(still_valid(&app.state, &by_token).await);
+    assert!(still_valid(&app.state, &by_cookie).await);
+    // Made sync-only, then managing again: its streams follow.
+    let path = format!("/api/devices/{device}");
+    app.call("PUT", &path, &cookie, Some(json!({ "scope": "sync" })))
+        .await;
+    assert!(!still_valid(&app.state, &by_token).await);
+    assert!(!still_valid(&app.state, &by_cookie).await);
+    app.call("PUT", &path, &cookie, Some(json!({ "scope": "manage" })))
+        .await;
+    assert!(still_valid(&app.state, &by_cookie).await);
+    // Paired again in its place: the old token's streams end, the new one's don't.
+    let (_, code) = app
+        .new_code(
+            &cookie,
+            json!({ "name": "Pixel 8", "scope": "manage", "replace": device }),
+        )
+        .await;
+    let (_, new) = paired(app.pair_from(LOCAL, pair(&code)).await).await;
+    assert!(!still_valid(&app.state, &by_token).await);
+    assert!(!still_valid(&app.state, &by_cookie).await);
+    let by_new = bearer_of(&new);
+    assert!(still_valid(&app.state, &by_new).await);
+    // Revoked: they end at the next check, as the browser's own doesn't.
+    app.call("POST", &format!("{path}/revoke"), &cookie, None)
+        .await;
+    assert!(!still_valid(&app.state, &by_new).await);
+    assert!(still_valid(&app.state, &cookie_header(&cookie)).await);
+}
+
 #[test]
 fn code_shaped_words_are_found_in_any_body() {
     use super::super::devices::codes_in;

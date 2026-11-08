@@ -25,6 +25,7 @@ use super::pairing::{self, Cancelled, Refused};
 use super::store::{DeviceInfo, NewDevice, PairingSetup, Store};
 use super::{Access, ClientAddr, Scope, ca, error, limit, no_store, now};
 use crate::Shared;
+use crate::events::{self, Notice};
 
 /// Longest device name.
 const MAX_NAME: usize = 64;
@@ -462,8 +463,18 @@ async fn save_setup(
         ca_path: path,
         allow_http: setup.allow_http,
     };
-    let saved = setup.clone();
-    db(&state, move |s| s.set_pairing_setup(&saved)).await?;
+    let (saved, s) = (setup.clone(), state.clone());
+    // Announced as Sync setup's save, which shows these: other browsers
+    // read it again.
+    blocking(move || {
+        s.auth.store.set_pairing_setup(&saved)?;
+        s.events.publish(Notice::SetupSaved {
+            setup: events::Setup::Sync,
+        });
+        Ok::<_, rusqlite::Error>(())
+    })
+    .await?
+    .map_err(Refusal::failed)?;
     tracing::info!(ca = ?setup.ca_path, allow_http = setup.allow_http, "saved the pairing setup");
     setup_response(setup).await
 }
@@ -603,6 +614,9 @@ impl From<Refused> for Refusal {
 /// words can be code-shaped too ("platform", "hostname"), so none is left
 /// out: that could leave out the real code. Cancelling a few dozen guesses
 /// at 40-bit codes this way gets nowhere, however many requests are sent.
+///
+/// Sorted, without repeats, for [`pairing::Pairings::cancel_codes`]: found
+/// all at once and sorted once, as a body may hold thousands.
 pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
     let mut codes = Vec::new();
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
@@ -614,14 +628,12 @@ pub(super) fn codes_in(body: &[u8]) -> Vec<String> {
         codes.push(code);
     }
     let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]);
-    let words = text
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .filter_map(pairing::normalize);
-    for code in words {
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
-    }
+    codes.extend(
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter_map(pairing::normalize),
+    );
+    codes.sort_unstable();
+    codes.dedup();
     codes
 }
 
@@ -654,11 +666,12 @@ async fn pair(
     let at = state.auth.instant();
     if !allow_http && !private_transport(peer, &headers) {
         // Whoever saw the code on the way mustn't get to use it over HTTPS.
-        let mut pairings = state.auth.pairings();
-        for code in codes_in(&body) {
-            pairings.cancel_code(&code, Cancelled::Insecure, at);
-        }
-        drop(pairings);
+        // Found before the lock is taken, which is held only to cancel.
+        let codes = codes_in(&body);
+        state
+            .auth
+            .pairings()
+            .cancel_codes(&codes, Cancelled::Insecure, at);
         tracing::warn!(client = ?client, "pairing refused: plain http");
         return Err(Refusal::new(
             StatusCode::FORBIDDEN,
