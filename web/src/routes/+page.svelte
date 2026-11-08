@@ -455,13 +455,16 @@
 		// saved at once, so edits begun after Save stay. What came meanwhile is
 		// checked after it (see enqueue).
 		saves++;
+		// One object for the answer wherever the sheet shows it: the editor is
+		// keyed on it, and starting over would lose edits made since.
+		if (result.album) detail = result.album;
+		const saved = result.album ? detail : null;
 		// If the album has left the grids meanwhile (renamed elsewhere, say), the
 		// sheet stays on it, quietly, until the notice saying where it went.
 		held =
 			holding && !openAlbum && sheetAlbum
-				? { ...holding, album: sheetAlbum, detail: result.album, changed: false }
+				? { ...holding, album: sheetAlbum, detail: saved, changed: false }
 				: null;
-		if (result.album) detail = result.album;
 		const grids = loadAlbums();
 		if (!from || result.album_id === from) return grids;
 		// A new title: the sheet stays while the grids catch up with the new id.
@@ -470,7 +473,7 @@
 				from,
 				next: result.album_id,
 				album: sheetAlbum,
-				detail: result.album,
+				detail: saved,
 				changed: false
 			};
 		enqueue({ kind: 'moved', from, to: result.album_id }, true);
@@ -547,6 +550,8 @@
 	 */
 	let live = false;
 	const SAFETY_POLL_MS = 60_000;
+	/** Counts pushed scan ends, so a poll answered after one doesn't end the scan again. */
+	let scanFinishes = 0;
 	/** The scan's progress as last pushed, which a poll answered before it mustn't undo. */
 	let pushedScan: Status['scan'] | null = null;
 	let pollTimer: ReturnType<typeof setTimeout>;
@@ -556,10 +561,12 @@
 		if (session.state === 'out') return;
 		try {
 			const wasRunning = status?.scan.running ?? false;
+			const finishes = scanFinishes;
 			const pushed = pushedScan;
 			const fresh = await api.status();
 			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
-			if (wasRunning && !status.scan.running) await scanFinished();
+			// A scan_finished that came meanwhile has seen to the end itself.
+			if (wasRunning && !status.scan.running && finishes === scanFinishes) await scanFinished();
 			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
 		} catch {}
 		// Only one poll waits at a time, even when two ran at once.
@@ -635,6 +642,17 @@
 	let saves = 0;
 
 	function enqueue(job: Job, first = false) {
+		// Tracks kept from an album no longer open are out of date once it
+		// changed (or notices were missed): opening it, or playing it, asks again.
+		const kept = detail?.id;
+		if (
+			kept &&
+			kept !== openId &&
+			kept !== holding?.next &&
+			(job.kind === 'resync' ||
+				(job.kind === 'notice' && (kept === job.id || kept === job.previous)))
+		)
+			detail = null;
 		// A later resync, reload or open makes one still waiting moot.
 		if (job.kind === 'resync' || job.kind === 'reload' || job.kind === 'open')
 			jobs = jobs.filter((j) => j.kind !== job.kind);
@@ -702,7 +720,8 @@
 					// The sheet moves once the grids have the new id.
 					if (openId !== job.from) return true;
 					await gridsSettled();
-					if (openId === job.from)
+					// Renamed again elsewhere: the notice saying so takes the sheet there.
+					if (openId === job.from && !renamedLater(job.to))
 						await goto(page.url.href, { state: { album: job.to }, shallow: true, replace: true });
 					return true;
 				case 'reload':
@@ -796,10 +815,7 @@
 		}
 		// A new copy of the album: the editor starts over, without the edits.
 		detail = fresh;
-		held =
-			to === sheet
-				? null
-				: { from: sheet, next: to, album: h.album, detail: fresh, changed: false };
+		held = to === sheet ? null : { from: sheet, next: to, album: h.album, detail, changed: false };
 		if (openId !== to)
 			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
 	}
@@ -850,6 +866,7 @@
 		},
 		scan_finished(scan) {
 			pushedScan = scan;
+			scanFinishes++;
 			if (status) status = { ...status, scan };
 			scanFinished();
 		},

@@ -65,7 +65,11 @@ export abstract class SetupStore<R> {
 			this.#again = true;
 			return;
 		}
-		const r = await this.fetch();
+		const r = await this.fetch().catch((e) => {
+			// The newest read failed: one sent before it, still under way, lands instead.
+			if (read === this.#reads) this.#reads--;
+			throw e;
+		});
 		// A newer read lands instead.
 		if (read !== this.#reads) return;
 		if (this.loaded && (this.#writing || writes !== this.#writes)) {

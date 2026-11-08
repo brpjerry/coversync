@@ -44,9 +44,14 @@ export class TagList {
 	isDefault = $derived(this.items.join() === this.defaults.join());
 
 	set(saved: string[], defaults: string[]) {
+		this.rebase(saved, defaults);
+		this.items = [...saved];
+	}
+
+	/** What's saved, leaving the list being edited be. */
+	rebase(saved: string[], defaults: string[]) {
 		this.defaults = defaults;
 		this.saved = saved;
-		this.items = [...saved];
 	}
 
 	/** Whether `id` can come off the list. */
@@ -116,8 +121,16 @@ class AppearanceStore extends SetupStore<AppearanceResponse> {
 	}
 
 	protected take(r: AppearanceResponse, first: boolean) {
-		// Unsaved edits are kept as they are.
-		if (first || !this.changes) this.#apply(r);
+		if (first || !this.changes) return this.#apply(r);
+		// Unsaved edits are kept; what's saved (elsewhere, say) still moves
+		// under them, so Revert goes back to it.
+		this.sortable = r.sortable;
+		this.filterable = r.filterable;
+		this.groups = r.groups;
+		this.sorts.rebase(r.setup.sort_tabs, r.defaults);
+		this.filters.rebase(r.setup.filter_tags, r.filter_defaults);
+		this.coverSizes = r.cover_sizes;
+		this.savedCoverSize = r.setup.cover_size;
 	}
 
 	label(id: string) {

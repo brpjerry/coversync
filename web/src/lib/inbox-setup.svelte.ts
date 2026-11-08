@@ -63,7 +63,8 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 	/** Move deletes originals, so the Inbox folder must be writable. */
 	canMove = $derived(this.folderStatus?.writable ?? false);
 
-	#apply(r: InboxSetupResponse) {
+	/** The setup as saved, and what the daemon owns, leaving edits be. */
+	#rebase(r: InboxSetupResponse) {
 		this.saved = {
 			ingest: r.setup.ingest,
 			folder: r.setup.folder ?? '',
@@ -74,6 +75,11 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 			familyNameFirst: r.setup.suggestions.family_name_first,
 			saveLookups: r.setup.suggestions.save_lookups
 		};
+		this.#status(r);
+	}
+
+	#apply(r: InboxSetupResponse) {
+		this.#rebase(r);
 		this.ingest = this.saved.ingest;
 		this.folder = this.saved.folder;
 		this.uploads = this.saved.uploads;
@@ -83,7 +89,6 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 		this.familyNameFirst = this.saved.familyNameFirst;
 		this.saveLookups = this.saved.saveLookups;
 		this.keyDraft = null;
-		this.#status(r);
 	}
 
 	/** What the daemon owns, refreshed even over unsaved edits. */
@@ -99,8 +104,9 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 	}
 
 	protected take(r: InboxSetupResponse, first: boolean) {
-		// Keep unsaved choices; refresh only what the daemon owns.
-		if (!first && this.changes) this.#status(r);
+		// Keep unsaved choices; what's saved (elsewhere, say) still moves under
+		// them, so Revert goes back to it.
+		if (!first && this.changes) this.#rebase(r);
 		else this.#apply(r);
 	}
 

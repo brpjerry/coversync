@@ -77,12 +77,10 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			this.variables = r.variables;
 			this.artFileNames = r.art_file_names;
 		}
+		// With unsaved edits, the setup as saved (elsewhere, say) still moves
+		// under them, so Revert goes back to it.
 		if (first || this.changes === 0) this.#apply(r);
-		else {
-			// Keep unsaved edits; refresh only what the daemon owns.
-			this.folderStatus = r.folder;
-			this.libraryProblem = r.library_problem;
-		}
+		else this.#rebase(r);
 	}
 
 	async loadCoverage() {
@@ -93,7 +91,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		}
 	}
 
-	#apply(r: SetupResponse) {
+	/** The setup as saved, and what the daemon owns, leaving edits be. */
+	#rebase(r: SetupResponse) {
 		const s = r.setup;
 		this.saved = {
 			required: s.rules.required_tags,
@@ -102,14 +101,19 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			art: s.rules.art,
 			separator: s.rules.separator
 		};
+		this.folderStatus = r.folder;
+		this.libraryProblem = r.library_problem;
+	}
+
+	#apply(r: SetupResponse) {
+		const s = r.setup;
+		this.#rebase(r);
 		this.required.clear();
 		for (const id of s.rules.required_tags) this.required.add(id);
 		this.folder = this.saved.folder;
 		this.structure = this.saved.structure;
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
-		this.folderStatus = r.folder;
-		this.libraryProblem = r.library_problem;
 	}
 
 	label(id: string) {

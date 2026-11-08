@@ -432,6 +432,26 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_job_is_updated_and_finishes() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = crate::test_state(&dir);
+        state
+            .identify
+            .lock()
+            .insert("album".into(), job(JobState::Failed("x".into())));
+        // A job replaced by a newer one (generation 3) changes nothing, and
+        // its end isn't published (`start` publishes only when this is true).
+        assert!(!update(&state, "album", 2, |j| j.stale = true));
+        assert!(!state.identify.lock()["album"].stale);
+        assert!(!update(&state, "other", 3, |_| {}));
+        assert!(update(&state, "album", 3, |j| j.stale = true));
+        assert!(state.identify.lock()["album"].stale);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clearing_keeps_running_jobs_but_marks_them_stale() {
         let jobs = Jobs::default();
         let running = JobState::Running(Step {

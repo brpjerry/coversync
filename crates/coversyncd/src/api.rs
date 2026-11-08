@@ -496,18 +496,19 @@ struct UnhideResult {
 }
 
 async fn unhide_all(State(state): State<Shared>) -> ApiResult<Json<UnhideResult>> {
-    let result = blocking(&state, |s| {
+    // Notices go out from the work itself, which carries on if the request is dropped.
+    blocking(&state, |s| {
         let unhidden = s.lib.unhide_all()?;
+        s.events.publish(Notice::SetupSaved {
+            setup: Setup::Inbox,
+        });
         Ok(UnhideResult {
             unhidden,
             hidden: s.lib.hidden_stats()?,
         })
     })
-    .await?;
-    state.events.publish(Notice::SetupSaved {
-        setup: Setup::Inbox,
-    });
-    Ok(Json(result))
+    .await
+    .map(Json)
 }
 
 #[derive(Serialize)]
@@ -543,11 +544,15 @@ async fn save_appearance(
     State(state): State<Shared>,
     Json(setup): Json<AppearanceSetup>,
 ) -> ApiResult<Json<AppearanceResponse>> {
-    let saved = blocking(&state, move |s| s.lib.set_appearance(setup)).await?;
-    state.events.publish(Notice::SetupSaved {
-        setup: Setup::Appearance,
-    });
-    Ok(appearance_response(saved))
+    blocking(&state, move |s| {
+        let saved = s.lib.set_appearance(setup)?;
+        s.events.publish(Notice::SetupSaved {
+            setup: Setup::Appearance,
+        });
+        Ok(saved)
+    })
+    .await
+    .map(appearance_response)
 }
 
 #[derive(Serialize)]
@@ -565,11 +570,13 @@ async fn save_sync_setup(
     State(state): State<Shared>,
     Json(setup): Json<SyncSetup>,
 ) -> ApiResult<Json<SyncSetupResponse>> {
-    let setup = blocking(&state, move |s| s.lib.set_sync_setup(setup)).await?;
-    state
-        .events
-        .publish(Notice::SetupSaved { setup: Setup::Sync });
-    Ok(Json(SyncSetupResponse { setup }))
+    blocking(&state, move |s| {
+        let setup = s.lib.set_sync_setup(setup)?;
+        s.events.publish(Notice::SetupSaved { setup: Setup::Sync });
+        Ok(SyncSetupResponse { setup })
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -741,7 +748,6 @@ async fn import_album(
     Json(req): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportResult>> {
     let _guard = state.jobs.lock().await;
-    let inbox_id = req.album_id.clone();
     let result = blocking(&state, move |s| {
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
@@ -763,16 +769,15 @@ async fn import_album(
         let imported =
             import::execute(&s.lib, &s.covers, &req.album_id, &req.edits, art, &progress)?;
         s.identify.forget(&req.album_id);
+        s.events.publish(Notice::Imported {
+            album_id: imported.album_id.clone(),
+            inbox_id: req.album_id,
+        });
         Ok(imported)
     })
     .await;
     crate::release_memory();
-    let imported = result?;
-    state.events.publish(Notice::Imported {
-        album_id: imported.album_id.clone(),
-        inbox_id,
-    });
-    Ok(Json(imported))
+    result.map(Json)
 }
 
 #[derive(Deserialize)]
@@ -909,7 +914,6 @@ async fn write_tags(
     let _guard = state.jobs.lock().await;
     // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
     let lookup = id.clone();
-    let previous_id = id.clone();
     let in_library = blocking(&state, move |s| {
         Ok(s.lib
             .album(&lookup)?
@@ -975,6 +979,11 @@ async fn write_tags(
             None => id.clone(),
         };
         let album = s.lib.album(&new_id)?;
+        s.events.publish(Notice::AlbumChanged {
+            id: new_id.clone(),
+            previous_id: (new_id != id).then_some(id),
+            collection,
+        });
         Ok(TagWriteResult {
             album_id: new_id,
             files_written: count,
@@ -983,15 +992,6 @@ async fn write_tags(
     })
     .await?;
     crate::release_memory();
-    state.events.publish(Notice::AlbumChanged {
-        id: result.album_id.clone(),
-        previous_id: (result.album_id != previous_id).then_some(previous_id),
-        collection: if in_library {
-            Collection::Library
-        } else {
-            Collection::Inbox
-        },
-    });
     Ok(Json(result))
 }
 
@@ -1024,9 +1024,18 @@ mod tests {
         std::fs::write(path, b).unwrap();
     }
 
+    /// Removes a test's scratch folder when the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A daemon's state over an Inbox holding one album and an empty Library
-    /// folder, scanned; and the Inbox album's id.
-    fn daemon(name: &str) -> (Shared, String) {
+    /// folder, scanned; the Inbox album's id; and the folder, removed with it.
+    fn daemon(name: &str) -> (Shared, String, Scratch) {
         let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let inbox = dir.join("inbox");
@@ -1063,7 +1072,7 @@ mod tests {
             .unwrap();
         assert_eq!(albums.len(), 1);
         let id = albums[0].id.clone();
-        (state, id)
+        (state, id, Scratch(dir))
     }
 
     fn edit(album: TagEdit) -> Json<TagWrite> {
@@ -1075,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn imports_and_edits_are_published() {
-        let (state, inbox_id) = daemon("notices");
+        let (state, inbox_id, _dir) = daemon("notices");
         let mut heard = state.events.subscribe();
 
         let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
@@ -1137,6 +1146,63 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(heard.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn saved_setups_are_published_and_failed_saves_are_not() {
+        let (state, _, dir) = daemon("setups");
+        let mut heard = state.events.subscribe();
+        let saved = |heard: &mut tokio::sync::broadcast::Receiver<Notice>| match heard.try_recv() {
+            Ok(Notice::SetupSaved { setup }) => Some(serde_json::to_value(setup).unwrap()),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => None,
+        };
+
+        let _ = unhide_all(State(state.clone())).await.unwrap();
+        assert_eq!(saved(&mut heard), Some("inbox".into()));
+        let appearance = state.lib.appearance().unwrap();
+        let _ = save_appearance(State(state.clone()), Json(appearance))
+            .await
+            .unwrap();
+        assert_eq!(saved(&mut heard), Some("appearance".into()));
+        let sync = state.lib.sync_setup().unwrap();
+        let _ = save_sync_setup(State(state.clone()), Json(sync))
+            .await
+            .unwrap();
+        assert_eq!(saved(&mut heard), Some("sync".into()));
+        let library = state.lib.library_setup().unwrap();
+        let _ = save_library_setup(State(state.clone()), Json(library.clone()))
+            .await
+            .unwrap();
+        assert_eq!(saved(&mut heard), Some("library".into()));
+        let inbox = serde_json::to_value(state.lib.inbox_setup().unwrap()).unwrap();
+        let request = || serde_json::from_value(inbox.clone()).unwrap();
+        let _ = save_inbox_setup(State(state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(saved(&mut heard), Some("inbox".into()));
+
+        // Saves that fail tell nobody.
+        let file = dir.0.join("a file");
+        std::fs::write(&file, b"").unwrap();
+        let bad_library = LibrarySetup {
+            folder: Some(file.display().to_string()),
+            ..library
+        };
+        assert!(
+            save_library_setup(State(state.clone()), Json(bad_library))
+                .await
+                .is_err()
+        );
+        let mut bad_inbox = inbox.clone();
+        bad_inbox["folder"] = dir.0.join("missing").display().to_string().into();
+        let bad_inbox = serde_json::from_value(bad_inbox).unwrap();
+        assert!(
+            save_inbox_setup(State(state.clone()), Json(bad_inbox))
+                .await
+                .is_err()
+        );
+        assert_eq!(saved(&mut heard), None);
     }
 
     #[test]

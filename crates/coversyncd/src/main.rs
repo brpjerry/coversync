@@ -315,6 +315,34 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn no_scan_progress_follows_the_end_of_a_scan() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        let state = test_state(&dir);
+        let mut setup = state.lib.inbox_setup().unwrap();
+        setup.folder = Some(dir.join("inbox").display().to_string());
+        state.lib.set_inbox_setup(setup).unwrap();
+        let mut heard = state.events.subscribe();
+        for _ in 0..3 {
+            spawn_scan(state.clone());
+            loop {
+                let notice = tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv())
+                    .await
+                    .expect("the scan ends")
+                    .unwrap();
+                if matches!(notice, events::Notice::ScanFinished(_)) {
+                    break;
+                }
+            }
+            // Past the reporter's next tick: nothing more comes.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            assert!(heard.try_recv().is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_uploads_folder_alone_is_indexed() {
         let dir = std::env::temp_dir().join(format!("coversyncd-roots-{}", std::process::id()));
