@@ -25,6 +25,7 @@
 	} from '#lib/filters.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
+	import { ago, devices } from '#lib/devices.svelte.ts';
 	import { drafts } from '#lib/drafts.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
@@ -232,22 +233,43 @@
 		</div>
 
 		{#if sync}
-			<!-- A placeholder: the devices the Library syncs to will be listed here, each with its own settings. -->
+			<!-- The paired devices; each will get its own sync settings (SYN-03). -->
 			<section
 				class="sync"
 				aria-labelledby="sidebar-sync-title"
 				transition:slide={{ duration: 220, easing: cubicOut }}
 			>
 				<h2 class="section" id="sidebar-sync-title">Sync</h2>
-				<div class="devices">
-					<span class="icon" aria-hidden="true"
-						><MonitorSmartphone size={17} strokeWidth={1.8} /></span
-					>
-					<p>
-						<b>No devices yet</b>
-						Devices the Library syncs to will show up here, each with its own settings.
-					</p>
-				</div>
+				{#if devices.active.length}
+					<ul class="paired">
+						{#each devices.active as d (d.id)}
+							<li>
+								<button
+									class="device"
+									onclick={() => onview('sync-setup')}
+									title={d.last_seen_at ? `Last seen ${ago(d.last_seen_at)}` : 'Not used yet'}
+								>
+									<span class="icon" aria-hidden="true"
+										><MonitorSmartphone size={16} strokeWidth={1.8} /></span
+									>
+									<span class="device-name">{d.name}</span>
+									{#if d.scope === 'sync'}<span class="n">Sync only</span>{/if}
+								</button>
+							</li>
+						{/each}
+					</ul>
+				{:else}
+					<div class="devices">
+						<span class="icon" aria-hidden="true"
+							><MonitorSmartphone size={17} strokeWidth={1.8} /></span
+						>
+						<p>
+							<b>No devices yet</b>
+							Pair the desktop app, your phone or a music player in
+							<button class="link" onclick={() => onview('sync-setup')}>Sync setup</button>.
+						</p>
+					</div>
+				{/if}
 			</section>
 		{/if}
 
@@ -608,6 +630,45 @@
 		font-size: 13.5px;
 		font-weight: 520;
 		color: var(--text-2);
+	}
+	.link {
+		font-size: inherit;
+		color: var(--accent);
+	}
+	.link:hover {
+		text-decoration: underline;
+	}
+	.paired {
+		display: grid;
+		gap: 1px;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	.device {
+		display: grid;
+		grid-template-columns: 16px minmax(0, 1fr) auto;
+		align-items: center;
+		gap: 10px;
+		width: 100%;
+		height: 34px;
+		padding: 0 10px 0 12px;
+		border-radius: 10px;
+		text-align: left;
+		font-size: 13.5px;
+		color: var(--text-2);
+		transition:
+			background 140ms,
+			color 140ms;
+	}
+	.device:hover {
+		background: var(--surface);
+		color: var(--text);
+	}
+	.device-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.setup {

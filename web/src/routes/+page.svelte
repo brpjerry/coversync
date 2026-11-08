@@ -41,6 +41,7 @@
 	import { appearance } from '#lib/appearance.svelte.ts';
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
+	import { devices } from '#lib/devices.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
 	import { listen, type Listening, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
@@ -1122,8 +1123,9 @@
 		return Promise.all([
 			poll(),
 			appearance.refresh(),
-			// Whether the sidebar shows its Sync section.
+			// Whether the sidebar shows its Sync section, and the devices it lists.
 			syncSetup.refresh(),
+			devices.load(),
 			// Whether an Inbox folder is set, for the empty Inbox's message.
 			inboxSetup.refresh(),
 			// Tag labels for attention badges.
