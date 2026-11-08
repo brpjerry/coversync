@@ -258,8 +258,10 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
 - Each server gets its own port, kept from run to run, so each has an origin
   of its own in the window: its cached pages and covers, and the UI's
   settings (sort, sidebar), are its own. Ports are kept for the saved server
-  and the 8 most recently used; a server that drops out of those loses its
-  cookies too, and its port never goes to another server. One server's
+  and the 8 others most recently used; a server that drops out of those
+  loses its cookies too, and its port never goes to another server. An
+  address that's refused (below) keeps no cookies either. Either way, a
+  kept server's origin keeps its cookies, whatever the prefix. One server's
   pages can't send requests through another's proxy.
 - The proxy keeps the server's cookies itself, apart for each server, and
   sends them as a browser would. So a server's login works as in a browser,
@@ -287,7 +289,8 @@ ports are kept in `config.json` in the app's config directory
 saving it. One instance of the app runs at a time: launching it again
 brings up its window, and shows the server given with `--server`, if any.
 A lock in the config directory keeps a second process off its settings
-even where that handover can't work (without a D-Bus session bus).
+even where that handover can't work (without a D-Bus session bus); where
+the file system can't lock at all, the app warns and runs without it.
 
 There are no packages for it yet. To build and run it on Arch Linux, you
 need WebKitGTK as well as Rust and pnpm. Playback also needs GStreamer's good

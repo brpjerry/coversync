@@ -165,18 +165,20 @@ impl Shell {
         *self.current.lock().expect("current lock") = Some(proxy);
     }
 
-    fn forget(&self, dropped: &[String]) {
+    /// Forgets the cookies of `servers`, which have no port kept, unless a
+    /// kept server shares an origin with one.
+    fn forget(&self, servers: &[String]) {
         let origin = |server: &String| {
             Upstream::parse(server)
                 .ok()
                 .map(|up| up.origin().to_owned())
         };
         let kept: Vec<String> = self.config.get().ports.keys().filter_map(origin).collect();
-        for server in dropped {
+        for server in servers {
             if let Some(origin) = origin(server)
                 && !kept.contains(&origin)
             {
-                tracing::info!("forgetting {server}'s cookies: it hasn't been used in a while");
+                tracing::info!("forgetting {server}'s cookies: no port is kept for it");
                 self.cookies.forget(&origin);
             }
         }
@@ -186,7 +188,8 @@ impl Shell {
     /// that it's a coversync server. Only then is a new server shown (and,
     /// with [`Save::Yes`], saved), so a typo can't replace an address that
     /// works. A failed retry of the current server becomes the page's
-    /// problem. Refusals are logged.
+    /// problem. Refusals are logged, and a refused new address's cookies
+    /// (the check may have stored some) are forgotten.
     pub async fn switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
         let address = server.clone();
         let result = self.try_switch(server, save).await;
@@ -222,6 +225,7 @@ impl Shell {
             ..Problem::new("Couldn't start the app's proxy", err.to_string())
         })?;
         if let Err(unreachable) = proxy.check(&upstream).await {
+            self.forget(&[upstream.url()]);
             let problem = Problem::unreachable(unreachable);
             if !new {
                 self.set_problem(Some(problem.clone()));
@@ -265,12 +269,19 @@ mod tests {
     /// A server that answers every request with `status`, and coversync's
     /// `/api/hello` body when it's a success.
     fn server(status: &'static str) -> SocketAddr {
+        server_by_path(move |_| status)
+    }
+
+    /// The same, with the status `status_for` gives each request's path.
+    fn server_by_path(status_for: impl Fn(&str) -> &'static str + Send + 'static) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 let mut request = [0; 4096];
-                let _ = stream.read(&mut request);
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                let status = status_for(request.split(' ').nth(1).unwrap_or("/"));
                 let body = if status.starts_with('2') {
                     r#"{"app":"coversync","name":"test","version":"0.1.0","api":["1"]}"#
                 } else {
@@ -474,6 +485,40 @@ mod tests {
             assert!(config.ports.contains_key(&url(*kept)));
             assert!(origins.contains(&origin(*kept)));
         }
+    }
+
+    #[test]
+    fn a_refused_address_leaves_no_cookies() {
+        let fixture = Fixture::new("refused-cookies", server("200 OK"));
+        // It sets a cookie as it refuses.
+        let refused = server("404 Not Found");
+        block(fixture.shell.switch(Some(url(refused)), Save::No)).unwrap_err();
+        let origins = fixture.shell.cookies.origins();
+        assert!(
+            !origins.contains(&format!("http://{refused}")),
+            "{origins:?}"
+        );
+    }
+
+    #[test]
+    fn a_kept_server_keeps_its_origins_cookies() {
+        let fixture = Fixture::new("shared-origin", server("200 OK"));
+        // One host: coversync under /a/, nothing under /b/.
+        let host = server_by_path(|path| {
+            if path.starts_with("/a/") {
+                "200 OK"
+            } else {
+                "404 Not Found"
+            }
+        });
+        let (a, b) = (format!("http://{host}/a/"), format!("http://{host}/b/"));
+        block(fixture.shell.switch(Some(a), Save::No)).unwrap();
+        block(fixture.shell.switch(Some(b), Save::No)).unwrap_err();
+        let origins = fixture.shell.cookies.origins();
+        assert!(
+            origins.contains(&format!("http://{host}")),
+            "/a/'s session stays: {origins:?}"
+        );
     }
 
     /// Opens `proxy`'s entry URL, then loads its server's page through it, as
