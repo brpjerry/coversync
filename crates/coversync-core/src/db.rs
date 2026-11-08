@@ -760,13 +760,18 @@ pub struct Library {
     conn: Mutex<Connection>,
 }
 
+/// A track's path relative to the folder it was found in (`Track::rel_path`).
+fn rel_path(path: &str, root: &str) -> String {
+    Path::new(path)
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 fn track_from_row(row: &Row<'_>) -> rusqlite::Result<(Track, String)> {
     let path: String = row.get("path")?;
     let root: String = row.get("root")?;
-    let rel = Path::new(&path)
-        .strip_prefix(&root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.clone());
+    let rel = rel_path(&path, &root);
     Ok((
         Track {
             id: row.get("id")?,
@@ -889,6 +894,35 @@ fn filter_values<'a>(
         }
     }
     out
+}
+
+/// An album's version (see [`AlbumDetail::version`]) from its tracks' ids
+/// and generations. Every write to a track gives it a higher generation,
+/// and a track leaving or joining the album changes the ids, so the
+/// digest changes with either, whichever of the tracks it was. (The
+/// highest generation alone wouldn't: a track removed that wasn't the
+/// latest written leaves it as it was.) Ids are unique across the Inbox
+/// and Library, and in each the generation is that database's counter.
+/// A Library album's also takes in the Library's id (`library`), which a
+/// Library restored from an older copy is given anew: its counter goes
+/// over the same generations again, so the same tracks can come back to
+/// the same ids and generations with other contents.
+fn album_version(mut tracks: Vec<(i64, i64)>, library: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    tracks.sort_unstable();
+    let mut h = Sha256::new();
+    if let Some(id) = library {
+        h.update(id.as_bytes());
+        h.update([0]);
+    }
+    for (id, generation) in tracks {
+        h.update(id.to_le_bytes());
+        h.update(generation.to_le_bytes());
+    }
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn sort_tracks(tracks: &mut [Track]) {
@@ -1623,22 +1657,33 @@ impl Library {
     }
 
     pub fn album(&self, id: &str) -> Result<Option<AlbumDetail>> {
-        let (mut tracks, dir, added) = {
+        let (mut tracks, dir, added, version) = {
             let conn = self.conn();
             let mut stmt = conn.prepare(&format!(
                 "SELECT * FROM temp.indexed_tracks WHERE album_id = ?1 AND {VISIBLE}"
             ))?;
             let mut dir = String::new();
             let mut added = Vec::new();
+            let mut generations = Vec::new();
             let mut tracks = Vec::new();
             let mut rows = stmt.query([id])?;
             while let Some(r) = rows.next()? {
                 let (t, d) = track_from_row(r)?;
                 dir = d;
                 added.push(r.get::<_, i64>("added_at")?);
+                generations.push((t.id, r.get::<_, i64>("generation")?));
                 tracks.push(t);
             }
-            (tracks, dir, added)
+            // Read with the tracks, so a Library attached meanwhile can't
+            // pair its id with another's tracks.
+            let library: Option<String> = match tracks.first() {
+                Some(t) if t.collection == Collection::Library => {
+                    get_setting(&conn, "lib", LIBRARY_ID)?
+                }
+                _ => None,
+            };
+            let version = album_version(generations, library.as_deref());
+            (tracks, dir, added, version)
         };
         let Some(collection) = tracks.first().map(|t| t.collection) else {
             return Ok(None);
@@ -1648,7 +1693,61 @@ impl Library {
         let refs: Vec<&Track> = tracks.iter().collect();
         let added = album_added(collection, added.into_iter());
         let album = summarize(id, &refs, added, covers.get(id));
-        Ok(Some(AlbumDetail { album, dir, tracks }))
+        Ok(Some(AlbumDetail {
+            album,
+            dir,
+            tracks,
+            version,
+        }))
+    }
+
+    /// The album most of `tracks` (ids, with their `rel_path`s) are in now
+    /// (the earliest listed on a tie), counting those still indexed and
+    /// shown under the same id and at the same path: SQLite can give a
+    /// removed track's id to a new file. None when none of them is. An
+    /// album's tracks can be found this way after an edit elsewhere has
+    /// given it a new id, as a new title does.
+    pub fn album_of_tracks(&self, tracks: &[(i64, String)]) -> Result<Option<String>> {
+        let conn = self.conn();
+        let mut inbox = conn.prepare_cached(&format!(
+            "SELECT album_id, path, root FROM main.tracks WHERE id = ?1 AND {VISIBLE}"
+        ))?;
+        // A Library id names its prefix and row (see ID_SPAN), as in
+        // track_root; its path is already relative to the Library folder.
+        let mut lib = conn.prepare_cached(
+            "SELECT t.album_id, t.path FROM lib.tracks t JOIN temp.lib_root r
+             WHERE r.prefix = ?1 AND t.id = ?2",
+        )?;
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for (id, path) in tracks {
+            let found: Option<(String, String)> = if *id >= 0 {
+                inbox
+                    .query_row([id], |r| {
+                        Ok((
+                            r.get(0)?,
+                            rel_path(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
+                        ))
+                    })
+                    .optional()?
+            } else {
+                lib.query_row([-id / ID_SPAN, -id % ID_SPAN], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?
+            };
+            let Some((album, _)) = found.filter(|(_, at)| at == path) else {
+                continue;
+            };
+            match counts.iter_mut().find(|(a, _)| *a == album) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((album, 1)),
+            }
+        }
+        Ok(counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, (_, n))| (*n, std::cmp::Reverse(*i)))
+            .map(|(_, (album, _))| album.clone()))
     }
 
     pub fn track_path(&self, id: i64) -> Result<Option<PathBuf>> {
@@ -2878,6 +2977,48 @@ mod tests {
         let lib = Library::open_in(&dir.join("state")).unwrap();
         assert_eq!(library_version(&lib).id, now.id);
         assert_eq!(library_version(&lib).generation, 2);
+    }
+
+    #[test]
+    fn a_restored_librarys_albums_get_new_versions_though_generations_come_round_again() {
+        let (dir, root, lib) = new_library("librestoreversion");
+        let album = library_file(&root, "A/1.flac", "A", 1).1;
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        drop(lib);
+        let backup = dir.join("backup.sqlite3");
+        std::fs::copy(root.join(LIBRARY_DB), &backup).unwrap();
+
+        // What a client saw last: the track written again, at generation 2.
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 2)])
+            .unwrap();
+        let seen = lib.album(&album).unwrap().unwrap();
+        let pairs = |lib: &Library| -> Vec<(i64, i64)> {
+            let changes = lib.library_changes(0).unwrap().unwrap();
+            changes
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.generation))
+                .collect()
+        };
+        let seen_pairs = pairs(&lib);
+        assert_eq!(seen_pairs[0].1, 2);
+        drop(lib);
+
+        // Restored from the backup, then written again (other contents):
+        // the same track id at the same generation.
+        std::fs::copy(&backup, root.join(LIBRARY_DB)).unwrap();
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 3)])
+            .unwrap();
+        assert_eq!(pairs(&lib), seen_pairs);
+        let now = lib.album(&album).unwrap().unwrap();
+        assert_ne!(
+            now.version, seen.version,
+            "the Library's new id tells them apart"
+        );
+        assert_eq!(lib.album(&album).unwrap().unwrap().version, now.version);
     }
 
     #[test]

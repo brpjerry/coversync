@@ -146,6 +146,32 @@ impl Setup {
         out
     }
 
+    /// The id of the album of `collection` titled `title`.
+    fn album(&self, collection: Collection, title: &str) -> String {
+        self.lib
+            .albums(collection, &[], &[], "", &[], None)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.title == title)
+            .unwrap_or_else(|| panic!("no album {title}"))
+            .id
+    }
+
+    /// An album's tracks as its details give them: ids and paths.
+    fn tracks_of(&self, album: &str) -> Vec<(i64, String)> {
+        let detail = self.lib.album(album).unwrap().unwrap();
+        detail
+            .tracks
+            .into_iter()
+            .map(|t| (t.id, t.rel_path))
+            .collect()
+    }
+
+    /// An album's version, as its details give it.
+    fn version(&self, album: &str) -> String {
+        self.lib.album(album).unwrap().unwrap().version
+    }
+
     fn inbox_album(&self) -> String {
         self.lib
             .albums(Collection::Inbox, &[], &[], "", &[], None)
@@ -386,4 +412,189 @@ fn a_scan_counts_new_changed_removed_and_moved_files() {
     assert_eq!(s.removed(3), [("A/1.wav".into(), now)]);
     s.scan();
     assert_eq!(s.library().generation, now);
+}
+
+/// Retag a file with a genre, as an edit made outside coversync would.
+fn regenre(path: &Path, genre: &str) {
+    retag(
+        path,
+        TagEdit {
+            genre: Some(genre.into()),
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+fn an_inbox_albums_version_changes_with_its_tracks_and_only_then() {
+    let s = setup("version-inbox");
+    for n in 1..=3 {
+        wav(&s.inbox.join(format!("Rec/{n}.wav")), "T", "Record", n);
+    }
+    for n in 1..=2 {
+        wav(&s.inbox.join(format!("Other/{n}.wav")), "T", "Other", n);
+    }
+    s.scan();
+    let (record, other) = (
+        s.album(Collection::Inbox, "Record"),
+        s.album(Collection::Inbox, "Other"),
+    );
+    let v0 = s.version(&record);
+    assert_eq!(v0.len(), 16);
+    assert_eq!(s.version(&record), v0, "the same when asked again");
+    assert_ne!(s.version(&other), v0);
+    s.scan();
+    assert_eq!(
+        s.version(&record),
+        v0,
+        "a scan that finds nothing changes nothing"
+    );
+
+    // Another album's change leaves this one's version alone.
+    let other_before = s.version(&other);
+    regenre(&s.inbox.join("Other/1.wav"), "Jazz");
+    s.scan();
+    assert_eq!(s.version(&record), v0);
+    assert_ne!(s.version(&other), other_before);
+
+    // Any of its tracks written.
+    regenre(&s.inbox.join("Rec/3.wav"), "Rock");
+    s.scan();
+    let v1 = s.version(&record);
+    assert_ne!(v1, v0);
+
+    // A track removed that wasn't the latest written: the highest
+    // generation among those left stays as it was.
+    fs::remove_file(s.inbox.join("Rec/1.wav")).unwrap();
+    s.scan();
+    let v2 = s.version(&record);
+    assert_eq!(s.lib.album(&record).unwrap().unwrap().tracks.len(), 2);
+    assert!(![&v0, &v1].contains(&&v2));
+
+    // A track added.
+    wav(&s.inbox.join("Rec/4.wav"), "T", "Record", 4);
+    s.scan();
+    let v3 = s.version(&record);
+    assert!(![&v0, &v1, &v2].contains(&&v3));
+    s.scan();
+    assert_eq!(s.version(&record), v3);
+}
+
+#[test]
+fn a_library_albums_version_changes_with_its_tracks_and_only_then() {
+    let s = setup("version-library");
+    for n in 1..=3 {
+        wav(
+            &s.inbox.join(format!("Rec/{n}.wav")),
+            &format!("T{n}"),
+            "Record",
+            n,
+        );
+    }
+    s.scan();
+    let album = s.import(&s.inbox_album()).album_id;
+    let v0 = s.version(&album);
+    s.scan();
+    assert_eq!(s.version(&album), v0);
+
+    // The last track written, then the first removed: the tracks left
+    // still top out at the generation of that write.
+    regenre(&s.root.join("Record/03 - T3.wav"), "Rock");
+    s.scan();
+    let v1 = s.version(&album);
+    assert_ne!(v1, v0);
+    let written = s.library().generation;
+    fs::remove_file(s.root.join("Record/01 - T1.wav")).unwrap();
+    s.scan();
+    assert_eq!(
+        s.changed_paths(written - 1),
+        [("Record/03 - T3.wav".into(), written)]
+    );
+    let v2 = s.version(&album);
+    assert!(![&v0, &v1].contains(&&v2));
+
+    wav(&s.root.join("Record/04 - T4.wav"), "T4", "Record", 4);
+    s.scan();
+    assert!(![&v0, &v1, &v2].contains(&&s.version(&album)));
+}
+
+#[test]
+fn an_albums_tracks_find_it_under_a_new_id() {
+    let s = setup("album-of-tracks");
+    for n in 1..=3 {
+        wav(&s.inbox.join(format!("Rec/{n}.wav")), "T", "Record", n);
+    }
+    s.scan();
+    let record = s.album(Collection::Inbox, "Record");
+    let tracks = s.tracks_of(&record);
+    assert_eq!(
+        s.lib.album_of_tracks(&tracks).unwrap().as_deref(),
+        Some(record.as_str())
+    );
+    // A track counts only at the path it had: its id can name another file.
+    let moved: Vec<(i64, String)> = tracks
+        .iter()
+        .map(|(id, path)| (*id, format!("{path}.old")))
+        .collect();
+    assert_eq!(s.lib.album_of_tracks(&moved).unwrap(), None);
+
+    // A new title gives the album a new id.
+    for n in 1..=3 {
+        retag(
+            &s.inbox.join(format!("Rec/{n}.wav")),
+            TagEdit {
+                album: Some("Renamed".into()),
+                ..Default::default()
+            },
+        );
+    }
+    s.scan();
+    let renamed = s.album(Collection::Inbox, "Renamed");
+    assert_ne!(renamed, record);
+    assert_eq!(
+        s.lib.album_of_tracks(&tracks).unwrap().as_deref(),
+        Some(renamed.as_str())
+    );
+
+    // Split across albums: the one most of them are in.
+    retag(
+        &s.inbox.join("Rec/1.wav"),
+        TagEdit {
+            album: Some("Single".into()),
+            ..Default::default()
+        },
+    );
+    s.scan();
+    assert_eq!(
+        s.lib.album_of_tracks(&tracks).unwrap().as_deref(),
+        Some(renamed.as_str())
+    );
+    let single = s.album(Collection::Inbox, "Single");
+    let first = s.tracks_of(&single);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        s.lib.album_of_tracks(&first).unwrap().as_deref(),
+        Some(single.as_str())
+    );
+
+    // Imported in Copy mode: the Inbox files are hidden, and the Library's
+    // copies are found by their own ids.
+    let library = s.import(&renamed).album_id;
+    assert_eq!(
+        s.lib.album_of_tracks(&tracks).unwrap().as_deref(),
+        Some(single.as_str())
+    );
+    let hidden: Vec<(i64, String)> = tracks
+        .iter()
+        .filter(|t| !first.contains(t))
+        .cloned()
+        .collect();
+    assert_eq!(s.lib.album_of_tracks(&hidden).unwrap(), None);
+    let copies = s.tracks_of(&library);
+    assert!(copies.iter().all(|(id, _)| *id < 0));
+    assert_eq!(
+        s.lib.album_of_tracks(&copies).unwrap().as_deref(),
+        Some(library.as_str())
+    );
+    assert_eq!(s.lib.album_of_tracks(&[]).unwrap(), None);
 }

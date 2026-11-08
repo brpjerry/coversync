@@ -69,9 +69,11 @@ pub struct AppState {
     pub lookups: LookupCache,
     pub progress: Progress,
     pub allow_writes: bool,
-    /// Serializes scans, tag writes and imports.
+    /// Serializes everything that writes tracks or changes which are
+    /// shown: scans, tag writes, imports, setup saves (which can switch the
+    /// Library or Inbox folder) and showing hidden Inbox files again.
     pub jobs: Mutex<()>,
-    /// A scan was requested while another ran; run again when it ends.
+    /// A scan is waiting for `jobs`; scans asked for meanwhile join it.
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
     pub identify: suggest::Jobs,
@@ -153,14 +155,18 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         .join("coversync")
 }
 
-/// Run a full scan on a blocking thread. If another job is running, the
-/// scan runs once that one is done.
+/// Run a full scan on a blocking thread, once whatever holds `jobs` (a
+/// scan, import, tag write, setup save or unhide) is done: the scan
+/// waits its turn for the lock, so none asked for is lost. Scans asked for
+/// while one waits join it; one asked for while a scan runs runs after it,
+/// as the files may have changed since it read them.
 pub fn spawn_scan(state: Shared) {
+    if state.rescan.swap(true, Ordering::SeqCst) {
+        return;
+    }
     tokio::spawn(async move {
-        let Ok(_guard) = state.jobs.try_lock() else {
-            state.rescan.store(true, Ordering::SeqCst);
-            return;
-        };
+        let _guard = state.jobs.lock().await;
+        // From here on, a scan asked for waits for this one.
         state.rescan.store(false, Ordering::SeqCst);
         let reporting = tokio::spawn(events::report_scan(state.clone()));
         let s = state.clone();
@@ -185,10 +191,6 @@ pub fn spawn_scan(state: Shared) {
         };
         state.events.publish(events::Notice::ScanFinished(progress));
         release_memory();
-        drop(_guard);
-        if state.rescan.swap(false, Ordering::SeqCst) {
-            spawn_scan(state);
-        }
     });
 }
 

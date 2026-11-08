@@ -66,6 +66,10 @@ pub enum Notice {
         /// Its id before, when the edit changed it (a new album title does).
         previous_id: Option<String>,
         collection: Collection,
+        /// Its `version` after the edit, as its details give it: a client
+        /// already showing that version has nothing to reload. Null if none
+        /// of its tracks is shown any more.
+        version: Option<String>,
     },
     /// A setup screen's settings were saved.
     SetupSaved { setup: Setup },
@@ -242,11 +246,17 @@ mod tests {
             id: "b".into(),
             previous_id: Some("a".into()),
             collection: Collection::Library,
+            version: Some("0123456789abcdef".into()),
         };
         assert_eq!(changed.name(), "album_changed");
         assert_eq!(
             serde_json::to_value(&changed).unwrap(),
-            serde_json::json!({ "id": "b", "previous_id": "a", "collection": "library" })
+            serde_json::json!({
+                "id": "b",
+                "previous_id": "a",
+                "collection": "library",
+                "version": "0123456789abcdef"
+            })
         );
         assert_eq!(
             serde_json::to_value(setup_saved(Setup::Inbox)).unwrap(),
