@@ -597,4 +597,10 @@ fn an_albums_tracks_find_it_under_a_new_id() {
         Some(library.as_str())
     );
     assert_eq!(s.lib.album_of_tracks(&[]).unwrap(), None);
+    // An id no track can have, as a client may send.
+    assert_eq!(
+        s.lib.album_of_tracks(&[(i64::MIN, "x".into())]).unwrap(),
+        None
+    );
+    assert_eq!(s.lib.track_path(i64::MIN).unwrap(), None);
 }

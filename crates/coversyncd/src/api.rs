@@ -761,8 +761,9 @@ async fn import_album(
     State(state): State<Shared>,
     Json(req): Json<ImportRequest>,
 ) -> ApiResult<Json<ImportResult>> {
-    let _guard = state.jobs.lock().await;
-    let result = blocking(&state, move |s| {
+    // Under the jobs lock, in a task of its own: a scan asked for meanwhile
+    // waits for the whole import, even if the request is dropped.
+    let result = exclusively(&state, move |s| {
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
         let art = req
@@ -1041,14 +1042,23 @@ async fn write_tags(
         for (_, edit) in &edits {
             tags::validate(edit)?;
         }
+        // Files written before one fails are indexed all the same, so their
+        // tracks (and the album's version) say they changed.
         let mut written = Vec::new();
+        let mut failed = None;
         for (track, edit) in &edits {
-            let (path, root) = s
+            let file = s
                 .lib
-                .track_root(*track)?
-                .ok_or(coversync_core::Error::NotFound)?;
-            tags::write(&path, edit)?;
-            written.push((path, root));
+                .track_root(*track)
+                .and_then(|found| found.ok_or(coversync_core::Error::NotFound))
+                .and_then(|(path, root)| tags::write(&path, edit).map(|()| (path, root)));
+            match file {
+                Ok(file) => written.push(file),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
         let stats: Vec<FileStat> = written
             .into_iter()
@@ -1070,12 +1080,17 @@ async fn write_tags(
         };
         let album = s.lib.album(&new_id)?;
         let previous = current.album.id;
-        s.events.publish(Notice::AlbumChanged {
-            id: new_id.clone(),
-            previous_id: (new_id != previous).then_some(previous),
-            collection,
-            version: album.as_ref().map(|a| a.version.clone()),
-        });
+        if count > 0 || failed.is_none() {
+            s.events.publish(Notice::AlbumChanged {
+                id: new_id.clone(),
+                previous_id: (new_id != previous).then_some(previous),
+                collection,
+                version: album.as_ref().map(|a| a.version.clone()),
+            });
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
         Ok(Ok(TagWriteResult {
             album_id: new_id,
             files_written: count,
@@ -1324,6 +1339,11 @@ mod tests {
     /// holding albums "Record" (three tracks) and "Other" (two), scanned;
     /// and the Inbox folder.
     fn editing_daemon(name: &str) -> (Shared, std::path::PathBuf) {
+        daemon_with(name, true)
+    }
+
+    /// As `editing_daemon`, editing Inbox files in place only if `allow_writes`.
+    fn daemon_with(name: &str, allow_writes: bool) -> (Shared, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let inbox = dir.join("inbox");
@@ -1334,7 +1354,7 @@ mod tests {
             track(&inbox, "Other", n);
         }
         let mut state = Arc::into_inner(crate::test_state(&dir)).unwrap();
-        state.allow_writes = true;
+        state.allow_writes = allow_writes;
         state
             .lib
             .set_inbox_setup(InboxSetup {
@@ -1712,6 +1732,173 @@ mod tests {
         // Nothing left waiting.
         let _idle = state.jobs.lock().await;
         assert!(!state.rescan.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Point Library setup at a folder beside the Inbox.
+    fn with_library(state: &Shared, inbox: &FsPath) {
+        let root = inbox.parent().unwrap().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        state
+            .lib
+            .set_library_setup(LibrarySetup {
+                folder: Some(root.display().to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    /// Import the Inbox album titled `title`; its id in the Library.
+    async fn import_titled(state: &Shared, title: &str) -> String {
+        let request = serde_json::from_value(
+            serde_json::json!({ "album_id": detail(state, title).album.id }),
+        )
+        .unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        imported.album_id
+    }
+
+    #[tokio::test]
+    async fn a_partly_failed_save_still_changes_the_albums_version() {
+        let (state, inbox) = editing_daemon("conflict-partial");
+        let base = detail(&state, "Record");
+        // The second file is gone (no scan has noticed): the save writes the
+        // first, then fails.
+        std::fs::remove_file(inbox.join(&base.tracks[1].rel_path)).unwrap();
+        let failed = put(&state, &base.album.id, save_on(&base, genre("Rock"))).await;
+        assert!(matches!(failed, Err(TagWriteError::Api(_))));
+        let first = state.lib.track_path(base.tracks[0].id).unwrap().unwrap();
+        assert_eq!(tags::read(&first).unwrap().genre.as_deref(), Some("Rock"));
+        assert_ne!(detail(&state, "Record").version, base.version);
+
+        // A save made on the album as it was, to the file already written: refused.
+        let mine = TagEdit {
+            title: Some("Mine".into()),
+            ..Default::default()
+        };
+        let stale = Json(TagWrite {
+            album: TagEdit::default(),
+            tracks: HashMap::from([(base.tracks[0].id, mine)]),
+            version: Some(base.version.clone()),
+            base_tracks: Some(base_tracks(&base)),
+        });
+        let now = conflict(put(&state, &base.album.id, stale).await).unwrap();
+        assert_eq!(now.album.genre.as_deref(), Some("Rock"));
+        assert_eq!(tags::read(&first).unwrap().title.as_deref(), Some("Song 1"));
+    }
+
+    #[tokio::test]
+    async fn versioned_saves_need_allow_writes_only_for_the_inbox_album_found() {
+        let (state, inbox) = daemon_with("conflict-writes-off", false);
+        with_library(&state, &inbox);
+        // Inbox files can't be edited in place.
+        let other = detail(&state, "Other");
+        match put(&state, &other.album.id, save_on(&other, genre("Rock"))).await {
+            Err(TagWriteError::Api(ApiError(status, _))) => {
+                assert_eq!(status, StatusCode::FORBIDDEN)
+            }
+            Err(TagWriteError::Conflict(_)) => panic!("a conflict"),
+            Ok(_) => panic!("written"),
+        }
+        assert_eq!(genres(&state, &other), [None, None]);
+
+        // A Library album, renamed: a save made on it as it is now, sent to the
+        // id it had, is found by its tracks and written.
+        let old_id = import_titled(&state, "Record").await;
+        let base = state.lib.album(&old_id).unwrap().unwrap();
+        let title = TagEdit {
+            album: Some("Renamed".into()),
+            ..Default::default()
+        };
+        let renamed = put(&state, &old_id, save_on(&base, title))
+            .await
+            .unwrap()
+            .album
+            .unwrap();
+        assert_ne!(renamed.album.id, old_id);
+        let saved = put(&state, &old_id, save_on(&renamed, genre("Rock")))
+            .await
+            .unwrap();
+        assert_eq!(saved.album_id, renamed.album.id);
+        assert_eq!(
+            genres(&state, &saved.album.unwrap()),
+            vec![Some("Rock".to_string()); 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_waits_for_work_whose_request_was_dropped() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let (state, inbox) = editing_daemon("cancelled");
+        with_library(&state, &inbox);
+        // Enough files that the work outlasts its request by a while.
+        for n in 1..=200 {
+            track(&inbox, "Big", n);
+        }
+        rescan_now(&state);
+        let library_tracks = |state: &Shared| -> u32 {
+            state
+                .lib
+                .albums(Collection::Library, &[], &[], "", &[], None)
+                .unwrap()
+                .iter()
+                .map(|a| a.track_count)
+                .sum()
+        };
+        for holder in ["import", "tag write"] {
+            let mut heard = state.events.subscribe();
+            let request = match holder {
+                "import" => {
+                    let request = serde_json::from_value(
+                        serde_json::json!({ "album_id": detail(&state, "Big").album.id }),
+                    )
+                    .unwrap();
+                    let s = state.clone();
+                    tokio::spawn(async move {
+                        let _ = import_album(State(s), Json(request)).await;
+                    })
+                }
+                _ => {
+                    let id = state
+                        .lib
+                        .albums(Collection::Library, &[], &[], "", &[], None)
+                        .unwrap()[0]
+                        .id
+                        .clone();
+                    let s = state.clone();
+                    tokio::spawn(async move {
+                        let _ = put(&s, &id, edit(genre("Rock"))).await;
+                    })
+                }
+            };
+            // Its work holds the lock; a scan asked for now waits; then the
+            // request goes (its client hung up).
+            while state.jobs.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            crate::spawn_scan(state.clone());
+            request.abort();
+            let mut done = false;
+            loop {
+                match heard.try_recv() {
+                    Ok(Notice::Imported { .. } | Notice::AlbumChanged { .. }) => done = true,
+                    Ok(Notice::ScanFinished(_)) => {
+                        assert!(done, "the scan finished before the {holder}");
+                        break;
+                    }
+                    Ok(_) | Err(TryRecvError::Empty) => {}
+                    Err(e) => panic!("{e:?}"),
+                }
+                // The scan only starts once the work is done.
+                if !done {
+                    let scanning = state.progress.read().unwrap().running;
+                    assert!(!scanning, "a scan ran while the {holder} did");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert_eq!(library_tracks(&state), 200, "no ghost tracks");
+        }
     }
 
     #[tokio::test]

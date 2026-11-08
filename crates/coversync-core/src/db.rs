@@ -1730,7 +1730,11 @@ impl Library {
                     })
                     .optional()?
             } else {
-                lib.query_row([-id / ID_SPAN, -id % ID_SPAN], |r| {
+                // No Library id is i64::MIN, which has no negation.
+                let Some(public) = id.checked_neg() else {
+                    continue;
+                };
+                lib.query_row([public / ID_SPAN, public % ID_SPAN], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .optional()?
@@ -1773,8 +1777,12 @@ impl Library {
                 .optional()?);
         }
         // A Library id names its Library's prefix and the stored row (see
-        // ID_SPAN); one from another Library names nothing here.
-        let (prefix, row_id) = (-id / ID_SPAN, -id % ID_SPAN);
+        // ID_SPAN); one from another Library names nothing here, nor does
+        // i64::MIN, which no Library id is.
+        let Some(public) = id.checked_neg() else {
+            return Ok(None);
+        };
+        let (prefix, row_id) = (public / ID_SPAN, public % ID_SPAN);
         Ok(conn
             .query_row(
                 "SELECT r.root || '/' || t.path, r.root FROM lib.tracks t JOIN temp.lib_root r
