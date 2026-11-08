@@ -291,7 +291,13 @@
 		openings++;
 	});
 	$effect(() => {
-		if (held && held.from !== openId) held = null;
+		if (!held || held.from === openId) return;
+		// The sheet closed (or another album opened) while held: what it kept of
+		// the album may be out of date, so the next opening reads it again.
+		// Moving on to the album's new id keeps it.
+		const kept = untrack(() => detail?.id);
+		if (openId !== held.next && (kept === held.from || kept === held.next)) detail = null;
+		held = null;
 	});
 	/** What the album sheet shows. */
 	let sheetAlbum = $derived(holding?.album ?? openAlbum);

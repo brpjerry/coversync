@@ -127,9 +127,13 @@ class AppearanceStore extends SetupStore<AppearanceResponse> {
 		this.sortable = r.sortable;
 		this.filterable = r.filterable;
 		this.groups = r.groups;
-		this.sorts.rebase(r.setup.sort_tabs, r.defaults);
-		this.filters.rebase(r.setup.filter_tags, r.filter_defaults);
+		// A list or size not edited here follows what's saved.
+		if (this.sorts.changes) this.sorts.rebase(r.setup.sort_tabs, r.defaults);
+		else this.sorts.set(r.setup.sort_tabs, r.defaults);
+		if (this.filters.changes) this.filters.rebase(r.setup.filter_tags, r.filter_defaults);
+		else this.filters.set(r.setup.filter_tags, r.filter_defaults);
 		this.coverSizes = r.cover_sizes;
+		if (this.coverSize === this.savedCoverSize) this.coverSize = r.setup.cover_size;
 		this.savedCoverSize = r.setup.cover_size;
 	}
 

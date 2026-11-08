@@ -65,6 +65,7 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 
 	/** The setup as saved, and what the daemon owns, leaving edits be. */
 	#rebase(r: InboxSetupResponse) {
+		const was = this.saved;
 		this.saved = {
 			ingest: r.setup.ingest,
 			folder: r.setup.folder ?? '',
@@ -75,6 +76,18 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 			familyNameFirst: r.setup.suggestions.family_name_first,
 			saveLookups: r.setup.suggestions.save_lookups
 		};
+		// Fields not edited here follow what's saved.
+		const now = this.saved;
+		if (this.ingest === was.ingest) this.ingest = now.ingest;
+		if (this.folder.trim() === was.folder) this.folder = now.folder;
+		if (this.uploads.trim() === was.uploads) this.uploads = now.uploads;
+		if (this.suggestions === was.suggestions) this.suggestions = now.suggestions;
+		if (this.preferEnglish === was.preferEnglish) this.preferEnglish = now.preferEnglish;
+		if (this.familyNameFirst === was.familyNameFirst) this.familyNameFirst = now.familyNameFirst;
+		if (this.saveLookups === was.saveLookups) this.saveLookups = now.saveLookups;
+		if (this.autofill && now.autofill)
+			for (const key of Object.keys(now.autofill) as (keyof Autofill)[])
+				if (this.autofill[key] === was.autofill?.[key]) this.autofill[key] = now.autofill[key];
 		this.#status(r);
 	}
 

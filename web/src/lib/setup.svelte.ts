@@ -91,9 +91,10 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		}
 	}
 
-	/** The setup as saved, and what the daemon owns, leaving edits be. */
+	/** The setup as saved, and what the daemon owns; fields not edited here follow it. */
 	#rebase(r: SetupResponse) {
 		const s = r.setup;
+		const was = this.saved;
 		this.saved = {
 			required: s.rules.required_tags,
 			folder: s.folder ?? '',
@@ -101,6 +102,20 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			art: s.rules.art,
 			separator: s.rules.separator
 		};
+		const requiredKept =
+			this.required.size === was.required.length &&
+			was.required.every((id) => this.required.has(id));
+		if (requiredKept) {
+			this.required.clear();
+			for (const id of s.rules.required_tags) this.required.add(id);
+		}
+		if (this.folder.trim() === was.folder) this.folder = this.saved.folder;
+		if (this.structure.trim() === was.structure) this.structure = this.saved.structure;
+		if (this.art.required === was.art.required) this.art.required = s.rules.art.required;
+		if (this.art.placement === was.art.placement) this.art.placement = s.rules.art.placement;
+		if ((this.art.file_name.trim() || 'cover') === was.art.file_name)
+			this.art.file_name = s.rules.art.file_name;
+		if (this.separator === was.separator) this.separator = s.rules.separator;
 		this.folderStatus = r.folder;
 		this.libraryProblem = r.library_problem;
 	}
