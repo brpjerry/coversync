@@ -55,11 +55,17 @@
 	}
 	/** No gliding while the width changes (window resize, sidebar collapse). */
 	let settling = $state(true);
+	/**
+	 * While the page scrolls, and for a moment after: the cards ignore the pointer then (see
+	 * `.scrolling`).
+	 */
+	let scrolling = $state(false);
 
 	onMount(() => {
 		const el = grid!;
 		let frame = 0;
 		let settle: ReturnType<typeof setTimeout>;
+		let still: ReturnType<typeof setTimeout>;
 		const measure = () => {
 			width = el.clientWidth;
 			top = el.getBoundingClientRect().top + window.scrollY;
@@ -68,6 +74,9 @@
 			if (m) meta = m.offsetHeight;
 		};
 		const onscroll = () => {
+			scrolling = true;
+			clearTimeout(still);
+			still = setTimeout(() => (scrolling = false), 150);
 			frame ||= requestAnimationFrame(() => {
 				frame = 0;
 				scrollY = window.scrollY;
@@ -93,6 +102,7 @@
 			removeEventListener('resize', measure);
 			cancelAnimationFrame(frame);
 			clearTimeout(settle);
+			clearTimeout(still);
 			clearTimeout(introTimer);
 		};
 	});
@@ -101,6 +111,7 @@
 <div
 	class="vgrid"
 	class:settling
+	class:scrolling
 	bind:this={grid}
 	style:max-width="{GRID_MAX_WIDTH}px"
 	style:height="{rows ? rows * rowHeight - rowGap : 0}px"
@@ -146,6 +157,14 @@
 	}
 	.settling .cell {
 		transition: none;
+	}
+	/* A touchpad scroll leaves the pointer where it is, so every card passing under it would
+	   start and end its hover effects: a lift, the play button, and a big blurred shadow that
+	   WebKit (the Linux desktop app) repaints every frame of its transition. In the app, drags
+	   over the grid went from 81-95 frames a second on a 120 Hz display to 104-113 without
+	   them; Firefox held 120 either way. */
+	.scrolling {
+		pointer-events: none;
 	}
 	/* Cards that mount during the intro (see `entrance`). */
 	.cell:global(.rise) {
