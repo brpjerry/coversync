@@ -1,8 +1,12 @@
-//! The coversync desktop app: one window onto a coversync server's UI.
+//! The coversync desktop app for Windows (Tauri): one window onto a coversync
+//! server's UI. Linux has an app of its own, `apps/desktop-linux` (GTK 4 and
+//! WebKitGTK 6.0): WebKitGTK 4.1, which Tauri uses there, draws at 60 frames
+//! a second at most. This one still builds and runs on Linux.
 //!
 //! The UI comes from the server, through a proxy on 127.0.0.1
 //! (`coversync-proxy`) that streams everything both ways and keeps the
-//! server's path prefix; each server gets its own (see [`shell`]). When no
+//! server's path prefix; each server gets its own (see
+//! [`coversync_desktop_core::shell`]). When no
 //! server is set, it can't be reached, or the page crashes, the window shows
 //! the bundled fallback page (`../ui`), where the server can be retried or
 //! changed. One instance runs at a time: launching it again brings its
@@ -10,29 +14,23 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod config;
-#[cfg(target_os = "linux")]
-mod gstreamer;
-mod shell;
-
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
+use coversync_desktop_core::gstreamer;
+use coversync_desktop_core::{
+    ConfigLock, EarlyLaunches, Problem, SERVER_ENV, Save, Shell, Store, config, log_filter,
+    server_arg,
+};
 use coversync_proxy::{Cookies, Proxy, Upstream};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
-
-use config::{ConfigLock, Store};
-use shell::{Problem, Save, Shell};
 
 /// The window's label, which the capabilities name.
 const WINDOW: &str = "main";
 /// The bundled fallback page.
 const FALLBACK: &str = "index.html";
-/// A server for this run only, like `--server`. Neither is saved.
-const SERVER_ENV: &str = "COVERSYNC_SERVER";
 
 /// What the fallback page shows.
 #[derive(Serialize)]
@@ -107,33 +105,6 @@ fn show_fallback(app: &AppHandle, problem: Problem) {
         && let Err(err) = window.navigate(shell.fallback.clone())
     {
         tracing::error!("couldn't show the fallback page: {err}");
-    }
-}
-
-/// Launches that came in before the app had started: set up, with its first
-/// page on the way (after the one cache clear, if due; see
-/// [`clear_http_cache_then`]). They're handled once it has.
-#[derive(Default)]
-struct EarlyLaunches {
-    started: bool,
-    waiting: Vec<Vec<String>>,
-}
-
-impl EarlyLaunches {
-    /// Keeps `args` for later until the app has started; then hands them
-    /// back.
-    fn hold(&mut self, args: Vec<String>) -> Option<Vec<String>> {
-        if self.started {
-            return Some(args);
-        }
-        self.waiting.push(args);
-        None
-    }
-
-    /// The app has started: the launches held until now.
-    fn release(&mut self) -> Vec<Vec<String>> {
-        self.started = true;
-        std::mem::take(&mut self.waiting)
     }
 }
 
@@ -322,21 +293,6 @@ fn fallback_url(app: &tauri::App) -> Result<Url, Box<dyn Error>> {
     Ok(base.join(FALLBACK)?)
 }
 
-/// `--server <url>` or `--server=<url>`, from the arguments after the
-/// program's name.
-fn server_arg(args: impl IntoIterator<Item = String>) -> Option<String> {
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--server" {
-            return args.next();
-        }
-        if let Some(url) = arg.strip_prefix("--server=") {
-            return Some(url.to_owned());
-        }
-    }
-    None
-}
-
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     if gstreamer::autoaudiosink_missing() {
@@ -504,28 +460,6 @@ fn show_error(message: &str) {
     let _ = message;
 }
 
-/// Warnings from everything, with `RUST_LOG`'s directives on top: so
-/// `RUST_LOG=coversync_proxy=debug` adds the proxy's requests without hiding
-/// the app's own warnings. A level of its own in `RUST_LOG` (`debug`)
-/// replaces the default.
-fn log_filter(rust_log: &str) -> EnvFilter {
-    let directives: Vec<&str> = rust_log
-        .split(',')
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .collect();
-    let has_level = directives.iter().any(|d| d.parse::<LevelFilter>().is_ok());
-    let all = if has_level {
-        directives.join(",")
-    } else {
-        std::iter::once("warn")
-            .chain(directives)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    EnvFilter::try_new(all).unwrap_or_else(|_| EnvFilter::new("warn"))
-}
-
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
@@ -548,19 +482,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keeps_warnings_whatever_rust_log_adds() {
-        let filter = |env: &str| log_filter(env).to_string();
-        assert_eq!(filter(""), "warn");
-        let proxy = filter("coversync_proxy=debug");
-        assert!(
-            proxy.contains("coversync_proxy=debug") && proxy.contains("warn"),
-            "{proxy}"
-        );
-        assert_eq!(filter("debug"), "debug");
-        assert_eq!(filter("not a [directive"), "warn");
-    }
 
     #[test]
     fn reads_the_activation_token() {
@@ -593,37 +514,5 @@ mod tests {
         assert_eq!(server_arg(args.into_iter()), None);
         let args = carried("abc", vec!["--server".to_owned(), "https://a/".to_owned()]);
         assert_eq!(server_arg(args.into_iter()).as_deref(), Some("https://a/"));
-    }
-
-    #[test]
-    fn launches_wait_until_the_app_has_started() {
-        let mut early = EarlyLaunches::default();
-        let launch = |n: &str| vec!["app".to_owned(), format!("--server=http://{n}/")];
-        // While setup or the cache clear runs.
-        assert_eq!(early.hold(launch("a")), None);
-        assert_eq!(early.hold(launch("b")), None);
-        assert_eq!(early.release(), [launch("a"), launch("b")]);
-        assert_eq!(early.hold(launch("c")), Some(launch("c")));
-        assert!(early.release().is_empty());
-    }
-
-    #[test]
-    fn reads_the_server_argument() {
-        let args = |list: &[&str]| server_arg(list.iter().map(|s| s.to_string()));
-        assert_eq!(
-            args(&["--server", "https://a/"]).as_deref(),
-            Some("https://a/")
-        );
-        assert_eq!(
-            args(&["--server=https://b/"]).as_deref(),
-            Some("https://b/")
-        );
-        assert_eq!(
-            args(&["-v", "--server", "https://c/", "x"]).as_deref(),
-            Some("https://c/")
-        );
-        assert_eq!(args(&["--server"]), None, "no value");
-        assert_eq!(args(&["--serverx=y", "https://d/"]), None);
-        assert_eq!(args(&[]), None);
     }
 }

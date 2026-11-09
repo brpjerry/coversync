@@ -246,8 +246,14 @@ WantedBy=default.target
 
 ## Desktop app
 
-`apps/desktop` is a desktop app (Tauri 2) that shows a coversync server's UI
-in a window of its own. The UI comes from the server, so the app doesn't
+There are two desktop apps that show a coversync server's UI in a window of
+their own: `apps/desktop-linux` for Linux (GTK 4 and WebKitGTK 6.0) and
+`apps/desktop` for Windows (Tauri 2, on WebView2). They share their settings,
+proxies and fallback page (`crates/coversync-desktop-core`, `apps/desktop/ui`).
+Linux has its own because WebKitGTK 4.1, which Tauri uses there, draws at
+60 frames a second at most (animations at 30); the GTK 4 app follows the
+display, 120 Hz and up. The Tauri app still builds and runs on Linux. The UI
+comes from the server, so the apps don't
 need updating when the server does. Everything the window loads goes through
 a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
 
@@ -292,26 +298,43 @@ A lock in the config directory keeps a second process off its settings
 even where that handover can't work (without a D-Bus session bus); where
 the file system can't lock at all, the app warns and runs without it.
 
-There are no packages for it yet. To build and run it on Arch Linux, you
-need WebKitGTK as well as Rust and pnpm. Playback also needs GStreamer's good
-plugins: without `autoaudiosink`, WebKitGTK's web process crashes as audio
-starts, and the app says so.
+There are no packages for them yet. To build and run the Linux app on Arch
+Linux, you need GTK 4 and WebKitGTK 6.0 as well as Rust. Playback also needs
+GStreamer's good plugins: without `autoaudiosink`, WebKitGTK's web process
+crashes as audio starts, and the app says so.
 
 ```sh
-sudo pacman -S --needed webkit2gtk-4.1 gst-plugins-good
+sudo pacman -S --needed gtk4 webkitgtk-6.0 gst-plugins-good
+cd apps/desktop-linux
+cargo run                    # or cargo run -- --server https://n5pro.internal/coversync/
+cargo build --release        # builds target/release/coversync-desktop
+```
+
+It runs natively on Wayland. Its web view sits in a `GtkGraphicsOffload`, so
+its frames go to the compositor without GTK drawing them again, and WebKit's
+`PreferPageRenderingUpdatesNear60FPS` is off; without either, it's back to 60
+frames a second. One instance runs at a time (`GtkApplication` over D-Bus).
+The fallback page is served from `coversync://app/`, and reaches the app
+through a message handler in a script world of its own, which a server's
+pages never see. A debug build has the web inspector (right-click) and writes
+the pages' console to stdout.
+
+The Windows app builds with pnpm and the Tauri CLI:
+
+```sh
 cd apps/desktop
 pnpm install                 # the Tauri CLI, and the API the fallback page uses
 pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
 pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
 ```
 
-It runs natively on Wayland. The app has its own Cargo workspace and lockfile
-in `apps/desktop/src-tauri`, apart from the repository's, so building and
-testing the rest doesn't need WebKitGTK. `RUST_LOG=coversync_proxy=debug`
+On Linux it needs `webkit2gtk-4.1` instead. Each app has its own Cargo
+workspace and lockfile, apart from the repository's, so building and testing
+the rest needs neither WebKitGTK nor Tauri. `RUST_LOG=coversync_proxy=debug`
 also logs each request the proxy forwards; warnings show either way. The
-fallback page has no build step: it imports a copy of `@tauri-apps/api`'s
-module from `ui/vendor`, which `pnpm vendor` refreshes after a version
-change.
+fallback page has no build step: in the Windows app it imports a copy of
+`@tauri-apps/api`'s module from `ui/vendor`, which `pnpm vendor` refreshes
+after a version change.
 
 ## Develop
 

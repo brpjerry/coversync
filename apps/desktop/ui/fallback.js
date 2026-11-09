@@ -2,9 +2,8 @@
 // the page crashed. Once a server answers, the app moves the window on to
 // its UI.
 
-// @tauri-apps/api's own module, copied into ui/vendor (see vendor.mjs): the app
-// doesn't put the API in a global, so pages served through its proxies don't get it.
-import { invoke } from './vendor/tauri-api/core.js';
+// The app's commands, through Tauri's IPC or the Linux app's bridge (see bridge.js).
+import { invoke } from './bridge.js';
 
 const $ = (id) => document.getElementById(id);
 const title = $('title');
@@ -23,8 +22,9 @@ const busy = $('busy');
 let current = null;
 
 /**
- * `status` is the app's `Status` (src-tauri/src/main.rs), and `problem` its `Problem`
- * (src-tauri/src/shell.rs): the one the page opened with, or the last attempt's. A problem
+ * `status` is the app's `Status` (each app's main.rs), and `problem` its `Problem`
+ * (crates/coversync-desktop-core/src/shell.rs): the one the page opened with, or the last
+ * attempt's. A problem
  * names the address it's about, which goes in the field: a refused new address, not the
  * server still in use.
  */

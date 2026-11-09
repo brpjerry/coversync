@@ -364,6 +364,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "coversync-desktop-core"
+version = "0.1.0"
+dependencies = [
+ "coversync-proxy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "coversync-proxy"
 version = "0.1.0"
 dependencies = [

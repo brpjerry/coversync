@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use coversync_proxy::{Cookies, Proxy, Unreachable, Upstream, UpstreamError};
 use serde::Serialize;
-use tauri::Url;
+use url::Url;
 
 use crate::config::Store;
 
@@ -34,7 +34,7 @@ pub struct Shell {
     /// Held from a connection attempt's check to the window's navigation
     /// (the fallback page's Connect, another launch's `--server`), so an
     /// older attempt can't overtake a newer one.
-    pub navigation: tauri::async_runtime::Mutex<()>,
+    pub navigation: tokio::sync::Mutex<()>,
 }
 
 /// Something that went wrong, as the fallback page shows it.
@@ -97,7 +97,7 @@ impl Shell {
             proxies: Mutex::new(HashMap::new()),
             current: Arc::new(Mutex::new(None)),
             problem: Mutex::new(None),
-            navigation: tauri::async_runtime::Mutex::new(()),
+            navigation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -335,7 +335,7 @@ mod tests {
             let shell = Shell::new(
                 config,
                 Cookies::default(),
-                Url::parse("tauri://localhost/index.html").unwrap(),
+                Url::parse("coversync://app/index.html").unwrap(),
                 Arc::new(|unreachable| REPORTS.lock().unwrap().push(unreachable.server)),
             );
             let upstream = Upstream::parse(&url(current)).unwrap();
@@ -356,8 +356,18 @@ mod tests {
     /// What reached the window, from every test's shell.
     static REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+    /// One runtime for every test, as the apps have: a proxy started on it
+    /// keeps running between the calls that use it.
     fn block<F: std::future::Future>(future: F) -> F::Output {
-        tauri::async_runtime::block_on(future)
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            })
+            .block_on(future)
     }
 
     #[test]
@@ -434,16 +444,13 @@ mod tests {
                 .shell
                 .is_proxied(&page(&format!("{}/coversync/", proxy.origin())))
         );
-        assert!(
-            !fixture
-                .shell
-                .is_proxied(&page("tauri://localhost/index.html"))
-        );
-        assert!(
-            !fixture
-                .shell
-                .is_proxied(&page("http://tauri.localhost/index.html"))
-        );
+        for bundled in [
+            "coversync://app/index.html",
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/index.html",
+        ] {
+            assert!(!fixture.shell.is_proxied(&page(bundled)), "{bundled}");
+        }
         let other_port = page(&format!("http://127.0.0.1:{}/", proxy.addr().port() ^ 1));
         assert!(
             !fixture.shell.is_proxied(&other_port),

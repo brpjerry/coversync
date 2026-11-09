@@ -603,6 +603,7 @@ dependencies = [
 name = "coversync-desktop"
 version = "0.1.0"
 dependencies = [
+ "coversync-desktop-core",
  "coversync-proxy",
  "gtk",
  "serde",
@@ -613,6 +614,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webkit2gtk",
+]
+
+[[package]]
+name = "coversync-desktop-core"
+version = "0.1.0"
+dependencies = [
+ "coversync-proxy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
