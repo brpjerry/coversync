@@ -208,13 +208,14 @@ impl App {
         let Some(server) = server_arg(args.into_iter().skip(1)) else {
             return;
         };
-        // Already shown: the page, and whatever it's playing, stays.
-        if self.shell.shows(&server) {
-            return;
-        }
         let (shell, events) = (self.shell.clone(), self.events.clone());
         self.runtime.spawn(async move {
             let _navigation = shell.navigation.lock().await;
+            // Already shown, once earlier launches are through: the page, and
+            // whatever it's playing, stays.
+            if shell.shows(&server) {
+                return;
+            }
             let event = match shell.open(&server).await {
                 Ok(proxy) => UiEvent::Open(proxy.entry_url()),
                 Err(problem) => UiEvent::Fallback(problem),

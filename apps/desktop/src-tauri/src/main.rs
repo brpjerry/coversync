@@ -137,19 +137,17 @@ fn launched_again(app: &AppHandle, args: Vec<String>) {
     let Some(server) = server_arg(args.into_iter().skip(1)) else {
         return;
     };
-    // Already shown: the page, and whatever it's playing, stays.
-    if app
-        .try_state::<Shell>()
-        .is_some_and(|shell| shell.shows(&server))
-    {
-        return;
-    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let Some(shell) = app.try_state::<Shell>() else {
             return;
         };
         let _navigation = shell.navigation.lock().await;
+        // Already shown, once earlier launches are through: the page, and
+        // whatever it's playing, stays.
+        if shell.shows(&server) {
+            return;
+        }
         match shell.open(&server).await {
             Ok(proxy) => {
                 if let Err(err) = open_ui(&app, &proxy) {

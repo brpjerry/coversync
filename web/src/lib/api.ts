@@ -696,7 +696,12 @@ let named: Promise<string | null> | undefined;
  */
 export async function serverAddress(): Promise<string> {
 	named ??= fetch(`${BASE}/api/hello`, { cache: 'no-store' })
-		.then((res) => res.headers.get('coversync-server'))
+		.then((res) => {
+			// An error, the proxy's 502 when the server is down, say, names no
+			// server: not an answer to keep.
+			if (!res.ok) throw new Error(`/api/hello: ${res.status}`);
+			return res.headers.get('coversync-server');
+		})
 		.catch(() => {
 			// Asked again next time.
 			named = undefined;
