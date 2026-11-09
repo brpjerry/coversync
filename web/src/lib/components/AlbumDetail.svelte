@@ -101,15 +101,19 @@
 		try {
 			return document.documentElement.matches(':active-view-transition');
 		} catch {
-			return false; // Browsers without the selector have no view transitions either.
+			return false; // Without the selector the whole window crossfades instead (see app.css).
 		}
 	}
 </script>
 
-<!-- Fades in and out only while its cover moves (see app.css). -->
+<!-- Fades in and out only while its cover moves (see app.css). Fading out to
+     the grid, it hides its own cover (.closing, set by the page's close()),
+     which the moving snapshot stands for; a fade that turns back (Forward, say)
+     shows it again. -->
 <div
 	class="sheet-wrap"
 	transition:fade|global={{ duration: morphing() ? 280 : 0, easing: expoOut }}
+	onintrostart={(e) => e.currentTarget.classList.remove('closing')}
 	style:--tint={shade(album.color, 14)}
 	style:--accent={accent(album.color)}
 	onclick={(e) => e.target === e.currentTarget && onclose()}
@@ -342,6 +346,11 @@
 		gap: 36px;
 		align-items: end;
 		padding: 48px 48px 28px;
+	}
+	/* The cover's name goes too: only one element may have it as the transition ends. */
+	.sheet-wrap:global(.closing) .hero-cover {
+		view-transition-name: none !important;
+		visibility: hidden;
 	}
 	.hero-cover {
 		position: relative;

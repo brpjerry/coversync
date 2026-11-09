@@ -26,6 +26,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use gtk::gdk::{self, EventType};
 use gtk::glib;
 use gtk::prelude::*;
 
@@ -91,17 +92,23 @@ pub fn install(widget: &impl IsA<gtk::Widget>, content: &webkit::UserContentMana
         }
     });
     widget.add_controller(scroll);
-    // A press rather than the click: the page acts on the release, by which
-    // time the animation runs.
+    // The press starts it, ahead of the page acting on the release; the
+    // release renews it, in case the press outlasted LINGER.
     let presses = gtk::EventControllerLegacy::new();
     presses.set_propagation_phase(gtk::PropagationPhase::Capture);
     presses.connect_event(move |_, event| {
-        if matches!(
-            event.event_type(),
-            gtk::gdk::EventType::ButtonPress
-                | gtk::gdk::EventType::TouchBegin
-                | gtk::gdk::EventType::KeyPress
-        ) {
+        let starts = match event.event_type() {
+            EventType::ButtonPress
+            | EventType::ButtonRelease
+            | EventType::TouchBegin
+            | EventType::TouchEnd => true,
+            // Shift or Ctrl alone changes nothing on the page.
+            EventType::KeyPress | EventType::KeyRelease => !event
+                .downcast_ref::<gdk::KeyEvent>()
+                .is_some_and(|key| key.is_modifier()),
+            _ => false,
+        };
+        if starts {
             input(&pacing);
         }
         glib::Propagation::Proceed

@@ -443,14 +443,17 @@
 		if (!target || !document.startViewTransition || reducedMotion()) return back();
 		const vt = document.startViewTransition(async () => {
 			await back();
-			// The sheet fades out from here with the page live under it, so its own
-			// cover goes: the snapshot is the one that moves, and only one may have the name.
-			heroCover?.style.setProperty('view-transition-name', 'none');
-			heroCover?.style.setProperty('visibility', 'hidden');
+			// History can go back to another album, whose sheet stays: then its
+			// cover is the end.
+			if (sheetAlbum) return;
+			// Back at the grid, the cover lands on its card, and the sheet fading
+			// out leaves its own cover to the moving snapshot (see AlbumDetail).
+			// Now, not on the fade's outrostart, which Svelte sends a frame later.
+			document.querySelector('.sheet-wrap')?.classList.add('closing');
 			target.style.viewTransitionName = 'album-cover';
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
-		follow(vt, () => target);
+		follow(vt, () => (sheetAlbum ? document.querySelector<HTMLElement>('.hero-cover') : target));
 		vt.finished.finally(() => (target.style.viewTransitionName = ''));
 	}
 
