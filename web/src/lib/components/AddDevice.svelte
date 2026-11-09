@@ -54,7 +54,11 @@
 
 	/** The address devices reach coversync at: this page's own until `serverAddress` says. */
 	let server = $state(`${location.origin}${BASE}/`);
-	const named = serverAddress().then((address) => (server = address));
+	// For the form's warnings; a code asks again (start).
+	serverAddress().then(
+		(address) => (server = address),
+		() => {}
+	);
 	let serverUrl = $derived(new URL(server));
 
 	/** Whether a host name is this machine, as URLs write it (`[::ffff:7f00:1]` for ::ffff:127.0.0.1). */
@@ -117,8 +121,8 @@
 		forget();
 		const mine = attempt;
 		try {
-			// The code goes with the server's address.
-			await named;
+			// The code goes with the server's address, so it has to be known.
+			server = await serverAddress();
 			const made = await api.newPairing(name, scope, replacing ? replace : null);
 			if (mine !== attempt) {
 				// The dialog closed meanwhile: nobody would see this code.

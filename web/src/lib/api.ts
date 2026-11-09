@@ -688,25 +688,22 @@ export const musicbrainzArtUrl = (release_id: string) =>
 	`${BASE}/api/musicbrainz/art/${release_id}/image`;
 export const streamUrl = (trackId: number) => `${BASE}/api/tracks/${trackId}/stream`;
 
-let named: Promise<string | null> | undefined;
+let address: Promise<string> | undefined;
 /**
  * The address other devices reach coversync at: this page's own, with its
  * path prefix. In the desktop apps the page comes from a proxy on 127.0.0.1,
- * which names the server it stands for in a `Coversync-Server` header.
+ * which names the server it stands for in a `Coversync-Server` header. Fails
+ * when `/api/hello` can't be read (the proxy's 502 while the server is down,
+ * say), and is asked again next time.
  */
-export async function serverAddress(): Promise<string> {
-	named ??= fetch(`${BASE}/api/hello`, { cache: 'no-store' })
-		.then((res) => {
-			// An error, the proxy's 502 when the server is down, say, names no
-			// server: not an answer to keep.
+export function serverAddress(): Promise<string> {
+	if (!address) {
+		address = fetch(`${BASE}/api/hello`, { cache: 'no-store' }).then((res) => {
 			if (!res.ok) throw new Error(`/api/hello: ${res.status}`);
-			return res.headers.get('coversync-server');
-		})
-		.catch(() => {
-			// Asked again next time.
-			named = undefined;
-			return null;
+			const named = res.headers.get('coversync-server');
+			return named && URL.canParse(named) ? named : `${location.origin}${BASE}/`;
 		});
-	const given = await named;
-	return given && URL.canParse(given) ? given : `${location.origin}${BASE}/`;
+		address.catch(() => (address = undefined));
+	}
+	return address;
 }
