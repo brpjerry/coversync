@@ -28,7 +28,22 @@ use gtk::prelude::*;
 
 use app::{APP_ID, App};
 
+/// WebKit's switch for painting with Skia's deferred display lists.
+const SKIA_DDL_ENV: &str = "WEBKIT_SKIA_ENABLE_DDL";
+
 fn main() -> glib::ExitCode {
+    // With deferred display lists (WebKit's default), tiles are recorded on
+    // worker threads but drawn, and the images in them uploaded, on the
+    // thread that composites each frame; scrolling into new rows of covers
+    // then ran that thread past the frame. Without, GPU worker threads paint
+    // the tiles. Two-finger drags over the album grid on a 120 Hz laptop:
+    // 8-14% of frames late with them, 0-1% without. The CPU time is the same;
+    // the web process holds about 400 MiB more GPU memory (770-810 MiB).
+    // Set before anything else runs, so the web processes inherit it.
+    if std::env::var_os(SKIA_DDL_ENV).is_none() {
+        // SAFETY: no other thread has started yet.
+        unsafe { std::env::set_var(SKIA_DDL_ENV, "0") };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
         .with_writer(std::io::stderr)
