@@ -7,6 +7,7 @@
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { expoOut } from 'svelte/easing';
 	import { fade, slide } from 'svelte/transition';
 	import {
 		coverUrl,
@@ -94,10 +95,21 @@
 	}
 
 	$effect(() => closeButton?.focus({ preventScroll: true }));
+
+	/** Whether a view transition is moving the cover between the grid and the sheet. */
+	function morphing() {
+		try {
+			return document.documentElement.matches(':active-view-transition');
+		} catch {
+			return false; // Browsers without the selector have no view transitions either.
+		}
+	}
 </script>
 
+<!-- Fades in and out only while its cover moves (see app.css). -->
 <div
 	class="sheet-wrap"
+	transition:fade|global={{ duration: morphing() ? 280 : 0, easing: expoOut }}
 	style:--tint={shade(album.color, 14)}
 	style:--accent={accent(album.color)}
 	onclick={(e) => e.target === e.currentTarget && onclose()}

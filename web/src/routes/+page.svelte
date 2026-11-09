@@ -443,6 +443,10 @@
 		if (!target || !document.startViewTransition || reducedMotion()) return back();
 		const vt = document.startViewTransition(async () => {
 			await back();
+			// The sheet fades out from here with the page live under it, so its own
+			// cover goes: the snapshot is the one that moves, and only one may have the name.
+			heroCover?.style.setProperty('view-transition-name', 'none');
+			heroCover?.style.setProperty('visibility', 'hidden');
 			target.style.viewTransitionName = 'album-cover';
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
@@ -1435,6 +1439,10 @@
 	   view-transition snapshots, so the blur dropped out while the cover moved. */
 	.page.behind {
 		filter: blur(18px) saturate(1.2);
+	}
+	/* While the cover moves the blur comes and goes with the sheet (see app.css). */
+	:global(:root:active-view-transition) .page {
+		transition: filter 280ms var(--ease-out);
 	}
 	/* Captured with the page while it's blurred: on its own it would lose the blur. */
 	.page.behind > :global(header) {
