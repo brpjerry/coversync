@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { slide } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { cubicOut } from 'svelte/easing';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 

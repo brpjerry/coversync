@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { fly, slide } from 'svelte/transition';
+	import { fly } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { cubicOut } from 'svelte/easing';
 	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import Copy from '@lucide/svelte/icons/copy';

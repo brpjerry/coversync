@@ -61,6 +61,10 @@
 		box-shadow: var(--shadow);
 		font-size: 13.5px;
 	}
+	/* Performance mode: no frost (app.css), so nearly solid. */
+	:global(:root[data-performance]) .toast {
+		background: color-mix(in oklab, var(--bg-raised) 97%, transparent);
+	}
 	.success :global(svg:first-child) {
 		color: var(--success);
 	}

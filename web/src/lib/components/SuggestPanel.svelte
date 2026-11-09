@@ -46,7 +46,8 @@
 
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { fade, fly, slide } from 'svelte/transition';
+	import { fade, fly } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { cubicOut } from 'svelte/easing';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import Sparkles from '@lucide/svelte/icons/sparkles';

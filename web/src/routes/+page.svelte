@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
-	import { fade, fly, slide } from 'svelte/transition';
+	import { fade, fly } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
@@ -39,6 +40,7 @@
 	} from '#lib/browse.ts';
 	import { setup } from '#lib/setup.svelte.ts';
 	import { appearance } from '#lib/appearance.svelte.ts';
+	import { performanceMode } from '#lib/performance.svelte.ts';
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import { devices } from '#lib/devices.svelte.ts';
@@ -329,6 +331,8 @@
 	});
 
 	const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+	/** No cover flight between grid and sheet: with reduced motion, and in performance mode. */
+	const noMorph = () => reducedMotion() || performanceMode.on;
 
 	/** Run a DOM update as a view transition morphing `from` into the cover `to` finds after it. */
 	async function morph(
@@ -336,7 +340,7 @@
 		update: () => Promise<void>,
 		to: () => HTMLElement | null
 	) {
-		if (!from || !document.startViewTransition || reducedMotion()) return update();
+		if (!from || !document.startViewTransition || noMorph()) return update();
 		from.style.viewTransitionName = 'album-cover';
 		const vt = document.startViewTransition(async () => {
 			from.style.viewTransitionName = '';
@@ -440,7 +444,7 @@
 		if (!id) return;
 		const heroCover = document.querySelector<HTMLElement>('.hero-cover');
 		const target = gridCover(id);
-		if (!target || !document.startViewTransition || reducedMotion()) return back();
+		if (!target || !document.startViewTransition || noMorph()) return back();
 		const vt = document.startViewTransition(async () => {
 			await back();
 			// The sheet fades out from here with the page live under it, so its own
@@ -1440,6 +1444,10 @@
 	   while the sheet scrolls. */
 	.page.behind {
 		filter: blur(18px) saturate(1.2);
+	}
+	/* Performance mode: the sheet's backdrop dims the page instead (AlbumDetail). */
+	:global(:root[data-performance]) .page.behind {
+		filter: none;
 	}
 	/* While the cover moves the blur comes and goes with the sheet (see app.css). */
 	:global(:root:active-view-transition) .page {

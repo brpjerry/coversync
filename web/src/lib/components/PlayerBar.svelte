@@ -167,6 +167,10 @@
 		border: 1px solid var(--border);
 		box-shadow: var(--shadow);
 	}
+	/* Performance mode: no frost (app.css), so nearly solid. */
+	:global(:root[data-performance]) .player {
+		background: color-mix(in oklab, var(--bg-raised) 96%, transparent);
+	}
 	/* Firefox leaves backdrop-filter out of view-transition snapshots, so there,
 	   while an album opens or closes, the bar is captured on its own, and its
 	   snapshot, below, frosts the page changing underneath. Elsewhere the bar

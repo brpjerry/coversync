@@ -5,6 +5,8 @@
 	import favicon from '#lib/assets/favicon.svg';
 	import Login from '#lib/components/Login.svelte';
 	import { session } from '#lib/session.svelte.ts';
+	// Sets performance mode's attribute before anything is drawn.
+	import '#lib/performance.svelte.ts';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();

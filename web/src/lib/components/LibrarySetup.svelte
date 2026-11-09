@@ -2,7 +2,8 @@
 	import { untrack } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
 	import { Tween } from 'svelte/motion';
-	import { fly, slide } from 'svelte/transition';
+	import { fly } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import HardDrive from '@lucide/svelte/icons/hard-drive';
 	import FolderTree from '@lucide/svelte/icons/folder-tree';

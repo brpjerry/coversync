@@ -6,13 +6,16 @@
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
 	import LayoutGrid from '@lucide/svelte/icons/layout-grid';
 	import Image from '@lucide/svelte/icons/image';
+	import Gauge from '@lucide/svelte/icons/gauge';
 	import type { Album } from '#lib/api.ts';
 	import { appearance } from '#lib/appearance.svelte.ts';
+	import { performanceMode } from '#lib/performance.svelte.ts';
 	import { gridLayout } from '#lib/grid.ts';
 	import AlbumCard from './AlbumCard.svelte';
 	import SetupPane, { type Back } from './SetupPane.svelte';
 	import SaveBar from './SaveBar.svelte';
 	import TagListEditor from './TagListEditor.svelte';
+	import Toggle from './Toggle.svelte';
 
 	interface Props {
 		/** Filter text from the top bar's search field. */
@@ -158,6 +161,28 @@
 			}}
 		/>
 	{/if}
+
+	<!-- Kept in the browser, not on coversyncd: it depends on this device. -->
+	<section
+		class="card"
+		aria-labelledby="device-title"
+		in:fly={{ y: 12, duration: 420, delay: 180 }}
+	>
+		<header class="card-head">
+			<span class="card-icon"><Gauge size={20} /></span>
+			<div>
+				<h2 id="device-title">This device</h2>
+				<p>Used only here, not on your other devices, and applied at once.</p>
+			</div>
+		</header>
+		<div class="card-body">
+			<Toggle
+				bind:checked={performanceMode.on}
+				label="Performance mode"
+				description="Leaves out the blurs, the frosted glass and the cover's flight between the grid and an album, which take the most drawing. For a slower graphics card, a large or high-refresh display, or a laptop on battery."
+			/>
+		</div>
+	</section>
 </SetupPane>
 
 <style>

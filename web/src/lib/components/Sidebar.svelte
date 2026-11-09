@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { fade, slide } from 'svelte/transition';
+	import { fade } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { cubicOut } from 'svelte/easing';
 	import Search from '@lucide/svelte/icons/search';
 	import X from '@lucide/svelte/icons/x';
@@ -313,6 +314,10 @@
 	.sidebar.collapsed {
 		width: 0;
 		border-right-width: 0;
+	}
+	/* Performance mode: the width changes at once, not laid out again every frame. */
+	:global(:root[data-performance]) .sidebar {
+		transition: none;
 	}
 	/* Fixed width, so closing slides the panel away instead of squeezing it. */
 	.inner {

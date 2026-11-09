@@ -8,7 +8,8 @@
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import { expoOut } from 'svelte/easing';
-	import { fade, slide } from 'svelte/transition';
+	import { fade } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import {
 		coverUrl,
 		type Album,
@@ -18,6 +19,7 @@
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { duration, longDuration, quality } from '#lib/format.ts';
+	import { performanceMode } from '#lib/performance.svelte.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
@@ -106,10 +108,14 @@
 	}
 </script>
 
-<!-- Fades in and out only while its cover moves (see app.css). -->
+<!-- Fades in and out while its cover moves (see app.css); in performance mode,
+     which has no cover flight, a short fade instead. -->
 <div
 	class="sheet-wrap"
-	transition:fade|global={{ duration: morphing() ? 280 : 0, easing: expoOut }}
+	transition:fade|global={{
+		duration: morphing() ? 280 : performanceMode.on ? 150 : 0,
+		easing: expoOut
+	}}
 	style:--tint={shade(album.color, 14)}
 	style:--accent={accent(album.color)}
 	onclick={(e) => e.target === e.currentTarget && onclose()}
@@ -287,6 +293,10 @@
 		padding: 48px 24px calc(var(--dock, 0px) + 40px);
 		/* Over the page, which blurs itself while the sheet is open (.page.behind). */
 		background: color-mix(in oklab, var(--bg) 55%, transparent);
+	}
+	/* Performance mode: the page isn't blurred, so it's dimmed more. */
+	:global(:root[data-performance]) .sheet-wrap {
+		background: color-mix(in oklab, var(--bg) 80%, transparent);
 	}
 	.sheet {
 		position: relative;

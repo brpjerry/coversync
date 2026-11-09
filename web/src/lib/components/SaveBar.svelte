@@ -56,6 +56,10 @@
 			var(--shadow),
 			0 0 0 4px color-mix(in oklab, var(--accent) 10%, transparent);
 	}
+	/* Performance mode: no frost (app.css), so nearly solid. */
+	:global(:root[data-performance]) .savebar {
+		background: color-mix(in oklab, var(--bg-raised) 96%, transparent);
+	}
 	.summary {
 		font-size: 13.5px;
 		color: var(--text-2);

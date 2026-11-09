@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { fade, fly, slide } from 'svelte/transition';
+	import { fade, fly } from 'svelte/transition';
+	import { slide } from '#lib/motion.ts';
 	import { cubicOut } from 'svelte/easing';
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import TriangleAlert from '@lucide/svelte/icons/triangle-alert';

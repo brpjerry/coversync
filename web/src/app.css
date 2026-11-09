@@ -62,6 +62,24 @@
 	}
 }
 
+/* Performance mode (lib/performance.svelte.ts) leaves out blurred backdrops
+   everywhere: frosted surfaces keep their colour, nearly solid, so what passes
+   under them doesn't show through sharp. Components leave out their other
+   costly effects themselves. */
+:root[data-performance] {
+	--bg-overlay: rgb(10 11 14 / 0.96);
+}
+@media (prefers-color-scheme: light) {
+	:root[data-performance]:not([data-theme='dark']) {
+		--bg-overlay: rgb(245 245 247 / 0.96);
+	}
+}
+:root[data-performance] *,
+:root[data-performance] *::before,
+:root[data-performance] *::after {
+	backdrop-filter: none !important;
+}
+
 *,
 *::before,
 *::after {

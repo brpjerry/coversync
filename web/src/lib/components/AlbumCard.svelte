@@ -149,6 +149,11 @@
 			0 18px 40px -14px color-mix(in oklab, var(--glow) 55%, transparent),
 			0 6px 16px -6px rgb(0 0 0 / 0.5);
 	}
+	/* Performance mode: the card still lifts, without the large glow. */
+	:global(:root[data-performance]) .card:hover .cover,
+	:global(:root[data-performance]) .card:focus-within .cover {
+		box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+	}
 	img {
 		width: 100%;
 		height: 100%;
@@ -172,6 +177,11 @@
 	}
 	.loaded img {
 		opacity: 1;
+		filter: none;
+		transform: none;
+	}
+	/* Performance mode: covers only fade in. */
+	:global(:root[data-performance]) img {
 		filter: none;
 		transform: none;
 	}

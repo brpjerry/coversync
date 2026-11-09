@@ -620,6 +620,10 @@
 			border-color 240ms,
 			box-shadow 240ms;
 	}
+	/* Performance mode: no frost (app.css), so nearly solid. */
+	:global(:root[data-performance]) .savebar {
+		background: color-mix(in oklab, var(--bg-raised) 96%, transparent);
+	}
 	.savebar.dirty {
 		border-color: color-mix(in oklab, var(--accent) 45%, transparent);
 		box-shadow:
