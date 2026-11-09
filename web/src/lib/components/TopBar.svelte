@@ -202,8 +202,8 @@
 	   while an album opens or closes, the bar is captured on its own, and its
 	   snapshot, below, frosts what's under it as it fades. Not while the page is
 	   blurred behind an album (.page.behind), which would lose the bar that blur.
-	   Chrome keeps the frost in the page's snapshot but won't frost one of the
-	   bar's own, so it captures the bar with the page. */
+	   Elsewhere the bar isn't captured: it stays live under the moving cover,
+	   the only thing captured (see app.css). */
 	/* Gecko only: no other engine knows -moz-appearance. */
 	@supports (-moz-appearance: none) {
 		.bar {

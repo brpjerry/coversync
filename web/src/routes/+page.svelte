@@ -1435,8 +1435,9 @@
 
 <style>
 	/* Frosted behind an open album's sheet. A filter on the page rather than a
-	   backdrop-filter on the sheet: Firefox leaves backdrop-filter out of
-	   view-transition snapshots, so the blur dropped out while the cover moved. */
+	   backdrop-filter on the sheet, which Firefox draws at full strength the
+	   whole time the cover moves, and WebKitGTK draws again on every frame,
+	   while the sheet scrolls. */
 	.page.behind {
 		filter: blur(18px) saturate(1.2);
 	}
@@ -1444,7 +1445,7 @@
 	:global(:root:active-view-transition) .page {
 		transition: filter 280ms var(--ease-out);
 	}
-	/* Captured with the page while it's blurred: on its own it would lose the blur. */
+	/* Not captured on its own while it's blurred (Firefox, see TopBar): its snapshot would lose the blur. */
 	.page.behind > :global(header) {
 		view-transition-name: none;
 	}

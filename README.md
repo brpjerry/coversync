@@ -481,7 +481,11 @@ cargo build --release        # builds target/release/coversync-desktop
 It runs natively on Wayland. Its web view sits in a `GtkGraphicsOffload`, so
 its frames go to the compositor without GTK drawing them again, and WebKit's
 `PreferPageRenderingUpdatesNear60FPS` is off; without either, it's back to 60
-frames a second. One instance runs at a time (`GtkApplication` over D-Bus).
+frames a second. WebKit paces a page with nothing moving on it well below the
+display, so while you scroll, click or press keys, and for two seconds after,
+the app keeps an invisible animation running: what you started (a scroll's
+momentum, an album opening) gets every refresh from its first frame. Idle, it
+draws nothing. One instance runs at a time (`GtkApplication` over D-Bus).
 The fallback page is served from `coversync://app/`, and reaches the app
 through a message handler in a script world of its own, which a server's
 pages never see. A debug build has the web inspector (right-click) and writes
