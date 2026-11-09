@@ -443,10 +443,17 @@
 		if (!target || !document.startViewTransition || reducedMotion()) return back();
 		const vt = document.startViewTransition(async () => {
 			await back();
+			// History can go back to another album, whose sheet stays: then its
+			// cover is the end.
+			if (sheetAlbum) return;
+			// Back at the grid, the cover lands on its card, and the sheet fading
+			// out leaves its own cover to the moving snapshot (see AlbumDetail).
+			// Now, not on the fade's outrostart, which Svelte sends a frame later.
+			document.querySelector('.sheet-wrap')?.classList.add('closing');
 			target.style.viewTransitionName = 'album-cover';
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
-		follow(vt, () => target);
+		follow(vt, () => (sheetAlbum ? document.querySelector<HTMLElement>('.hero-cover') : target));
 		vt.finished.finally(() => (target.style.viewTransitionName = ''));
 	}
 
@@ -1431,12 +1438,17 @@
 
 <style>
 	/* Frosted behind an open album's sheet. A filter on the page rather than a
-	   backdrop-filter on the sheet: Firefox leaves backdrop-filter out of
-	   view-transition snapshots, so the blur dropped out while the cover moved. */
+	   backdrop-filter on the sheet, which Firefox draws at full strength the
+	   whole time the cover moves, and WebKitGTK draws again on every frame,
+	   while the sheet scrolls. */
 	.page.behind {
 		filter: blur(18px) saturate(1.2);
 	}
-	/* Captured with the page while it's blurred: on its own it would lose the blur. */
+	/* While the cover moves the blur comes and goes with the sheet (see app.css). */
+	:global(:root:active-view-transition) .page {
+		transition: filter 280ms var(--ease-out);
+	}
+	/* Not captured on its own while it's blurred (Firefox, see TopBar): its snapshot would lose the blur. */
 	.page.behind > :global(header) {
 		view-transition-name: none;
 	}

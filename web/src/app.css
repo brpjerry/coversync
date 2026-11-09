@@ -184,10 +184,25 @@ button {
 	animation-timing-function: var(--ease-out);
 	z-index: 10;
 }
-::view-transition-old(root),
-::view-transition-new(root) {
-	animation-duration: 280ms;
-	animation-timing-function: var(--ease-out);
+/* Only the cover is captured. The page stays live under it, and the sheet and
+   the page's blur fade in and out as the page's snapshots did (.sheet-wrap,
+   .page.behind). Capturing the whole window cost WebKitGTK (the Linux app)
+   350-410 ms on each open, during which nothing moved. */
+:root {
+	view-transition-name: none;
+}
+/* Browsers with view transitions but not :active-view-transition (Chromium
+   111-124, Safari 18.0-18.1) can't time those fades, so there the window is
+   captured and crossfades, as it used to. */
+@supports not selector(:active-view-transition) {
+	:root {
+		view-transition-name: root;
+	}
+	::view-transition-old(root),
+	::view-transition-new(root) {
+		animation-duration: 280ms;
+		animation-timing-function: var(--ease-out);
+	}
 }
 
 @media (prefers-reduced-motion: reduce) {

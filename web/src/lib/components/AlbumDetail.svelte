@@ -7,6 +7,7 @@
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { expoOut } from 'svelte/easing';
 	import { fade, slide } from 'svelte/transition';
 	import {
 		coverUrl,
@@ -94,10 +95,25 @@
 	}
 
 	$effect(() => closeButton?.focus({ preventScroll: true }));
+
+	/** Whether a view transition is moving the cover between the grid and the sheet. */
+	function morphing() {
+		try {
+			return document.documentElement.matches(':active-view-transition');
+		} catch {
+			return false; // Without the selector the whole window crossfades instead (see app.css).
+		}
+	}
 </script>
 
+<!-- Fades in and out only while its cover moves (see app.css). Fading out to
+     the grid, it hides its own cover (.closing, set by the page's close()),
+     which the moving snapshot stands for; a fade that turns back (Forward, say)
+     shows it again. -->
 <div
 	class="sheet-wrap"
+	transition:fade|global={{ duration: morphing() ? 280 : 0, easing: expoOut }}
+	onintrostart={(e) => e.currentTarget.classList.remove('closing')}
 	style:--tint={shade(album.color, 14)}
 	style:--accent={accent(album.color)}
 	onclick={(e) => e.target === e.currentTarget && onclose()}
@@ -330,6 +346,11 @@
 		gap: 36px;
 		align-items: end;
 		padding: 48px 48px 28px;
+	}
+	/* The cover's name goes too: only one element may have it as the transition ends. */
+	.sheet-wrap:global(.closing) .hero-cover {
+		view-transition-name: none !important;
+		visibility: hidden;
 	}
 	.hero-cover {
 		position: relative;

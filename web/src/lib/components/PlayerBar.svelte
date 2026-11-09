@@ -169,9 +169,8 @@
 	}
 	/* Firefox leaves backdrop-filter out of view-transition snapshots, so there,
 	   while an album opens or closes, the bar is captured on its own, and its
-	   snapshot, below, frosts the page changing underneath. Chrome keeps the
-	   frost in the page's snapshot but won't frost one of the bar's own, so it
-	   captures the bar with the page. */
+	   snapshot, below, frosts the page changing underneath. Elsewhere the bar
+	   isn't captured: it stays live, as the page does (see app.css). */
 	/* Gecko only: no other engine knows -moz-appearance. */
 	@supports (-moz-appearance: none) {
 		.player {
@@ -183,7 +182,7 @@
 		}
 	}
 	/* Above the moving album cover (z-index 10), as the bar is above the sheet.
-	   Outside Firefox the bar is part of the page's snapshot, under the cover. */
+	   Outside Firefox the live bar is under the cover, as the page is. */
 	:global(::view-transition-group(player)) {
 		z-index: 11;
 	}
