@@ -1,0 +1,180 @@
+/* The web UI's font, Latin only: @fontsource-variable/inter's file, under the
+   SIL Open Font License (fonts/OFL.txt). Other scripts use the system's fonts. */
+@font-face {
+	font-family: 'Inter Variable';
+	font-style: normal;
+	font-display: swap;
+	font-weight: 100 900;
+	src: url('fonts/inter-latin-wght-normal.woff2') format('woff2-variations');
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+		U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* The web UI's colors (web/src/app.css), dark and light. */
+:root {
+	color-scheme: dark;
+	--bg: #0a0b0e;
+	--surface: rgb(255 255 255 / 0.045);
+	--border: rgb(255 255 255 / 0.08);
+	--border-strong: rgb(255 255 255 / 0.16);
+	--text: #eef0f4;
+	--text-2: #a7adba;
+	--text-3: #6e7584;
+	--accent: hsl(252 85% 74%);
+	--accent-ink: #0a0b0e;
+	--warn-text: color-mix(in oklab, hsl(40 90% 70%) 85%, var(--text));
+	--warn-surface: hsl(40 90% 60% / 0.1);
+	--warn-border: hsl(40 90% 60% / 0.3);
+	--radius-sm: 9px;
+	--font: 'Inter Variable', system-ui, 'Noto Sans CJK JP', sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		color-scheme: light;
+		--bg: #f5f5f7;
+		--surface: rgb(0 0 0 / 0.04);
+		--border: rgb(0 0 0 / 0.08);
+		--border-strong: rgb(0 0 0 / 0.16);
+		--text: #14161b;
+		--text-2: #4d5361;
+		--text-3: #858b98;
+		--accent: hsl(252 70% 56%);
+		--accent-ink: #ffffff;
+		--warn-text: hsl(30 60% 24%);
+		--warn-surface: hsl(42 95% 55% / 0.16);
+		--warn-border: hsl(38 85% 45% / 0.4);
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+[hidden] {
+	display: none !important;
+}
+
+html,
+body {
+	height: 100%;
+	margin: 0;
+}
+
+body {
+	display: grid;
+	place-items: center;
+	padding: 24px;
+	background: var(--bg);
+	color: var(--text);
+	font: 15px/1.5 var(--font);
+}
+
+main {
+	width: min(100%, 520px);
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.logo {
+	width: 56px;
+	height: 56px;
+}
+
+h1 {
+	margin: 0;
+	font-size: 24px;
+	font-weight: 650;
+	letter-spacing: -0.01em;
+}
+
+p {
+	margin: 0;
+}
+
+.problem {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 10px 14px;
+	border: 1px solid var(--warn-border);
+	border-radius: var(--radius-sm);
+	background: var(--warn-surface);
+	color: var(--warn-text);
+	overflow-wrap: anywhere;
+}
+
+.problem .address {
+	font-weight: 600;
+}
+
+.problem .detail {
+	font-size: 12px;
+	opacity: 0.8;
+}
+
+form {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+label {
+	color: var(--text-2);
+	font-size: 13px;
+	font-weight: 550;
+}
+
+.row {
+	display: flex;
+	gap: 8px;
+}
+
+input {
+	flex: 1;
+	min-width: 0;
+	padding: 9px 12px;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-sm);
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+}
+
+input:focus-visible,
+button:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+
+button {
+	padding: 9px 16px;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-sm);
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+	font-weight: 550;
+	cursor: pointer;
+}
+
+button.primary {
+	border-color: transparent;
+	background: var(--accent);
+	color: var(--accent-ink);
+}
+
+button:disabled,
+input:disabled {
+	opacity: 0.55;
+	cursor: default;
+}
+
+.hint,
+.busy {
+	color: var(--text-3);
+	font-size: 13px;
+}

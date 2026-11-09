@@ -295,13 +295,18 @@
 		background: var(--tint);
 		overflow: hidden;
 	}
+	/* Blurred at an eighth of its size, then scaled up: the picture of a full-size image
+	   scaled by 1.3 about its centre with a 60px blur, but a blurred cover has no detail to
+	   lose, and the blur is about a fiftieth of the work. Full size, WebKit (the Linux
+	   desktop app) stalled 150-700 ms drawing it as the sheet opened. */
 	.backdrop img {
-		width: 100%;
-		height: 100%;
+		width: 12.5%;
+		height: 12.5%;
 		object-fit: cover;
-		filter: blur(60px) saturate(1.4);
+		filter: blur(7.5px) saturate(1.4);
 		opacity: 0.55;
-		transform: scale(1.3);
+		transform-origin: 0 0;
+		transform: translate(-120%, -120%) scale(10.4);
 	}
 	.backdrop::after {
 		content: '';

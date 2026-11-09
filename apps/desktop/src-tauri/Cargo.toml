@@ -1,0 +1,32 @@
+[package]
+name = "coversync-desktop"
+version = "0.1.0"
+description = "The coversync desktop app: a window onto a coversync server"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Its own workspace, apart from the repository's: it needs WebKitGTK to build.
+[workspace]
+
+# `features = []` is how the Tauri CLI writes these; it rewrites them on every
+# build otherwise.
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+coversync-desktop-core = { path = "../../../crates/coversync-desktop-core" }
+coversync-proxy = { path = "../../../crates/coversync-proxy" }
+open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-single-instance = "2.5.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# The window and webview themselves (to notice when the web process dies,
+# raise the window, clear the cache). The versions are the ones Tauri uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18.2"
+webkit2gtk = "2.0.2"

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/coversync-core", "crates/coversyncd"]
+members = ["crates/coversync-core", "crates/coversync-desktop-core", "crates/coversync-proxy", "crates/coversyncd"]
+# The desktop apps build on their own, with their own lockfiles: they need
+# WebKitGTK (Linux) or Tauri (Windows).
+exclude = ["apps/desktop", "apps/desktop-linux"]
 
 [workspace.package]
 edition = "2024"

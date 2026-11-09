@@ -92,8 +92,13 @@ used on a home server.
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
+crates/coversync-proxy  the desktop apps' proxy to a server, on 127.0.0.1
+crates/coversync-desktop-core  what the desktop apps share: settings, servers, launches
 web/                    SvelteKit / Svelte 5 single-page app
+apps/desktop-linux/     Linux desktop app (GTK 4, WebKitGTK 6.0), a window onto a server's UI
+apps/desktop/           Windows desktop app (Tauri 2); each app is its own Cargo workspace
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
+tools/player_stall.py   the player's buffering spinner while audio stalls, in headless Firefox
 tools/upload.py         uploads an album folder through the upload API
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
@@ -402,6 +407,110 @@ NoNewPrivileges=yes
 WantedBy=default.target
 ```
 
+## Desktop app
+
+There are two desktop apps that show a coversync server's UI in a window of
+their own: `apps/desktop-linux` for Linux (GTK 4 and WebKitGTK 6.0) and
+`apps/desktop` for Windows (Tauri 2, on WebView2). They share their settings,
+proxies and fallback page (`crates/coversync-desktop-core`, `apps/desktop/ui`).
+Linux has its own because WebKitGTK 4.1, which Tauri uses there, draws at
+60 frames a second at most (animations at 30); the GTK 4 app follows the
+display, 120 Hz and up. The Tauri app still builds and runs on Linux. The UI
+comes from the server, so the apps don't
+need updating when the server does. Everything the window loads goes through
+a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
+
+- Bodies stream both ways, so covers, playback and seeking, uploads and
+  server-sent events work as in a browser.
+- The server's path prefix stays: `https://n5pro.internal/coversync/` is
+  served at `http://127.0.0.1:<port>/coversync/`.
+- Each server gets its own port, kept from run to run, so each has an origin
+  of its own in the window: its cached pages and covers, and the UI's
+  settings (sort, sidebar), are its own. Ports are kept for the saved server
+  and the 8 others most recently used; a server that drops out of those
+  loses its cookies too, and its port never goes to another server. An
+  address that's refused (below) keeps no cookies either. Either way, a
+  kept server's origin keeps its cookies, whatever the prefix. One server's
+  pages can't send requests through another's proxy.
+- The proxy keeps the server's cookies itself, apart for each server, and
+  sends them as a browser would. So a server's login works as in a browser,
+  and one server's cookies never go to another. Persistent ones (a login)
+  are kept in `cookies.json` in the app's config directory, readable only by
+  you.
+- Only the app's window can use it. The window opens the proxy with a secret
+  made at each launch, which the proxy trades for a cookie, and requests
+  without that cookie are refused.
+- HTTPS servers are checked against the system's certificate store, so a LAN
+  server with a certificate from your own CA (mkcert's, say) works once that
+  CA is installed there.
+
+When no server is set or it can't be reached, the window shows a page
+bundled with the app, to try again or change the server. On Linux it also
+does when the page crashes; the Windows app doesn't watch for that yet. A
+new server entered there is used and saved only once it's checked: its `/api/hello`, which
+coversync answers without a login, has to say it's coversync. A server too
+old to have it, an error, or a redirect outside its address doesn't pass.
+Neither does a server behind a login of its own in front (HTTP basic auth on
+its reverse proxy, say), which answers 401 for `/api/hello`; `--server` or
+`COVERSYNC_SERVER` still opens it, without the check, whether the app is
+starting or already running. The address and the
+ports are kept in `config.json` in the app's config directory
+(`~/.config/io.github.brpjerry.coversync/` on Linux).
+`--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
+saving it. One instance of the app runs at a time: launching it again
+brings up its window, and shows the server given with `--server` (on Linux,
+or `COVERSYNC_SERVER`), if any; a server already showing isn't reloaded.
+Links that would open a new window, such as MusicBrainz's, open in the
+default browser.
+A lock in the config directory keeps a second process off its settings
+even where that handover can't work (without a D-Bus session bus); where
+the file system can't lock at all, the app warns and runs without it.
+
+There are no packages for them yet. To build and run the Linux app on Arch
+Linux, you need GTK 4 and WebKitGTK 6.0 as well as Rust. Playback also needs
+GStreamer's good plugins: without `autoaudiosink`, WebKitGTK's web process
+crashes as audio starts, and the app says so.
+
+```sh
+sudo pacman -S --needed gtk4 webkitgtk-6.0 gst-plugins-good
+cd apps/desktop-linux
+cargo run                    # or cargo run -- --server https://n5pro.internal/coversync/
+cargo build --release        # builds target/release/coversync-desktop
+```
+
+It runs natively on Wayland. Its web view sits in a `GtkGraphicsOffload`, so
+its frames go to the compositor without GTK drawing them again, and WebKit's
+`PreferPageRenderingUpdatesNear60FPS` is off; without either, it's back to 60
+frames a second. One instance runs at a time (`GtkApplication` over D-Bus).
+The fallback page is served from `coversync://app/`, and reaches the app
+through a message handler in a script world of its own, which a server's
+pages never see. A debug build has the web inspector (right-click) and writes
+the pages' console to stdout.
+
+The app sets `WEBKIT_SKIA_ENABLE_DDL=0` for WebKit, unless it's set already:
+pages are then painted on WebKit's GPU worker threads instead of the thread
+that composites each frame, which kept scrolling through new rows of covers
+at the display's rate. It costs the web process about 400 MiB more GPU
+memory (system memory, on integrated graphics). `WEBKIT_SKIA_ENABLE_DDL=1`
+brings back WebKit's default.
+
+The Windows app builds with pnpm and the Tauri CLI:
+
+```sh
+cd apps/desktop
+pnpm install                 # the Tauri CLI, and the API the fallback page uses
+pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
+pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
+```
+
+On Linux it needs `webkit2gtk-4.1` instead. Each app has its own Cargo
+workspace and lockfile, apart from the repository's, so building and testing
+the rest needs neither WebKitGTK nor Tauri. `RUST_LOG=coversync_proxy=debug`
+also logs each request the proxy forwards; warnings show either way. The
+fallback page has no build step: in the Windows app it imports a copy of
+`@tauri-apps/api`'s module from `ui/vendor`, which `pnpm vendor` refreshes
+after a version change.
+
 ## Develop
 
 ```sh
@@ -409,6 +518,7 @@ WantedBy=default.target
 cargo test --workspace && cargo clippy --workspace --all-targets
 (cd web && pnpm check)
 COVERSYNC_PASSWORD=… tools/ui_smoke.py http://127.0.0.1:8770/ shots/   # read-only tour of the UI
+COVERSYNC_PASSWORD=… tools/player_stall.py http://127.0.0.1:8770/       # the player's spinner through stalls
 COVERSYNC_PASSWORD=… tools/upload.py http://127.0.0.1:8770/ ~/Music/Album   # upload a folder
 ```
 
@@ -423,6 +533,10 @@ Library folder.
 For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
 `pnpm lint`, `pnpm check`, rustfmt, Clippy with warnings as errors and the
 tests, and builds the pacman package.
+
+Changes to the desktop app or its proxy also run
+`.github/workflows/desktop.yml`, which builds the app against WebKitGTK and
+runs rustfmt, Clippy and its tests.
 
 ### Release
 

@@ -154,6 +154,14 @@
 		height: 100%;
 		object-fit: cover;
 		display: block;
+		/* The tint .cover already shows, under an opaque cover: no visible change.
+		   In WebKitGTK (the Linux desktop app), a background keeps a cover that's
+		   fading in from becoming a layer holding just the image, which WebKit
+		   decodes on the page's main thread and uploads on the thread that
+		   composites each frame. With it, covers decode on WebKit's decoding
+		   thread and are painted with the rest of the page. A border radius
+		   would do the same there, but antialiases the corners twice. */
+		background: var(--tint);
 		opacity: 0;
 		filter: blur(8px);
 		transform: scale(1.04);
