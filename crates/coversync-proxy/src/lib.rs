@@ -13,6 +13,9 @@
 //!   server, and go with requests as a browser would send them to the server
 //!   itself. The app's `Authorization` header goes on every request once
 //!   there is one ([`Upstream::with_authorization`]).
+//! - Every answer names the server it came from in a `Coversync-Server`
+//!   header ([`SERVER_HEADER`]), since the page's own address is the
+//!   proxy's: the UI gives other devices that one (pairing).
 //! - Only the app's window gets in: any local process can reach a localhost
 //!   port. The window opens [`Proxy::entry_url`], which carries a secret
 //!   made for this launch. The proxy trades it for an HttpOnly cookie and
@@ -45,6 +48,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
 use url::Url;
 
+pub use headers::SERVER as SERVER_HEADER;
 pub use jar::Cookies;
 pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};

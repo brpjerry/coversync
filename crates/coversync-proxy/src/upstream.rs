@@ -17,6 +17,8 @@ pub struct Upstream {
     scheme: Scheme,
     authority: Authority,
     host: HeaderValue,
+    /// [`Upstream::url`], for the `Coversync-Server` header.
+    named: HeaderValue,
     origin: String,
     /// The origin as a URL, to resolve redirects against.
     base: Url,
@@ -85,10 +87,12 @@ impl Upstream {
         let origin = format!("{scheme}://{authority}");
         let base = Url::parse(&origin).map_err(|_| invalid())?;
         let prefix = url.path().trim_end_matches('/').to_owned();
+        let named = HeaderValue::from_str(&format!("{origin}{prefix}/")).map_err(|_| invalid())?;
         Ok(Self {
             scheme,
             authority,
             host,
+            named,
             origin,
             base,
             prefix,
@@ -110,6 +114,11 @@ impl Upstream {
     /// The server's URL, normalized: `https://n5pro.internal/coversync/`.
     pub fn url(&self) -> String {
         format!("{}{}/", self.origin, self.prefix)
+    }
+
+    /// [`Upstream::url`] as a header value.
+    pub(crate) fn named(&self) -> &HeaderValue {
+        &self.named
     }
 
     /// `https://n5pro.internal`, without the scheme's default port.

@@ -687,3 +687,21 @@ export const fullCoverUrl = (id: string) => `${BASE}/api/albums/${id}/cover/full
 export const musicbrainzArtUrl = (release_id: string) =>
 	`${BASE}/api/musicbrainz/art/${release_id}/image`;
 export const streamUrl = (trackId: number) => `${BASE}/api/tracks/${trackId}/stream`;
+
+let named: Promise<string | null> | undefined;
+/**
+ * The address other devices reach coversync at: this page's own, with its
+ * path prefix. In the desktop apps the page comes from a proxy on 127.0.0.1,
+ * which names the server it stands for in a `Coversync-Server` header.
+ */
+export async function serverAddress(): Promise<string> {
+	named ??= fetch(`${BASE}/api/hello`, { cache: 'no-store' })
+		.then((res) => res.headers.get('coversync-server'))
+		.catch(() => {
+			// Asked again next time.
+			named = undefined;
+			return null;
+		});
+	const given = await named;
+	return given && URL.canParse(given) ? given : `${location.origin}${BASE}/`;
+}

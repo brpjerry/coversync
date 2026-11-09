@@ -8,6 +8,11 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::upstream::Upstream;
 
+/// The server's URL, on every answer the proxy passes on. The page's own
+/// address is the proxy's, on 127.0.0.1, so the UI reads this one where it
+/// gives other devices the server's address (pairing).
+pub const SERVER: HeaderName = HeaderName::from_static("coversync-server");
+
 /// Headers that describe one connection, not the request or response.
 const HOP_BY_HOP: [&str; 9] = [
     "connection",
@@ -71,6 +76,7 @@ pub(crate) fn from_upstream(headers: &mut HeaderMap, local_origin: &str, upstrea
     strip_hop_by_hop(headers);
     headers.remove(STRICT_TRANSPORT_SECURITY);
     headers.remove(ALT_SVC);
+    headers.insert(SERVER, upstream.named().clone());
     // The server's own absolute URLs ("https://n5pro.internal/…" or
     // "//n5pro.internal/…") would take the window out of the proxy.
     if let Some(location) = headers.get(LOCATION).and_then(|l| l.to_str().ok())

@@ -18,7 +18,8 @@
 		type Device,
 		type NewPairing,
 		type PairingStatus,
-		type Scope
+		type Scope,
+		serverAddress
 	} from '#lib/api.ts';
 	import { devices, platformName, SCOPES } from '#lib/devices.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
@@ -51,8 +52,10 @@
 	/** Copying the link failed: it's shown to copy by hand. */
 	let showLink = $state(false);
 
-	/** The address devices reach coversync at: this page's own, with its path prefix. */
-	const server = `${location.origin}${BASE}/`;
+	/** The address devices reach coversync at: this page's own until `serverAddress` says. */
+	let server = $state(`${location.origin}${BASE}/`);
+	const named = serverAddress().then((address) => (server = address));
+	let serverUrl = $derived(new URL(server));
 
 	/** Whether a host name is this machine, as URLs write it (`[::ffff:7f00:1]` for ::ffff:127.0.0.1). */
 	function isLoopback(host: string) {
@@ -65,11 +68,13 @@
 			/^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(h)
 		);
 	}
-	/** Only apps on this computer can reach coversync at this page's address. */
-	const loopback = isLoopback(location.hostname);
-	/** Devices given this page's address would pair over plain http, which the server refuses. */
+	/** Only apps on this computer can reach coversync at this address. */
+	let loopback = $derived(isLoopback(serverUrl.hostname));
+	/** Devices given this address would pair over plain http, which the server refuses. */
 	let insecure = $derived(
-		location.protocol === 'http:' && !loopback && !(pairing?.allow_http ?? syncSetup.savedAllowHttp)
+		serverUrl.protocol === 'http:' &&
+			!loopback &&
+			!(pairing?.allow_http ?? syncSetup.savedAllowHttp)
 	);
 	let link = $derived(
 		pairing
@@ -112,6 +117,8 @@
 		forget();
 		const mine = attempt;
 		try {
+			// The code goes with the server's address.
+			await named;
 			const made = await api.newPairing(name, scope, replacing ? replace : null);
 			if (mine !== attempt) {
 				// The dialog closed meanwhile: nobody would see this code.

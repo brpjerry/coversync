@@ -18,8 +18,8 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
     Escape closes only it), and New code double-clicked after the device to replace was
     removed. Stops at the first failure.
 --pairing-link only checks the link Add device makes (its server address with the page's
-    path prefix, and ca= when Sync setup has a CA certificate), and makes no device: for a
-    UI built with BASE_PATH behind a proxy.
+    path prefix, or the one a desktop app's proxy names, and ca= when Sync setup has a CA
+    certificate), and makes no device: for a UI built with BASE_PATH behind a proxy.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
@@ -855,13 +855,18 @@ def device_edits_keep_newer_ones(d):
 
 
 def check_pairing_link(d):
-    """The link in Add device's QR code: the page's own address up to its
-    path prefix, the code, and ca= when Sync setup has a CA certificate."""
+    """The link in Add device's QR code: the server's address (the page's
+    own up to its path prefix, or the one a desktop app's proxy names in
+    Coversync-Server), the code, and ca= when Sync setup has a CA
+    certificate."""
     link = d.js("return document.querySelector('.dialog [data-link]')?.dataset.link")
     want = d.s("POST", "/execute/async", {"args": [], "script": """
         const done = arguments[0];
-        fetch('api/pairing/setup').then(r => r.json()).then(s => {
-            const server = location.origin + location.pathname.replace(/[^/]*$/, '');
+        Promise.all([
+            fetch('api/pairing/setup').then(r => r.json()),
+            fetch('api/hello').then(r => r.headers.get('coversync-server')),
+        ]).then(([s, named]) => {
+            const server = named ?? location.origin + location.pathname.replace(/[^/]*$/, '');
             const code = document.querySelector('.dialog .code').textContent.trim().replace('-', '');
             const ca = s.ca ? s.ca.fingerprint : null;
             done({server, ca, link: 'coversync://pair?server=' + encodeURIComponent(server)

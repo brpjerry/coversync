@@ -20,7 +20,7 @@ use bytes::Bytes;
 use common::{
     Log, WAIT, Window, bytes, channel_body, client, echo, pattern, serve, text, upstream,
 };
-use coversync_proxy::{Cookies, Proxy, Unreachable};
+use coversync_proxy::{Cookies, Proxy, SERVER_HEADER, Unreachable};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tokio::net::TcpListener;
@@ -266,6 +266,19 @@ async fn adds_the_apps_authorization() {
         .unwrap();
     window.send(req).await;
     assert_eq!(log.last().headers[AUTHORIZATION], "Bearer app-token");
+}
+
+#[tokio::test]
+async fn answers_name_the_server() {
+    // A header of the server's own with that name doesn't get through.
+    let router = Router::new()
+        .fallback(|| async { ([(SERVER_HEADER, "https://elsewhere.example/")], "hello") });
+    let addr = serve(router).await;
+    let window = Window::open(addr, "/coversync/").await;
+
+    let res = window.get("/coversync/api/hello").await;
+    let named: Vec<_> = res.headers().get_all(SERVER_HEADER).iter().collect();
+    assert_eq!(named, [format!("http://{addr}/coversync/").as_str()]);
 }
 
 #[tokio::test]
