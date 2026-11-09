@@ -315,9 +315,10 @@
 		width: 0;
 		border-right-width: 0;
 	}
-	/* Performance mode: the width changes at once, not laid out again every frame. */
+	/* Performance mode: the width changes at once, not laid out again every frame.
+	   The narrow-screen drawer still slides (a transform, below). */
 	:global(:root[data-performance]) .sidebar {
-		transition: none;
+		transition-property: transform;
 	}
 	/* Fixed width, so closing slides the panel away instead of squeezing it. */
 	.inner {

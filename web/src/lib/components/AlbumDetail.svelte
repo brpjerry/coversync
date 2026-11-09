@@ -98,6 +98,8 @@
 
 	$effect(() => closeButton?.focus({ preventScroll: true }));
 
+	const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 	/** Whether a view transition is moving the cover between the grid and the sheet. */
 	function morphing() {
 		try {
@@ -116,7 +118,7 @@
 <div
 	class="sheet-wrap"
 	transition:fade|global={{
-		duration: morphing() ? 280 : performanceMode.on ? 150 : 0,
+		duration: morphing() ? 280 : performanceMode.on && !reducedMotion() ? 150 : 0,
 		easing: expoOut
 	}}
 	onintrostart={(e) => e.currentTarget.classList.remove('closing')}

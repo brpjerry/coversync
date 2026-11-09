@@ -14,6 +14,12 @@ class PerformanceMode {
 
 	constructor() {
 		this.#apply();
+		// Other tabs on this device follow a change made in one.
+		addEventListener('storage', (e) => {
+			if (e.key !== KEY) return;
+			this.#on = e.newValue === 'on';
+			this.#apply();
+		});
 	}
 
 	get on() {

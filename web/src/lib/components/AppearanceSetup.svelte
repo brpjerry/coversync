@@ -150,16 +150,6 @@
 				/>
 			</div>
 		</section>
-
-		<SaveBar
-			changes={appearance.changes}
-			saving={appearance.saving}
-			saveLabel="Save"
-			onrevert={() => appearance.revert()}
-			onsave={async () => {
-				if (await appearance.save()) onsaved();
-			}}
-		/>
 	{/if}
 
 	<!-- Kept in the browser, not on coversyncd: it depends on this device. -->
@@ -183,6 +173,20 @@
 			/>
 		</div>
 	</section>
+
+	<!-- Last, so the bar closes the form (sticky, and fixed on phones), and isn't
+	     taken to save this device's switch, which applies at once. -->
+	{#if appearance.loaded && !appearance.failed}
+		<SaveBar
+			changes={appearance.changes}
+			saving={appearance.saving}
+			saveLabel="Save"
+			onrevert={() => appearance.revert()}
+			onsave={async () => {
+				if (await appearance.save()) onsaved();
+			}}
+		/>
+	{/if}
 </SetupPane>
 
 <style>

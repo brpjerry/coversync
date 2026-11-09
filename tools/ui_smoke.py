@@ -22,6 +22,9 @@ It signs in with the password in COVERSYNC_PASSWORD, or the one after --password
     certificate), and makes no device: for a UI built with BASE_PATH behind a proxy.
 --save clicks Save in the tag editor and library setup: only use it against a scratch library.
 --cover-size tries Appearance's cover size slider instead of the full tour.
+--performance tries performance mode instead (kept in the browser): Appearance's switch turns it
+    on at once, it stays on over a reload, an album then opens without the cover's flight or
+    the page's blur, and turning it off brings the frost back. Stops at the first failure.
 --suggest ALBUM [--superset ALBUM] tries Smart suggestions on an Inbox album
     (scratch daemons only: it imports the album); --superset names one that
     AcoustID matches to a bigger release, to check the warning.
@@ -295,6 +298,49 @@ def appearance_flow(d, out, tag):
     d.click(".setup .back")
     d.wait("return document.querySelectorAll('.card').length > 0")
     print("after back:", repr(d.js("return location.search")))
+
+
+def performance_flow(d, out, tag):
+    """Performance mode: see --performance in the module docs."""
+    on = "return document.documentElement.hasAttribute('data-performance')"
+    frost = "return getComputedStyle(document.querySelector('header')).backdropFilter"
+    switch = "//button[@role='switch'][contains(normalize-space(.), 'Performance mode')]"
+
+    def flip():
+        d.open_setup("Appearance")
+        d.wait("return [...document.querySelectorAll('[role=switch]')].some(e => e.textContent.includes('Performance mode'))")
+        d.click_xpath(switch)
+        time.sleep(0.4)
+
+    def reload():
+        d.s("POST", "/refresh", {})
+        d.wait("return !!document.querySelector('header')")
+        time.sleep(0.8)
+
+    check(not d.js(on) and d.js(frost) != "none", "off by default, with the top bar frosted")
+    flip()
+    check(d.js(on) and d.js(frost) == "none", "Appearance's switch turns it on at once, and the frost goes")
+    reload()
+    check(d.js(on) and d.js(frost) == "none", "it stays on over a reload")
+    press(d, ESCAPE)
+    d.wait("return document.querySelectorAll('.card').length > 0")
+    d.js("""window.__vts = 0;
+      const start = document.startViewTransition?.bind(document);
+      if (start) document.startViewTransition = (cb) => (window.__vts++, start(cb));""")
+    d.click(".card .cover")
+    d.wait("return !!document.querySelector('.sheet-wrap')")
+    time.sleep(0.6)
+    check(d.js("return window.__vts") == 0, "an album opens without the cover's flight")
+    check(d.js("return getComputedStyle(document.querySelector('.page')).filter") == "none", "nor the page's blur")
+    d.shot(out / f"10-performance-{tag}.png")
+    press(d, ESCAPE)
+    d.wait("return !document.querySelector('.sheet-wrap')")
+    flip()
+    check(not d.js(on) and d.js(frost) != "none", "turning it off brings the frost back")
+    reload()
+    check(not d.js(on), "and it stays off over a reload")
+    press(d, ESCAPE)
+    d.wait("return document.querySelectorAll('.card').length > 0")
 
 
 def sync_flow(d, out, tag):
@@ -1365,6 +1411,9 @@ def main():
             return
         if "--cover-size" in sys.argv:
             cover_size_flow(d, out, tag, "--save" in sys.argv)
+            return
+        if "--performance" in sys.argv:
+            performance_flow(d, out, tag)
             return
 
         d.click_sort("Year")
