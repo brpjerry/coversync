@@ -68,7 +68,10 @@ used on a home server.
   saved, so those are asked again each time. With **Save lookups** off,
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
-  filters by, and the cover size.
+  filters by, and the cover size. **Performance mode**, under This device, is
+  kept in the browser instead: it leaves out the blurs, the frosted glass and
+  the cover's flight into an album, for a slower graphics card, a large or
+  high-refresh display, or a battery.
 - **Sync** (planned): devices pair with the server from Sync setup, each with
   a token of its own (see [Pairing devices](#pairing-devices)), and the
   sidebar's Sync section lists them. Copying the Library to them comes later.
