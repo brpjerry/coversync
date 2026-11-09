@@ -22,6 +22,18 @@ pub fn server_arg(args: impl IntoIterator<Item = String>) -> Option<String> {
     None
 }
 
+/// A later launch's arguments, with its `COVERSYNC_SERVER` as `--server`
+/// when it gives no `--server` of its own: an app that's handed a launch's
+/// environment (the Linux one) keeps both together while it waits to start.
+pub fn with_env_server(mut args: Vec<String>, env_server: Option<String>) -> Vec<String> {
+    if let Some(server) = env_server.filter(|server| !server.is_empty())
+        && server_arg(args.iter().skip(1).cloned()).is_none()
+    {
+        args.push(format!("--server={server}"));
+    }
+    args
+}
+
 /// Launches that came in before the app had started: set up, with its first
 /// page on the way (after the one cache clear, if due). They're handled once
 /// it has.
@@ -98,6 +110,20 @@ mod tests {
         assert_eq!(early.release(), [launch("a"), launch("b")]);
         assert_eq!(early.hold(launch("c")), Some(launch("c")));
         assert!(early.release().is_empty());
+    }
+
+    #[test]
+    fn a_launchs_environment_names_a_server_its_arguments_dont() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = |server: &str| Some(server.to_owned());
+        assert_eq!(
+            with_env_server(args(&["app"]), env("https://env/")),
+            args(&["app", "--server=https://env/"])
+        );
+        let given = args(&["app", "--server", "https://arg/"]);
+        assert_eq!(with_env_server(given.clone(), env("https://env/")), given);
+        assert_eq!(with_env_server(args(&["app"]), env("")), args(&["app"]));
+        assert_eq!(with_env_server(args(&["app"]), None), args(&["app"]));
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl Problem {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Save {
     Yes,
-    /// `--server` and `COVERSYNC_SERVER` pick a server for one run.
+    /// Shown for this run only.
     No,
 }
 
@@ -184,6 +184,46 @@ impl Shell {
         }
     }
 
+    /// Shows `server` without checking it or saving it: a launch's `--server`
+    /// or `COVERSYNC_SERVER`, which may name a server the check would refuse
+    /// (one behind a login of its own, say). If it can't be reached, its
+    /// page load says so.
+    pub async fn open(&self, server: &str) -> Result<Proxy, Problem> {
+        let result = async {
+            let upstream = Upstream::parse(server).map_err(|err| Problem::invalid(err, server))?;
+            let proxy = self.started_proxy(&upstream).await?;
+            self.show(proxy.clone());
+            self.set_problem(None);
+            Ok(proxy)
+        }
+        .await;
+        if let Err(problem) = &result {
+            log_refusal(Some(server), problem);
+        }
+        result
+    }
+
+    /// Whether the window shows `server`'s UI, with nothing wrong: a launch
+    /// that asks for it again only needs the window brought up.
+    pub fn shows(&self, server: &str) -> bool {
+        let Ok(asked) = Upstream::parse(server) else {
+            return false;
+        };
+        self.problem().is_none()
+            && self
+                .current()
+                .and_then(|proxy| proxy.upstream())
+                .is_some_and(|shown| shown.url() == asked.url())
+    }
+
+    /// [`Shell::proxy_for`], with a failure to start it as the page's problem.
+    async fn started_proxy(&self, upstream: &Upstream) -> Result<Proxy, Problem> {
+        self.proxy_for(upstream).await.map_err(|err| Problem {
+            server: Some(upstream.url()),
+            ..Problem::new("Couldn't start the app's proxy", err.to_string())
+        })
+    }
+
     /// Picks `server`, or with `None` tries the current one again, and checks
     /// that it's a coversync server. Only then is a new server shown (and,
     /// with [`Save::Yes`], saved), so a typo can't replace an address that
@@ -194,17 +234,7 @@ impl Shell {
         let address = server.clone();
         let result = self.try_switch(server, save).await;
         if let Err(problem) = &result {
-            let address = problem.server.as_ref().or(address.as_ref());
-            tracing::warn!(
-                "not showing {}: {}{}",
-                address.map_or("the server", String::as_str),
-                problem.message,
-                problem
-                    .detail
-                    .as_ref()
-                    .map(|detail| format!(" ({detail})"))
-                    .unwrap_or_default()
-            );
+            log_refusal(address.as_deref(), problem);
         }
         result
     }
@@ -220,10 +250,7 @@ impl Shell {
                 None => return Err(Problem::new("No server is set", "Enter its address.")),
             },
         };
-        let proxy = self.proxy_for(&upstream).await.map_err(|err| Problem {
-            server: Some(upstream.url()),
-            ..Problem::new("Couldn't start the app's proxy", err.to_string())
-        })?;
+        let proxy = self.started_proxy(&upstream).await?;
         if let Err(unreachable) = proxy.check(&upstream).await {
             self.forget(&[upstream.url()]);
             let problem = Problem::unreachable(unreachable);
@@ -256,6 +283,23 @@ impl Shell {
                 Url::parse(proxy.origin()).is_ok_and(|origin| origin.origin() == page.origin())
             })
     }
+}
+
+fn log_refusal(address: Option<&str>, problem: &Problem) {
+    tracing::warn!(
+        "not showing {}: {}{}",
+        problem
+            .server
+            .as_deref()
+            .or(address)
+            .unwrap_or("the server"),
+        problem.message,
+        problem
+            .detail
+            .as_ref()
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default()
+    );
 }
 
 #[cfg(test)]
@@ -386,6 +430,41 @@ mod tests {
         block(fixture.shell.switch(Some(url(new)), Save::No)).unwrap();
         assert_eq!(fixture.saved_server(), Some(url(old)));
         assert_eq!(fixture.shown(), url(new));
+    }
+
+    #[test]
+    fn a_launchs_server_opens_unchecked_and_unsaved() {
+        let saved = server("200 OK");
+        let fixture = Fixture::new("open", saved);
+        // No /api/hello, as behind a login of its own.
+        let guarded = server("401 Unauthorized");
+        fixture
+            .shell
+            .set_problem(Some(Problem::new("Can't open the server", "earlier")));
+        block(fixture.shell.open(&url(guarded))).unwrap();
+        assert_eq!(fixture.shown(), url(guarded));
+        assert!(fixture.shell.problem().is_none());
+        assert_eq!(fixture.saved_server(), Some(url(saved)));
+
+        let invalid = block(fixture.shell.open("not a :// url")).unwrap_err();
+        assert_eq!(invalid.server.as_deref(), Some("not a :// url"));
+        assert_eq!(fixture.shown(), url(guarded), "still shown");
+    }
+
+    #[test]
+    fn knows_the_server_it_shows() {
+        let shown = server("200 OK");
+        let fixture = Fixture::new("shows", shown);
+        assert!(fixture.shell.shows(&url(shown)));
+        // The same server, written another way.
+        assert!(fixture.shell.shows(&format!("http://{shown}")));
+        assert!(!fixture.shell.shows(&url(server("200 OK"))));
+        assert!(!fixture.shell.shows("not a :// url"));
+        // The fallback page is up instead.
+        fixture
+            .shell
+            .set_problem(Some(Problem::new("Can't open the server", "down")));
+        assert!(!fixture.shell.shows(&url(shown)));
     }
 
     #[test]

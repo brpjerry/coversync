@@ -444,19 +444,24 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   server with a certificate from your own CA (mkcert's, say) works once that
   CA is installed there.
 
-When no server is set, it can't be reached, or the page crashes, the window
-shows a page bundled with the app, to try again or change the server. A new
-server is used and saved only once it's checked: its `/api/hello`, which
+When no server is set or it can't be reached, the window shows a page
+bundled with the app, to try again or change the server. On Linux it also
+does when the page crashes; the Windows app doesn't watch for that yet. A
+new server entered there is used and saved only once it's checked: its `/api/hello`, which
 coversync answers without a login, has to say it's coversync. A server too
 old to have it, an error, or a redirect outside its address doesn't pass.
 Neither does a server behind a login of its own in front (HTTP basic auth on
 its reverse proxy, say), which answers 401 for `/api/hello`; `--server` or
-`COVERSYNC_SERVER` still opens it, without the check. The address and the
+`COVERSYNC_SERVER` still opens it, without the check, whether the app is
+starting or already running. The address and the
 ports are kept in `config.json` in the app's config directory
 (`~/.config/io.github.brpjerry.coversync/` on Linux).
 `--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
 saving it. One instance of the app runs at a time: launching it again
-brings up its window, and shows the server given with `--server`, if any.
+brings up its window, and shows the server given with `--server` (on Linux,
+or `COVERSYNC_SERVER`), if any; a server already showing isn't reloaded.
+Links that would open a new window, such as MusicBrainz's, open in the
+default browser.
 A lock in the config directory keeps a second process off its settings
 even where that handover can't work (without a D-Bus session bus); where
 the file system can't lock at all, the app warns and runs without it.
@@ -481,6 +486,13 @@ The fallback page is served from `coversync://app/`, and reaches the app
 through a message handler in a script world of its own, which a server's
 pages never see. A debug build has the web inspector (right-click) and writes
 the pages' console to stdout.
+
+The app sets `WEBKIT_SKIA_ENABLE_DDL=0` for WebKit, unless it's set already:
+pages are then painted on WebKit's GPU worker threads instead of the thread
+that composites each frame, which kept scrolling through new rows of covers
+at the display's rate. It costs the web process about 400 MiB more GPU
+memory (system memory, on integrated graphics). `WEBKIT_SKIA_ENABLE_DDL=1`
+brings back WebKit's default.
 
 The Windows app builds with pnpm and the Tauri CLI:
 

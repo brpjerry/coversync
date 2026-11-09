@@ -7,10 +7,10 @@
 //! (`coversync-proxy`) that streams everything both ways and keeps the
 //! server's path prefix; each server gets its own (see
 //! [`coversync_desktop_core::shell`]). When no
-//! server is set, it can't be reached, or the page crashes, the window shows
-//! the bundled fallback page (`../ui`), where the server can be retried or
-//! changed. One instance runs at a time: launching it again brings its
-//! window up.
+//! server is set or it can't be reached, or (on Linux) the page crashes, the
+//! window shows the bundled fallback page (`../ui`), where the server can be
+//! retried or changed. One instance runs at a time: launching it again
+//! brings its window up.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use coversync_desktop_core::gstreamer;
 use coversync_desktop_core::{
-    ConfigLock, EarlyLaunches, Problem, SERVER_ENV, Save, Shell, Store, config, log_filter,
+    ConfigLock, EarlyLaunches, Problem, SERVER_ENV, Save, Shell, Store, config, links, log_filter,
     server_arg,
 };
-use coversync_proxy::{Cookies, Proxy, Upstream};
+use coversync_proxy::{Cookies, Proxy};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 
@@ -122,7 +122,8 @@ fn started(app: &AppHandle) {
 }
 
 /// Another launch of the app: bring the window up, and show the server it
-/// was given with `--server`, if any, for this run.
+/// was given with `--server`, if any, for this run, unchecked as at the first
+/// launch. (The plugin passes on arguments only, not `COVERSYNC_SERVER`.)
 fn launched_again(app: &AppHandle, args: Vec<String>) {
     let held = app
         .state::<Mutex<EarlyLaunches>>()
@@ -136,13 +137,20 @@ fn launched_again(app: &AppHandle, args: Vec<String>) {
     let Some(server) = server_arg(args.into_iter().skip(1)) else {
         return;
     };
+    // Already shown: the page, and whatever it's playing, stays.
+    if app
+        .try_state::<Shell>()
+        .is_some_and(|shell| shell.shows(&server))
+    {
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let Some(shell) = app.try_state::<Shell>() else {
             return;
         };
         let _navigation = shell.navigation.lock().await;
-        match shell.switch(Some(server), Save::No).await {
+        match shell.open(&server).await {
             Ok(proxy) => {
                 if let Err(err) = open_ui(&app, &proxy) {
                     tracing::error!("couldn't open the server's UI: {err}");
@@ -314,8 +322,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     };
     app.manage(lock);
     let config = Store::open(config_dir.clone());
-    let clear_cache = config.get().needs_cache_clear();
     let saved = config.get();
+    let clear_cache = saved.needs_cache_clear();
     let server = server_arg(std::env::args().skip(1))
         .or_else(|| std::env::var(SERVER_ENV).ok().filter(|s| !s.is_empty()))
         .or(saved.server);
@@ -330,14 +338,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
     );
     // Straight to the server's UI when there's a server; the fallback page
     // takes over if it can't be reached.
-    let url = match server.as_deref().map(|url| (url, Upstream::parse(url))) {
-        Some((_, Ok(upstream))) => {
-            let proxy = tauri::async_runtime::block_on(shell.proxy_for(&upstream))?;
-            shell.show(proxy.clone());
-            WebviewUrl::External(Url::parse(&proxy.entry_url())?)
-        }
-        Some((address, Err(err))) => {
-            shell.set_problem(Some(Problem::invalid(err, address)));
+    let url = match server.map(|server| tauri::async_runtime::block_on(shell.open(&server))) {
+        Some(Ok(proxy)) => WebviewUrl::External(Url::parse(&proxy.entry_url())?),
+        Some(Err(problem)) => {
+            shell.set_problem(Some(problem));
             WebviewUrl::App(FALLBACK.into())
         }
         None => WebviewUrl::App(FALLBACK.into()),
@@ -352,6 +356,22 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn Error>> {
         .title("coversync")
         .inner_size(1280.0, 860.0)
         .min_inner_size(720.0, 480.0)
+        // The app has one window: links that would open another
+        // (`target="_blank"`) go to the default browser.
+        .on_new_window(|url, _| {
+            match links::for_browser(url.as_str()) {
+                Some(url) => {
+                    if let Err(err) = open::that_detached(url.as_str()) {
+                        tracing::warn!("couldn't open a link in the browser: {err}");
+                    }
+                }
+                None => tracing::info!("not opening {url}: only web links go to the browser"),
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+        // Tauri's own handler would take files dropped on the window, which
+        // WebView2 then never passes to the page (the import's artwork).
+        .disable_drag_drop_handler()
         .build()?;
     watch_web_process(&window)?;
     if clear_cache {

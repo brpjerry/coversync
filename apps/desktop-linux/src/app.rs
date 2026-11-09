@@ -13,9 +13,10 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use coversync_desktop_core::{
-    ConfigLock, EarlyLaunches, Problem, Save, Shell, Store, config, gstreamer, server_arg,
+    ConfigLock, EarlyLaunches, Problem, Save, Shell, Store, config, gstreamer, links, server_arg,
+    with_env_server,
 };
-use coversync_proxy::{Cookies, Upstream};
+use coversync_proxy::Cookies;
 use gtk::prelude::*;
 use serde::Serialize;
 use tokio::runtime::Handle;
@@ -90,8 +91,8 @@ impl App {
         // Before anything reads the settings or the cookies.
         let lock = ConfigLock::take(&config_dir)?;
         let config = Store::open(config_dir.clone());
-        let clear_cache = config.get().needs_cache_clear();
         let saved = config.get();
+        let clear_cache = saved.needs_cache_clear();
         let server = server_arg(args.into_iter().skip(1))
             .or(env_server)
             .or(saved.server);
@@ -111,31 +112,17 @@ impl App {
         ));
         // Straight to the server's UI when there's a server; the fallback
         // page takes over if it can't be reached.
-        let first = match server.as_deref().map(|url| (url, Upstream::parse(url))) {
-            Some((_, Ok(upstream))) => match runtime.block_on(shell.proxy_for(&upstream)) {
-                Ok(proxy) => {
-                    shell.show(proxy.clone());
-                    proxy.entry_url()
-                }
-                Err(err) => {
-                    shell.set_problem(Some(Problem {
-                        server: Some(upstream.url()),
-                        ..Problem::new("Couldn't start the app's proxy", err.to_string())
-                    }));
-                    FALLBACK.to_owned()
-                }
-            },
-            Some((address, Err(err))) => {
-                shell.set_problem(Some(Problem::invalid(err, address)));
+        let first = match server.map(|server| runtime.block_on(shell.open(&server))) {
+            Some(Ok(proxy)) => proxy.entry_url(),
+            Some(Err(problem)) => {
+                shell.set_problem(Some(problem));
                 FALLBACK.to_owned()
             }
             None => FALLBACK.to_owned(),
         };
 
-        let session = webkit::NetworkSession::new(
-            Some(&data_dir().to_string_lossy()),
-            Some(&data_dir().to_string_lossy()),
-        );
+        let data = data_dir().to_string_lossy().into_owned();
+        let session = webkit::NetworkSession::new(Some(&data), Some(&data));
         let app = Rc::new_cyclic(|this: &Weak<Self>| {
             let view = web_view(&session, this.clone());
             let offload = gtk::GraphicsOffload::new(Some(&view));
@@ -206,26 +193,29 @@ impl App {
 
     /// Another launch of the app: brings the window up, and shows the server
     /// it was given with `--server` (or `COVERSYNC_SERVER`), if any, for this
-    /// run. GTK hands the launch's activation token to the window, so the
-    /// compositor may raise and focus it (GNOME and KDE do; Hyprland only
-    /// with `focus_on_activate`).
-    pub fn launched_again(&self, mut args: Vec<String>, env_server: Option<String>) {
-        if let Some(server) = env_server
-            && server_arg(args.iter().skip(1).cloned()).is_none()
-        {
-            args.push(format!("--server={server}"));
-        }
-        let Some(args) = self.early.borrow_mut().hold(args) else {
+    /// run, unchecked as at the first launch. GTK hands the launch's
+    /// activation token to the window, so the compositor may raise and focus
+    /// it (GNOME and KDE do; Hyprland only with `focus_on_activate`).
+    pub fn launched_again(&self, args: Vec<String>, env_server: Option<String>) {
+        let Some(args) = self
+            .early
+            .borrow_mut()
+            .hold(with_env_server(args, env_server))
+        else {
             return;
         };
         self.window.present();
         let Some(server) = server_arg(args.into_iter().skip(1)) else {
             return;
         };
+        // Already shown: the page, and whatever it's playing, stays.
+        if self.shell.shows(&server) {
+            return;
+        }
         let (shell, events) = (self.shell.clone(), self.events.clone());
         self.runtime.spawn(async move {
             let _navigation = shell.navigation.lock().await;
-            let event = match shell.switch(Some(server), Save::No).await {
+            let event = match shell.open(&server).await {
                 Ok(proxy) => UiEvent::Open(proxy.entry_url()),
                 Err(problem) => UiEvent::Fallback(problem),
             };
@@ -366,6 +356,30 @@ fn web_view(session: &webkit::NetworkSession, app: Weak<App>) -> webkit::WebView
         if let Some(app) = app.upgrade() {
             app.show_fallback(Problem::new("The page stopped working", message));
         }
+    });
+    // The app has one window: links that would open another
+    // (`target="_blank"`) go to the default browser.
+    view.connect_create(|view, action| {
+        let uri = action.request().and_then(|request| request.uri());
+        match uri.as_deref().and_then(links::for_browser) {
+            Some(url) => {
+                let window = view.root().and_downcast::<gtk::Window>();
+                gtk::UriLauncher::new(url.as_str()).launch(
+                    window.as_ref(),
+                    None::<&gio::Cancellable>,
+                    |result| {
+                        if let Err(err) = result {
+                            tracing::warn!("couldn't open a link in the browser: {err}");
+                        }
+                    },
+                );
+            }
+            None => tracing::info!(
+                "not opening {}: only web links go to the browser",
+                uri.unwrap_or_default()
+            ),
+        }
+        None
     });
     view
 }
