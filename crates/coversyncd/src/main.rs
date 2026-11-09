@@ -2,7 +2,9 @@
 
 mod api;
 mod auth;
+mod events;
 mod suggest;
+mod uploads;
 mod web;
 
 use std::net::SocketAddr;
@@ -16,6 +18,7 @@ use clap::{Parser, Subcommand};
 use coversync_core::cover::CoverCache;
 use coversync_core::lookups::{self, LookupCache};
 use coversync_core::scan::{self, Progress};
+use coversync_core::upload::Uploads;
 use coversync_core::{Collection, Library, ScanProgress};
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
@@ -66,38 +69,65 @@ pub struct AppState {
     pub lookups: LookupCache,
     pub progress: Progress,
     pub allow_writes: bool,
-    /// Serializes scans, tag writes and imports.
+    /// Serializes everything that writes tracks or changes which are
+    /// shown: scans, tag writes, imports, setup saves (which can switch the
+    /// Library or Inbox folder) and showing hidden Inbox files again.
     pub jobs: Mutex<()>,
-    /// A scan was requested while another ran; run again when it ends.
+    /// A scan is waiting for `jobs`; scans asked for meanwhile join it.
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
     pub identify: suggest::Jobs,
     /// The password, sessions and app tokens.
     pub auth: auth::Auth,
+    /// Uploads under way into the Inbox.
+    pub uploads: Uploads,
+    /// Change notices for clients listening on `/api/events`.
+    pub events: events::Events,
 }
 
 impl AppState {
     /// The folders to index, from the Inbox and Library settings.
     pub fn roots(&self) -> Vec<(PathBuf, Collection)> {
-        let inbox = self.lib.inbox_setup().ok().and_then(|s| s.folder);
+        let setup = self.lib.inbox_setup().ok();
+        let inbox = setup.as_ref().and_then(|s| s.folder.clone());
+        let uploads = setup.and_then(|s| s.uploads);
         let library = self.lib.library_setup().ok().and_then(|s| s.folder);
-        [(inbox, Collection::Inbox), (library, Collection::Library)]
-            .into_iter()
-            .filter_map(|(folder, c)| {
-                let path = PathBuf::from(folder?);
-                match path.canonicalize() {
-                    Ok(p) => Some((p, c)),
-                    Err(e) => {
-                        // A library folder is created on first import.
-                        if c == Collection::Inbox {
-                            tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
-                        }
-                        None
-                    }
-                }
-            })
-            .collect()
+        index_roots(inbox, uploads, library)
     }
+}
+
+/// The folders to index: the Inbox and Library folders that are there, and
+/// an uploads folder outside the Inbox folder, indexed as part of the Inbox
+/// (one inside it is anyway).
+fn index_roots(
+    inbox: Option<String>,
+    uploads: Option<String>,
+    library: Option<String>,
+) -> Vec<(PathBuf, Collection)> {
+    let mut roots: Vec<_> = [(inbox, Collection::Inbox), (library, Collection::Library)]
+        .into_iter()
+        .filter_map(|(folder, c)| {
+            let path = PathBuf::from(folder?);
+            match path.canonicalize() {
+                Ok(p) => Some((p, c)),
+                Err(e) => {
+                    // A library folder is created on first import.
+                    if c == Collection::Inbox {
+                        tracing::warn!(path = %path.display(), "Inbox folder unavailable: {e}");
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+    // Created by the first upload, so it may not exist yet; and the Inbox
+    // and Library folders may not be there either.
+    if let Some(uploads) = uploads.and_then(|u| PathBuf::from(u).canonicalize().ok())
+        && !roots.iter().any(|(r, _)| uploads.starts_with(r))
+    {
+        roots.push((uploads, Collection::Inbox));
+    }
+    roots
 }
 
 pub type Shared = Arc<AppState>;
@@ -105,6 +135,7 @@ pub type Shared = Arc<AppState>;
 /// The API, the login routes and the UI, behind the login guard.
 fn app(state: Shared) -> Router {
     api::router()
+        .merge(uploads::router())
         .merge(auth::router())
         .merge(web::router())
         // Every /api route but the few auth::router opens needs a login.
@@ -124,15 +155,20 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         .join("coversync")
 }
 
-/// Run a full scan on a blocking thread. If another job is running, the
-/// scan runs once that one is done.
+/// Run a full scan on a blocking thread, once whatever holds `jobs` (a
+/// scan, import, tag write, setup save or unhide) is done: the scan
+/// waits its turn for the lock, so none asked for is lost. Scans asked for
+/// while one waits join it; one asked for while a scan runs runs after it,
+/// as the files may have changed since it read them.
 pub fn spawn_scan(state: Shared) {
+    if state.rescan.swap(true, Ordering::SeqCst) {
+        return;
+    }
     tokio::spawn(async move {
-        let Ok(_guard) = state.jobs.try_lock() else {
-            state.rescan.store(true, Ordering::SeqCst);
-            return;
-        };
+        let _guard = state.jobs.lock().await;
+        // From here on, a scan asked for waits for this one.
         state.rescan.store(false, Ordering::SeqCst);
+        let reporting = tokio::spawn(events::report_scan(state.clone()));
         let s = state.clone();
         let result = tokio::task::spawn_blocking(move || {
             // The Library folder may have appeared (or gone) since the last scan.
@@ -145,16 +181,16 @@ pub fn spawn_scan(state: Shared) {
             Ok(Err(e)) => tracing::error!("scan failed: {e}"),
             Err(e) => tracing::error!("scan panicked: {e}"),
         }
-        state
-            .progress
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .running = false;
+        reporting.abort();
+        // Once it has stopped, no `scan` notice can follow `scan_finished`.
+        let _ = reporting.await;
+        let progress = {
+            let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
+            p.running = false;
+            p.clone()
+        };
+        state.events.publish(events::Notice::ScanFinished(progress));
         release_memory();
-        drop(_guard);
-        if state.rescan.swap(false, Ordering::SeqCst) {
-            spawn_scan(state);
-        }
     });
 }
 
@@ -227,15 +263,20 @@ async fn run() -> anyhow::Result<()> {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
+        uploads: Uploads::default(),
+        events: events::Events::default(),
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
+    uploads::follow_folder(&state);
     spawn_scan(state.clone());
+    tokio::spawn(uploads::housekeeping(state.clone()));
 
-    let app = app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let app = app(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", args.listen);
+    let closing = state.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("SIGTERM handler");
@@ -243,8 +284,12 @@ async fn run() -> anyhow::Result<()> {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
+            // Event streams never end on their own, and would hold up the shutdown.
+            closing.events.close();
         })
         .await?;
+    // Where uploads got to, so they carry on from there.
+    tokio::task::spawn_blocking(move || state.uploads.save()).await?;
     Ok(())
 }
 
@@ -263,5 +308,71 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),
+        uploads: Uploads::default(),
+        events: events::Events::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn no_scan_progress_follows_the_end_of_a_scan() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inbox")).unwrap();
+        let state = test_state(&dir);
+        let mut setup = state.lib.inbox_setup().unwrap();
+        setup.folder = Some(dir.join("inbox").display().to_string());
+        state.lib.set_inbox_setup(setup).unwrap();
+        let mut heard = state.events.subscribe();
+        for _ in 0..3 {
+            spawn_scan(state.clone());
+            loop {
+                let notice = tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv())
+                    .await
+                    .expect("the scan ends")
+                    .unwrap();
+                if matches!(notice, events::Notice::ScanFinished(_)) {
+                    break;
+                }
+            }
+            // Past the reporter's next tick: nothing more comes.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            assert!(heard.try_recv().is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_uploads_folder_alone_is_indexed() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Uploads")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let s = |p: &str| Some(dir.join(p).display().to_string());
+        // The Inbox disk isn't mounted, and nothing was imported yet.
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        assert_eq!(
+            index_roots(None, s("Uploads"), None),
+            [(dir.join("Uploads"), Collection::Inbox)]
+        );
+        std::fs::create_dir_all(dir.join("Inbox/Uploads")).unwrap();
+        std::fs::create_dir_all(dir.join("Library")).unwrap();
+        assert_eq!(
+            index_roots(s("Inbox"), s("Uploads"), s("Library")),
+            [
+                (dir.join("Inbox"), Collection::Inbox),
+                (dir.join("Library"), Collection::Library),
+                (dir.join("Uploads"), Collection::Inbox),
+            ]
+        );
+        // One inside the Inbox folder is indexed with it.
+        assert_eq!(index_roots(s("Inbox"), s("Inbox/Uploads"), None).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -349,6 +349,7 @@ name = "coversync-core"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "getrandom 0.4.3",
  "image",
  "libc",
  "lofty",
@@ -407,6 +408,7 @@ dependencies = [
  "base64",
  "clap",
  "coversync-core",
+ "futures-util",
  "getrandom 0.4.3",
  "libc",
  "mime_guess",

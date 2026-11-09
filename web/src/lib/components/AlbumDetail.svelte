@@ -6,7 +6,8 @@
 	import ListMusic from '@lucide/svelte/icons/list-music';
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
-	import { fade } from 'svelte/transition';
+	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { fade, slide } from 'svelte/transition';
 	import {
 		coverUrl,
 		type Album,
@@ -18,20 +19,59 @@
 	import { duration, longDuration, quality } from '#lib/format.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor from './TagEditor.svelte';
+	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
 		detail: AlbumDetail | null;
 		allowWrites: boolean;
 		onclose: () => void;
-		onsaved: (result: TagWriteResult) => void;
+		/** A save of the album's tags, answered; `id` is the album's id as it was. */
+		onsaved: (result: TagWriteResult, id: string) => void;
 		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
 		onimport?: (edits?: ImportEdits) => void;
+		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
+		changed?: boolean;
+		/** Drop the edits and show the album as it is now. */
+		onreload?: () => void;
+		/** Hears what edits the tag editor has. */
+		ondraft?: (draft: Draft) => void;
+		/**
+		 * Edits from a save refused because the album had changed elsewhere, on top
+		 * of `detail`, the album as it is now (see TagEditor). The notice says so.
+		 */
+		kept?: TagDraft | null;
+		/** A tag save was refused (see TagEditor). */
+		onrefused?: (current: AlbumDetail | null, draft: () => TagDraft | null, id: string) => void;
+		/** The tag editor's edits were dropped (Revert, Done, or the Tracks view): `kept` with them. */
+		ondiscard?: () => void;
 	}
-	let { album, detail, allowWrites, onclose, onsaved, onimport }: Props = $props();
+	let {
+		album,
+		detail,
+		allowWrites,
+		onclose,
+		onsaved,
+		onimport,
+		changed = false,
+		onreload,
+		ondraft,
+		kept = null,
+		onrefused,
+		ondiscard
+	}: Props = $props();
+
+	/** Leave the tag editor: its edits go, kept ones included. */
+	function showTracks() {
+		if (mode === 'edit') ondiscard?.();
+		mode = 'tracks';
+	}
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
+	/** The tag editor's edits, for the notice. */
+	let editing = $state<Draft>('none');
+	/** Kept edits for tracks no longer in the album, which couldn't be put back. */
+	let dropped = $derived(kept && detail ? lostTracks(kept, detail) : 0);
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -128,7 +168,7 @@
 							role="tab"
 							aria-selected={mode === 'tracks'}
 							class:on={mode === 'tracks'}
-							onclick={() => (mode = 'tracks')}
+							onclick={showTracks}
 						>
 							<ListMusic size={15} /> Tracks
 						</button>
@@ -147,6 +187,21 @@
 		</header>
 
 		<div class="body">
+			{#if changed}
+				<p class="elsewhere" role="status" transition:slide={{ duration: 200 }}>
+					<CircleAlert size={15} strokeWidth={2.2} />
+					<span
+						>This album was changed elsewhere.{kept && editing !== 'none'
+							? ' It shows those changes, marked, with your edits on top: save to apply them.'
+							: ''}{kept && dropped
+							? ` Edits to ${dropped} ${dropped === 1 ? 'track' : 'tracks'} no longer in it were dropped.`
+							: ''}</span
+					>
+					<button class="link" title="Your edits here are dropped" onclick={() => onreload?.()}>
+						Reload
+					</button>
+				</p>
+			{/if}
 			{#if !detail}
 				<div class="skeleton" aria-busy="true">
 					{#each { length: Math.min(album.track_count, 10) } as _, i (i)}
@@ -193,7 +248,14 @@
 							{allowWrites}
 							{onsaved}
 							{onimport}
-							oncancel={() => (mode = 'tracks')}
+							ondraft={(d) => {
+								editing = d;
+								ondraft?.(d);
+							}}
+							{kept}
+							{onrefused}
+							onrevert={() => ondiscard?.()}
+							oncancel={showTracks}
 						/>
 					{/key}
 				</div>
@@ -407,6 +469,35 @@
 	.body {
 		padding: 8px 32px 36px;
 		min-height: 200px;
+	}
+	.elsewhere {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 8px 0 14px;
+		padding: 8px 8px 8px 14px;
+		border-radius: 12px;
+		font-size: 13.5px;
+		color: var(--text-2);
+		background: var(--warn-surface);
+		border: 1px solid var(--warn-border);
+	}
+	.elsewhere :global(svg) {
+		flex: none;
+		color: var(--warn);
+	}
+	.elsewhere .link {
+		margin-left: auto;
+		padding: 4px 10px;
+		border-radius: 999px;
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--accent);
+		white-space: nowrap;
+		transition: background 140ms;
+	}
+	.elsewhere .link:hover {
+		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.disc {
 		margin: 18px 16px 6px;

@@ -55,6 +55,8 @@ export interface Track {
 export interface AlbumDetail extends Album {
 	dir: string;
 	tracks: Track[];
+	/** Changes whenever any of the album's tracks is written, or a track joins or leaves it. */
+	version: string;
 }
 
 export interface ScanProgress {
@@ -86,6 +88,13 @@ export type TagEdit = Partial<Record<TagField, string>>;
 export interface TagWrite {
 	album: TagEdit;
 	tracks: Record<number, TagEdit>;
+	/** The album's version the edits were made on: if it has changed since, nothing is saved (see TagConflict). */
+	version?: string;
+	/**
+	 * The album's tracks then (ids and paths, from its details), to find it by if it
+	 * has a new id since (a new title gives it one).
+	 */
+	base_tracks?: Pick<Track, 'id' | 'rel_path'>[];
 }
 
 export interface TagWriteResult {
@@ -136,7 +145,7 @@ export interface FolderStatus {
 	exists: boolean;
 	dir: boolean;
 	writable: boolean;
-	/** A missing folder can be created (on first import). */
+	/** A missing folder can be created (on first import or upload). */
 	creatable: boolean;
 	/** Tracks in the coversync library this folder already holds, if it holds one. */
 	library: number | null;
@@ -259,6 +268,8 @@ export interface Autofill {
 export interface InboxSetup {
 	ingest: IngestMode;
 	folder: string | null;
+	/** Where uploads go; null means Uploads in the Inbox folder. */
+	uploads: string | null;
 	autofill: Autofill;
 	suggestions: {
 		enabled: boolean;
@@ -279,6 +290,8 @@ export interface HiddenStats {
 export interface InboxSetupResponse {
 	setup: InboxSetup;
 	folder: FolderStatus | null;
+	/** The folder uploads go to, as set or by default; null without an Inbox folder. */
+	uploads: FolderStatus | null;
 	hidden: HiddenStats;
 	suggest: {
 		/** The saved AcoustID key's last characters; the key itself stays on the server. */
@@ -419,6 +432,76 @@ export interface SyncSetupResponse {
 	setup: SyncSetup;
 }
 
+/** What a paired device may do: everything but managing devices, or only syncing. */
+export type Scope = 'manage' | 'sync';
+
+/** A paired app or player, with its own token. Times are Unix seconds. */
+export interface Device {
+	id: number;
+	name: string;
+	scope: Scope;
+	/** What it said it runs on: "android", "linux", … */
+	platform: string | null;
+	hostname: string | null;
+	app_version: string | null;
+	created_at: number;
+	/** When its current token was issued. */
+	paired_at: number;
+	last_seen_at: number | null;
+	last_ip: string | null;
+	revoked_at: number | null;
+}
+
+export interface DevicesResponse {
+	devices: Device[];
+	/** The device this page is signed in as, through its token. */
+	this_device: number | null;
+	/** Signed in with the password: only that may add, change or revoke devices. */
+	can_manage: boolean;
+}
+
+/** A pairing code, just made by Add device. */
+export interface NewPairing {
+	id: string;
+	/** 8 characters, shown as two groups of four. */
+	code: string;
+	expires_in: number;
+	/** The CA certificate's SHA-256 (hex), for the link's `ca=`. */
+	ca: string | null;
+	ca_problem: string | null;
+	allow_http: boolean;
+}
+
+export type PairingStatus =
+	| { state: 'waiting'; expires_in: number }
+	/** A device used it; its token is being issued. */
+	| { state: 'pairing' }
+	| { state: 'paired'; device: Device | null }
+	| { state: 'expired' }
+	| { state: 'cancelled'; why: 'failures' | 'insecure' | 'removed' }
+	| { state: 'failed' };
+
+export interface PairingSetup {
+	/** The public certificate of the CA that signed the server's certificate, for Android apps. */
+	ca_path: string | null;
+	/** Pairing over plain http, for a network that is encrypted already. */
+	allow_http: boolean;
+}
+
+export interface CaInfo {
+	/** SHA-256 in lowercase hex, as in the pairing link. */
+	fingerprint: string;
+	/** As `openssl x509 -noout -fingerprint -sha256` prints it. */
+	sha256: string;
+}
+
+export interface PairingSetupResponse {
+	setup: PairingSetup;
+	ca: CaInfo | null;
+	/** Why the CA certificate can't be used, if it can't. */
+	ca_problem: string | null;
+}
+
 /** How this browser is signed in (`GET /api/session`). */
 export interface Access {
 	/** A password login, an app's token, or a session traded for one. */
@@ -430,9 +513,27 @@ export interface Access {
 export class ApiError extends Error {
 	constructor(
 		public status: number,
-		message: string
+		message: string,
+		/** The error response's JSON, `{}` if it had none. */
+		public body: Record<string, unknown> = {}
 	) {
 		super(message);
+	}
+
+	/** The API's `code` for it, when it gave one. */
+	get code(): string | undefined {
+		return typeof this.body.code === 'string' ? this.body.code : undefined;
+	}
+}
+
+/** A tag save refused because the album had changed since the version it was made on: nothing was saved. */
+export class TagConflict extends ApiError {
+	constructor(
+		message: string,
+		/** The album as it is now; null when neither its tracks nor its id name one any more. */
+		public album: AlbumDetail | null
+	) {
+		super(409, message);
 	}
 }
 
@@ -447,10 +548,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({}));
 		if (res.status === 401) unauthorized(body.code ?? 'login_required');
-		throw new ApiError(res.status, body.error ?? res.statusText);
+		throw new ApiError(res.status, body.error ?? res.statusText, body);
 	}
-	return res.status === 202 ? (undefined as T) : res.json();
+	return res.status === 202 || res.status === 204 ? (undefined as T) : res.json();
 }
+
+const json = (method: string, body: unknown): RequestInit => ({
+	method,
+	headers: { 'content-type': 'application/json' },
+	body: JSON.stringify(body)
+});
 
 export const api = {
 	session: () => request<Access>('/api/session'),
@@ -502,8 +609,11 @@ export const api = {
 		),
 	preview: (structure: string) =>
 		request<StructurePreview>(`/api/library/preview?structure=${encodeURIComponent(structure)}`),
-	checkFolder: (path: string) =>
-		request<FolderStatus | null>(`/api/fs/check?path=${encodeURIComponent(path)}`),
+	/** `uploads`: check it as an uploads folder, which only the folder holding it can make. */
+	checkFolder: (path: string, uploads = false) =>
+		request<FolderStatus | null>(
+			`/api/fs/check?path=${encodeURIComponent(path)}${uploads ? '&uploads=true' : ''}`
+		),
 	importPlan: (album_id: string, edits: ImportEdits = {}) =>
 		request<ImportPlan>('/api/import/plan', {
 			method: 'POST',
@@ -534,13 +644,37 @@ export const api = {
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(setup)
 		}),
+	devices: () => request<DevicesResponse>('/api/devices'),
+	/** Rename or re-scope a device (needs a password login). */
+	updateDevice: (id: number, change: { name?: string; scope?: Scope }) =>
+		request<Device>(`/api/devices/${id}`, json('PUT', change)),
+	revokeDevice: (id: number) => request<Device>(`/api/devices/${id}/revoke`, { method: 'POST' }),
+	removeDevice: (id: number) => request<void>(`/api/devices/${id}`, { method: 'DELETE' }),
+	/** Add device: a code for a device to pair with, replacing `replace`'s entry if given. */
+	newPairing: (name: string, scope: Scope, replace: number | null) =>
+		request<NewPairing>('/api/pairings', json('POST', { name, scope, replace })),
+	pairing: (id: string) => request<PairingStatus>(`/api/pairings/${encodeURIComponent(id)}`),
+	/** The dialog closed: its code stops working. */
+	closePairing: (id: string, keepalive = false) =>
+		request<void>(`/api/pairings/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
+	pairingSetup: () => request<PairingSetupResponse>('/api/pairing/setup'),
+	savePairingSetup: (setup: PairingSetup) =>
+		request<PairingSetupResponse>('/api/pairing/setup', json('PUT', setup)),
+	/** Check a CA certificate path as it's typed; null for an empty one. */
+	checkCa: (path: string) =>
+		request<CaInfo | null>(`/api/pairing/check-ca?path=${encodeURIComponent(path)}`),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
+	/** Throws TagConflict when `body.version` is no longer the album's. */
 	writeTags: (id: string, body: TagWrite) =>
 		request<TagWriteResult>(`/api/albums/${id}/tags`, {
 			method: 'PUT',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify(body)
+		}).catch((e) => {
+			if (e instanceof ApiError && e.status === 409)
+				throw new TagConflict(e.message, (e.body.album as AlbumDetail | null) ?? null);
+			throw e;
 		})
 };
 

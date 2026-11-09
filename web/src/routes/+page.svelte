@@ -41,7 +41,9 @@
 	import { appearance } from '#lib/appearance.svelte.ts';
 	import { inboxSetup } from '#lib/inbox-setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
+	import { devices } from '#lib/devices.svelte.ts';
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
+	import { listen, type Listening, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
@@ -60,6 +62,7 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
+	import type { Draft, TagDraft } from '#lib/components/TagEditor.svelte';
 
 	const SORT_KEY = 'coversync.sort';
 	const SIDEBAR_KEY = 'coversync.sidebar';
@@ -264,21 +267,57 @@
 	let openId = $derived(page.state.album ?? null);
 	let openAlbum = $derived(openId ? (byId.get(openId) ?? null) : null);
 
-	// Load the open album's tracks (again after signing back in, if that failed).
+	/** The open album's tag editor's edits: none, some not sent yet, or some being saved. */
+	let draft = $state<Draft>('none');
+	/**
+	 * The sheet stays on the open album as it last showed it, though the grids
+	 * have moved on. When `changed`, the album changed elsewhere (edited,
+	 * renamed, imported, gone) while its tags had unsaved edits here, and the
+	 * sheet keeps them until the user reloads it. Otherwise the sheet is on its
+	 * way to the album's new id. `next` is the album's id now, if known. After
+	 * a save refused for that, the sheet shows the album as it is now, with
+	 * the edits on top (`kept`; see TagEditor).
+	 */
+	let held = $state<{
+		from: string;
+		next: string | null;
+		album: Album;
+		detail: Detail | null;
+		changed: boolean;
+		kept: TagDraft | null;
+	} | null>(null);
+	let holding = $derived(held?.from === openId ? held : null);
+	/** Counts the sheet's openings (and closings): a Reload belongs to one. */
+	let openings = 0;
+	$effect(() => {
+		void openId;
+		openings++;
+	});
+	// `detail` is the open sheet's: once it closes, or another album opens, it's
+	// dropped, and the next opening reads the album again. Moving on to the
+	// album's new id (a rename, Reload) keeps what was read for it.
 	$effect(() => {
 		const id = openId;
+		untrack(() => {
+			if (detail && detail.id !== id) detail = null;
+			if (held && held.from !== id) held = null;
+		});
+	});
+	/** What the album sheet shows. */
+	let sheetAlbum = $derived(holding?.album ?? openAlbum);
+	let sheetDetail = $derived(
+		holding ? holding.detail : detail?.id === sheetAlbum?.id ? detail : null
+	);
+
+	// Load the open album's tracks (again after signing back in, if that failed).
+	$effect(() => {
+		void openId;
 		void session.generation;
-		if (!id || untrack(() => detail?.id) === id) return;
-		let cancelled = false;
-		api
-			.album(id)
-			.then((d) => !cancelled && (detail = d))
-			.catch(() => toast('Could not load album', 'error'));
-		return () => (cancelled = true);
+		untrack(() => enqueue({ kind: 'open' }));
 	});
 
 	$effect(() => {
-		document.documentElement.style.overflow = openAlbum || importing ? 'hidden' : '';
+		document.documentElement.style.overflow = sheetAlbum || importing ? 'hidden' : '';
 	});
 
 	// Room the player takes at the bottom of the window, for bars that float above it.
@@ -420,26 +459,81 @@
 		}
 	}
 
-	async function onsaved(result: TagWriteResult) {
-		await loadAlbums();
+	function onsaved(result: TagWriteResult, id: string) {
+		const from = openId;
+		// Saved over whatever changed elsewhere: the sheet shows the album as
+		// saved at once, so edits begun after Save stay. What came meanwhile is
+		// checked after it (see enqueue).
+		saves++;
+		// Answered once the sheet that saved has closed (or shows another album):
+		// only the grids show it.
+		if (sheetDetail?.id !== id) return loadAlbums();
+		// One object for the answer wherever the sheet shows it: the editor is
+		// keyed on it, and starting over would lose edits made since.
 		if (result.album) detail = result.album;
-		if (result.album_id !== openId)
-			await goto(page.url.href, {
-				state: { album: result.album_id },
-				shallow: true,
-				replace: true
-			});
+		const saved = result.album ? detail : null;
+		// If the album has left the grids meanwhile (renamed elsewhere, say), the
+		// sheet stays on it, quietly, until the notice saying where it went.
+		held =
+			holding && !openAlbum && sheetAlbum
+				? { ...holding, album: sheetAlbum, detail: saved, changed: false, kept: null }
+				: null;
+		const grids = loadAlbums();
+		if (!from || result.album_id === from) return grids;
+		// A new title: the sheet stays while the grids catch up with the new id.
+		if (sheetAlbum)
+			held = {
+				from,
+				next: result.album_id,
+				album: sheetAlbum,
+				detail: saved,
+				changed: false,
+				kept: null
+			};
+		enqueue({ kind: 'moved', from, to: result.album_id }, true);
+		return grids;
 	}
 
 	let lastAlbums = 0;
-	async function loadAlbums() {
+	async function fetchAlbums() {
 		try {
-			[albums, library] = await Promise.all([api.albums('inbox'), api.albums('library')]);
+			const [inbox, managed] = await Promise.all([api.albums('inbox'), api.albums('library')]);
+			// The open album has left the grids (renamed, imported or removed
+			// elsewhere) while its tags have unsaved edits, or while a notice
+			// saying where it went waits its turn: the sheet stays on it.
+			const gone = (id: string) =>
+				!inbox.some((a) => a.id === id) && !managed.some((a) => a.id === id);
+			const moving = !!openId && renamedLater(openId);
+			// During a save, or when moving, it stays without a word.
+			if (
+				openId &&
+				(draft !== 'none' || moving) &&
+				!holding &&
+				openId !== importingHere &&
+				gone(openId)
+			)
+				hold(null, draft === 'draft');
+			[albums, library] = [inbox, managed];
 			lastAlbums = Date.now();
 		} catch {
 			toast('Could not reach coversyncd', 'error');
 		}
 		loaded = true;
+	}
+	let albumsLoading: Promise<void> | null = null;
+	let albumsNext: Promise<void> | null = null;
+	/**
+	 * Reload both grids. Asked again while a reload runs, which may have been
+	 * answered before the change, one more follows it (just one, however often
+	 * it's asked), so the albums shown last are always the newest.
+	 */
+	function loadAlbums(): Promise<void> {
+		if (!albumsLoading)
+			return (albumsLoading = fetchAlbums().finally(() => (albumsLoading = null)));
+		return (albumsNext ??= albumsLoading.then(() => {
+			albumsNext = null;
+			return loadAlbums();
+		}));
 	}
 
 	// New rules or folder structure change which albums need attention.
@@ -454,6 +548,26 @@
 		await loadAlbums();
 		dataGeneration++;
 	}
+	/** A scan ended: show what it found. */
+	function scanFinished() {
+		dataGeneration++;
+		// The Inbox folder may have come or gone; the empty Inbox's message says which.
+		inboxSetup.refresh();
+		return loadAlbums();
+	}
+
+	/** While a scan runs, the grids reload about this often, so albums appear as it reads them. */
+	const SCAN_RELOAD_MS = 4000;
+	/**
+	 * The daemon's change notices are arriving, so polling is only a safety
+	 * net. Without them, scans are polled for as before.
+	 */
+	let live = false;
+	const SAFETY_POLL_MS = 60_000;
+	/** Counts pushed scan ends, so a poll answered after one doesn't end the scan again. */
+	let scanFinishes = 0;
+	/** The scan's progress as last pushed, which a poll answered before it mustn't undo. */
+	let pushedScan: Status['scan'] | null = null;
 	let pollTimer: ReturnType<typeof setTimeout>;
 	async function poll() {
 		clearTimeout(pollTimer);
@@ -461,16 +575,397 @@
 		if (session.state === 'out') return;
 		try {
 			const wasRunning = status?.scan.running ?? false;
-			status = await api.status();
-			if (wasRunning && !status.scan.running) {
-				dataGeneration++;
-				// The Inbox folder may have come or gone; the empty Inbox's message says which.
-				inboxSetup.load();
-			}
-			if (status.scan.running ? Date.now() - lastAlbums > 4000 : wasRunning) await loadAlbums();
+			const finishes = scanFinishes;
+			const pushed = pushedScan;
+			const fresh = await api.status();
+			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
+			// A scan_finished that came meanwhile has seen to the end itself.
+			if (wasRunning && !status.scan.running && finishes === scanFinishes) await scanFinished();
+			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
 		} catch {}
-		pollTimer = setTimeout(poll, status?.scan.running ? 1500 : 10000);
+		// Only one poll waits at a time, even when two ran at once.
+		clearTimeout(pollTimer);
+		pollTimer = setTimeout(poll, live ? SAFETY_POLL_MS : status?.scan.running ? 1500 : 10000);
 	}
+
+	/** How long the first reads wait for the stream to open. */
+	const OPEN_WAIT_MS = 1500;
+	let readsStarted = false;
+	let startReads = () => {};
+
+	/**
+	 * The stream first opened. The first reads start only now, so a change
+	 * made before them is in them, and one made after comes as a notice. If
+	 * they couldn't wait for it (see `OPEN_WAIT_MS`), they may have missed some.
+	 */
+	function onfirst() {
+		if (readsStarted) resync();
+		else startReads();
+	}
+
+	function onlive(up: boolean) {
+		if (up === live) return;
+		live = up;
+		// Down: poll again straight away. Up: the safety poll takes over after a resync.
+		if (!up) poll();
+	}
+
+	/** The open album's id as of the latest notice (a held sheet's album may have a new one). */
+	const openNow = () => holding?.next ?? openId;
+
+	/** An album: `null` if it's gone (404), `undefined` if that couldn't be told. */
+	const fetchAlbum = (id: string) =>
+		api.album(id).catch((e) => (e instanceof ApiError && e.status === 404 ? null : undefined));
+
+	/** Once the grid reloads asked for so far are done. */
+	const gridsSettled = (): Promise<void> => albumsNext ?? albumsLoading ?? Promise.resolve();
+
+	/**
+	 * Keep the sheet on the open album as it shows it now, with its unsaved
+	 * edits, and say it changed elsewhere (unless not `changed`, yet). `next` is
+	 * the album's id now, if known.
+	 */
+	function hold(next: string | null, changed = true) {
+		if (!openId || !sheetAlbum) return;
+		held = {
+			from: openId,
+			next: next ?? holding?.next ?? null,
+			album: sheetAlbum,
+			detail: sheetDetail,
+			changed,
+			kept: holding?.kept ?? null
+		};
+	}
+
+	/**
+	 * What can change the open album's sheet once it's open: an album opened,
+	 * a notice, a resync, this page's save giving it a new title, and Reload.
+	 * They run one at a time, in order, each going by the sheet as it is when
+	 * its turn comes, so none lands over another. While this page saves, they
+	 * wait (but for opening an album) until it's answered.
+	 */
+	type Job =
+		| { kind: 'open' }
+		| { kind: 'notice'; id: string; previous: string | null; version?: string | null }
+		| { kind: 'resync' }
+		| { kind: 'moved'; from: string; to: string }
+		| { kind: 'reload'; sheet: string; opening: number }
+		| {
+				kind: 'refused';
+				saved: string;
+				current: Detail | null;
+				kept: () => TagDraft | null;
+		  };
+	let jobs: Job[] = [];
+	let running = false;
+	let wake: (() => void) | null = null;
+	/** Bumped by each save that worked, whose answer is shown at once (see onsaved). */
+	let saves = 0;
+
+	function enqueue(job: Job, first = false) {
+		// A later resync, reload or open makes one still waiting moot.
+		if (job.kind === 'resync' || job.kind === 'reload' || job.kind === 'open')
+			jobs = jobs.filter((j) => j.kind !== job.kind);
+		if (first) jobs.unshift(job);
+		else jobs.push(job);
+		if (running) wake?.();
+		else void run();
+	}
+
+	async function run() {
+		running = true;
+		try {
+			while (jobs.length) {
+				// A save's own answers (moved, refused) go on while it's answered.
+				const job =
+					draft === 'saving'
+						? jobs.find((j) => j.kind === 'open' || j.kind === 'moved' || j.kind === 'refused')
+						: jobs[0];
+				if (!job) {
+					await new Promise<void>((resolve) => (wake = resolve));
+					wake = null;
+					continue;
+				}
+				jobs = jobs.filter((j) => j !== job);
+				// An answer that may be from before a save made meanwhile is asked again.
+				if (!(await perform(job))) jobs.unshift(job);
+				// The sheet, and its editor, settle before the next.
+				await tick();
+			}
+		} finally {
+			running = false;
+		}
+	}
+
+	/** A notice still waiting renames album `id`. */
+	const renamedLater = (id: string) =>
+		jobs.some((j) => j.kind === 'notice' && j.previous === id && j.id !== id);
+
+	/** Returns false if the job is to run again. */
+	async function perform(job: Job): Promise<boolean> {
+		try {
+			const now = openNow();
+			switch (job.kind) {
+				case 'open':
+					await loadOpen();
+					return true;
+				case 'notice':
+					if (now === null || (now !== job.id && now !== job.previous)) return true;
+					// A later notice says where the album went: that one shows it, and
+					// now matches the sheet as this one would have.
+					if (renamedLater(job.id)) {
+						if (job.id !== now)
+							jobs = jobs.map((j) =>
+								j.kind === 'notice' && j.previous === job.id ? { ...j, previous: now } : j
+							);
+						return true;
+					}
+					// The sheet shows that version already (a save of this page's,
+					// answered or refused): nothing to show.
+					if (job.version && sheetDetail?.version === job.version) return true;
+					// Held: Reload shows it as it is; a new id is noted for that.
+					if (holding?.changed) {
+						if (job.id !== now) hold(job.id);
+						return true;
+					}
+					return await check(job.id);
+				case 'resync':
+					if (now === null || holding?.changed || renamedLater(now)) return true;
+					return await check(now, true);
+				case 'moved':
+					// The sheet moves once the grids have the new id.
+					if (openId !== job.from) return true;
+					await gridsSettled();
+					// Renamed again elsewhere: the notice saying so takes the sheet there.
+					if (openId === job.from && !renamedLater(job.to))
+						await goto(page.url.href, { state: { album: job.to }, shallow: true, replace: true });
+					return true;
+				case 'reload':
+					await reload(job.sheet, job.opening);
+					return true;
+				case 'refused':
+					refused(job);
+					return true;
+			}
+		} catch (e) {
+			console.error(e);
+			return true;
+		}
+	}
+
+	/** An album was opened: load its tracks. */
+	async function loadOpen() {
+		const id = openId;
+		if (!id || detail?.id === id) return;
+		const d = await fetchAlbum(id);
+		if (openId !== id) return;
+		if (d) detail = d;
+		else toast('Could not load album', 'error');
+	}
+
+	/**
+	 * The open album changed, and is now `to` (a new id or not). Fetch it, then
+	 * go by the sheet as it is once that's answered: with no unsaved edits,
+	 * show it, under the new id once the grids have it; with some, keep them
+	 * and say it changed, if it did. An answer that couldn't be had changes
+	 * nothing. Returns false if a save of this page's was answered meanwhile,
+	 * as the album may have been read before it. `settle`: a resync, with no
+	 * notice to come; otherwise a new id already gone has been renamed again,
+	 * and the notice saying so moves the sheet on.
+	 */
+	async function check(to: string, settle = false): Promise<boolean> {
+		const from = openId;
+		if (!from || !sheetAlbum) return true;
+		// A new id is a change: with edits, say so at once.
+		if (to !== from && draft === 'draft') {
+			hold(to);
+			return true;
+		}
+		// Without, the sheet stays as it is while it moves.
+		if (to !== from)
+			held = {
+				from,
+				next: to,
+				album: sheetAlbum,
+				detail: sheetDetail,
+				changed: false,
+				kept: null
+			};
+		const before = saves;
+		const [fresh] = await Promise.all([fetchAlbum(to), to !== from ? gridsSettled() : null]);
+		if (openId !== from) return true;
+		if (saves !== before) return false;
+		// A notice waiting renames it again: that one shows it.
+		if (renamedLater(to)) return true;
+		// Not known (the daemon away, signed out): a later resync asks again.
+		if (fresh === undefined) return true;
+		// Unchanged (this page's own save, come back): the editor and its edits
+		// are left be. Its version says, as a save's does (see refused).
+		if (fresh && to === from && fresh.version === sheetDetail?.version) return true;
+		if (draft !== 'none') {
+			// A save begun meanwhile says so if it fails (see ondraft).
+			hold(fresh ? to : null, draft === 'draft');
+			return true;
+		}
+		if (!fresh) {
+			if (settle || to === from) hold(null);
+			return true;
+		}
+		if (to === from) held = null;
+		detail = fresh;
+		if (openId !== to)
+			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
+		return true;
+	}
+
+	/** Reload, pressed on the sheet opened as `sheet`: drop its edits, and show the album as it is now. */
+	async function reload(sheet: string, opening: number) {
+		const h = holding;
+		const before = saves;
+		// The sheet it was asked on, still held, or it's moot: closed (or
+		// reopened) since, or saved over.
+		const current = () => openId === sheet && openings === opening && holding === h;
+		if (!h || !current()) return;
+		const to = h.next ?? sheet;
+		const [fresh] = await Promise.all([fetchAlbum(to), loadAlbums()]);
+		if (!current() || saves !== before) return;
+		if (fresh === undefined) {
+			toast('Couldn’t reload the album. Try again in a moment.', 'error');
+			return;
+		}
+		if (fresh === null) {
+			// Its new id isn't known when the notice was missed (a hidden tab, the stream down).
+			toast('This album was renamed, imported or removed elsewhere', 'info');
+			held = null;
+			return close();
+		}
+		// A new copy of the album: the editor starts over, without the edits.
+		detail = fresh;
+		held =
+			to === sheet
+				? null
+				: { from: sheet, next: to, album: h.album, detail, changed: false, kept: null };
+		if (openId !== to)
+			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
+	}
+
+	function ondraft(next: Draft) {
+		const was = draft;
+		draft = next;
+		if (was !== 'saving' || next === 'saving') return;
+		// The save failed, and the album moved meanwhile (the sheet stayed for it): say so now.
+		if (next === 'draft' && holding && !holding.changed) hold(holding.next);
+		// What came during the save goes on, after its answer.
+		wake?.();
+	}
+
+	/**
+	 * A save was refused because the album had changed elsewhere since the
+	 * sheet's copy: `current` is the album as it is now (null: gone), `kept`
+	 * reads the edits from the editor that saved (null once it has closed), and
+	 * `id` is the album's id the save was sent for. It goes through the queue,
+	 * ahead of what came meanwhile, so no notice lands over it.
+	 */
+	function onrefused(current: Detail | null, kept: () => TagDraft | null, id: string) {
+		// The sheet has moved on (closed, or another album): only the toast says so.
+		if (sheetDetail?.id !== id) return;
+		enqueue({ kind: 'refused', saved: id, current, kept }, true);
+	}
+
+	/**
+	 * Hold the sheet on the album as it is now, with the edits of the editor
+	 * that saved on top, as they are now, and the fields changed since marked
+	 * (see TagEditor). That editor closed (the sheet with it, or left for the
+	 * Tracks view), it's moot. Notices about versions the sheet shows from now
+	 * on change nothing. Gone, the sheet stays as it is, held.
+	 */
+	function refused(job: Extract<Job, { kind: 'refused' }>) {
+		if (!openId || sheetDetail?.id !== job.saved) return;
+		const kept = job.kept();
+		if (!kept) return;
+		if (!job.current) return hold(null);
+		held = {
+			from: openId,
+			next: job.current.id === openId ? null : job.current.id,
+			album: job.current,
+			detail: job.current,
+			changed: true,
+			kept
+		};
+		void loadAlbums();
+	}
+
+	/** The tag editor's edits were dropped: those kept from a refused save go too. */
+	function ondiscard() {
+		if (holding?.kept) held = { ...holding, kept: null };
+	}
+
+	/** Drop the held sheet's unsaved edits and show its album as it is now. */
+	function reloadHeld() {
+		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings });
+	}
+
+	/** An album was edited, here or elsewhere: show it as it is now. */
+	function albumChanged({ id, previous_id, collection, version }: Notices['album_changed']) {
+		// The Inbox's tag coverage, which Library setup shows, may have changed.
+		if (collection === 'inbox') dataGeneration++;
+		loadAlbums();
+		enqueue({ kind: 'notice', id, previous: previous_id, version });
+	}
+
+	/** Reload everything: notices were missed, or the stream has just come back. */
+	function resync() {
+		poll();
+		appearance.refresh();
+		syncSetup.refresh();
+		setup.refresh();
+		inboxSetup.refresh();
+		dataGeneration++;
+		loadAlbums();
+		enqueue({ kind: 'resync' });
+	}
+
+	/** What each change notice reloads. */
+	const notices: NoticeHandlers = {
+		scan(scan) {
+			pushedScan = scan;
+			// Until the first poll answers, it's kept for that (see poll).
+			if (status) status = { ...status, scan };
+			// Albums appear in the grids as the scan reads their tags.
+			if (!albumsLoading && Date.now() - lastAlbums > SCAN_RELOAD_MS) loadAlbums();
+		},
+		scan_finished(scan) {
+			pushedScan = scan;
+			scanFinishes++;
+			if (status) status = { ...status, scan };
+			scanFinished();
+		},
+		imported({ album_id, inbox_id }) {
+			// Copies hide the Inbox files, which Inbox setup counts.
+			inboxSetup.refresh();
+			inboxChanged();
+			// The Inbox album open moves to the Library (an import made here
+			// closes its sheet itself); a Library album open may have more tracks.
+			enqueue({
+				kind: 'notice',
+				id: album_id,
+				previous: inbox_id === importingHere ? null : inbox_id
+			});
+		},
+		album_changed: albumChanged,
+		setup_saved({ setup: saved }) {
+			// Each can change which albums need attention, or what sorts and filters show.
+			if (saved === 'library') setup.refresh();
+			else if (saved === 'inbox') {
+				// Hidden files may be back in the Inbox.
+				inboxSetup.refresh();
+				dataGeneration++;
+			} else if (saved === 'appearance') appearance.refresh();
+			else return syncSetup.refresh();
+			loadAlbums();
+		},
+		resync
+	};
 
 	// Right-click menu on album cards.
 	let menu = $state<{ album: Album; x: number; y: number } | null>(null);
@@ -527,6 +1022,8 @@
 		}
 	}
 
+	/** The Inbox album this page is importing, whose sheet it closes itself. */
+	let importingHere: string | null = null;
 	/** Returns an error message, or null when the album was imported. */
 	/** `autofilled`: kinds autofill sets, mentioned in the success toast. */
 	async function runImport(
@@ -538,6 +1035,7 @@
 		musicbrainzArt?: string
 	): Promise<string | null> {
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
+		importingHere = album.id;
 		try {
 			const r = await api.importAlbum(album.id, edits, art, musicbrainzArt);
 			importing = null;
@@ -567,6 +1065,7 @@
 			if (!importing) toast(message, 'error', 8000, fixAction(message));
 			return message;
 		} finally {
+			importingHere = null;
 			dismiss(working);
 		}
 	}
@@ -581,7 +1080,7 @@
 	async function rescan() {
 		await api.rescan().catch(() => toast('Rescan failed to start', 'error'));
 		// The folder may have been mounted (or unmounted) since the page loaded.
-		inboxSetup.load();
+		inboxSetup.refresh();
 		setTimeout(poll, 300);
 	}
 
@@ -616,17 +1115,23 @@
 		filters[browsing] = {};
 	}
 
-	/** What the page needs from the daemon. Setups that have loaded aren't asked again (they may hold unsaved edits). */
+	/**
+	 * What the page needs from the daemon. A setup already loaded (by its
+	 * screen, say) is read again, keeping unsaved edits.
+	 */
 	function loadAll() {
-		if (!appearance.loaded) appearance.load();
-		// Whether the sidebar shows its Sync section.
-		if (!syncSetup.loaded) syncSetup.load();
-		// Whether an Inbox folder is set, for the empty Inbox's message.
-		if (!inboxSetup.loaded) inboxSetup.load();
-		// Tag labels for attention badges (loaded once).
-		setup.load();
-		loadAlbums();
-		poll();
+		return Promise.all([
+			poll(),
+			appearance.refresh(),
+			// Whether the sidebar shows its Sync section, and the devices it lists.
+			syncSetup.refresh(),
+			devices.load(),
+			// Whether an Inbox folder is set, for the empty Inbox's message.
+			inboxSetup.refresh(),
+			// Tag labels for attention badges.
+			setup.refresh(),
+			loadAlbums()
+		]);
 	}
 
 	// Signed back in after the session ended: whatever was asked for meanwhile failed.
@@ -634,8 +1139,24 @@
 		if (session.generation > 0) untrack(loadAll);
 	});
 
+	let listening: Listening | undefined;
+	// Signed out, the stream would only be refused: it waits, and catches up
+	// once signed back in.
+	$effect(() => {
+		const out = session.state === 'out';
+		untrack(() => (out ? listening?.pause() : listening?.resume()));
+	});
+
 	onMount(() => {
-		loadAll();
+		// Listen first, then read: see onfirst.
+		listening = listen(notices, onlive, onfirst);
+		const wait = setTimeout(() => startReads(), OPEN_WAIT_MS);
+		startReads = () => {
+			if (readsStarted) return;
+			readsStarted = true;
+			clearTimeout(wait);
+			loadAll();
+		};
 		const mq = matchMedia(NARROW);
 		const onchange = () => {
 			narrow = mq.matches;
@@ -643,6 +1164,8 @@
 		};
 		mq.addEventListener('change', onchange);
 		return () => {
+			clearTimeout(wait);
+			listening?.stop();
 			clearTimeout(pollTimer);
 			mq.removeEventListener('change', onchange);
 		};
@@ -652,7 +1175,7 @@
 <svelte:window {onkeydown} />
 
 <!-- The page under an open album: inert, and blurred (see .behind). -->
-<div class="page" class:behind={!!openAlbum} inert={!!openAlbum}>
+<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum}>
 	<TopBar
 		bind:query
 		bind:search
@@ -855,16 +1378,22 @@
 	></button>
 {/if}
 
-{#if openAlbum}
+{#if sheetAlbum}
 	<AlbumDetail
-		album={openAlbum}
-		detail={detail?.id === openAlbum.id ? detail : null}
-		allowWrites={openAlbum.collection === 'library' || (status?.allow_writes ?? false)}
+		album={sheetAlbum}
+		detail={sheetDetail}
+		allowWrites={sheetAlbum.collection === 'library' || (status?.allow_writes ?? false)}
 		onclose={close}
 		{onsaved}
-		onimport={openAlbum.collection === 'inbox'
-			? (edits) => startImport(openAlbum!, edits)
+		onimport={sheetAlbum.collection === 'inbox'
+			? (edits) => startImport(sheetAlbum!, edits)
 			: undefined}
+		changed={holding?.changed ?? false}
+		onreload={reloadHeld}
+		{ondraft}
+		kept={holding?.kept ?? null}
+		{onrefused}
+		{ondiscard}
 	/>
 {/if}
 

@@ -3,6 +3,7 @@
 // need them; the Appearance screen edits `sorts`, `filters` and `coverSize`.
 
 import { api, ApiError, type AppearanceResponse, type CoverSizes, type Sortable } from './api';
+import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
 /** Match the daemon's defaults, so the top bar and sidebar are right before it answers. */
@@ -43,9 +44,14 @@ export class TagList {
 	isDefault = $derived(this.items.join() === this.defaults.join());
 
 	set(saved: string[], defaults: string[]) {
+		this.rebase(saved, defaults);
+		this.items = [...saved];
+	}
+
+	/** What's saved, leaving the list being edited be. */
+	rebase(saved: string[], defaults: string[]) {
 		this.defaults = defaults;
 		this.saved = saved;
-		this.items = [...saved];
 	}
 
 	/** Whether `id` can come off the list. */
@@ -80,10 +86,7 @@ export class TagList {
 	}
 }
 
-class AppearanceStore {
-	loaded = $state(false);
-	failed = $state(false);
-	saving = $state(false);
+class AppearanceStore extends SetupStore<AppearanceResponse> {
 	sortable = $state<Sortable[]>([]);
 	filterable = $state<Sortable[]>([]);
 	groups = $state<{ id: string; label: string }[]>([]);
@@ -113,14 +116,25 @@ class AppearanceStore {
 		this.savedCoverSize = this.coverSize = r.setup.cover_size;
 	}
 
-	async load() {
-		try {
-			this.#apply(await api.appearance());
-			this.loaded = true;
-			this.failed = false;
-		} catch {
-			this.failed = !this.loaded;
-		}
+	protected fetch() {
+		return api.appearance();
+	}
+
+	protected take(r: AppearanceResponse, first: boolean) {
+		if (first || !this.changes) return this.#apply(r);
+		// Unsaved edits are kept; what's saved (elsewhere, say) still moves
+		// under them, so Revert goes back to it.
+		this.sortable = r.sortable;
+		this.filterable = r.filterable;
+		this.groups = r.groups;
+		// A list or size not edited here follows what's saved.
+		if (this.sorts.changes) this.sorts.rebase(r.setup.sort_tabs, r.defaults);
+		else this.sorts.set(r.setup.sort_tabs, r.defaults);
+		if (this.filters.changes) this.filters.rebase(r.setup.filter_tags, r.filter_defaults);
+		else this.filters.set(r.setup.filter_tags, r.filter_defaults);
+		this.coverSizes = r.cover_sizes;
+		if (this.coverSize === this.savedCoverSize) this.coverSize = r.setup.cover_size;
+		this.savedCoverSize = r.setup.cover_size;
 	}
 
 	label(id: string) {
@@ -134,24 +148,23 @@ class AppearanceStore {
 	}
 
 	/** Returns whether it saved; new sorts and filters need fresh album data for their values. */
-	async save(): Promise<boolean> {
-		this.saving = true;
-		try {
-			this.#apply(
-				await api.saveAppearance({
-					sort_tabs: this.sorts.items,
-					filter_tags: this.filters.items,
-					cover_size: this.coverSize
-				})
-			);
-			toast('Appearance saved', 'success');
-			return true;
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
-			return false;
-		} finally {
-			this.saving = false;
-		}
+	save(): Promise<boolean> {
+		return this.write(async () => {
+			try {
+				this.#apply(
+					await api.saveAppearance({
+						sort_tabs: this.sorts.items,
+						filter_tags: this.filters.items,
+						cover_size: this.coverSize
+					})
+				);
+				toast('Appearance saved', 'success');
+				return true;
+			} catch (e) {
+				toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
+				return false;
+			}
+		});
 	}
 }
 

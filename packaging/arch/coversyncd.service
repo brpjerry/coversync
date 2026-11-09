@@ -10,7 +10,7 @@ StateDirectory=coversync
 CacheDirectory=coversync
 # Optional, with `systemctl --user edit coversyncd`: a folder coversync must
 # never change, such as an Inbox that another program syncs. Imports from it
-# can then only copy.
+# can then only copy, and uploads need an uploads folder outside it.
 #ReadOnlyPaths=/path/to/inbox
 ProtectSystem=full
 PrivateTmp=yes
