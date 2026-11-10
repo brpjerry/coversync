@@ -1,7 +1,6 @@
-// How the fallback page reaches the app. In the Windows app (Tauri), through Tauri's IPC. In
-// the Linux app (apps/desktop-linux), through events: a script of the app's own, in a script
+// How the fallback page reaches the app: through events. A script of the app's own, in a script
 // world of its own that a server's pages never get, passes them on to the app and its answers
-// back (apps/desktop-linux/src/bridge.js).
+// back (../src/relay.js).
 
 /** How long an answer can take: a check gives up after 15 seconds, so this is plenty. */
 const TIMEOUT_MS = 60_000;
@@ -21,10 +20,6 @@ document.addEventListener('coversync-response', (event) => {
 
 /** Runs the app's command `cmd`; rejects with the app's `Problem` (crates/coversync-desktop-core). */
 export async function invoke(cmd, args = {}) {
-	if ('__TAURI_INTERNALS__' in window) {
-		const tauri = await import('./vendor/tauri-api/core.js');
-		return tauri.invoke(cmd, args);
-	}
 	return new Promise((resolve, reject) => {
 		const id = ++next;
 		const timer = setTimeout(() => {

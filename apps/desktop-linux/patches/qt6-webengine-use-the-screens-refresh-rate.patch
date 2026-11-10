@@ -1,0 +1,38 @@
+--- a/src/core/render_widget_host_view_qt.cpp
++++ b/src/core/render_widget_host_view_qt.cpp
+@@ -64,6 +64,8 @@
+ #include <QScreen>
+ #include <QWindow>
+ 
++#include <cmath>
++
+ namespace QtWebEngineCore {
+ 
+ enum ImStateFlags {
+@@ -968,6 +970,16 @@
+     if (!window)
+         return false;
+ 
++    // Chromium paces its frames with a timer that runs at 60 Hz until it is told the display's rate.
++    // Nothing else in Qt WebEngine tells it, so pages were drawn at 60 fps on faster screens.
++    if (const QScreen *qscreen = window->screen(); qscreen && m_uiCompositor) {
++        const qreal hz = qscreen->refreshRate();
++        if (hz >= 1.0 && std::abs(hz - m_displayRefreshRate) > 0.01) {
++            m_displayRefreshRate = hz;
++            m_uiCompositor->SetDisplayVSyncParameters(base::TimeTicks::Now(), base::Hertz(hz));
++        }
++    }
++
+     display::ScreenInfos newScreenInfos = screenInfosFromQtForUpdate(window->screen());
+ 
+     // We always want to use the scale from our current window
+--- a/src/core/render_widget_host_view_qt.h
++++ b/src/core/render_widget_host_view_qt.h
+@@ -231,6 +231,7 @@
+ 
+     // Wheel
+     bool m_wheelAckPending = false;
++    qreal m_displayRefreshRate = 0; // the rate last given to m_uiCompositor
+     QList<blink::WebMouseWheelEvent> m_pendingWheelEvents;
+     content::MouseWheelPhaseHandler m_mouseWheelPhaseHandler { this };
+ 

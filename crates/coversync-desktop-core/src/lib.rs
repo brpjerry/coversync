@@ -1,13 +1,13 @@
-//! What the coversync desktop apps share, apart from their windows and
-//! webviews: the settings ([`config`]), the servers and a proxy for each
-//! ([`shell`]), how a launch picks a server ([`launch`]), and which links go
-//! to the browser ([`links`]).
+//! The coversync desktop app, apart from its window and web view: the
+//! settings ([`config`]), the servers and a proxy for each ([`shell`]), how a
+//! launch picks a server ([`launch`]), and which links go to the browser
+//! ([`links`]).
 //!
-//! The Linux app (`apps/desktop-linux`, GTK 4 and WebKitGTK 6.0) and the
-//! Windows one (`apps/desktop`, Tauri) each wrap these in their own window.
+//! The app (`apps/desktop-linux`, Qt 6 and Qt WebEngine) wraps these in its
+//! window. They are here, in the repository's workspace, so they build and
+//! are tested without Qt.
 
 pub mod config;
-pub mod gstreamer;
 pub mod launch;
 pub mod links;
 pub mod shell;

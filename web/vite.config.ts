@@ -5,7 +5,7 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, type Plugin } from 'vite';
 
-// Deployed behind a path prefix (e.g. BASE_PATH=/coversync); empty for dev and Tauri.
+// Deployed behind a path prefix (e.g. BASE_PATH=/coversync); empty for dev.
 const base = (process.env.BASE_PATH ?? '') as '' | `/${string}`;
 
 /**

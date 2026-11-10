@@ -23,8 +23,8 @@ pub fn server_arg(args: impl IntoIterator<Item = String>) -> Option<String> {
 }
 
 /// A later launch's arguments, with its `COVERSYNC_SERVER` as `--server`
-/// when it gives no `--server` of its own: an app that's handed a launch's
-/// environment (the Linux one) keeps both together while it waits to start.
+/// when it gives no `--server` of its own: the app, which is handed a
+/// launch's environment, keeps both together while it waits to start.
 pub fn with_env_server(mut args: Vec<String>, env_server: Option<String>) -> Vec<String> {
     if let Some(server) = env_server.filter(|server| !server.is_empty())
         && server_arg(args.iter().skip(1).cloned()).is_none()

@@ -1,7 +1,7 @@
 [package]
 name = "coversync-desktop-core"
 version = "0.1.0"
-description = "What the desktop apps share, apart from their windows: settings, servers and their proxies, launches"
+description = "The desktop app apart from its window: settings, servers and their proxies, launches"
 edition.workspace = true
 license.workspace = true
 publish = false

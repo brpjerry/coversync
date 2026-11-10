@@ -1,13 +1,13 @@
 [package]
 name = "coversync-desktop-linux"
 version = "0.1.0"
-description = "The coversync desktop app for Linux: a GTK 4 window onto a coversync server"
+description = "The coversync desktop app for Linux: a Qt 6 window onto a coversync server"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
 
-# Its own workspace, apart from the repository's: it needs GTK 4 and
-# WebKitGTK 6.0 to build.
+# Its own workspace, apart from the repository's: it needs Qt 6 (with
+# Qt WebEngine) to build.
 [workspace]
 
 [[bin]]
@@ -15,17 +15,20 @@ name = "coversync-desktop"
 path = "src/main.rs"
 
 [dependencies]
-async-channel = "2.5.0"
 coversync-desktop-core = { path = "../../crates/coversync-desktop-core" }
 coversync-proxy = { path = "../../crates/coversync-proxy" }
-# GtkGraphicsOffload (4.14) is what lets frames reach the display at its
-# refresh rate; AlertDialog is 4.10.
-gtk = { package = "gtk4", version = "0.11.5", features = ["v4_14"] }
+# The window is Qt's, in C++ (`cpp/`); this is the bridge to it.
+cxx = "1.0.205"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
-# Settings::set_feature_enabled is 2.42.
-webkit = { package = "webkit6", version = "0.6.1", features = ["v2_44"] }
+
+[build-dependencies]
+# Finds Qt (through qmake), runs moc, and compiles and links `cpp/`.
+cxx-qt-build = "0.10.0"
+
+[dev-dependencies]
+tempfile = "3"

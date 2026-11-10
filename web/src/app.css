@@ -186,8 +186,8 @@ button {
 }
 /* Only the cover is captured. The page stays live under it, and the sheet and
    the page's blur fade in and out as the page's snapshots did (.sheet-wrap,
-   .page.behind). Capturing the whole window cost WebKitGTK (the Linux app)
-   350-410 ms on each open, during which nothing moved. */
+   .page.behind). Capturing the whole window cost WebKitGTK (the Linux app
+   then) 350-410 ms on each open, during which nothing moved. */
 :root {
 	view-transition-name: none;
 }

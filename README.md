@@ -92,11 +92,10 @@ used on a home server.
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
-crates/coversync-proxy  the desktop apps' proxy to a server, on 127.0.0.1
-crates/coversync-desktop-core  what the desktop apps share: settings, servers, launches
+crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
+crates/coversync-desktop-core  the desktop app's settings, servers and launches, apart from its window
 web/                    SvelteKit / Svelte 5 single-page app
-apps/desktop-linux/     Linux desktop app (GTK 4, WebKitGTK 6.0), a window onto a server's UI
-apps/desktop/           Windows desktop app (Tauri 2); each app is its own Cargo workspace
+apps/desktop-linux/     Linux desktop app (Qt 6, Qt WebEngine), a window onto a server's UI; its own Cargo workspace
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
 tools/player_stall.py   the player's buffering spinner while audio stalls, in headless Firefox
 tools/upload.py         uploads an album folder through the upload API
@@ -339,7 +338,7 @@ the others, and only the browser ever sees the password.
   certificate and trust it for this server alone. A file holding a private
   key, such as `rootCA-key.pem` beside it, is refused, as is anything but
   one PEM certificate. Leave it empty for a publicly trusted certificate;
-  desktop apps use the system's certificates either way.
+  the desktop app uses the system's certificates either way.
 
 ### Moving the Library
 
@@ -409,15 +408,12 @@ WantedBy=default.target
 
 ## Desktop app
 
-There are two desktop apps that show a coversync server's UI in a window of
-their own: `apps/desktop-linux` for Linux (GTK 4 and WebKitGTK 6.0) and
-`apps/desktop` for Windows (Tauri 2, on WebView2). They share their settings,
-proxies and fallback page (`crates/coversync-desktop-core`, `apps/desktop/ui`).
-Linux has its own because WebKitGTK 4.1, which Tauri uses there, draws at
-60 frames a second at most (animations at 30); the GTK 4 app follows the
-display, 120 Hz and up. The Tauri app still builds and runs on Linux. The UI
-comes from the server, so the apps don't
-need updating when the server does. Everything the window loads goes through
+The desktop app, `apps/desktop-linux`, shows a coversync server's UI in a
+window of its own. It is for Linux, on Qt 6 and Qt WebEngine (which is
+Chromium); there is none for Windows or macOS. Its settings, servers and
+proxies are in `crates/coversync-desktop-core`, apart from the window, and
+the page it shows without a server in `apps/desktop-linux/ui`. The UI comes
+from the server, so the app doesn't need updating when the server does. Everything the window loads goes through
 a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
 
 - Bodies stream both ways, so covers, playback and seeking, uploads and
@@ -445,8 +441,8 @@ a small proxy in the app, on 127.0.0.1 (`crates/coversync-proxy`):
   CA is installed there.
 
 When no server is set or it can't be reached, the window shows a page
-bundled with the app, to try again or change the server. On Linux it also
-does when the page crashes; the Windows app doesn't watch for that yet. A
+bundled with the app, to try again or change the server. It also does when
+the page's process crashes. A
 new server entered there is used and saved only once it's checked: its `/api/hello`, which
 coversync answers without a login, has to say it's coversync. A server too
 old to have it, an error, or a redirect outside its address doesn't pass.
@@ -455,65 +451,63 @@ its reverse proxy, say), which answers 401 for `/api/hello`; `--server` or
 `COVERSYNC_SERVER` still opens it, without the check, whether the app is
 starting or already running. The address and the
 ports are kept in `config.json` in the app's config directory
-(`~/.config/io.github.brpjerry.coversync/` on Linux).
+(`~/.config/io.github.brpjerry.coversync/`).
 `--server URL` or `COVERSYNC_SERVER=URL` picks a server for one run without
 saving it. One instance of the app runs at a time: launching it again
-brings up its window, and shows the server given with `--server` (on Linux,
-or `COVERSYNC_SERVER`), if any; a server already showing isn't reloaded.
+brings up its window, and shows the server given with `--server` (or
+`COVERSYNC_SERVER`), if any; a server already showing isn't reloaded.
 Links that would open a new window, such as MusicBrainz's, open in the
 default browser.
 A lock in the config directory keeps a second process off its settings
-even where that handover can't work (without a D-Bus session bus); where
-the file system can't lock at all, the app warns and runs without it.
+even where that handover can't work (it goes over a socket in
+`$XDG_RUNTIME_DIR`); where the file system can't lock at all, the app warns
+and runs without it.
 
-There are no packages for them yet. To build and run the Linux app on Arch
-Linux, you need GTK 4 and WebKitGTK 6.0 as well as Rust. Playback also needs
-GStreamer's good plugins: without `autoaudiosink`, WebKitGTK's web process
-crashes as audio starts, and the app says so.
+There is no package for it yet. To build and run it on Arch Linux, you need Qt 6.9 or later with Qt WebEngine, a C++ compiler and Rust:
 
 ```sh
-sudo pacman -S --needed gtk4 webkitgtk-6.0 gst-plugins-good
+sudo pacman -S --needed base-devel qt6-base qt6-declarative qt6-webengine
 cd apps/desktop-linux
 cargo run                    # or cargo run -- --server https://n5pro.internal/coversync/
 cargo build --release        # builds target/release/coversync-desktop
 ```
 
-It runs natively on Wayland. Its web view sits in a `GtkGraphicsOffload`, so
-its frames go to the compositor without GTK drawing them again, and WebKit's
-`PreferPageRenderingUpdatesNear60FPS` is off; without either, it's back to 60
-frames a second. WebKit paces a page with nothing moving on it well below the
-display, so while you scroll, click or press keys, and for two seconds after,
-the app keeps an invisible animation running: what you started (a scroll's
-momentum, an album opening) gets every refresh from its first frame. Idle, it
-draws nothing. One instance runs at a time (`GtkApplication` over D-Bus).
-The fallback page is served from `coversync://app/`, and reaches the app
-through a message handler in a script world of its own, which a server's
-pages never see. A debug build has the web inspector (right-click) and writes
-the pages' console to stdout.
+The window is Qt's, in C++ and QML (`cpp/`, `src/window.qml`), and the rest
+is Rust; `build.rs` finds Qt through `qmake` and compiles both. It runs
+natively on Wayland. One instance runs at a time: a later launch hands its
+arguments to the first over a socket and ends. The fallback page is served
+from `coversync://app/`, and reaches the app through a script in a script
+world of its own, which a server's pages never see; the app checks where
+each of its commands comes from. A debug build writes the pages' console to
+stdout.
 
-The app sets `WEBKIT_SKIA_ENABLE_DDL=0` for WebKit, unless it's set already:
-pages are then painted on WebKit's GPU worker threads instead of the thread
-that composites each frame, which kept scrolling through new rows of covers
-at the display's rate. It costs the web process about 400 MiB more GPU
-memory (system memory, on integrated graphics). `WEBKIT_SKIA_ENABLE_DDL=1`
-brings back WebKit's default.
+What the window takes from the desktop comes through its portal
+(`xdg-desktop-portal`), as for GTK apps and browsers: light or dark, and the
+file chooser behind a page's "Choose image". The app runs on Qt's
+`xdgdesktopportal` platform theme for that, whatever `QT_QPA_PLATFORMTHEME`
+says: a theme meant for Qt's widgets (qt6ct, say) would hand pages its own
+palette instead of the desktop's preference.
 
-The Windows app builds with pnpm and the Tauri CLI:
+Qt WebEngine has no momentum for two-finger scrolling on Linux, so the app
+carries a scroll on itself once the fingers lift (`cpp/momentum.h`, which
+lists the environment variables that tune it; `COVERSYNC_MOMENTUM=0` turns it
+off).
 
-```sh
-cd apps/desktop
-pnpm install                 # the Tauri CLI, and the API the fallback page uses
-pnpm tauri dev               # or COVERSYNC_SERVER=https://n5pro.internal/coversync/ pnpm tauri dev
-pnpm tauri build             # builds src-tauri/target/release/coversync-desktop
-```
+Qt WebEngine doesn't tell Chromium the display's refresh rate (QTBUG-123640),
+so with Qt's own packages pages are drawn at 60 frames a second whatever the
+display does. `patches/qt6-webengine-use-the-screens-refresh-rate.patch`
+passes the rate on; it applies to Qt WebEngine 6.11.3, in `prepare()` of
+Arch's `qt6-webengine` PKGBUILD, say. On a 120 Hz laptop, two-finger drags
+over the album grid ran at 55 frames a second on Arch's package and 111 on
+the patched one. Without the patch, `COVERSYNC_FRAME_RATE=unlimited` takes
+Chromium's limit away, and scrolling then follows the display, but it is for
+trying only: a view transition, which opening an album is, then never
+finishes and the page stops being redrawn.
 
-On Linux it needs `webkit2gtk-4.1` instead. Each app has its own Cargo
-workspace and lockfile, apart from the repository's, so building and testing
-the rest needs neither WebKitGTK nor Tauri. `RUST_LOG=coversync_proxy=debug`
-also logs each request the proxy forwards; warnings show either way. The
-fallback page has no build step: in the Windows app it imports a copy of
-`@tauri-apps/api`'s module from `ui/vendor`, which `pnpm vendor` refreshes
-after a version change.
+The app has its own Cargo workspace and lockfile, apart from the
+repository's, so building and testing the rest doesn't need Qt.
+`RUST_LOG=coversync_proxy=debug` also logs each request the proxy forwards;
+warnings show either way. The fallback page has no build step.
 
 ## Develop
 
@@ -539,8 +533,8 @@ For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
 tests, and builds the pacman package.
 
 Changes to the desktop app or its proxy also run
-`.github/workflows/desktop.yml`, which builds the app against WebKitGTK and
-runs rustfmt, Clippy and its tests.
+`.github/workflows/desktop.yml`, which builds the app against Qt, in an Arch
+Linux container, and runs rustfmt, Clippy and its tests.
 
 ### Release
 
