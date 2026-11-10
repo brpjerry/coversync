@@ -10,9 +10,11 @@
 #include <QtCore/QStringList>
 #include <QtCore/QUrl>
 #include <QtCore/QVariantMap>
+#include <QtDBus/QDBusContext>
 #include <QtDBus/QDBusVariant>
 
-class Backend : public QObject {
+// A QDBusContext, so the slot for a chooser's answer can tell which request it is for.
+class Backend : public QObject, protected QDBusContext {
     Q_OBJECT
     // Whether the desktop's file chooser can be asked for: the portal has one, and it has opened when asked.
     Q_PROPERTY(bool hasFileChooser READ hasFileChooser NOTIFY hasFileChooserChanged)

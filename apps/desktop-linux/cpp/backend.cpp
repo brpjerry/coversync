@@ -226,14 +226,13 @@ void Backend::chooseFiles(bool multiple, const QStringList &accepted)
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, request](QDBusPendingCallWatcher *call) {
         call->deleteLater();
         const QDBusPendingReply<QDBusObjectPath> reply = *call;
-        if (!reply.isError())
+        // A later request may have taken this one's place meanwhile: that one is the page's now, and what
+        // became of this one says nothing.
+        if (!reply.isError() || m_request != request)
             return;
         std::fprintf(stderr, "coversync: the file chooser couldn't open: %s\n", qUtf8Printable(reply.error().message()));
         // Qt's own from now on.
         setFileChooser(false);
-        // Unless a later request has taken this one's place meanwhile: that one is the page's now.
-        if (m_request != request)
-            return;
         forgetRequest();
         emit filesChosen({});
     });
@@ -258,9 +257,12 @@ void Backend::closeRequest()
     forgetRequest();
 }
 
-// Only the request under way is listened for, so this is its answer.
+// The answer to a request: the one under way, unless it was on its way here when a later request took that
+// one's place.
 void Backend::chooserResponse(uint response, const QVariantMap &results)
 {
+    if (calledFromDBus() && message().path() != m_request)
+        return;
     forgetRequest();
     QStringList files;
     // 0: chosen; anything else: closed.
