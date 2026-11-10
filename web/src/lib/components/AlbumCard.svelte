@@ -33,6 +33,23 @@
 	let loaded = $state(false);
 	let cached = $state(false);
 	let failed = $state(false);
+	/**
+	 * The cover's pixels have been decoded once. From then on it decodes
+	 * synchronously: a browser may drop the decoded pixels of an image it
+	 * hasn't painted for a while, and WebKit (the Linux desktop app) does so to
+	 * the covers on screen once many are decoded. With `decoding="async"`, the
+	 * next repaint then draws no cover at all until it's decoded again, so the
+	 * covers flashed dark for a frame or two shortly after a scroll began.
+	 * The first decode stays asynchronous, off the main thread, as rows of
+	 * covers scroll in.
+	 */
+	let decoded = $state(false);
+	function decodeOnce(img: HTMLImageElement) {
+		img.decode().then(
+			() => (decoded = true),
+			() => {}
+		);
+	}
 	// A cover asked for while signed out failed; try again once signed back in.
 	$effect(() => {
 		if (session.generation) failed = false;
@@ -72,13 +89,19 @@
 					sizes="{Math.ceil(width)}px"
 					alt=""
 					loading="lazy"
-					decoding="async"
-					onload={() => (loaded = true)}
+					decoding={decoded ? 'sync' : 'async'}
+					onload={(e) => {
+						loaded = true;
+						decodeOnce(e.currentTarget as HTMLImageElement);
+					}}
 					onerror={() => (failed = true)}
 					{@attach (img: HTMLImageElement) => {
 						// Cards are rebuilt as the grid scrolls; covers already in the
 						// browser's cache show at once instead of fading in again.
-						if (img.complete && img.naturalWidth) cached = loaded = true;
+						if (img.complete && img.naturalWidth) {
+							cached = loaded = true;
+							decodeOnce(img);
+						}
 					}}
 				/>
 			{:else}
