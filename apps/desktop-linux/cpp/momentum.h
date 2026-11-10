@@ -20,6 +20,8 @@
 //   COVERSYNC_SCROLL_TRACE=1           logs each wheel event (W), held report (F), coast (M) and coast step (T)
 #pragma once
 
+#include "coversync-desktop-linux/src/ffi.cxx.h"
+
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QObject>
 #include <QtCore/QPoint>
@@ -30,6 +32,8 @@
 class QPointingDevice;
 class QQuickWindow;
 
+// The arithmetic is in src/momentum.rs, where it is tested; this watches the window's wheel events and sends
+// the coast's.
 class Momentum : public QObject {
 public:
     // Watches `window`'s wheel events, and sends it the coast's.
@@ -42,26 +46,16 @@ protected:
     bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
-    struct Sample {
-        double time; // the device's, in seconds
-        double arrived; // ours
-        double x;
-        double y;
-    };
-
     double seconds() const { return m_clock.nsecsElapsed() / 1e9; }
-    bool looksLikeLiftFlush(QPoint delta, double now) const;
     void releaseHeld();
     bool startCoast(double now);
     void send(int dx, int dy, Qt::ScrollPhase phase);
     void stop();
+    void forget();
     void tick();
 
     QQuickWindow *m_window;
-    double m_tau = 0.325;
-    double m_recent = 0.030;
-    double m_liftLag = 0.045;
-    double m_blendTau = 0.040;
+    Tuning m_tuning { 0.325, 0.030, 0.045, 0.040 };
     bool m_trace = false;
     QElapsedTimer m_clock;
 
@@ -79,11 +73,8 @@ private:
     QPoint m_held;
     bool m_holding = false;
 
-    // The coast: the fingers' speed, slowing; what the speed on screen had over or under it, fading; and the
-    // fraction of an angle unit not sent yet.
-    double m_velocity[2] = { 0, 0 };
-    double m_excess[2] = { 0, 0 };
-    double m_carry[2] = { 0, 0 };
+    // The coast.
+    CoastState m_coast { 0, 0, 0, 0, 0, 0 };
     double m_last = 0;
     bool m_coasting = false;
     bool m_begun = false;

@@ -463,7 +463,9 @@ even where that handover can't work (it goes over a socket in
 `$XDG_RUNTIME_DIR`); where the file system can't lock at all, the app warns
 and runs without it.
 
-There is no package for it yet. To build and run it on Arch Linux, you need Qt 6.9 or later with Qt WebEngine, a C++ compiler and Rust:
+There is no package for it yet. To build and run it on Arch Linux, you need Qt with Qt WebEngine, a C++ compiler and Rust. It uses Qt
+6.9's API; it has been built and run only on Qt 6.12, with Qt WebEngine
+6.11:
 
 ```sh
 sudo pacman -S --needed base-devel qt6-base qt6-declarative qt6-webengine

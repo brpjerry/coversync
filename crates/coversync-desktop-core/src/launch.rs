@@ -37,25 +37,35 @@ pub fn with_env_server(mut args: Vec<String>, env_server: Option<String>) -> Vec
 /// Launches that came in before the app had started: set up, with its first
 /// page on the way (after the one cache clear, if due). They're handled once
 /// it has.
-#[derive(Default)]
-pub struct EarlyLaunches {
+/// A launch is whatever the app keeps of one: its arguments, or those with
+/// the token that lets its window take the focus.
+pub struct EarlyLaunches<T = Vec<String>> {
     started: bool,
-    waiting: Vec<Vec<String>>,
+    waiting: Vec<T>,
 }
 
-impl EarlyLaunches {
-    /// Keeps `args` for later until the app has started; then hands them
-    /// back.
-    pub fn hold(&mut self, args: Vec<String>) -> Option<Vec<String>> {
-        if self.started {
-            return Some(args);
+impl<T> Default for EarlyLaunches<T> {
+    fn default() -> Self {
+        Self {
+            started: false,
+            waiting: Vec::new(),
         }
-        self.waiting.push(args);
+    }
+}
+
+impl<T> EarlyLaunches<T> {
+    /// Keeps `launch` for later until the app has started; then hands it
+    /// back.
+    pub fn hold(&mut self, launch: T) -> Option<T> {
+        if self.started {
+            return Some(launch);
+        }
+        self.waiting.push(launch);
         None
     }
 
     /// The app has started: the launches held until now.
-    pub fn release(&mut self) -> Vec<Vec<String>> {
+    pub fn release(&mut self) -> Vec<T> {
         self.started = true;
         std::mem::take(&mut self.waiting)
     }
@@ -102,7 +112,7 @@ mod tests {
 
     #[test]
     fn launches_wait_until_the_app_has_started() {
-        let mut early = EarlyLaunches::default();
+        let mut early = EarlyLaunches::<Vec<String>>::default();
         let launch = |n: &str| vec!["app".to_owned(), format!("--server=http://{n}/")];
         // While setup or the cache clear runs.
         assert_eq!(early.hold(launch("a")), None);

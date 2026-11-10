@@ -32,6 +32,8 @@ constexpr int kCacheClearTimeoutMs = 5000;
 // The application while run() is in its event loop, for work handed over from other threads.
 std::mutex g_lock;
 QCoreApplication *g_app = nullptr;
+// quit() came before there was an application to tell.
+bool g_quitAsked = false;
 
 // The main thread's alone.
 QPointer<QQuickWindow> g_window;
@@ -171,10 +173,18 @@ private:
 };
 
 // Qt takes the program's arguments for its own options (-platform and the like): it gets none of the app's.
+//
+// The platform theme is the one that follows the desktop's portal, over the desktop's own theme for everything
+// else, whatever QT_QPA_PLATFORMTHEME names: pages get light or dark from Qt's platform theme, and a theme set
+// for Qt's widgets (qt6ct, say) reports its own palette there, so a page came up light on a desktop set to
+// dark. The app has no Qt widgets to theme. As an argument, which Qt takes over the variable, and not in the
+// environment: what the app starts (a browser, for a link) keeps the user's theme.
 struct Arguments {
     char name[18] = "coversync-desktop";
-    char *argv[2] = { name, nullptr };
-    int argc = 1;
+    char themeOption[15] = "-platformtheme";
+    char theme[17] = "xdgdesktopportal";
+    char *argv[4] = { name, themeOption, theme, nullptr };
+    int argc = 3;
 };
 
 const char *const kErrorQml = R"qml(
@@ -284,6 +294,9 @@ int run(const Options &options)
     {
         const std::lock_guard<std::mutex> lock(g_lock);
         g_app = &app;
+        // Asked to end while this was being set up: once the event loop runs.
+        if (g_quitAsked)
+            QMetaObject::invokeMethod(&app, [] { QCoreApplication::quit(); }, Qt::QueuedConnection);
     }
 
     const QUrl first(qstring(options.first_url));
@@ -364,5 +377,9 @@ void bridge_reply(std::uint64_t id, rust::Slice<const std::uint8_t> body)
 
 void quit()
 {
-    onMainThread([] { QCoreApplication::quit(); });
+    const std::lock_guard<std::mutex> lock(g_lock);
+    if (g_app)
+        QMetaObject::invokeMethod(g_app, [] { QCoreApplication::quit(); }, Qt::QueuedConnection);
+    else
+        g_quitAsked = true;
 }

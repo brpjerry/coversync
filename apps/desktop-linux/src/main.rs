@@ -17,6 +17,7 @@ mod app;
 mod bridge;
 mod ffi;
 mod instance;
+mod momentum;
 mod pages;
 mod paths;
 
@@ -56,15 +57,6 @@ fn chromium_flags(set: Option<String>, frame_rate: Option<String>) -> Option<Str
     Some(format!("{set} {NO_FRAME_LIMIT}").trim().to_owned())
 }
 
-/// Which of Qt's platform themes the app runs with.
-const PLATFORM_THEME_ENV: &str = "QT_QPA_PLATFORMTHEME";
-/// The one that follows the desktop's portal, over the desktop's own theme
-/// for everything else. Pages get light or dark from Qt's platform theme,
-/// and a theme set for Qt's widgets (qt6ct, say) reports its own palette
-/// there: a page then came up light on a desktop set to dark. The app has no
-/// Qt widgets to theme, so whatever the environment names is replaced.
-const PLATFORM_THEME: &str = "xdgdesktopportal";
-
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -75,20 +67,28 @@ fn main() -> ExitCode {
         // SAFETY: no other thread has started yet.
         unsafe { std::env::set_var(CHROMIUM_FLAGS_ENV, flags) };
     }
-    // SAFETY: as above.
-    unsafe { std::env::set_var(PLATFORM_THEME_ENV, PLATFORM_THEME) };
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(&std::env::var("RUST_LOG").unwrap_or_default()))
         .with_writer(std::io::stderr)
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    // Lossily: an argument that isn't UTF-8 (the program's own path, say)
+    // mustn't keep the app from starting.
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let env_server = env(SERVER_ENV);
 
     // One instance: a later launch hands its arguments (and environment) to
     // the first and ends.
     let socket = instance::socket_path(&paths::config_dir());
-    let mut listening = match instance::claim(&socket) {
+    let claim = match &socket {
+        Some(socket) => instance::claim(socket),
+        None => Err(std::io::Error::other(
+            "no XDG_RUNTIME_DIR for the socket that hands launches over",
+        )),
+    };
+    let mut listening = match claim {
         Ok(Claim::First(listening)) => Some(listening),
         Ok(Claim::Running(stream)) => {
             let launch = Launch {
@@ -109,10 +109,7 @@ fn main() -> ExitCode {
         }
         // Without it the settings' lock still keeps a second instance out.
         Err(err) => {
-            tracing::warn!(
-                "couldn't open {}: {err}; later launches won't reach this window",
-                socket.display()
-            );
+            tracing::warn!("later launches won't reach this window: {err}");
             None
         }
     };
@@ -149,12 +146,15 @@ fn main() -> ExitCode {
         ) else {
             return;
         };
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
-            _ = hup.recv() => {}
+        loop {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+                _ = hup.recv() => {}
+            }
+            // Kept until the window is there to close, if it isn't yet.
+            qt::quit();
         }
-        qt::quit();
     });
 
     let options = qt::Options {

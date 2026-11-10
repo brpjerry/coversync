@@ -36,6 +36,58 @@ pub mod qt {
         bridge_url: String,
     }
 
+    /// A two-finger movement, as the window saw it: when (the device's time
+    /// and the window's, in seconds) and how far, in angle units.
+    #[derive(Clone, Copy)]
+    struct Sample {
+        time: f64,
+        arrived: f64,
+        x: f64,
+        y: f64,
+    }
+
+    /// Momentum's settings (`cpp/momentum.h`), in seconds.
+    struct Tuning {
+        /// The coast's speed falls to 1/e in this time.
+        tau: f64,
+        /// How far back the speed on screen is weighted.
+        recent: f64,
+        /// The movement a lift's last report is taken to hold; 0 ignores its
+        /// size.
+        lift_lag: f64,
+        /// How fast the coast moves from the speed on screen to the fingers'.
+        blend: f64,
+    }
+
+    /// Whether a coast starts, from which speed on screen, towards which
+    /// speed of the fingers'.
+    struct CoastStart {
+        starts: bool,
+        shown_x: f64,
+        shown_y: f64,
+        fingers_x: f64,
+        fingers_y: f64,
+    }
+
+    /// A coast under way: the fingers' speed, slowing; what the speed on
+    /// screen had over or under it, fading; and the fraction of an angle unit
+    /// not sent yet.
+    struct CoastState {
+        velocity_x: f64,
+        velocity_y: f64,
+        excess_x: f64,
+        excess_y: f64,
+        carry_x: f64,
+        carry_y: f64,
+    }
+
+    /// What one step of a coast scrolls by, and whether it was the last.
+    struct CoastStep {
+        dx: i32,
+        dy: i32,
+        done: bool,
+    }
+
     unsafe extern "C++" {
         include!("shell.h");
 
@@ -90,11 +142,26 @@ pub mod qt {
 
         /// The first page is on its way.
         fn started();
+
+        // Momentum's arithmetic: see `crate::momentum`.
+
+        fn momentum_looks_like_lift_flush(samples: &[Sample], dx: f64, dy: f64, now: f64) -> bool;
+        /// `holding` says whether `(held_x, held_y)` is a report held back.
+        fn momentum_coast_start(
+            samples: &[Sample],
+            holding: bool,
+            held_x: f64,
+            held_y: f64,
+            now: f64,
+            tuning: &Tuning,
+        ) -> CoastStart;
+        fn momentum_coast_state(start: &CoastStart) -> CoastState;
+        fn momentum_coast_step(state: &mut CoastState, dt: f64, tuning: &Tuning) -> CoastStep;
     }
 }
 
 use crate::app::App;
-use crate::pages;
+use crate::{momentum, pages};
 
 fn app_page_type(path: &str) -> &'static str {
     pages::find(path).map_or("", |page| page.content_type)
@@ -140,4 +207,27 @@ fn started() {
     if let Some(app) = App::get() {
         app.started();
     }
+}
+
+fn momentum_looks_like_lift_flush(samples: &[qt::Sample], dx: f64, dy: f64, now: f64) -> bool {
+    momentum::looks_like_lift_flush(samples, dx, dy, now)
+}
+
+fn momentum_coast_start(
+    samples: &[qt::Sample],
+    holding: bool,
+    held_x: f64,
+    held_y: f64,
+    now: f64,
+    tuning: &qt::Tuning,
+) -> qt::CoastStart {
+    momentum::coast_start(samples, holding.then_some((held_x, held_y)), now, tuning)
+}
+
+fn momentum_coast_state(start: &qt::CoastStart) -> qt::CoastState {
+    momentum::coast_state(start)
+}
+
+fn momentum_coast_step(state: &mut qt::CoastState, dt: f64, tuning: &qt::Tuning) -> qt::CoastStep {
+    momentum::coast_step(state, dt, tuning)
 }

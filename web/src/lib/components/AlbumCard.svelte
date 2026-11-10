@@ -87,8 +87,8 @@
 					onload={() => {
 						// A cover that fades in is drawn on a layer of its own until it has. A row of
 						// them arriving while the grid scrolls cost frames: in the desktop app, fast
-						// two-finger scrolls had 30 late frames in 800 with the fade and 6 without. It
-						// isn't seen fading at that speed anyway.
+						// two-finger scrolls had 20-30 late frames in about 830 with the fade and 1
+						// without. It isn't seen fading at that speed anyway.
 						if (scrolling) cached = true;
 						loaded = true;
 					}}

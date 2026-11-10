@@ -12,7 +12,7 @@ import QtWebEngine
 Window {
     id: window
 
-    // The fallback page's colours (apps/desktop/ui/fallback.css), for what shows before a page has drawn and
+    // The fallback page's colours (ui/fallback.css), for what shows before a page has drawn and
     // for the dialogs.
     readonly property bool dark: Qt.styleHints.colorScheme !== Qt.Light
     readonly property color pageColor: dark ? "#0a0b0e" : "#f5f5f7"

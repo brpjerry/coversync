@@ -88,6 +88,7 @@ Backend::Backend(bool console, QObject *parent) : QObject(parent), m_console(con
         return;
     bus.connect(kPortal, kPortalPath, kSettings, QStringLiteral("SettingChanged"), this,
                 SLOT(settingChanged(QString, QString, QDBusVariant)));
+    lookForFileChooser();
     QDBusMessage read = QDBusMessage::createMethodCall(kPortal, kPortalPath, kSettings, QStringLiteral("Read"));
     read << kAppearance << kColorScheme;
     // The web view takes light or dark as it is set up, so this is asked before there is one, and waited for;
@@ -110,8 +111,29 @@ Backend::Backend(bool console, QObject *parent) : QObject(parent), m_console(con
 void Backend::portalAnswered(const QVariant &colorScheme)
 {
     applyColorScheme(colorScheme);
-    // The portal is there: so is its file chooser.
-    m_fileChooser = true;
+}
+
+// The portal's parts come from different programs: that its settings answer doesn't mean it has a file chooser.
+// Its version is asked for, which only a file chooser that is there can tell.
+void Backend::lookForFileChooser()
+{
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    QDBusMessage get = QDBusMessage::createMethodCall(kPortal, kPortalPath, QStringLiteral("org.freedesktop.DBus.Properties"),
+                                                      QStringLiteral("Get"));
+    get << kFileChooser << QStringLiteral("version");
+    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(get), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        const QDBusPendingReply<QDBusVariant> reply = *call;
+        setFileChooser(!reply.isError());
+    });
+}
+
+void Backend::setFileChooser(bool there)
+{
+    if (m_fileChooser == there)
+        return;
+    m_fileChooser = there;
     emit hasFileChooserChanged();
 }
 
@@ -170,15 +192,16 @@ void Backend::consoleMessage(int level, const QString &message, int line, const 
 void Backend::chooseFiles(bool multiple, const QStringList &accepted)
 {
     QDBusConnection bus = QDBusConnection::sessionBus();
+    // One chooser at a time: the one a page asked for before goes.
+    closeRequest();
     // The request's object, which answers: its path follows from this connection's name and a token of ours,
     // so the answer can be listened for before the request is made.
     const QString token = QStringLiteral("coversync%1").arg(++m_requests);
     QString sender = bus.baseService().mid(1);
     sender.replace(QLatin1Char('.'), QLatin1Char('_'));
-    if (!m_request.isEmpty())
-        bus.disconnect(kPortal, m_request, kRequest, QStringLiteral("Response"), this, SLOT(chooserResponse(uint, QVariantMap)));
-    m_request = QStringLiteral("/org/freedesktop/portal/desktop/request/%1/%2").arg(sender, token);
-    bus.connect(kPortal, m_request, kRequest, QStringLiteral("Response"), this, SLOT(chooserResponse(uint, QVariantMap)));
+    const QString request = QStringLiteral("/org/freedesktop/portal/desktop/request/%1/%2").arg(sender, token);
+    m_request = request;
+    bus.connect(kPortal, request, kRequest, QStringLiteral("Response"), this, SLOT(chooserResponse(uint, QVariantMap)));
 
     QVariantMap options;
     options.insert(QStringLiteral("handle_token"), token);
@@ -200,22 +223,45 @@ void Backend::chooseFiles(bool multiple, const QStringList &accepted)
     // No parent window: the chooser stands on its own.
     open << QString() << QCoreApplication::translate("Backend", "Choose a file") << options;
     auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(open), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *call) {
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, request](QDBusPendingCallWatcher *call) {
         call->deleteLater();
         const QDBusPendingReply<QDBusObjectPath> reply = *call;
-        if (reply.isError()) {
-            std::fprintf(stderr, "coversync: the file chooser couldn't open: %s\n", qUtf8Printable(reply.error().message()));
-            m_request.clear();
-            emit filesChosen({});
-        }
+        if (!reply.isError())
+            return;
+        std::fprintf(stderr, "coversync: the file chooser couldn't open: %s\n", qUtf8Printable(reply.error().message()));
+        // Qt's own from now on.
+        setFileChooser(false);
+        // Unless a later request has taken this one's place meanwhile: that one is the page's now.
+        if (m_request != request)
+            return;
+        forgetRequest();
+        emit filesChosen({});
     });
 }
 
-void Backend::chooserResponse(uint response, const QVariantMap &results)
+// Stops listening for the request under way.
+void Backend::forgetRequest()
 {
+    if (m_request.isEmpty())
+        return;
     QDBusConnection::sessionBus().disconnect(kPortal, m_request, kRequest, QStringLiteral("Response"), this,
                                              SLOT(chooserResponse(uint, QVariantMap)));
     m_request.clear();
+}
+
+// Closes the chooser that is open for the request under way, if there is one, and forgets the request.
+void Backend::closeRequest()
+{
+    if (m_request.isEmpty())
+        return;
+    QDBusConnection::sessionBus().asyncCall(QDBusMessage::createMethodCall(kPortal, m_request, kRequest, QStringLiteral("Close")));
+    forgetRequest();
+}
+
+// Only the request under way is listened for, so this is its answer.
+void Backend::chooserResponse(uint response, const QVariantMap &results)
+{
+    forgetRequest();
     QStringList files;
     // 0: chosen; anything else: closed.
     if (response == 0) {

@@ -53,7 +53,7 @@ pub struct Start {
 pub struct App {
     runtime: Handle,
     shell: Arc<Shell>,
-    early: Mutex<EarlyLaunches>,
+    early: Mutex<EarlyLaunches<Launch>>,
     /// Held for the whole run: see [`ConfigLock`].
     _lock: ConfigLock,
 }
@@ -148,12 +148,8 @@ impl App {
     /// waited for it.
     pub fn started(&'static self) {
         let waiting = self.early.lock().unwrap().release();
-        for args in waiting {
-            self.launched_again(Launch {
-                args,
-                env_server: None,
-                activation_token: None,
-            });
+        for launch in waiting {
+            self.launched_again(launch);
         }
     }
 
@@ -163,15 +159,13 @@ impl App {
     /// goes to the window, so the compositor may raise and focus it (GNOME
     /// and KDE do; Hyprland only with `focus_on_activate`). Any thread.
     pub fn launched_again(&'static self, launch: Launch) {
-        let Some(args) = self
-            .early
-            .lock()
-            .unwrap()
-            .hold(with_env_server(launch.args, launch.env_server))
-        else {
+        // Whole, token and all: a launch that waits can still bring the
+        // window to the front once it is handled.
+        let Some(launch) = self.early.lock().unwrap().hold(launch) else {
             return;
         };
         qt::raise(launch.activation_token.as_deref().unwrap_or_default());
+        let args = with_env_server(launch.args, launch.env_server);
         let Some(server) = server_arg(args.into_iter().skip(1)) else {
             return;
         };

@@ -52,16 +52,23 @@ pub enum Claim {
     Running(UnixStream),
 }
 
-/// The socket of the instance that uses `config_dir`. Its name carries a
-/// hash of the folder rather than the folder: a socket's path can't be long.
-pub fn socket_path(config_dir: &Path) -> PathBuf {
+/// The socket of the instance that uses `config_dir`, in the session's
+/// runtime folder, which is the user's alone; without one there is no
+/// socket, since anywhere else another user could be listening at its name.
+/// The name carries a hash of the folder rather than the folder: a socket's
+/// path can't be long.
+pub fn socket_path(config_dir: &Path) -> Option<PathBuf> {
+    Some(socket_in(&paths::runtime_dir()?, config_dir))
+}
+
+fn socket_in(runtime_dir: &Path, config_dir: &Path) -> PathBuf {
     // FNV-1a.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in config_dir.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    paths::runtime_dir().join(format!("{APP_ID}-{hash:016x}.sock"))
+    runtime_dir.join(format!("{APP_ID}-{hash:016x}.sock"))
 }
 
 /// Becomes the instance at `path`, or reaches the one that is.
@@ -70,7 +77,7 @@ pub fn claim(path: &Path) -> io::Result<Claim> {
         match UnixListener::bind(path) {
             Ok(listener) => {
                 // The runtime folder is the user's alone already; this is for
-                // the temporary folder, where it isn't.
+                // one that isn't as it should be.
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
                 return Ok(Claim::First(Listening {
                     listener: Some(listener),
@@ -192,14 +199,16 @@ mod tests {
 
     #[test]
     fn each_settings_folder_has_a_socket_of_its_own_with_a_short_path() {
-        let a = socket_path(Path::new("/home/a/.config/io.github.brpjerry.coversync"));
-        let b = socket_path(Path::new("/home/b/.config/io.github.brpjerry.coversync"));
+        let socket = |config: &Path| socket_in(Path::new("/run/user/1000"), config);
+        let a = socket(Path::new("/home/a/.config/io.github.brpjerry.coversync"));
+        let b = socket(Path::new("/home/b/.config/io.github.brpjerry.coversync"));
         assert_ne!(a, b);
         assert_eq!(
             a,
-            socket_path(Path::new("/home/a/.config/io.github.brpjerry.coversync"))
+            socket(Path::new("/home/a/.config/io.github.brpjerry.coversync"))
         );
-        let long = socket_path(&Path::new("/tmp").join("x".repeat(400)));
+        assert!(a.starts_with("/run/user/1000"));
+        let long = socket(&Path::new("/tmp").join("x".repeat(400)));
         let name = long.file_name().unwrap().to_string_lossy().into_owned();
         // sockaddr_un's path holds 108 bytes; the folder takes some.
         assert!(name.len() < 60, "{name}");

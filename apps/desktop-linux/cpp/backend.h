@@ -14,7 +14,7 @@
 
 class Backend : public QObject {
     Q_OBJECT
-    // Whether the desktop's file chooser can be asked for: its portal has answered.
+    // Whether the desktop's file chooser can be asked for: the portal has one, and it has opened when asked.
     Q_PROPERTY(bool hasFileChooser READ hasFileChooser NOTIFY hasFileChooserChanged)
 
 public:
@@ -43,6 +43,10 @@ private slots:
 private:
     void portalAnswered(const QVariant &colorScheme);
     void applyColorScheme(const QVariant &value);
+    void lookForFileChooser();
+    void setFileChooser(bool there);
+    void forgetRequest();
+    void closeRequest();
 
     bool m_console;
     bool m_fileChooser = false;

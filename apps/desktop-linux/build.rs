@@ -21,15 +21,8 @@ fn main() {
         .cpp_file("cpp/pages.cpp")
         .cpp_file("cpp/shell.cpp")
         .build();
-    for file in [
-        "backend.h",
-        "momentum.cpp",
-        "momentum.h",
-        "pages.cpp",
-        "pages.h",
-        "shell.cpp",
-        "shell.h",
-    ] {
+    // cxx-qt-build watches what it compiles; the headers those include are ours to name.
+    for file in ["momentum.h", "pages.h", "shell.h"] {
         println!("cargo:rerun-if-changed=cpp/{file}");
     }
 }
