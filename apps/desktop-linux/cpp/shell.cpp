@@ -14,6 +14,8 @@
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
 #include <QtQml/QQmlError>
+#include <QtCore/QSet>
+#include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 #include <QtWebEngineQuick/QtWebEngineQuick>
@@ -69,12 +71,74 @@ void printWarnings(QQmlEngine &engine)
     });
 }
 
-// When the window comes back from being hidden (another workspace, say), Qt's render thread starts drawing it
-// again, and the web view's picture doesn't survive that: the view stays black, and no new frame arrives
-// however the page changes. Hiding the view and showing it again makes it hand over a new one.
+// Qt stops drawing a window that can't be seen (on another workspace, say), and tells its items so. Qt WebEngine
+// then gives up the page's picture, and asks for no new one when the window is drawn again: the view stays
+// black however the page changes. Other windows keep their picture, since Qt keeps what it drew with.
+//
+// PictureKeeper undoes that: it cuts the connection through which the view's inner item, which holds the
+// picture, hears that drawing stops. (It still hears when Qt really lets go of what it draws with.) That item is
+// Qt WebEngine's own, found by its class name, and there's a new one for each process that draws a page.
+class PictureKeeper : public QObject {
+public:
+    PictureKeeper(QQuickWindow *window, QQuickItem *view) : QObject(window), m_window(window), m_view(view)
+    {
+        // Once the new item has joined the window, which is when it starts listening.
+        connect(view, &QQuickItem::childrenChanged, this, [this] {
+            QMetaObject::invokeMethod(this, [this] { keep(); }, Qt::QueuedConnection);
+        });
+        keep();
+    }
+
+    // Whether every item that holds a picture now keeps it.
+    bool kept() const
+    {
+        bool any = false;
+        for (QQuickItem *item : holders()) {
+            if (!m_kept.contains(item))
+                return false;
+            any = true;
+        }
+        return any;
+    }
+
+private:
+    QList<QQuickItem *> holders() const
+    {
+        QList<QQuickItem *> found;
+        if (!m_view)
+            return found;
+        const QList<QQuickItem *> children = m_view->childItems();
+        for (QQuickItem *child : children) {
+            if (QByteArrayView(child->metaObject()->className()).contains("RenderWidgetHostViewQtDelegateItem"))
+                found.append(child);
+        }
+        return found;
+    }
+
+    void keep()
+    {
+        for (QQuickItem *item : holders()) {
+            if (m_kept.contains(item))
+                continue;
+            if (QObject::disconnect(m_window, &QQuickWindow::sceneGraphAboutToStop, item, nullptr)) {
+                m_kept.insert(item);
+                connect(item, &QObject::destroyed, this, [this, item] { m_kept.remove(item); });
+            }
+        }
+    }
+
+    QQuickWindow *m_window;
+    QPointer<QQuickItem> m_view;
+    QSet<QObject *> m_kept;
+};
+
+// Where PictureKeeper couldn't (a Qt WebEngine that names or wires its item otherwise): when the window is drawn
+// again after it wasn't, hiding the view and showing it again makes it ask for a new picture. The window is
+// black until that arrives, a tenth of a second or so.
 class Reviver : public QObject {
 public:
-    Reviver(QQuickWindow *window, QObject *view) : QObject(window), m_window(window), m_view(view)
+    Reviver(QQuickWindow *window, QQuickItem *view, const PictureKeeper *keeper)
+        : QObject(window), m_window(window), m_view(view), m_keeper(keeper)
     {
         m_exposed = window->isExposed();
         window->installEventFilter(this);
@@ -86,13 +150,13 @@ protected:
         if (event->type() != QEvent::Expose)
             return false;
         const bool exposed = m_window->isExposed();
-        if (exposed && !m_exposed) {
+        if (exposed && !m_exposed && !m_keeper->kept()) {
             // Once the window has taken the event in.
             QMetaObject::invokeMethod(this, [this] {
                 if (!m_view)
                     return;
-                m_view->setProperty("visible", false);
-                m_view->setProperty("visible", true);
+                m_view->setVisible(false);
+                m_view->setVisible(true);
             }, Qt::QueuedConnection);
         }
         m_exposed = exposed;
@@ -101,7 +165,8 @@ protected:
 
 private:
     QQuickWindow *m_window;
-    QPointer<QObject> m_view;
+    QPointer<QQuickItem> m_view;
+    const PictureKeeper *m_keeper;
     bool m_exposed = false;
 };
 
@@ -210,7 +275,8 @@ int run(const Options &options)
 
     if (Momentum::enabled())
         new Momentum(window);
-    new Reviver(window, view);
+    if (auto *item = qobject_cast<QQuickItem *>(view))
+        new Reviver(window, item, new PictureKeeper(window, item));
 
     g_window = window;
     g_view = view;
