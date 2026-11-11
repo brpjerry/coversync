@@ -40,6 +40,12 @@ export interface Listening {
 	pause(): void;
 	/** Open it again, catching up on what was missed. */
 	resume(): void;
+	/**
+	 * Listen while the page is hidden too, from now on: the desktop app tells
+	 * the user what finished while its window was out of sight, and has no
+	 * other tabs to leave connections for.
+	 */
+	stayOpen(): void;
 }
 
 const NAMES = [
@@ -91,6 +97,8 @@ export function listen(
 	let dropped = false;
 	/** The page has been hidden a while. */
 	let hidden = false;
+	/** A hidden page keeps listening. */
+	let always = false;
 	/** Paused by the page. */
 	let held = false;
 	/** Closed for one of those, rather than down. */
@@ -168,7 +176,7 @@ export function listen(
 		if (!document.hidden) {
 			hidden = false;
 			settle();
-		} else
+		} else if (!always)
 			away = setTimeout(() => {
 				hidden = true;
 				settle();
@@ -192,6 +200,12 @@ export function listen(
 		},
 		resume() {
 			held = false;
+			settle();
+		},
+		stayOpen() {
+			always = true;
+			clearTimeout(away);
+			hidden = false;
 			settle();
 		}
 	};

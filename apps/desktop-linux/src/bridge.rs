@@ -7,6 +7,9 @@
 //! send those: the scheme is local, so a server's pages can't reach it, and
 //! [`allowed`] checks each request's origin and the page the window shows
 //! regardless.
+//!
+//! A server's pages have commands of their own, far fewer, which go through
+//! their proxy instead: see [`coversync_desktop_core::bridge`].
 
 use serde::{Deserialize, Serialize};
 

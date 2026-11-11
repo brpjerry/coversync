@@ -179,6 +179,12 @@ void Backend::renderTerminated(int status, int exitCode)
     render_terminated(status, exitCode);
 }
 
+bool Backend::mayNotify(const QUrl &origin)
+{
+    const QByteArray asked = origin.toString(QUrl::FullyEncoded).toUtf8();
+    return may_notify(rust::Str(asked.constData(), static_cast<std::size_t>(asked.size())));
+}
+
 void Backend::consoleMessage(int level, const QString &message, int line, const QString &source)
 {
     if (!m_console)

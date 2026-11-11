@@ -34,6 +34,9 @@ pub mod qt {
         origin: String,
         /// Where the fallback page's commands are sent.
         bridge_url: String,
+        /// The app's icon as a file, for notifications on a desktop that has
+        /// no icon by the app's ID; empty if there is none.
+        icon_file: String,
     }
 
     /// A two-finger movement, as the window saw it: when (the device's time
@@ -143,6 +146,18 @@ pub mod qt {
         /// The first page is on its way.
         fn started();
 
+        /// Whether the page at `origin` may show notifications: asked when
+        /// it asks for the permission.
+        fn may_notify(origin: &str) -> bool;
+
+        /// Whether a notification from the page at `origin` is shown now.
+        /// `window_active` says whether the window has the focus.
+        fn shows_notification(origin: &str, window_active: bool) -> bool;
+
+        /// Whether the desktop has anything to show notifications with:
+        /// said once, soon after the window opens.
+        fn notifications_found(available: bool);
+
         // Momentum's arithmetic: see `crate::momentum`.
 
         fn momentum_looks_like_lift_flush(samples: &[Sample], dx: f64, dy: f64, now: f64) -> bool;
@@ -206,6 +221,20 @@ fn cache_cleared(cleared: bool) {
 fn started() {
     if let Some(app) = App::get() {
         app.started();
+    }
+}
+
+fn may_notify(origin: &str) -> bool {
+    App::get().is_some_and(|app| app.may_notify(origin))
+}
+
+fn shows_notification(origin: &str, window_active: bool) -> bool {
+    App::get().is_some_and(|app| app.shows_notification(origin, window_active))
+}
+
+fn notifications_found(available: bool) {
+    if let Some(app) = App::get() {
+        app.notifications_found(available);
     }
 }
 

@@ -41,6 +41,9 @@ Window {
         cachePath: appCachePath
         // The sign-in is kept by the app's proxy, not by the view.
         persistentCookiesPolicy: WebEngineProfile.NoPersistentCookies
+        // What a page is allowed (notifications) is decided each run, by where the page is from: nothing kept
+        // on disk can allow another page at the same address later.
+        persistentPermissionsPolicy: WebEngineProfile.StoreInMemory
     }
 
     // The view is made only once the window is complete. The prototype has no profile to give before
@@ -94,6 +97,16 @@ Window {
                     fileRequest.dialogReject();
                 fileRequest = request;
                 backend.chooseFiles(multiple, request.acceptedMimeTypes);
+            }
+            // A server's UI may show notifications, which the app hands to the desktop (cpp/notifier.h). Any other
+            // page is refused, and nothing else a page asks for is decided here.
+            onPermissionRequested: function (permission) {
+                if (permission.permissionType !== WebEnginePermission.PermissionType.Notifications)
+                    return;
+                if (backend.mayNotify(permission.origin))
+                    permission.grant();
+                else
+                    permission.deny();
             }
             // A menu only where it has something for the app's user: text to edit or copy, a link.
             onContextMenuRequested: function (request) {

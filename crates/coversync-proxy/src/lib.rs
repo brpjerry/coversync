@@ -20,7 +20,10 @@
 //!   port. The window opens [`Proxy::entry_url`], which carries a secret
 //!   made for this launch. The proxy trades it for an HttpOnly cookie and
 //!   refuses every request without that cookie.
+//! - The UI's requests to the app itself, under `/__coversync-app/`, are
+//!   answered here and never forwarded ([`AppCommands`]).
 
+mod app;
 mod headers;
 mod jar;
 mod pages;
@@ -48,6 +51,7 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
 use url::Url;
 
+pub use app::{AppAnswer, AppCommands, AppError, HEADER as APP_HEADER, RESERVED as APP_PATH};
 pub use headers::SERVER as SERVER_HEADER;
 pub use jar::Cookies;
 pub use unreachable::Unreachable;
@@ -69,6 +73,7 @@ pub struct Builder {
     cookies: Option<Cookies>,
     page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
+    commands: Option<Arc<dyn AppCommands>>,
 }
 
 impl Default for Builder {
@@ -80,6 +85,7 @@ impl Default for Builder {
             cookies: None,
             page_timeout: PAGE_TIMEOUT,
             on_unreachable: None,
+            commands: None,
         }
     }
 }
@@ -135,6 +141,14 @@ impl Builder {
         self
     }
 
+    /// The app's commands for the server's pages, which the proxy answers
+    /// under [`APP_PATH`] and says it has in [`APP_HEADER`]. Without them it
+    /// has none, and doesn't say so; the path is never forwarded either way.
+    pub fn app_commands(mut self, commands: Arc<dyn AppCommands>) -> Self {
+        self.commands = Some(commands);
+        self
+    }
+
     /// Listens on 127.0.0.1, on the preferred port or a random one, and
     /// serves for as long as the tokio runtime runs.
     pub async fn start(self) -> io::Result<Proxy> {
@@ -161,6 +175,7 @@ impl Builder {
             addr,
             page_timeout: self.page_timeout,
             on_unreachable: self.on_unreachable,
+            commands: self.commands,
         });
         let app = Router::new()
             .fallback(handle)
@@ -341,6 +356,8 @@ struct Shared {
     host: HeaderValue,
     page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
+    /// The app's commands for the server's pages.
+    commands: Option<Arc<dyn AppCommands>>,
 }
 
 impl Shared {
@@ -370,6 +387,9 @@ impl Shared {
     async fn forward(&self, upstream: &Upstream, req: Request) -> Response {
         let document = is_document(&req);
         let (mut parts, body) = req.into_parts();
+        // Where the UI looks for the app.
+        let hello = self.commands.is_some()
+            && parts.uri.path().strip_prefix(upstream.prefix()) == Some("/api/hello");
         let path_and_query = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
         let Some(uri) = upstream.uri(path_and_query) else {
             return pages::text(StatusCode::BAD_REQUEST, "Bad request.");
@@ -423,6 +443,9 @@ impl Shared {
             }
         }
         headers::from_upstream(&mut parts.headers, &self.origin, upstream);
+        if hello {
+            parts.headers.insert(app::HEADER, app::VERSIONS);
+        }
         Response::from_parts(parts, Body::new(body))
     }
 }
@@ -477,6 +500,16 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
     // its requests here too. Refuse what another origin sends.
     if from_elsewhere(req.headers(), &proxy.origin) {
         return pages::forbidden();
+    }
+    // The app's own path, whatever the server's prefix: never forwarded.
+    if app::reserved(path) {
+        return app::answer(
+            proxy.commands.as_ref(),
+            &proxy.origin,
+            upstream.as_deref(),
+            req,
+        )
+        .await;
     }
     let Some(upstream) = upstream else {
         return pages::text(StatusCode::SERVICE_UNAVAILABLE, "No server is set.");

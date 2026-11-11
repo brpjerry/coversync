@@ -5,12 +5,13 @@
 //! between runs, so each has an origin of its own in the webview: its HTTP
 //! cache and the UI's local storage (sort, sidebar) aren't shared with
 //! another server's. The proxies share one cookie jar, which keeps each
-//! server's cookies apart.
+//! server's cookies apart, and the app's commands for the servers' pages
+//! ([`crate::bridge`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use coversync_proxy::{Cookies, Proxy, Unreachable, Upstream, UpstreamError};
+use coversync_proxy::{AppCommands, Cookies, Proxy, Unreachable, Upstream, UpstreamError};
 use serde::Serialize;
 use url::Url;
 
@@ -24,6 +25,8 @@ pub struct Shell {
     /// The fallback page's URL.
     pub fallback: Url,
     on_unreachable: UnreachableHandler,
+    /// What the servers' pages may ask of the app, through their proxies.
+    commands: Option<Arc<dyn AppCommands>>,
     /// A proxy for each server used in this run, by its URL.
     proxies: Mutex<HashMap<String, Proxy>>,
     /// The server the window shows. A proxy's report reaches the window only
@@ -94,11 +97,19 @@ impl Shell {
             cookies,
             fallback,
             on_unreachable,
+            commands: None,
             proxies: Mutex::new(HashMap::new()),
             current: Arc::new(Mutex::new(None)),
             problem: Mutex::new(None),
             navigation: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Gives the servers' pages the app's commands: every proxy started from
+    /// now on answers them (see [`crate::bridge::Commands`]).
+    pub fn with_commands(mut self, commands: Arc<dyn AppCommands>) -> Self {
+        self.commands = Some(commands);
+        self
     }
 
     pub fn current(&self) -> Option<Proxy> {
@@ -124,7 +135,11 @@ impl Shell {
         }
         let config = self.config.get();
         let (current, on_unreachable) = (self.current.clone(), self.on_unreachable.clone());
-        let proxy = Proxy::builder()
+        let mut builder = Proxy::builder();
+        if let Some(commands) = &self.commands {
+            builder = builder.app_commands(commands.clone());
+        }
+        let proxy = builder
             .upstream(Some(upstream.clone()))
             .preferred_port(config.ports.get(&url).copied())
             .avoid_ports(config.taken_except(&url))
@@ -603,25 +618,32 @@ mod tests {
         );
     }
 
-    /// Opens `proxy`'s entry URL, then loads its server's page through it, as
-    /// the window does, over plain sockets.
-    fn page_load(proxy: &Proxy) {
+    /// Sends `lines` to `proxy` as one request over a plain socket, and
+    /// returns the whole answer.
+    fn send(proxy: &Proxy, lines: &[String], body: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(proxy.addr()).unwrap();
+        let request = format!("{}\r\n\r\n{body}", lines.join("\r\n"));
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    }
+
+    /// Opens `proxy`'s entry URL, as the window does, and returns the
+    /// cookie it gets: `name=value`.
+    fn enter(proxy: &Proxy) -> String {
         let addr = proxy.addr();
         let entry = proxy.entry_url();
         let entry = &entry[entry.find("/?k=").unwrap()..];
-        let send = |request: String| {
-            let mut stream = std::net::TcpStream::connect(addr).unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
-            let mut answer = String::new();
-            let _ = stream.read_to_string(&mut answer);
-            answer
-        };
-        let request = |lines: &[String]| format!("{}\r\n\r\n", lines.join("\r\n"));
-        let answer = send(request(&[
-            format!("GET {entry} HTTP/1.1"),
-            format!("Host: {addr}"),
-            "Connection: close".to_owned(),
-        ]));
+        let answer = send(
+            proxy,
+            &[
+                format!("GET {entry} HTTP/1.1"),
+                format!("Host: {addr}"),
+                "Connection: close".to_owned(),
+            ],
+            "",
+        );
         let cookie = answer
             .lines()
             .find_map(|line| {
@@ -630,15 +652,74 @@ mod tests {
                     .then(|| value.trim().to_owned())
             })
             .unwrap();
-        let cookie = cookie.split(';').next().unwrap();
-        send(request(&[
-            "GET / HTTP/1.1".to_owned(),
-            format!("Host: {addr}"),
-            format!("Cookie: {cookie}"),
-            "Sec-Fetch-Dest: document".to_owned(),
-            "Accept: text/html".to_owned(),
-            "Connection: close".to_owned(),
-        ]));
+        cookie.split(';').next().unwrap().to_owned()
+    }
+
+    /// Opens `proxy`'s entry URL, then loads its server's page through it, as
+    /// the window does, over plain sockets.
+    fn page_load(proxy: &Proxy) {
+        let cookie = enter(proxy);
+        send(
+            proxy,
+            &[
+                "GET / HTTP/1.1".to_owned(),
+                format!("Host: {}", proxy.addr()),
+                format!("Cookie: {cookie}"),
+                "Sec-Fetch-Dest: document".to_owned(),
+                "Accept: text/html".to_owned(),
+                "Connection: close".to_owned(),
+            ],
+            "",
+        );
+    }
+
+    #[test]
+    fn every_servers_proxy_answers_the_apps_commands() {
+        use crate::bridge::{Commands, Feature, Features, Host};
+
+        struct Notifies;
+        impl Host for Notifies {
+            fn features(&self) -> Features {
+                Box::pin(async { vec![Feature::Notify] })
+            }
+        }
+
+        let (a, b) = (server("200 OK"), server("200 OK"));
+        let mut fixture = Fixture::new("commands", a);
+        // As the app sets its shell up: before any server is shown.
+        let dir = fixture.dir.join("with-commands");
+        fixture.shell = Shell::new(
+            Store::open(dir),
+            Cookies::default(),
+            Url::parse("coversync://app/index.html").unwrap(),
+            Arc::new(|_| {}),
+        )
+        .with_commands(Arc::new(Commands::new(Arc::new(Notifies))));
+
+        for addr in [a, b] {
+            let proxy = block(fixture.shell.switch(Some(url(addr)), Save::No)).unwrap();
+            let cookie = enter(&proxy);
+            let answer = send(
+                &proxy,
+                &[
+                    "POST /__coversync-app/v1/capabilities HTTP/1.1".to_owned(),
+                    format!("Host: {}", proxy.addr()),
+                    format!("Cookie: {cookie}"),
+                    format!("Origin: {}", proxy.origin()),
+                    "Sec-Fetch-Site: same-origin".to_owned(),
+                    "Content-Type: application/json".to_owned(),
+                    "Content-Length: 2".to_owned(),
+                    "Connection: close".to_owned(),
+                ],
+                "{}",
+            );
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            let body = answer.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({ "version": 1, "features": ["notify"] })
+            );
+        }
     }
 
     #[test]

@@ -28,6 +28,8 @@ public:
     Q_INVOKABLE void openInBrowser(const QUrl &url);
     // The process that draws the page ended; `status` is the view's RenderProcessTerminationStatus.
     Q_INVOKABLE void renderTerminated(int status, int exitCode);
+    // Whether the page at `origin` may show notifications: a server's UI may.
+    Q_INVOKABLE bool mayNotify(const QUrl &origin);
     // A page's console message, printed in debug builds.
     Q_INVOKABLE void consoleMessage(int level, const QString &message, int line, const QString &source);
     // Opens the desktop's file chooser for a page: `accepted` is what its input takes (MIME types, or
