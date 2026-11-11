@@ -23,7 +23,31 @@ use crate::pages;
 #[serde(tag = "cmd", content = "args", rename_all = "snake_case")]
 pub enum Request {
     Status {},
-    Connect { server: Option<String> },
+    /// Opens a server (or, without one, the one in use again), signed in as
+    /// it is: with this computer's token if it's paired, by the server's
+    /// own login if not. `without_token` leaves the token out even for a
+    /// paired server (it couldn't be had, or the server refused it), so the
+    /// server's own login shows.
+    Connect {
+        server: Option<String>,
+        #[serde(default)]
+        without_token: bool,
+    },
+    /// Whether an address is a coversync server, and whether this computer
+    /// is paired with it. Changes nothing.
+    Check {
+        server: String,
+    },
+    /// Pairs this computer with a server, with a code from its Add device,
+    /// and opens it.
+    Pair {
+        server: String,
+        code: String,
+    },
+    /// Forgets a server: its token, its cookies and its port.
+    Forget {
+        server: String,
+    },
 }
 
 impl Request {
@@ -75,12 +99,33 @@ mod tests {
         ));
         assert!(matches!(
             read(r#"{"cmd":"connect","args":{"server":null}}"#),
-            Ok(Request::Connect { server: None })
+            Ok(Request::Connect {
+                server: None,
+                without_token: false
+            })
         ));
         assert!(matches!(
             read(r#"{"cmd":"connect","args":{"server":"https://a/"}}"#),
-            Ok(Request::Connect { server: Some(s) }) if s == "https://a/"
+            Ok(Request::Connect { server: Some(s), without_token: false }) if s == "https://a/"
         ));
+        assert!(matches!(
+            read(r#"{"cmd":"connect","args":{"server":"https://a/","without_token":true}}"#),
+            Ok(Request::Connect { server: Some(s), without_token: true }) if s == "https://a/"
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"check","args":{"server":"https://a/"}}"#),
+            Ok(Request::Check { server }) if server == "https://a/"
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"pair","args":{"server":"https://a/","code":"K7QM-4ZTD"}}"#),
+            Ok(Request::Pair { server, code }) if server == "https://a/" && code == "K7QM-4ZTD"
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"forget","args":{"server":"https://a/"}}"#),
+            Ok(Request::Forget { server }) if server == "https://a/"
+        ));
+        // A pairing needs both its parts.
+        assert!(read(r#"{"cmd":"pair","args":{"server":"https://a/"}}"#).is_err());
         assert!(read(r#"{"cmd":"rm","args":{}}"#).is_err());
         assert!(read("").is_err());
     }
@@ -98,5 +143,11 @@ mod tests {
         assert!(!allowed("coversync://other", page));
         // The app's origin, but the window has moved on to a server's page.
         assert!(!allowed("coversync://app", "http://127.0.0.1:40000/"));
+        // The pairing link's address is no page of the app's.
+        assert!(!allowed("coversync://pair", page));
+        assert!(!allowed(
+            "coversync://app",
+            "coversync://pair?server=x&code=y"
+        ));
     }
 }

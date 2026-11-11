@@ -35,9 +35,21 @@ pub struct Config {
     /// or a server's dropped from `ports`. Their origins may still hold that
     /// server's cache, so no other server ever gets them.
     pub retired: Vec<u16>,
+    /// The servers this computer is paired with, by URL: what each calls
+    /// it. The tokens themselves are in the keychain, never here.
+    pub paired: BTreeMap<String, Device>,
     /// The one port the first builds kept, for every server; read once.
     #[serde(skip_serializing)]
     port: Option<u16>,
+}
+
+/// This computer, as a server it's paired with lists it among its devices.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    /// The server's number for it.
+    pub id: i64,
+    /// The name it was given in Add device.
+    pub name: String,
 }
 
 impl Config {
@@ -86,6 +98,19 @@ impl Config {
             .map(|(_, port)| *port)
             .chain(self.retired.iter().copied())
             .collect()
+    }
+
+    /// Forgets `url`'s server: it's no longer the saved one, paired, or
+    /// among those shown, and its port is retired.
+    pub fn forget(&mut self, url: &str) {
+        if self.server.as_deref() == Some(url) {
+            self.server = None;
+        }
+        self.paired.remove(url);
+        self.recent.retain(|server| server != url);
+        if let Some(port) = self.ports.remove(url) {
+            self.retire(port);
+        }
     }
 
     fn retire(&mut self, port: u16) {
@@ -230,6 +255,36 @@ mod tests {
 
     fn server(n: usize) -> String {
         format!("http://server-{n}/")
+    }
+
+    #[test]
+    fn forgets_a_server_whole() {
+        let mut config = Config {
+            server: Some(server(0)),
+            ..Config::default()
+        };
+        config.shown(&server(0), 4000);
+        config.shown(&server(1), 4001);
+        for n in [0, 1] {
+            let device = Device {
+                id: n as i64,
+                name: "Laptop".into(),
+            };
+            config.paired.insert(server(n), device);
+        }
+        config.forget(&server(0));
+        assert_eq!(config.server, None);
+        assert_eq!(config.recent, [server(1)]);
+        assert_eq!(config.ports.keys().collect::<Vec<_>>(), [&server(1)]);
+        assert_eq!(config.paired.keys().collect::<Vec<_>>(), [&server(1)]);
+        assert!(
+            config.taken_except(&server(2)).contains(&4000),
+            "its port goes to no other server"
+        );
+        // One it never knew: nothing changes.
+        let before = serde_json::to_string(&config).unwrap();
+        config.forget(&server(9));
+        assert_eq!(serde_json::to_string(&config).unwrap(), before);
     }
 
     #[test]

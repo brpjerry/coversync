@@ -5,6 +5,11 @@
 //! local, so a server's pages can't load or link to it, and as secure and
 //! CORS-enabled, which module scripts need. The fallback page's commands
 //! travel the same way: a POST to [`BRIDGE`] (see [`crate::bridge`]).
+//!
+//! The scheme has a second use, apart from the window: a pairing link
+//! (`coversync://pair?…`), which the desktop hands to the app as a launch's
+//! argument (see [`coversync_desktop_core::PairLink`]). Nothing is served
+//! there, and no page can open one: only `coversync://app/` has pages.
 
 use std::path::Path;
 
@@ -90,6 +95,13 @@ mod tests {
         assert!(is_app_page("coversync://app/fallback.js"));
         assert!(is_app_page(BRIDGE));
         assert!(!is_app_page("coversync://other/index.html"));
+        // A pairing link is the desktop's to hand over, not a page.
+        let link = "coversync://pair?server=https%3A%2F%2Fa.example%2F&code=K7QM4ZTD";
+        assert!(!is_app_page(link));
+        assert!(!is_app_page("coversync://pair/index.html"));
+        assert!(coversync_desktop_core::PairLink::parse(link).is_some());
+        assert!(coversync_desktop_core::PairLink::parse(FALLBACK).is_none());
+        assert!(coversync_desktop_core::PairLink::parse(BRIDGE).is_none());
         assert!(!is_app_page("http://127.0.0.1:40000/coversync/"));
         assert!(!is_app_page(
             "https://coversync.example.com/coversync://app/"

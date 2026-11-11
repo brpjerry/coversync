@@ -28,6 +28,10 @@ mod tests {
         for refused in [
             "file:///etc/passwd",
             "coversync://app/",
+            // A pairing link: the desktop would hand it back to the app.
+            "coversync://pair?server=https%3A%2F%2Fevil.example%2F&code=K7QM4ZTD",
+            "mailto:someone@example.com",
+            "steam://run/1",
             "javascript:1",
             "about:blank",
             "",

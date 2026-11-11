@@ -291,10 +291,13 @@
 					</button>
 				{/each}
 			</nav>
-			<button class="nav-item sign-out" onclick={signOut}>
-				<span class="icon"><LogOut size={17} strokeWidth={1.8} /></span>
-				Sign out
-			</button>
+			<!-- A desktop app paired with the server is signed in as a device of its own: there's no session to end. -->
+			{#if session.via !== 'token'}
+				<button class="nav-item sign-out" onclick={signOut}>
+					<span class="icon"><LogOut size={17} strokeWidth={1.8} /></span>
+					Sign out
+				</button>
+			{/if}
 		</div>
 	</div>
 </aside>

@@ -401,6 +401,18 @@ void bridge_reply(std::uint64_t id, rust::Slice<const std::uint8_t> body)
     });
 }
 
+void ask(std::uint64_t id, rust::Str message, rust::Str accept, rust::Str cancel)
+{
+    onMainThread([id, message = qstring(message), accept = qstring(accept), cancel = qstring(cancel)] {
+        // The window's QML draws it, and tells the backend the answer. Without a window there is no one to ask.
+        const bool asked = g_window
+            && QMetaObject::invokeMethod(g_window, "askForApp", Q_ARG(QVariant, QString::number(id)), Q_ARG(QVariant, message),
+                                         Q_ARG(QVariant, accept), Q_ARG(QVariant, cancel));
+        if (!asked)
+            answered(id, false);
+    });
+}
+
 void quit()
 {
     const std::lock_guard<std::mutex> lock(g_lock);

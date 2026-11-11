@@ -8,16 +8,20 @@
 //! the window for something: the requests reach it in the order they're
 //! made.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use coversync_desktop_core::bridge::{Commands, Feature, Features, Host};
+use coversync_desktop_core::tokens::Keychain;
 use coversync_desktop_core::{
-    ConfigLock, EarlyLaunches, Problem, Save, Shell, Store, config, server_arg, with_env_server,
+    ConfigLock, EarlyLaunches, PairLink, Problem, Save, Shell, Store, config, server_arg,
+    with_env_server,
 };
-use coversync_proxy::Cookies;
+use coversync_proxy::{AboutApp, Cookies, Upstream};
 use serde::Serialize;
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use url::Url;
 
 use crate::bridge::{self, Reply, Request};
@@ -73,6 +77,8 @@ struct Status {
     server: Option<String>,
     /// Why the server's UI isn't showing.
     problem: Option<Problem>,
+    /// The servers the app keeps something of, which the page can forget.
+    remembered: Vec<String>,
 }
 
 /// What the window opens with.
@@ -87,6 +93,13 @@ pub struct App {
     runtime: Handle,
     shell: Arc<Shell>,
     early: Mutex<EarlyLaunches<Launch>>,
+    /// The pairing link the app was started with, until the window is there
+    /// to ask about it.
+    first_link: Mutex<Option<PairLink>>,
+    /// The questions the window is asking for the app, each waiting for its
+    /// answer.
+    questions: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    next_question: AtomicU64,
     /// Whether the desktop shows notifications: `None` until the window has
     /// found out.
     notifications: watch::Sender<Option<bool>>,
@@ -113,6 +126,7 @@ impl App {
         let config = Store::open(config_dir.clone());
         let saved = config.get();
         let clear_cache = saved.needs_cache_clear();
+        let first_link = PairLink::among(args.iter().skip(1).cloned());
         let server = server_arg(args.into_iter().skip(1))
             .or(env_server)
             .or(saved.server);
@@ -133,7 +147,20 @@ impl App {
                     }
                 }),
             )
-            .with_commands(Arc::new(Commands::new(Arc::new(desktop)))),
+            .with_commands(Arc::new(Commands::new(Arc::new(desktop))))
+            .with_pairing(
+                Arc::new(Keychain::new(APP_ID)),
+                AboutApp {
+                    platform: "linux".to_owned(),
+                    app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    hostname: hostname(),
+                },
+                Arc::new(|refused| {
+                    if let Some(app) = App::get() {
+                        app.token_refused(refused);
+                    }
+                }),
+            ),
         );
         // Straight to the server's UI when there's a server; the fallback
         // page takes over if it can't be reached.
@@ -150,6 +177,9 @@ impl App {
             runtime,
             shell,
             early: Mutex::new(EarlyLaunches::default()),
+            first_link: Mutex::new(first_link),
+            questions: Mutex::new(HashMap::new()),
+            next_question: AtomicU64::new(1),
             notifications,
             _lock: lock,
         };
@@ -192,9 +222,83 @@ impl App {
     /// waited for it.
     pub fn started(&'static self) {
         let waiting = self.early.lock().unwrap().release();
+        if let Some(link) = self.first_link.lock().unwrap().take() {
+            self.pair_from_link(link);
+        }
         for launch in waiting {
             self.launched_again(launch);
         }
+    }
+
+    /// A server refused this computer's token (the device was removed
+    /// there): the token is forgotten, and if the window shows that server,
+    /// the fallback page says so and offers to pair again. Any thread.
+    fn token_refused(&'static self, refused: Upstream) {
+        self.runtime.spawn(async move {
+            // After a pairing or a switch under way, and before the next: a
+            // new pairing's token isn't the one refused, and mustn't be
+            // removed from the keychain along with it.
+            let _navigation = self.shell.navigation.lock().await;
+            if let Some(problem) = self.shell.rejected(refused).await {
+                self.show_fallback(problem);
+            }
+        });
+    }
+
+    /// Asks the user `message` in the window's own dialog, with a button
+    /// saying `accept` and, unless `cancel` is empty, one saying `cancel`.
+    /// `false` also when the window closes before an answer.
+    async fn ask(&self, message: &str, accept: &str, cancel: &str) -> bool {
+        let id = self.next_question.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        self.questions.lock().unwrap().insert(id, answer);
+        qt::ask(id, message, accept, cancel);
+        answered.await.unwrap_or(false)
+    }
+
+    /// The window's answer to a question of [`App::ask`]'s.
+    pub fn answered(&self, id: u64, accepted: bool) {
+        if let Some(answer) = self.questions.lock().unwrap().remove(&id) {
+            let _ = answer.send(accepted);
+        }
+    }
+
+    /// A pairing link was opened (`coversync://pair?server=…&code=…`, from
+    /// the server's Add device): pairs this computer with its server, once
+    /// the user has said so. A link can come from anywhere, so nothing
+    /// happens, and nothing is sent, before that. What goes wrong is said
+    /// in a dialog, and the page the window shows stays.
+    fn pair_from_link(&'static self, link: PairLink) {
+        self.runtime.spawn(async move {
+            // As the app reads the address, which is what it would pair with.
+            let server = match Upstream::parse(&link.server) {
+                Ok(upstream) => upstream.url(),
+                Err(err) => {
+                    tracing::warn!("ignoring a pairing link: {err}");
+                    let message = format!("That pairing link doesn't work.\n\n{err}");
+                    self.ask(&message, "OK", "").await;
+                    return;
+                }
+            };
+            tracing::info!("a pairing link for {server}: asking");
+            let question = format!(
+                "Pair this computer with {server}?\n\nThe app will show that server from now \
+                 on, signed in as a device of its own. Go on only if you made this link \
+                 yourself, in that server's Add device."
+            );
+            if !self.ask(&question, "Pair", "Cancel").await {
+                tracing::info!("not pairing with {server}: declined");
+                return;
+            }
+            let _navigation = self.shell.navigation.lock().await;
+            match self.shell.pair(&server, &link.code).await {
+                Ok(proxy) => qt::load(&proxy.entry_url()),
+                Err(problem) => {
+                    let message = format!("{}\n\n{}", problem.title, problem.message);
+                    self.ask(&message, "OK", "").await;
+                }
+            }
+        });
     }
 
     /// Another launch of the app: brings the window up, and shows the server
@@ -209,6 +313,10 @@ impl App {
             return;
         };
         qt::raise(launch.activation_token.as_deref().unwrap_or_default());
+        // A pairing link is the whole of what its launch asks.
+        if let Some(link) = PairLink::among(launch.args.iter().skip(1).cloned()) {
+            return self.pair_from_link(link);
+        }
         let args = with_env_server(launch.args, launch.env_server);
         let Some(server) = server_arg(args.into_iter().skip(1)) else {
             return;
@@ -251,16 +359,55 @@ impl App {
                     .and_then(|proxy| proxy.upstream())
                     .map(|upstream| upstream.url()),
                 problem: self.shell.problem(),
+                remembered: self.shell.remembered(),
             }),
-            Request::Connect { server } => {
+            Request::Connect {
+                server,
+                without_token,
+            } => {
                 self.runtime.spawn(async move {
                     let _navigation = self.shell.navigation.lock().await;
-                    match self.shell.switch(server, Save::Yes).await {
+                    let switched = match (server, without_token) {
+                        (Some(server), true) => {
+                            self.shell.switch_without_token(server, Save::Yes).await
+                        }
+                        (server, _) => self.shell.switch(server, Save::Yes).await,
+                    };
+                    match switched {
                         Ok(proxy) => {
                             // Under the lock, so a later switch can't open first.
                             qt::load(&proxy.entry_url());
                             reply.ok(());
                         }
+                        Err(problem) => reply.err(problem),
+                    }
+                });
+            }
+            Request::Check { server } => {
+                self.runtime.spawn(async move {
+                    match self.shell.probe(&server).await {
+                        Ok(probe) => reply.ok(probe),
+                        Err(problem) => reply.err(problem),
+                    }
+                });
+            }
+            Request::Pair { server, code } => {
+                self.runtime.spawn(async move {
+                    let _navigation = self.shell.navigation.lock().await;
+                    match self.shell.pair(&server, &code).await {
+                        Ok(proxy) => {
+                            qt::load(&proxy.entry_url());
+                            reply.ok(());
+                        }
+                        Err(problem) => reply.err(problem),
+                    }
+                });
+            }
+            Request::Forget { server } => {
+                self.runtime.spawn(async move {
+                    let _navigation = self.shell.navigation.lock().await;
+                    match self.shell.forget_server(&server).await {
+                        Ok(()) => reply.ok(()),
                         Err(problem) => reply.err(problem),
                     }
                 });
@@ -315,6 +462,14 @@ impl App {
         tracing::error!("{message} (status {status}, exit code {exit_code})");
         self.show_fallback(Problem::new("The page stopped working", message));
     }
+}
+
+/// This computer's name, for the server's list of devices; empty if it has
+/// none to tell.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
