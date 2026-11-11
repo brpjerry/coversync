@@ -1,20 +1,18 @@
 name: Desktop app
 
-# The desktop apps build apart from the workspace, against WebKitGTK, so they
-# have jobs of their own that run only when an app or what they share changes.
-# The shared crates' tests run with the workspace's, in CI.
+# The desktop app builds apart from the workspace, against Qt, so it has a job
+# of its own that runs only when the app or the crates it uses change. Those
+# crates' tests run with the workspace's, in CI.
 on:
   push:
     branches: [main]
     paths:
-      - apps/desktop/**
       - apps/desktop-linux/**
       - crates/coversync-desktop-core/**
       - crates/coversync-proxy/**
       - .github/workflows/desktop.yml
   pull_request:
     paths:
-      - apps/desktop/**
       - apps/desktop-linux/**
       - crates/coversync-desktop-core/**
       - crates/coversync-proxy/**
@@ -28,84 +26,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  linux-gtk4:
-    name: Linux app (GTK 4)
+  linux-qt:
+    name: Linux app (Qt 6)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/desktop-linux
+    # The app needs Qt 6.9 or later with Qt WebEngine; Ubuntu 24.04 has
+    # 6.4. Arch Linux has the current one, and Rust with Clippy and rustfmt.
+    container: archlinux:latest
     steps:
-      - uses: actions/checkout@v7
-      # GTK 4.14 (GtkGraphicsOffload) and WebKitGTK 6.0 2.44, which Ubuntu
-      # 24.04 has.
-      - name: Install GTK 4 and WebKitGTK 6.0
+      - name: Install Qt 6 and Rust
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust qt6-base qt6-declarative qt6-webengine
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop-linux
       - name: rustfmt
+        working-directory: apps/desktop-linux
         run: cargo fmt --check
       - name: Clippy
+        working-directory: apps/desktop-linux
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
+        working-directory: apps/desktop-linux
         run: cargo test --locked
       - name: Build
+        working-directory: apps/desktop-linux
         run: cargo build --locked --release
-
-  # The Windows app (Tauri), built on Linux, where it still runs.
-  linux:
-    name: Linux build
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/desktop
-    steps:
-      - uses: actions/checkout@v7
-      # What Tauri 2 needs on Linux: WebKitGTK 4.1 (with GTK 3 and
-      # JavaScriptCore), libsoup 3, and librsvg for icons.
-      - name: Install WebKitGTK
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: apps/desktop/src-tauri
-
-      - name: Install the Tauri CLI
-        run: pnpm install --frozen-lockfile
-      # The fallback page's copy of @tauri-apps/api must match the locked one.
-      - name: Check ui/vendor
-        run: |
-          pnpm vendor
-          git diff --exit-code -- ui/vendor
-          test -z "$(git status --porcelain -- ui/vendor)"
-      - name: rustfmt
-        working-directory: apps/desktop/src-tauri
-        run: cargo fmt --check
-      - name: Clippy
-        working-directory: apps/desktop/src-tauri
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Tests
-        working-directory: apps/desktop/src-tauri
-        run: cargo test --locked
-      # The app's binary, without installers (DSK-07 adds those).
-      - name: Build
-        run: pnpm tauri build --debug --no-bundle --ci -- --locked

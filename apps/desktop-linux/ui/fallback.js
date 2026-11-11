@@ -2,7 +2,7 @@
 // the page crashed. Once a server answers, the app moves the window on to
 // its UI.
 
-// The app's commands, through Tauri's IPC or the Linux app's bridge (see bridge.js).
+// The app's commands (see bridge.js).
 import { invoke } from './bridge.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,7 +22,7 @@ const busy = $('busy');
 let current = null;
 
 /**
- * `status` is the app's `Status` (each app's main.rs), and `problem` its `Problem`
+ * `status` is the app's `Status` (../src/app.rs), and `problem` its `Problem`
  * (crates/coversync-desktop-core/src/shell.rs): the one the page opened with, or the last
  * attempt's. A problem
  * names the address it's about, which goes in the field: a refused new address, not the

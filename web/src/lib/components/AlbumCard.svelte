@@ -19,8 +19,19 @@
 		/** Shown as a warning badge, e.g. "Genre" or "3 missing", with `flagTitle` as tooltip. */
 		flag?: string | null;
 		flagTitle?: string;
+		/** The grid is scrolling: a cover that arrives meanwhile shows at once, without fading in. */
+		scrolling?: boolean;
 	}
-	let { album, width, onopen, onplay, onmenu, flag = null, flagTitle }: Props = $props();
+	let {
+		album,
+		width,
+		onopen,
+		onplay,
+		onmenu,
+		flag = null,
+		flagTitle,
+		scrolling = false
+	}: Props = $props();
 
 	function menuKey(e: KeyboardEvent) {
 		if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
@@ -73,7 +84,14 @@
 					alt=""
 					loading="lazy"
 					decoding="async"
-					onload={() => (loaded = true)}
+					onload={() => {
+						// A cover that fades in is drawn on a layer of its own until it has. A row of
+						// them arriving while the grid scrolls cost frames: in the desktop app, fast
+						// two-finger scrolls had 20-30 late frames in about 830 with the fade and 1
+						// without. It isn't seen fading at that speed anyway.
+						if (scrolling) cached = true;
+						loaded = true;
+					}}
 					onerror={() => (failed = true)}
 					{@attach (img: HTMLImageElement) => {
 						// Cards are rebuilt as the grid scrolls; covers already in the
@@ -155,7 +173,7 @@
 		object-fit: cover;
 		display: block;
 		/* The tint .cover already shows, under an opaque cover: no visible change.
-		   In WebKitGTK (the Linux desktop app), a background keeps a cover that's
+		   In WebKitGTK (the Linux desktop app then), a background keeps a cover that's
 		   fading in from becoming a layer holding just the image, which WebKit
 		   decodes on the page's main thread and uploads on the thread that
 		   composites each frame. With it, covers decode on WebKit's decoding

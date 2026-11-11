@@ -138,6 +138,7 @@
 				{onmenu}
 				flag={f?.text}
 				flagTitle={f?.title}
+				{scrolling}
 			/>
 		</div>
 	{/each}
@@ -160,7 +161,7 @@
 	}
 	/* A touchpad scroll leaves the pointer where it is, so every card passing under it would
 	   start and end its hover effects: a lift, the play button, and a big blurred shadow that
-	   WebKit (the Linux desktop app) repaints every frame of its transition. In the app, drags
+	   WebKit (the Linux desktop app then) repaints every frame of its transition. In it, drags
 	   over the grid went from 81-95 frames a second on a 120 Hz display to 104-113 without
 	   them; Firefox held 120 either way. */
 	.scrolling {

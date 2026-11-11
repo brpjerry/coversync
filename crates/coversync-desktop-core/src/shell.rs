@@ -523,11 +523,7 @@ mod tests {
                 .shell
                 .is_proxied(&page(&format!("{}/coversync/", proxy.origin())))
         );
-        for bundled in [
-            "coversync://app/index.html",
-            "tauri://localhost/index.html",
-            "http://tauri.localhost/index.html",
-        ] {
+        for bundled in ["coversync://app/index.html", "coversync://app/fallback.js"] {
             assert!(!fixture.shell.is_proxied(&page(bundled)), "{bundled}");
         }
         let other_port = page(&format!("http://127.0.0.1:{}/", proxy.addr().port() ^ 1));

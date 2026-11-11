@@ -691,7 +691,7 @@ export const streamUrl = (trackId: number) => `${BASE}/api/tracks/${trackId}/str
 let address: Promise<string> | undefined;
 /**
  * The address other devices reach coversync at: this page's own, with its
- * path prefix. In the desktop apps the page comes from a proxy on 127.0.0.1,
+ * path prefix. In the desktop app the page comes from a proxy on 127.0.0.1,
  * which names the server it stands for in a `Coversync-Server` header. Fails
  * when `/api/hello` can't be read (the proxy's 502 while the server is down,
  * say), and is asked again next time.

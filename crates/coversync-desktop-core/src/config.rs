@@ -180,7 +180,7 @@ impl Store {
 /// A lock on the config directory for the whole run: `config.json` and
 /// `cookies.json` are each written whole by one process. The app's
 /// single-instance handover usually keeps a second process out, but not
-/// without a D-Bus session bus, or with another one.
+/// where it can't work (no socket to hand a launch over).
 pub struct ConfigLock(#[allow(dead_code)] Option<File>);
 
 impl ConfigLock {
