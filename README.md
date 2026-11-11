@@ -500,8 +500,8 @@ round. The proxy answers that path itself and never forwards it
 `crates/coversync-desktop-core/src/bridge.rs`), and coversyncd serves nothing
 there. Only a page of the server's own UI can ask: a request needs the
 proxy's cookie, `Sec-Fetch-Site: same-origin`, the proxy's own `Origin` and a
-JSON body, so a page from elsewhere, a frame, or another server's page in the
-same window is refused. The commands are safe for any script on the page:
+JSON body, so a page from elsewhere, a frame of another origin or of none, or
+another server's page in the same window is refused. The commands are safe for any script on the page:
 none takes a file's path, gives out a sign-in, or changes the server the app
 uses. In a browser there is no such header, and the UI never asks.
 

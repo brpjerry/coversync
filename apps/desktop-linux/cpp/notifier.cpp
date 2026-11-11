@@ -169,7 +169,7 @@ void Notifier::showOnDesktop(const QString &key)
     const QPointer<QWebEngineNotification> notification = shown.notification;
     whenAnswered<QDBusPendingReply<uint>>(notify, this, [this, key, notification](const QDBusPendingReply<uint> &reply) {
         if (reply.isError()) {
-            std::fprintf(stderr, "coversync: couldn't show a notification: %s\n", qUtf8Printable(reply.error().message()));
+            failed(key, notification, reply.error().message());
             return;
         }
         const auto it = m_shown.find(key);
@@ -197,10 +197,23 @@ void Notifier::showInPortal(const QString &key)
     notification.insert(QStringLiteral("default-action"), kPortalDefault);
     QDBusMessage add = QDBusMessage::createMethodCall(kPortal, kPortalPath, kPortalNotification, QStringLiteral("AddNotification"));
     add << key << notification;
-    whenAnswered<QDBusPendingReply<>>(add, this, [](const QDBusPendingReply<> &reply) {
+    const QPointer<QWebEngineNotification> page = shown.notification;
+    whenAnswered<QDBusPendingReply<>>(add, this, [this, key, page](const QDBusPendingReply<> &reply) {
         if (reply.isError())
-            std::fprintf(stderr, "coversync: couldn't show a notification: %s\n", qUtf8Printable(reply.error().message()));
+            failed(key, page, reply.error().message());
     });
+}
+
+// The desktop didn't take `notification`: nothing will ever be heard of it from there, so it's let go of now, and
+// the page told that it's closed. Unless another has taken its place meanwhile, which stays.
+void Notifier::failed(const QString &key, QWebEngineNotification *notification, const QString &why)
+{
+    std::fprintf(stderr, "coversync: couldn't show a notification: %s\n", qUtf8Printable(why));
+    if (!notification || m_shown.value(key).notification != notification)
+        return;
+    notification->disconnect(this);
+    withdraw(key);
+    dismiss(notification);
 }
 
 // Takes a notification off the screen and forgets it.
