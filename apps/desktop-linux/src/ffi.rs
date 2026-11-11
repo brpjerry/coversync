@@ -114,6 +114,12 @@ pub mod qt {
         /// Answers the fallback page's command `id` with `body` (JSON).
         fn bridge_reply(id: u64, body: &[u8]);
 
+        /// Asks the user something over the page, in the window's own
+        /// dialog: `message`, with a button that says `accept` and, unless
+        /// `cancel` is empty, one that says `cancel`. `answered(id, …)`
+        /// follows.
+        fn ask(id: u64, message: &str, accept: &str, cancel: &str);
+
         /// Closes the window, which ends [`run`].
         fn quit();
     }
@@ -145,6 +151,10 @@ pub mod qt {
 
         /// The first page is on its way.
         fn started();
+
+        /// The user answered the question `id` (see `ask`): with its accept
+        /// button, or not.
+        fn answered(id: u64, accepted: bool);
 
         /// Whether the page at `origin` may show notifications: asked when
         /// it asks for the permission.
@@ -221,6 +231,12 @@ fn cache_cleared(cleared: bool) {
 fn started() {
     if let Some(app) = App::get() {
         app.started();
+    }
+}
+
+fn answered(id: u64, accepted: bool) {
+    if let Some(app) = App::get() {
+        app.answered(id, accepted);
     }
 }
 

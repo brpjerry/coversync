@@ -14,4 +14,5 @@ void show_error(rust::Str appId, rust::Str message);
 void load(rust::Str url);
 void raise(rust::Str activationToken);
 void bridge_reply(std::uint64_t id, rust::Slice<const std::uint8_t> body);
+void ask(std::uint64_t id, rust::Str message, rust::Str accept, rust::Str cancel);
 void quit();

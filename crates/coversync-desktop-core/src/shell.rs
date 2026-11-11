@@ -7,17 +7,26 @@
 //! another server's. The proxies share one cookie jar, which keeps each
 //! server's cookies apart, and the app's commands for the servers' pages
 //! ([`crate::bridge`]).
+//!
+//! A server the app has paired with gets the app's token with every request
+//! ([`Shell::pair`]), from the keychain ([`crate::tokens`]). One it hasn't is
+//! used as in a browser, with the server's own login.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use coversync_proxy::{AppCommands, Cookies, Proxy, Unreachable, Upstream, UpstreamError};
+use coversync_proxy::{
+    AboutApp, AppCommands, Cookies, PairError, Proxy, Unreachable, Upstream, UpstreamError,
+};
 use serde::Serialize;
 use url::Url;
 
-use crate::config::Store;
+use crate::config::{Device, Store};
+use crate::tokens::Tokens;
 
 pub type UnreachableHandler = Arc<dyn Fn(Unreachable) + Send + Sync>;
+/// Hears of a server that refused the app's token: see [`Shell::rejected`].
+pub type RejectedHandler = Arc<dyn Fn(Upstream) + Send + Sync>;
 
 pub struct Shell {
     pub config: Store,
@@ -27,6 +36,9 @@ pub struct Shell {
     on_unreachable: UnreachableHandler,
     /// What the servers' pages may ask of the app, through their proxies.
     commands: Option<Arc<dyn AppCommands>>,
+    /// Where the servers' tokens are kept, and what the app says of itself
+    /// as it pairs. Without them the app can't pair.
+    pairing: Option<Pairing>,
     /// A proxy for each server used in this run, by its URL.
     proxies: Mutex<HashMap<String, Proxy>>,
     /// The server the window shows. A proxy's report reaches the window only
@@ -40,6 +52,21 @@ pub struct Shell {
     pub navigation: tokio::sync::Mutex<()>,
 }
 
+struct Pairing {
+    tokens: Arc<dyn Tokens>,
+    about: AboutApp,
+    on_rejected: RejectedHandler,
+}
+
+/// An address that passed the check: a coversync server the app can use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Probe {
+    /// Its URL, as the app writes it.
+    pub server: String,
+    /// Whether this computer is paired with it already.
+    pub paired: bool,
+}
+
 /// Something that went wrong, as the fallback page shows it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Problem {
@@ -49,6 +76,9 @@ pub struct Problem {
     pub detail: Option<String>,
     /// The address it's about: the page shows it, and puts it in the field.
     pub server: Option<String>,
+    /// The way on is to pair this computer with `server`: the page offers
+    /// that right away.
+    pub pair: bool,
 }
 
 impl Problem {
@@ -58,6 +88,7 @@ impl Problem {
             message: message.into(),
             detail: None,
             server: None,
+            pair: false,
         }
     }
 
@@ -74,6 +105,40 @@ impl Problem {
             server: Some(address.to_owned()),
             ..Self::new("That address won't work", err.to_string())
         }
+    }
+
+    /// About `server`, the address it concerns.
+    fn about(self, server: &Upstream) -> Self {
+        Self {
+            server: Some(server.url()),
+            ..self
+        }
+    }
+
+    fn no_proxy(err: std::io::Error, server: &Upstream) -> Self {
+        Self::new("Couldn't start the app's proxy", err.to_string()).about(server)
+    }
+
+    fn pairing(err: PairError) -> Self {
+        Self {
+            detail: err.detail,
+            ..Self::new("Couldn't pair with the server", err.message)
+        }
+    }
+
+    /// The server took this computer off its list of devices (or its
+    /// token stopped working some other way).
+    pub fn removed(server: &Upstream) -> Self {
+        Self {
+            pair: true,
+            ..Self::new(
+                "This computer was removed from the server",
+                "The server no longer takes this computer's token. Pair it again with a \
+                 code from Add device (to keep its settings there, choose Replace an \
+                 existing device), or sign in with the server's password.",
+            )
+        }
+        .about(server)
     }
 }
 
@@ -98,6 +163,7 @@ impl Shell {
             fallback,
             on_unreachable,
             commands: None,
+            pairing: None,
             proxies: Mutex::new(HashMap::new()),
             current: Arc::new(Mutex::new(None)),
             problem: Mutex::new(None),
@@ -109,6 +175,24 @@ impl Shell {
     /// now on answers them (see [`crate::bridge::Commands`]).
     pub fn with_commands(mut self, commands: Arc<dyn AppCommands>) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    /// Lets the app pair with servers: their tokens are kept in `tokens`,
+    /// `about` is what a server is told of the app, and `on_rejected` hears
+    /// when a server refuses a token it gave (it should call
+    /// [`Shell::rejected`]).
+    pub fn with_pairing(
+        mut self,
+        tokens: Arc<dyn Tokens>,
+        about: AboutApp,
+        on_rejected: RejectedHandler,
+    ) -> Self {
+        self.pairing = Some(Pairing {
+            tokens,
+            about,
+            on_rejected,
+        });
         self
     }
 
@@ -138,6 +222,10 @@ impl Shell {
         let mut builder = Proxy::builder();
         if let Some(commands) = &self.commands {
             builder = builder.app_commands(commands.clone());
+        }
+        if let Some(pairing) = &self.pairing {
+            let on_rejected = pairing.on_rejected.clone();
+            builder = builder.on_rejected(move |upstream| on_rejected(upstream));
         }
         let proxy = builder
             .upstream(Some(upstream.clone()))
@@ -206,6 +294,7 @@ impl Shell {
     pub async fn open(&self, server: &str) -> Result<Proxy, Problem> {
         let result = async {
             let upstream = Upstream::parse(server).map_err(|err| Problem::invalid(err, server))?;
+            let upstream = self.with_token(upstream).await?;
             let proxy = self.started_proxy(&upstream).await?;
             self.show(proxy.clone());
             self.set_problem(None);
@@ -231,11 +320,261 @@ impl Shell {
                 .is_some_and(|shown| shown.url() == asked.url())
     }
 
-    /// [`Shell::proxy_for`], with a failure to start it as the page's problem.
+    /// [`Shell::proxy_for`], with a failure to start it as the page's
+    /// problem. The proxy sends `upstream`'s token from now on, or none if
+    /// it has none.
     async fn started_proxy(&self, upstream: &Upstream) -> Result<Proxy, Problem> {
-        self.proxy_for(upstream).await.map_err(|err| Problem {
-            server: Some(upstream.url()),
-            ..Problem::new("Couldn't start the app's proxy", err.to_string())
+        let proxy = self
+            .proxy_for(upstream)
+            .await
+            .map_err(|err| Problem::no_proxy(err, upstream))?;
+        if proxy.upstream().as_ref() != Some(upstream) {
+            proxy.set_upstream(Some(upstream.clone()));
+        }
+        Ok(proxy)
+    }
+
+    /// `upstream` with this computer's token for it, if it's paired with
+    /// that server. A pairing whose token the keychain no longer has (a new
+    /// keychain, say) is forgotten: the server's own login shows, and the
+    /// computer can be paired again.
+    async fn with_token(&self, upstream: Upstream) -> Result<Upstream, Problem> {
+        let url = upstream.url();
+        let Some(pairing) = &self.pairing else {
+            return Ok(upstream);
+        };
+        if !self.config.get().paired.contains_key(&url) {
+            return Ok(upstream);
+        }
+        let token = pairing.tokens.load(&url).await.map_err(|why| {
+            Problem::new("Can't get this computer's token for the server", why).about(&upstream)
+        })?;
+        match token {
+            Some(token) => Ok(upstream.with_authorization(Some(token.authorization()))),
+            None => {
+                tracing::warn!("the keychain has no token for {url}: no longer paired with it");
+                self.unpair(&url);
+                Ok(upstream)
+            }
+        }
+    }
+
+    /// Takes `url`'s server off the list of those this computer is paired
+    /// with.
+    fn unpair(&self, url: &str) {
+        if let Err(err) = self.config.update(|config| config.paired.remove(url)) {
+            tracing::warn!("couldn't save the settings: {err}");
+        }
+    }
+
+    /// Whether `server` is a coversync server the app can use, and whether
+    /// this computer is paired with it. Nothing changes: the window goes on
+    /// showing what it shows. A refused address's cookies (the check may
+    /// have stored some) are forgotten.
+    pub async fn probe(&self, server: &str) -> Result<Probe, Problem> {
+        let result = async {
+            let upstream = Upstream::parse(server).map_err(|err| Problem::invalid(err, server))?;
+            self.checked(&upstream).await?;
+            let url = upstream.url();
+            Ok(Probe {
+                paired: self.config.get().paired.contains_key(&url),
+                server: url,
+            })
+        }
+        .await;
+        if let Err(problem) = &result {
+            log_refusal(Some(server), problem);
+        }
+        result
+    }
+
+    /// The proxy for `upstream`, once its server has answered as coversync.
+    /// The proxy is left as it is: one that sends a token goes on sending
+    /// it while the address is only looked at.
+    async fn checked(&self, upstream: &Upstream) -> Result<Proxy, Problem> {
+        let proxy = self
+            .proxy_for(upstream)
+            .await
+            .map_err(|err| Problem::no_proxy(err, upstream))?;
+        if let Err(unreachable) = proxy.check(upstream).await {
+            self.forget(&[upstream.url()]);
+            return Err(Problem::unreachable(unreachable));
+        }
+        Ok(proxy)
+    }
+
+    /// Pairs this computer with `server`, using a code from its Add device:
+    /// the token it gets goes to the keychain and, from then on, with every
+    /// request to that server. The server is shown and saved, as after
+    /// [`Shell::switch`]. Nothing is changed unless all of it worked.
+    pub async fn pair(&self, server: &str, code: &str) -> Result<Proxy, Problem> {
+        let result = self.try_pair(server, code).await;
+        if let Err(problem) = &result {
+            log_refusal(Some(server), problem);
+        }
+        result
+    }
+
+    async fn try_pair(&self, server: &str, code: &str) -> Result<Proxy, Problem> {
+        let upstream = Upstream::parse(server).map_err(|err| Problem::invalid(err, server))?;
+        let url = upstream.url();
+        let Some(pairing) = &self.pairing else {
+            return Err(
+                Problem::new("Couldn't pair with the server", "This app can't pair.")
+                    .about(&upstream),
+            );
+        };
+        let code = code.trim();
+        if code.is_empty() || code.len() > MAX_CODE || !code.chars().all(is_code_char) {
+            return Err(Problem::new(
+                "That isn't a pairing code",
+                "A pairing code has 8 letters and digits, like K7QM-4ZTD. Add device, in the \
+                 server's Sync setup, makes one.",
+            )
+            .about(&upstream));
+        }
+        let proxy = self.checked(&upstream).await?;
+        // Before the code is spent: it works once.
+        pairing.tokens.ready().await.map_err(|why| {
+            Problem::new("Can't keep a token on this computer", why).about(&upstream)
+        })?;
+        let paired = proxy
+            .pair(&upstream, code, &pairing.about)
+            .await
+            .map_err(|err| Problem::pairing(err).about(&upstream))?;
+        let listed = if paired.name.is_empty() {
+            "the device this code added".to_owned()
+        } else {
+            format!("“{}”", paired.name)
+        };
+        if !paired.manages {
+            return Err(Problem::new(
+                "That code is for syncing only",
+                format!(
+                    "The app needs a code made for Management and sync, to show the \
+                     library. Make one in Add device, and remove {listed} from the \
+                     server's devices."
+                ),
+            )
+            .about(&upstream));
+        }
+        pairing
+            .tokens
+            .save(&url, &paired.token)
+            .await
+            .map_err(|why| {
+                Problem {
+                    detail: Some(why),
+                    ..Problem::new(
+                        "Paired, but couldn't keep the token",
+                        format!(
+                            "The keychain didn't take this computer's token, so it's lost. \
+                             Remove {listed} from the server's devices, and pair again."
+                        ),
+                    )
+                }
+                .about(&upstream)
+            })?;
+        let device = Device {
+            id: paired.device_id,
+            name: paired.name,
+        };
+        if let Err(err) = self.config.update(|config| {
+            config.paired.insert(url.clone(), device);
+            config.server = Some(url.clone());
+        }) {
+            tracing::warn!("couldn't save the pairing: {err}");
+        }
+        proxy.set_upstream(Some(
+            upstream.with_authorization(Some(paired.token.authorization())),
+        ));
+        self.show(proxy.clone());
+        self.set_problem(None);
+        tracing::info!("paired with {url}");
+        Ok(proxy)
+    }
+
+    /// A server refused the app's token (`refused` is the server as the
+    /// request went to it): the device was removed there. The token is
+    /// forgotten, and the server is used without one from now on. Returns
+    /// the problem to show if the window shows that server; `None` if it
+    /// shows another, or the token refused wasn't the one in use any more
+    /// (an answer that came late, after pairing again).
+    pub async fn rejected(&self, refused: Upstream) -> Option<Problem> {
+        let url = refused.url();
+        let proxy = self
+            .proxies
+            .lock()
+            .expect("proxies lock")
+            .get(&url)
+            .cloned()?;
+        let now = proxy.upstream()?;
+        if now.authorization().is_none() || now.authorization() != refused.authorization() {
+            return None;
+        }
+        proxy.set_upstream(Some(now.clone().with_authorization(None)));
+        self.unpair(&url);
+        if let Some(pairing) = &self.pairing
+            && let Err(why) = pairing.tokens.forget(&url).await
+        {
+            tracing::warn!("couldn't remove {url}'s token from the keychain: {why}");
+        }
+        let shown = self
+            .current()
+            .and_then(|proxy| proxy.upstream())
+            .is_some_and(|shown| shown.url() == url);
+        shown.then(|| {
+            let problem = Problem::removed(&now);
+            self.set_problem(Some(problem.clone()));
+            problem
+        })
+    }
+
+    /// Forgets `server`: its token leaves the keychain, and its cookies,
+    /// its port and its place as the saved server go. If the window shows
+    /// it, it shows no server from now on. Everything that can be removed
+    /// is, even if the keychain can't be reached; that is then the error.
+    pub async fn forget_server(&self, server: &str) -> Result<(), Problem> {
+        let upstream = Upstream::parse(server).map_err(|err| Problem::invalid(err, server))?;
+        let url = upstream.url();
+        let token = match &self.pairing {
+            Some(pairing) => pairing.tokens.forget(&url).await,
+            None => Ok(()),
+        };
+        if let Err(err) = self.config.update(|config| config.forget(&url)) {
+            tracing::warn!("couldn't save the settings: {err}");
+        }
+        self.forget(std::slice::from_ref(&url));
+        if let Some(proxy) = self.proxies.lock().expect("proxies lock").remove(&url) {
+            proxy.set_upstream(None);
+        }
+        let mut current = self.current.lock().expect("current lock");
+        let shown = current
+            .as_ref()
+            .and_then(Proxy::upstream)
+            .is_none_or(|shown| shown.url() == url);
+        if shown {
+            *current = None;
+        }
+        drop(current);
+        // What was wrong with it goes with it.
+        let about_it = self
+            .problem()
+            .is_some_and(|problem| shown || problem.server.as_deref() == Some(url.as_str()));
+        if about_it {
+            self.set_problem(None);
+        }
+        tracing::info!("forgot {url}");
+        token.map_err(|why| {
+            Problem {
+                detail: Some(why),
+                ..Problem::new(
+                    "Forgotten, except in the keychain",
+                    "This computer's token for the server couldn't be removed from the \
+                     keychain. It can be deleted there by hand.",
+                )
+            }
+            .about(&upstream)
         })
     }
 
@@ -256,10 +595,10 @@ impl Shell {
 
     async fn try_switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
         let (upstream, new) = match server {
-            Some(url) => (
-                Upstream::parse(&url).map_err(|err| Problem::invalid(err, &url))?,
-                true,
-            ),
+            Some(url) => {
+                let upstream = Upstream::parse(&url).map_err(|err| Problem::invalid(err, &url))?;
+                (self.with_token(upstream).await?, true)
+            }
             None => match self.current().and_then(|proxy| proxy.upstream()) {
                 Some(upstream) => (upstream, false),
                 None => return Err(Problem::new("No server is set", "Enter its address.")),
@@ -298,6 +637,16 @@ impl Shell {
                 Url::parse(proxy.origin()).is_ok_and(|origin| origin.origin() == page.origin())
             })
     }
+}
+
+/// More than a pairing code comes to, however it's written.
+const MAX_CODE: usize = 32;
+
+/// What a pairing code is written with: the server reads it leniently
+/// (`k7qm 4ztd`, `K7QM-4ZTD`), so only what could never be one is refused
+/// here.
+fn is_code_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == ' '
 }
 
 fn log_refusal(address: Option<&str>, problem: &Problem) {
@@ -671,6 +1020,559 @@ mod tests {
             ],
             "",
         );
+    }
+
+    /// What a pairing server saw of a request.
+    #[derive(Clone, Debug)]
+    struct Asked {
+        path: String,
+        authorization: Option<String>,
+        body: String,
+    }
+
+    /// A coversync server with pairing: `/api/pair` gives the code
+    /// `K7QM4ZTD` the token `cst_first` (and `K7QM-4ZTD`, written the long
+    /// way, `cst_second`), `SYNC0NLY` a sync-only one, and refuses any
+    /// other; `/api/hello` is open; everything else wants a token it gave
+    /// and hasn't revoked, or none at all (as if signed in by cookie).
+    struct PairingServer {
+        addr: SocketAddr,
+        asked: Arc<Mutex<Vec<Asked>>>,
+        revoked: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PairingServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let asked: Arc<Mutex<Vec<Asked>>> = Arc::default();
+            let revoked: Arc<Mutex<Vec<String>>> = Arc::default();
+            let (log, gone) = (asked.clone(), revoked.clone());
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let Some(request) = read_request(&mut stream) else {
+                        continue;
+                    };
+                    log.lock().unwrap().push(request.clone());
+                    let (status, body) = answer(&request, &gone.lock().unwrap());
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                         Set-Cookie: session=1; Path=/; Max-Age=3600\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes());
+                }
+            });
+            Self {
+                addr,
+                asked,
+                revoked,
+            }
+        }
+
+        fn url(&self) -> String {
+            url(self.addr)
+        }
+
+        fn asked(&self, path: &str) -> Vec<Asked> {
+            let asked = self.asked.lock().unwrap();
+            asked.iter().filter(|a| a.path == path).cloned().collect()
+        }
+
+        fn revoke(&self, token: &str) {
+            self.revoked.lock().unwrap().push(token.to_owned());
+        }
+    }
+
+    /// Reads one request whole: its head, then as much body as it says.
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<Asked> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let (head_end, length) = loop {
+            let read = stream.read(&mut chunk).ok().filter(|read| *read > 0)?;
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                let length = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (end + 4, length);
+            }
+        };
+        while bytes.len() < head_end + length {
+            let read = stream.read(&mut chunk).ok().filter(|read| *read > 0)?;
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+        let header = |wanted: &str| {
+            head.lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                .map(|(_, value)| value.trim().to_owned())
+        };
+        Some(Asked {
+            path: head.split(' ').nth(1).unwrap_or("/").to_owned(),
+            authorization: header("authorization"),
+            body: String::from_utf8_lossy(&bytes[head_end..]).into_owned(),
+        })
+    }
+
+    fn answer(request: &Asked, revoked: &[String]) -> (&'static str, String) {
+        let hello = r#"{"app":"coversync","name":"test","version":"0.1.0","api":["1"]}"#;
+        let paired = |token: &str, scope: &str| {
+            (
+                "200 OK",
+                format!(r#"{{"device_id":7,"token":"{token}","name":"Laptop","scope":"{scope}"}}"#),
+            )
+        };
+        match request.path.as_str() {
+            "/api/hello" => ("200 OK", hello.to_owned()),
+            "/api/pair" => {
+                let sent: serde_json::Value =
+                    serde_json::from_str(&request.body).unwrap_or_default();
+                match sent["code"].as_str() {
+                    Some("K7QM4ZTD") => paired("cst_first", "manage"),
+                    Some("K7QM-4ZTD") => paired("cst_second", "manage"),
+                    Some("SYNC0NLY") => paired("cst_sync", "sync"),
+                    _ => (
+                        "400 Bad Request",
+                        r#"{"error":"That pairing code isn't right.","code":"wrong_code"}"#
+                            .to_owned(),
+                    ),
+                }
+            }
+            _ => match &request.authorization {
+                Some(sent)
+                    if !sent.starts_with("Bearer cst_")
+                        || revoked.iter().any(|token| sent.ends_with(token.as_str())) =>
+                {
+                    (
+                        "401 Unauthorized",
+                        r#"{"error":"This app's token isn't valid; pair it again.","code":"invalid_token"}"#
+                            .to_owned(),
+                    )
+                }
+                _ => ("200 OK", hello.to_owned()),
+            },
+        }
+    }
+
+    /// A fixture whose shell can pair, with its keychain and what its
+    /// proxies reported as refused.
+    struct Pairing {
+        fixture: Fixture,
+        tokens: Arc<crate::tokens::Memory>,
+        refused: Arc<Mutex<Vec<Upstream>>>,
+    }
+
+    impl Pairing {
+        fn new(name: &str) -> Self {
+            let tokens = Arc::new(crate::tokens::Memory::default());
+            let refused: Arc<Mutex<Vec<Upstream>>> = Arc::default();
+            let mut fixture = Fixture::new(name, server("200 OK"));
+            fixture.shell = Self::shell(&fixture.dir, &tokens, &refused);
+            Self {
+                fixture,
+                tokens,
+                refused,
+            }
+        }
+
+        /// A shell over the settings in `dir`, as after a restart.
+        fn shell(
+            dir: &std::path::Path,
+            tokens: &Arc<crate::tokens::Memory>,
+            refused: &Arc<Mutex<Vec<Upstream>>>,
+        ) -> Shell {
+            let refused = refused.clone();
+            Shell::new(
+                Store::open(dir.join("pairing")),
+                Cookies::default(),
+                Url::parse("coversync://app/index.html").unwrap(),
+                Arc::new(|_| {}),
+            )
+            .with_pairing(
+                tokens.clone(),
+                AboutApp {
+                    platform: "linux".into(),
+                    app_version: "0.1.0".into(),
+                    hostname: "thinkpad".into(),
+                },
+                Arc::new(move |upstream| refused.lock().unwrap().push(upstream)),
+            )
+        }
+
+        fn restarted(&self) -> Shell {
+            Self::shell(&self.fixture.dir, &self.tokens, &self.refused)
+        }
+
+        fn settings(&self) -> crate::config::Config {
+            Store::open(self.fixture.dir.join("pairing")).get()
+        }
+
+        fn settings_text(&self) -> String {
+            std::fs::read_to_string(self.fixture.dir.join("pairing").join("config.json"))
+                .unwrap_or_default()
+        }
+    }
+
+    /// Asks for `path` through `proxy`, as a page of its UI would, and
+    /// returns the answer's first line.
+    fn fetch(proxy: &Proxy, path: &str) -> String {
+        let cookie = enter(proxy);
+        let answer = send(
+            proxy,
+            &[
+                format!("GET {path} HTTP/1.1"),
+                format!("Host: {}", proxy.addr()),
+                format!("Cookie: {cookie}"),
+                "Connection: close".to_owned(),
+            ],
+            "",
+        );
+        answer.lines().next().unwrap_or_default().to_owned()
+    }
+
+    fn token_of(proxy: &Proxy) -> Option<String> {
+        let upstream = proxy.upstream()?;
+        let header = upstream.authorization()?.to_str().ok()?.to_owned();
+        Some(header.trim_start_matches("Bearer ").to_owned())
+    }
+
+    #[test]
+    fn pairing_gets_a_token_keeps_it_in_the_keychain_and_sends_it() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair");
+        let shell = &pairing.fixture.shell;
+
+        assert_eq!(
+            block(shell.probe(&server.url())).unwrap(),
+            Probe {
+                server: server.url(),
+                paired: false
+            }
+        );
+        let proxy = block(shell.pair(&server.url(), " K7QM4ZTD ")).unwrap();
+
+        // The server heard the code, and of this computer.
+        let sent: serde_json::Value =
+            serde_json::from_str(&server.asked("/api/pair")[0].body).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "code": "K7QM4ZTD", "platform": "linux", "app_version": "0.1.0",
+                "hostname": "thinkpad",
+            })
+        );
+        // The token is in the keychain, under the server, and nowhere in the settings.
+        assert_eq!(pairing.tokens.servers(), [server.url()]);
+        let settings = pairing.settings();
+        assert_eq!(
+            settings.server,
+            Some(server.url()),
+            "saved, as after Connect"
+        );
+        assert_eq!(
+            settings.paired.get(&server.url()),
+            Some(&Device {
+                id: 7,
+                name: "Laptop".into()
+            })
+        );
+        assert!(!pairing.settings_text().contains("cst_"));
+        // It's the server shown, and its requests carry the token.
+        assert_eq!(shell.current().unwrap().addr(), proxy.addr());
+        assert!(fetch(&proxy, "/api/status").contains("200"));
+        assert_eq!(
+            server.asked("/api/status")[0].authorization.as_deref(),
+            Some("Bearer cst_first")
+        );
+        assert!(block(shell.probe(&server.url())).unwrap().paired);
+    }
+
+    #[test]
+    fn a_paired_server_opens_with_its_token_after_a_restart() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-restart");
+        block(pairing.fixture.shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+
+        for way in ["open", "switch"] {
+            let shell = pairing.restarted();
+            let proxy = match way {
+                "open" => block(shell.open(&server.url())),
+                _ => block(shell.switch(Some(server.url()), Save::Yes)),
+            }
+            .unwrap();
+            assert_eq!(token_of(&proxy).as_deref(), Some("cst_first"), "{way}");
+        }
+        // A server it never paired with gets none.
+        let other = url(super::tests::server("200 OK"));
+        let proxy = block(pairing.restarted().open(&other)).unwrap();
+        assert_eq!(token_of(&proxy), None);
+    }
+
+    #[test]
+    fn a_code_that_is_refused_changes_nothing() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-wrong");
+        let shell = &pairing.fixture.shell;
+        let before = pairing.settings_text();
+
+        let refused = block(shell.pair(&server.url(), "00000000")).unwrap_err();
+        assert_eq!(refused.title, "Couldn't pair with the server");
+        assert_eq!(refused.message, "That pairing code isn't right.");
+        assert_eq!(refused.server, Some(server.url()));
+        // What could never be a code isn't sent at all.
+        for junk in ["", "   ", "K7QM4ZTD; rm -rf", &"A".repeat(40), "ｋ７ｑｍ"] {
+            let refused = block(shell.pair(&server.url(), junk)).unwrap_err();
+            assert_eq!(refused.title, "That isn't a pairing code", "{junk:?}");
+        }
+        assert_eq!(server.asked("/api/pair").len(), 1);
+
+        assert!(pairing.tokens.servers().is_empty());
+        assert_eq!(pairing.settings_text(), before);
+        assert!(shell.current().is_none(), "nothing is shown that wasn't");
+        assert!(shell.problem().is_none());
+    }
+
+    #[test]
+    fn an_address_that_isnt_coversync_never_gets_the_code() {
+        let pairing = Pairing::new("pair-elsewhere");
+        let shell = &pairing.fixture.shell;
+        let refused = block(shell.pair(&url(closed()), "K7QM4ZTD")).unwrap_err();
+        assert_eq!(refused.title, "Can't open the server");
+        let invalid = block(shell.pair("not a :// url", "K7QM4ZTD")).unwrap_err();
+        assert_eq!(invalid.title, "That address won't work");
+        assert!(pairing.tokens.servers().is_empty());
+    }
+
+    #[test]
+    fn without_a_keychain_no_code_is_spent() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-no-keychain");
+        pairing
+            .tokens
+            .fail_with(Some("This desktop has no keychain."));
+        let refused = block(pairing.fixture.shell.pair(&server.url(), "K7QM4ZTD")).unwrap_err();
+        assert_eq!(refused.title, "Can't keep a token on this computer");
+        assert_eq!(refused.message, "This desktop has no keychain.");
+        assert!(server.asked("/api/pair").is_empty(), "the code still works");
+        assert!(pairing.settings().paired.is_empty());
+    }
+
+    #[test]
+    fn a_token_the_keychain_wont_take_isnt_used() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-full");
+        pairing
+            .tokens
+            .refuse_saves_with(Some("The keychain is full."));
+        let shell = &pairing.fixture.shell;
+        let refused = block(shell.pair(&server.url(), "K7QM4ZTD")).unwrap_err();
+        assert_eq!(refused.title, "Paired, but couldn't keep the token");
+        assert!(refused.message.contains("“Laptop”"), "{}", refused.message);
+        assert_eq!(refused.detail.as_deref(), Some("The keychain is full."));
+        assert!(pairing.settings().paired.is_empty());
+        assert!(shell.current().is_none());
+    }
+
+    #[test]
+    fn a_sync_only_code_isnt_kept() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-sync");
+        let refused = block(pairing.fixture.shell.pair(&server.url(), "SYNC0NLY")).unwrap_err();
+        assert_eq!(refused.title, "That code is for syncing only");
+        assert!(refused.message.contains("“Laptop”"), "{}", refused.message);
+        assert!(pairing.tokens.servers().is_empty());
+        assert!(pairing.settings().paired.is_empty());
+    }
+
+    #[test]
+    fn pairing_again_replaces_the_token_and_a_failed_try_keeps_it() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-again");
+        let shell = &pairing.fixture.shell;
+        let proxy = block(shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+
+        // Looking at the address, or a wrong code, leaves the token in use.
+        block(shell.probe(&server.url())).unwrap();
+        block(shell.pair(&server.url(), "00000000")).unwrap_err();
+        assert_eq!(token_of(&proxy).as_deref(), Some("cst_first"));
+
+        let again = block(shell.pair(&server.url(), "K7QM-4ZTD")).unwrap();
+        assert_eq!(
+            again.addr(),
+            proxy.addr(),
+            "the same proxy, so the same origin"
+        );
+        assert_eq!(token_of(&proxy).as_deref(), Some("cst_second"));
+        assert_eq!(pairing.tokens.servers(), [server.url()]);
+    }
+
+    #[test]
+    fn a_token_the_keychain_lost_unpairs_the_server() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-lost");
+        block(pairing.fixture.shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+        // A new keychain: nothing in it.
+        block(pairing.tokens.forget(&server.url())).unwrap();
+
+        let proxy = block(pairing.restarted().open(&server.url())).unwrap();
+        assert_eq!(token_of(&proxy), None, "the server's own login shows");
+        assert!(pairing.settings().paired.is_empty());
+    }
+
+    #[test]
+    fn a_keychain_that_cant_be_read_is_a_problem_to_show() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-locked");
+        block(pairing.fixture.shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+        pairing
+            .tokens
+            .fail_with(Some("The keychain wasn't unlocked."));
+
+        let shell = pairing.restarted();
+        let problem = block(shell.open(&server.url())).unwrap_err();
+        assert_eq!(
+            problem.title,
+            "Can't get this computer's token for the server"
+        );
+        assert_eq!(problem.server, Some(server.url()));
+        assert!(
+            pairing.settings().paired.contains_key(&server.url()),
+            "still paired"
+        );
+        // Unlocked: it opens.
+        pairing.tokens.fail_with(None);
+        assert_eq!(
+            token_of(&block(shell.open(&server.url())).unwrap()).as_deref(),
+            Some("cst_first")
+        );
+    }
+
+    #[test]
+    fn a_token_the_server_refuses_is_forgotten_and_said() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-removed");
+        let shell = &pairing.fixture.shell;
+        let proxy = block(shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+
+        // The device is removed on the server: the page's next request is refused.
+        server.revoke("cst_first");
+        assert!(fetch(&proxy, "/api/status").contains("401"));
+        let refused = pairing.refused.lock().unwrap().clone();
+        assert_eq!(refused.len(), 1, "the proxy told the app");
+
+        let problem = block(shell.rejected(refused[0].clone())).unwrap();
+        assert_eq!(problem.title, "This computer was removed from the server");
+        assert_eq!(problem.server, Some(server.url()));
+        assert_eq!(shell.problem().map(|p| p.title), Some(problem.title));
+        assert!(pairing.tokens.servers().is_empty());
+        assert!(pairing.settings().paired.is_empty());
+        assert_eq!(token_of(&proxy), None);
+        assert_eq!(
+            pairing.settings().server,
+            Some(server.url()),
+            "still the server"
+        );
+
+        // The same refusal, heard again from another request: nothing more to do.
+        assert!(block(shell.rejected(refused[0].clone())).is_none());
+        // Signed in with the password instead, the page works.
+        assert!(fetch(&proxy, "/api/status").contains("200"));
+    }
+
+    #[test]
+    fn a_late_refusal_of_an_old_token_doesnt_undo_a_new_pairing() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-late");
+        let shell = &pairing.fixture.shell;
+        let proxy = block(shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+        let old = proxy.upstream().unwrap();
+        block(shell.pair(&server.url(), "K7QM-4ZTD")).unwrap();
+
+        assert!(block(shell.rejected(old)).is_none());
+        assert_eq!(token_of(&proxy).as_deref(), Some("cst_second"));
+        assert_eq!(pairing.tokens.servers(), [server.url()]);
+    }
+
+    #[test]
+    fn a_refusal_from_a_server_not_shown_stays_quiet() {
+        let (a, b) = (PairingServer::start(), PairingServer::start());
+        let pairing = Pairing::new("pair-quiet");
+        let shell = &pairing.fixture.shell;
+        let proxy_a = block(shell.pair(&a.url(), "K7QM4ZTD")).unwrap();
+        block(shell.switch(Some(b.url()), Save::No)).unwrap();
+
+        assert!(block(shell.rejected(proxy_a.upstream().unwrap())).is_none());
+        assert!(shell.problem().is_none(), "B's page stays");
+        assert!(
+            pairing.tokens.servers().is_empty(),
+            "A's token is gone all the same"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_server_removes_its_token_cookies_and_port() {
+        let (a, b) = (PairingServer::start(), PairingServer::start());
+        let pairing = Pairing::new("forget");
+        let shell = &pairing.fixture.shell;
+        block(shell.pair(&b.url(), "K7QM4ZTD")).unwrap();
+        let proxy = block(shell.pair(&a.url(), "K7QM4ZTD")).unwrap();
+        let port = proxy.addr().port();
+        let origin = format!("http://{}", a.addr);
+        assert!(
+            shell.cookies.origins().contains(&origin),
+            "the check's cookie"
+        );
+
+        // Whatever was wrong with it is said no more once it's forgotten.
+        shell.set_problem(Some(Problem::removed(&proxy.upstream().unwrap())));
+        block(shell.forget_server(&a.url())).unwrap();
+        assert_eq!(pairing.tokens.servers(), [b.url()], "B keeps its own");
+        let settings = pairing.settings();
+        assert_eq!(settings.server, None);
+        assert!(!settings.paired.contains_key(&a.url()));
+        assert!(!settings.ports.contains_key(&a.url()));
+        assert!(settings.taken_except(&b.url()).contains(&port));
+        assert!(!shell.cookies.origins().contains(&origin));
+        assert!(shell.current().is_none(), "the window shows no server");
+        assert!(proxy.upstream().is_none(), "its proxy serves nothing");
+        assert!(shell.problem().is_none());
+        assert!(settings.paired.contains_key(&b.url()));
+
+        // Again, or a server it never knew: nothing to do, and no error.
+        block(shell.forget_server(&a.url())).unwrap();
+        assert_eq!(
+            block(shell.forget_server("not a :// url"))
+                .unwrap_err()
+                .title,
+            "That address won't work"
+        );
+    }
+
+    #[test]
+    fn forgetting_goes_as_far_as_it_can_without_the_keychain() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("forget-no-keychain");
+        let shell = &pairing.fixture.shell;
+        block(shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+        pairing
+            .tokens
+            .fail_with(Some("The keychain wasn't unlocked."));
+
+        let problem = block(shell.forget_server(&server.url())).unwrap_err();
+        assert_eq!(problem.title, "Forgotten, except in the keychain");
+        assert_eq!(
+            problem.detail.as_deref(),
+            Some("The keychain wasn't unlocked.")
+        );
+        assert!(pairing.settings().paired.is_empty());
+        assert_eq!(pairing.settings().server, None);
     }
 
     #[test]

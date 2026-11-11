@@ -28,6 +28,8 @@ public:
     Q_INVOKABLE void openInBrowser(const QUrl &url);
     // The process that draws the page ended; `status` is the view's RenderProcessTerminationStatus.
     Q_INVOKABLE void renderTerminated(int status, int exitCode);
+    // The user's answer to the app's question `id` (see window.qml's askForApp).
+    Q_INVOKABLE void answered(const QString &id, bool accepted);
     // Whether the page at `origin` may show notifications: a server's UI may.
     Q_INVOKABLE bool mayNotify(const QUrl &origin);
     // A page's console message, printed in debug builds.

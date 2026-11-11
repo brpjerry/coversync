@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=coversync
+Comment=Manage a coversync music library
+Exec=coversync-desktop %u
+Icon=io.github.brpjerry.coversync
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupWMClass=io.github.brpjerry.coversync
+# Pairing links from a server's Add device (coversync://pair?server=…&code=…) open the app.
+MimeType=x-scheme-handler/coversync;

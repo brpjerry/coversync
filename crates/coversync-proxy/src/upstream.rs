@@ -102,7 +102,8 @@ impl Upstream {
 
     /// The `Authorization` header the proxy adds to every request it forwards,
     /// replacing the webview's own. `None` (the default) passes the webview's
-    /// through. The app's token goes here once it has one (DSK-02).
+    /// through. The app's token goes here once it has paired with the server
+    /// ([`Token::authorization`](crate::Token::authorization)).
     pub fn with_authorization(mut self, authorization: Option<HeaderValue>) -> Self {
         self.authorization = authorization.map(|mut value| {
             value.set_sensitive(true);
