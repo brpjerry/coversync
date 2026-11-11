@@ -25,9 +25,13 @@ pub enum Request {
     Status {},
     /// Opens a server (or, without one, the one in use again), signed in as
     /// it is: with this computer's token if it's paired, by the server's
-    /// own login if not.
+    /// own login if not. `without_token` leaves the token out even for a
+    /// paired server (it couldn't be had, or the server refused it), so the
+    /// server's own login shows.
     Connect {
         server: Option<String>,
+        #[serde(default)]
+        without_token: bool,
     },
     /// Whether an address is a coversync server, and whether this computer
     /// is paired with it. Changes nothing.
@@ -95,11 +99,18 @@ mod tests {
         ));
         assert!(matches!(
             read(r#"{"cmd":"connect","args":{"server":null}}"#),
-            Ok(Request::Connect { server: None })
+            Ok(Request::Connect {
+                server: None,
+                without_token: false
+            })
         ));
         assert!(matches!(
             read(r#"{"cmd":"connect","args":{"server":"https://a/"}}"#),
-            Ok(Request::Connect { server: Some(s) }) if s == "https://a/"
+            Ok(Request::Connect { server: Some(s), without_token: false }) if s == "https://a/"
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"connect","args":{"server":"https://a/","without_token":true}}"#),
+            Ok(Request::Connect { server: Some(s), without_token: true }) if s == "https://a/"
         ));
         assert!(matches!(
             read(r#"{"cmd":"check","args":{"server":"https://a/"}}"#),

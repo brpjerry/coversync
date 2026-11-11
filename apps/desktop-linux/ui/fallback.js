@@ -29,6 +29,8 @@ const busy = $('busy');
 
 // The server in use, which retrying opens: the field may hold another address.
 let current = null;
+// The server "Forget this server" is about, while it's offered.
+let forgettable = null;
 // The server the pairing form is for, while it shows.
 let pairing = null;
 
@@ -63,7 +65,11 @@ function show(status, problem = status.problem) {
 	pairForm.hidden = !pairing;
 	pairServer.textContent = pairing ?? '';
 	retryRow.hidden = Boolean(pairing) || !status.server;
-	forgetRow.hidden = Boolean(pairing) || !status.server;
+	// Any server the app keeps something of can be forgotten: the one in use, or the one the
+	// pairing form is for (one whose token can't be had isn't in use, and is still kept).
+	const about = pairing ?? status.server ?? null;
+	forgettable = about && (status.remembered ?? []).includes(about) ? about : null;
+	forgetRow.hidden = !forgettable;
 	// Retrying opens the server in use, which isn't the one refused.
 	const other = problem?.server && status.server && problem.server !== status.server;
 	retry.textContent = other ? `Back to ${status.server}` : 'Try again';
@@ -104,10 +110,16 @@ async function attempt(doing, cmd, args) {
 	}
 }
 
-/** Opens `server` (or, with null, the one in use again), signed in as it is. */
-async function connect(server) {
+/**
+ * Opens `server` (or, with null, the one in use again), signed in as it is. With `withoutToken`,
+ * by the server's own login even if this computer is paired with it.
+ */
+async function connect(server, withoutToken = false) {
 	// On success the app moves the window on to the server's UI.
-	const done = await attempt(`Connecting to ${server ?? current}…`, 'connect', { server });
+	const done = await attempt(`Connecting to ${server ?? current}…`, 'connect', {
+		server,
+		without_token: withoutToken
+	});
 	if (done) setBusy(`Opening ${server ?? current}…`);
 }
 
@@ -136,7 +148,7 @@ pairForm.addEventListener('submit', async (event) => {
 	if (done) setBusy(`Opening ${server}…`);
 	else code.select();
 });
-passwordButton.addEventListener('click', () => connect(pairing));
+passwordButton.addEventListener('click', () => connect(pairing, true));
 otherButton.addEventListener('click', async () => {
 	input.value = pairing ?? '';
 	pairing = null;
@@ -144,13 +156,16 @@ otherButton.addEventListener('click', async () => {
 	input.select();
 });
 forgetButton.addEventListener('click', async () => {
-	const server = current;
+	const server = forgettable;
 	const sure = confirm(
 		`Forget ${server}?\n\nThis computer's sign-in for it is removed, and what the window kept ` +
 			'of it. If this computer is paired with it, remove it from the server’s devices too.'
 	);
 	if (!sure) return;
 	// Whether or not all of it could be forgotten, the page shows what is left.
+	// Whatever comes of it, the server is forgotten as far as it could be: back to the address
+	// field, with what went wrong (the keychain out of reach) still said.
+	pairing = null;
 	if (await attempt(`Forgetting ${server}…`, 'forget', { server })) {
 		input.value = '';
 		show(await invoke('status'));

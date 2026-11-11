@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use axum::http::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use serde_json::{Value, json};
@@ -113,17 +115,59 @@ impl PairError {
     }
 }
 
-/// The length of an answer that is JSON and short enough to be one of the
-/// server's refusals, which says so in `Content-Length`; `None` for any
-/// other, which isn't read.
+/// The length of an answer that can be read here as one of the server's
+/// refusals: JSON, not compressed, and short, which it says in
+/// `Content-Length`. `None` for any other, which is passed on unread (a
+/// reverse proxy may compress the server's answers, or send them in
+/// chunks): see [`token_refused`].
 pub(crate) fn small_json(headers: &HeaderMap) -> Option<usize> {
     let json = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"));
+    let plain = headers
+        .get(CONTENT_ENCODING)
+        .is_none_or(|encoding| encoding == "identity");
     let length: usize = headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()?;
-    (json && length <= ANSWER_LIMIT).then_some(length)
+    (json && plain && length <= ANSWER_LIMIT).then_some(length)
+}
+
+/// Asks `upstream` itself whether it still takes the token the proxy sends
+/// it: for a 401 whose body couldn't be read on its way to the page. The
+/// question is the session's (`/api/session`), asked uncompressed, and its
+/// answer is the proxy's alone, so it's read whole however it's framed.
+/// `false` when that can't be told: the token stays until the server
+/// plainly refuses it.
+pub(crate) async fn token_refused(
+    client: &HttpsClient,
+    upstream: &Upstream,
+    timeout: Duration,
+) -> bool {
+    let (Some(authorization), Some(uri)) = (
+        upstream.authorization(),
+        upstream.uri(&format!("{}/api/session", upstream.prefix())),
+    ) else {
+        return false;
+    };
+    let Ok(req) = Request::get(uri)
+        .header(HOST, upstream.host())
+        .header(AUTHORIZATION, authorization)
+        .header(ACCEPT, "application/json")
+        .header(ACCEPT_ENCODING, "identity")
+        .body(Body::empty())
+    else {
+        return false;
+    };
+    let asked = async {
+        let res = client.request(req).await.ok()?;
+        if res.status() != StatusCode::UNAUTHORIZED {
+            return Some(false);
+        }
+        let body = Limited::new(res.into_body(), ANSWER_LIMIT).collect().await;
+        Some(says_invalid_token(&body.ok()?.to_bytes()))
+    };
+    matches!(tokio::time::timeout(timeout, asked).await, Ok(Some(true)))
 }
 
 /// Whether a 401's body is the server refusing a token: its `code` is
@@ -264,7 +308,11 @@ mod tests {
             small_json(&headers("application/json; charset=utf-8", "0")),
             Some(0)
         );
-        // A page, a stream without a length, or more than a refusal comes to.
+        // A page, a stream without a length, a compressed answer, or more
+        // than a refusal comes to.
+        let mut gzipped = headers("application/json", "83");
+        gzipped.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(small_json(&gzipped), None);
         assert_eq!(small_json(&headers("text/html", "83")), None);
         assert_eq!(small_json(&headers("application/json", "70000")), None);
         let mut unsized_ = headers("application/json", "1");

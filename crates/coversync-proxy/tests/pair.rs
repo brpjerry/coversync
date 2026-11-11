@@ -325,3 +325,106 @@ async fn a_401_without_a_token_is_the_pages_own_business() {
     );
     assert!(rejected.lock().unwrap().is_empty());
 }
+
+/// A server behind a reverse proxy that changes how its 401s travel:
+/// compressed (`gzip`), or in chunks without a length (`chunked`). Its
+/// `/api/session`, asked uncompressed, answers plainly: refusing the token
+/// when `revoked`, and with a wrong password's refusal when not (a 401 that
+/// isn't about the token).
+fn behind_a_reverse_proxy(how: &'static str, revoked: bool, log: Log) -> Router {
+    let refusal =
+        json!({ "error": "This app's token isn't valid; pair it again.", "code": "invalid_token" });
+    let session = {
+        let refusal = refusal.clone();
+        move || async move {
+            if revoked {
+                json_answer(StatusCode::UNAUTHORIZED, &refusal)
+            } else {
+                json_answer(
+                    StatusCode::OK,
+                    &json!({ "via": "token", "scope": "manage", "device": 1 }),
+                )
+            }
+        }
+    };
+    Router::new()
+        .route("/api/session", axum::routing::get(session))
+        .fallback(move |req: Request| {
+            let (log, refusal) = (log.clone(), refusal.to_string());
+            async move {
+                log.record(&req);
+                let res = axum::http::Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(CONTENT_TYPE, "application/json");
+                match how {
+                    // Not the JSON's own bytes: only a decoder could read them.
+                    "gzip" => res
+                        .header("content-encoding", "gzip")
+                        .body(Body::from(vec![
+                            0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3,
+                        ]))
+                        .unwrap(),
+                    _ => {
+                        let (tx, body) = common::channel_body();
+                        tokio::spawn(async move {
+                            for half in [&refusal[..10], &refusal[10..]] {
+                                let _ = tx
+                                    .send(bytes::Bytes::copy_from_slice(half.as_bytes()))
+                                    .await;
+                            }
+                        });
+                        res.body(body).unwrap()
+                    }
+                }
+            }
+        })
+}
+
+#[tokio::test]
+async fn a_refusal_it_cant_read_is_checked_with_the_server() {
+    for how in ["gzip", "chunked"] {
+        for revoked in [true, false] {
+            let log = Log::default();
+            let server = upstream(
+                serve(behind_a_reverse_proxy(how, revoked, log.clone())).await,
+                "/",
+            );
+            let rejected: Arc<Mutex<Vec<Upstream>>> = Arc::default();
+            let sent = with_token(&server, "cst_token");
+            let window =
+                Window::open_with(Proxy::builder().upstream(Some(sent.clone())).on_rejected({
+                    let rejected = rejected.clone();
+                    move |upstream| rejected.lock().unwrap().push(upstream)
+                }))
+                .await;
+
+            // The page gets the answer as the server's reverse proxy sent it.
+            let res = window.get("/api/status").await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{how}");
+            if how == "gzip" {
+                assert_eq!(res.headers()["content-encoding"], "gzip");
+                assert_eq!(common::bytes(res).await.len(), 13);
+            } else {
+                let body: Value = serde_json::from_str(&text(res).await).unwrap();
+                assert_eq!(body["code"], "invalid_token");
+            }
+
+            // The app hears of it only if the server, asked plainly, refuses the token.
+            let told = async {
+                for _ in 0..100 {
+                    if !rejected.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                rejected.lock().unwrap().clone()
+            }
+            .await;
+            if revoked {
+                assert_eq!(told, [sent], "{how}: refused");
+            } else {
+                assert!(told.is_empty(), "{how}: the token is fine");
+            }
+        }
+    }
+}

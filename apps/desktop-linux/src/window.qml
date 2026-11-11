@@ -198,6 +198,7 @@ Window {
             id: label
             anchors.centerIn: parent
             color: button.primary ? window.accentTextColor : window.textColor
+            textFormat: Text.PlainText
             font.pixelSize: 14
             font.weight: Font.Medium
         }
@@ -304,6 +305,9 @@ Window {
                         return dialog.isLeave ? "Leave this page? Changes you made may not be saved." : "";
                     }
                     color: window.textColor
+                    // As written: a page's message, or a pairing link's address, is never markup (which could
+                    // also fetch an image).
+                    textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     font.pixelSize: 15
                     lineHeight: 1.25

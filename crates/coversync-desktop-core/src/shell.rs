@@ -346,8 +346,14 @@ impl Shell {
         if !self.config.get().paired.contains_key(&url) {
             return Ok(upstream);
         }
+        // The ways on are the pairing form's: pair again, the server's own
+        // login, or forgetting the server.
         let token = pairing.tokens.load(&url).await.map_err(|why| {
-            Problem::new("Can't get this computer's token for the server", why).about(&upstream)
+            Problem {
+                pair: true,
+                ..Problem::new("Can't get this computer's token for the server", why)
+            }
+            .about(&upstream)
         })?;
         match token {
             Some(token) => Ok(upstream.with_authorization(Some(token.authorization()))),
@@ -365,6 +371,22 @@ impl Shell {
         if let Err(err) = self.config.update(|config| config.paired.remove(url)) {
             tracing::warn!("couldn't save the settings: {err}");
         }
+    }
+
+    /// The servers the app keeps something of: the saved one, those with a
+    /// port, and those this computer is paired with. Any of them can be
+    /// forgotten ([`Shell::forget_server`]), shown or not.
+    pub fn remembered(&self) -> Vec<String> {
+        let config = self.config.get();
+        let mut servers: Vec<String> = config
+            .ports
+            .into_keys()
+            .chain(config.paired.into_keys())
+            .chain(config.server)
+            .collect();
+        servers.sort();
+        servers.dedup();
+        servers
     }
 
     /// Whether `server` is a coversync server the app can use, and whether
@@ -585,19 +607,46 @@ impl Shell {
     /// problem. Refusals are logged, and a refused new address's cookies
     /// (the check may have stored some) are forgotten.
     pub async fn switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
+        self.switch_as(server, save, true).await
+    }
+
+    /// [`Shell::switch`] to `server` without this computer's token for it,
+    /// whether or not it's paired: the server's own login shows. This is
+    /// the way in when the token can't be had (a keychain that can't be
+    /// read) or is no use (the device was removed). The pairing itself
+    /// stays as it is.
+    pub async fn switch_without_token(&self, server: String, save: Save) -> Result<Proxy, Problem> {
+        self.switch_as(Some(server), save, false).await
+    }
+
+    async fn switch_as(
+        &self,
+        server: Option<String>,
+        save: Save,
+        with_token: bool,
+    ) -> Result<Proxy, Problem> {
         let address = server.clone();
-        let result = self.try_switch(server, save).await;
+        let result = self.try_switch(server, save, with_token).await;
         if let Err(problem) = &result {
             log_refusal(address.as_deref(), problem);
         }
         result
     }
 
-    async fn try_switch(&self, server: Option<String>, save: Save) -> Result<Proxy, Problem> {
+    async fn try_switch(
+        &self,
+        server: Option<String>,
+        save: Save,
+        with_token: bool,
+    ) -> Result<Proxy, Problem> {
         let (upstream, new) = match server {
             Some(url) => {
                 let upstream = Upstream::parse(&url).map_err(|err| Problem::invalid(err, &url))?;
-                (self.with_token(upstream).await?, true)
+                let upstream = match with_token {
+                    true => self.with_token(upstream).await?,
+                    false => upstream,
+                };
+                (upstream, true)
             }
             None => match self.current().and_then(|proxy| proxy.upstream()) {
                 Some(upstream) => (upstream, false),
@@ -1452,6 +1501,37 @@ mod tests {
             token_of(&block(shell.open(&server.url())).unwrap()).as_deref(),
             Some("cst_first")
         );
+    }
+
+    #[test]
+    fn a_pairing_whose_token_cant_be_had_leaves_ways_on() {
+        let server = PairingServer::start();
+        let pairing = Pairing::new("pair-stuck");
+        block(pairing.fixture.shell.pair(&server.url(), "K7QM4ZTD")).unwrap();
+        pairing
+            .tokens
+            .fail_with(Some("The keychain wasn't unlocked."));
+
+        // As at a start: nothing is shown, and the problem offers the
+        // pairing form for the server it names.
+        let shell = pairing.restarted();
+        let problem = block(shell.open(&server.url())).unwrap_err();
+        assert!(problem.pair);
+        assert!(shell.current().is_none());
+        assert_eq!(shell.remembered(), [server.url()], "it can be forgotten");
+
+        // The server's own login, without the token.
+        let proxy = block(shell.switch_without_token(server.url(), Save::Yes)).unwrap();
+        assert_eq!(token_of(&proxy), None);
+        assert!(fetch(&proxy, "/api/status").contains("200"));
+        assert!(
+            pairing.settings().paired.contains_key(&server.url()),
+            "still paired"
+        );
+
+        // Or forgotten, as far as that goes without the keychain.
+        block(shell.forget_server(&server.url())).unwrap_err();
+        assert!(shell.remembered().is_empty());
     }
 
     #[test]

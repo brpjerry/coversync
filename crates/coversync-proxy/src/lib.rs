@@ -154,9 +154,11 @@ impl Builder {
     /// as after the device was removed on the server. That is a 401 that
     /// says `invalid_token`, to a request that carried the token; another
     /// 401 (a wrong password at the server's login, say) isn't about the
-    /// token. It's given the server as the request went to it, token and
-    /// all, and may be called once for each request refused; the answer
-    /// goes on to the page as it is.
+    /// token. Where a 401's body can't be read on its way to the page
+    /// (compressed or sent in chunks by a reverse proxy), the proxy asks
+    /// the server itself. It's given the server as the request went to it,
+    /// token and all, and may be called once for each request refused; the
+    /// answer goes on to the page as it is.
     pub fn on_rejected(mut self, handler: impl Fn(Upstream) + Send + Sync + 'static) -> Self {
         self.on_rejected = Some(Arc::new(handler));
         self
@@ -420,7 +422,7 @@ impl Shared {
         }
     }
 
-    async fn forward(&self, upstream: &Upstream, req: Request) -> Response {
+    async fn forward(self: &Arc<Self>, upstream: &Upstream, req: Request) -> Response {
         let document = is_document(&req);
         let (mut parts, body) = req.into_parts();
         // Where the UI looks for the app.
@@ -472,17 +474,34 @@ impl Shared {
         if parts.status == StatusCode::UNAUTHORIZED
             && upstream.authorization().is_some()
             && let Some(handler) = &self.on_rejected
-            && let Some(refusal) = pair::small_json(&parts.headers)
         {
-            // The server's refusals are a line of JSON: read whole, and
-            // passed on as it came.
-            let read = Limited::new(body, refusal).collect().await;
-            let bytes = read.map(|body| body.to_bytes()).unwrap_or_default();
-            if pair::says_invalid_token(&bytes) {
+            let refused = |upstream: &Upstream| {
                 tracing::warn!("{} refused the app's token", upstream.url());
                 handler(upstream.clone());
+            };
+            if let Some(refusal) = pair::small_json(&parts.headers) {
+                // The server's refusals are a line of JSON: read whole, and
+                // passed on as it came.
+                let read = Limited::new(body, refusal).collect().await;
+                let bytes = read.map(|body| body.to_bytes()).unwrap_or_default();
+                if pair::says_invalid_token(&bytes) {
+                    refused(upstream);
+                }
+                body = Body::from(bytes);
+            } else {
+                // One that can't be read here goes on untouched, and the
+                // server is asked directly, without holding the answer up.
+                let (proxy, upstream) = (Arc::clone(self), upstream.clone());
+                tokio::spawn(async move {
+                    let timeout = proxy.page_timeout;
+                    if pair::token_refused(&proxy.client, &upstream, timeout).await
+                        && let Some(handler) = &proxy.on_rejected
+                    {
+                        tracing::warn!("{} refused the app's token", upstream.url());
+                        handler(upstream);
+                    }
+                });
             }
-            body = Body::from(bytes);
         }
         if document {
             if let Some(down) = Unreachable::from_status(upstream, parts.status) {

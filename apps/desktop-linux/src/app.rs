@@ -77,6 +77,8 @@ struct Status {
     server: Option<String>,
     /// Why the server's UI isn't showing.
     problem: Option<Problem>,
+    /// The servers the app keeps something of, which the page can forget.
+    remembered: Vec<String>,
 }
 
 /// What the window opens with.
@@ -233,6 +235,10 @@ impl App {
     /// the fallback page says so and offers to pair again. Any thread.
     fn token_refused(&'static self, refused: Upstream) {
         self.runtime.spawn(async move {
+            // After a pairing or a switch under way, and before the next: a
+            // new pairing's token isn't the one refused, and mustn't be
+            // removed from the keychain along with it.
+            let _navigation = self.shell.navigation.lock().await;
             if let Some(problem) = self.shell.rejected(refused).await {
                 self.show_fallback(problem);
             }
@@ -353,11 +359,21 @@ impl App {
                     .and_then(|proxy| proxy.upstream())
                     .map(|upstream| upstream.url()),
                 problem: self.shell.problem(),
+                remembered: self.shell.remembered(),
             }),
-            Request::Connect { server } => {
+            Request::Connect {
+                server,
+                without_token,
+            } => {
                 self.runtime.spawn(async move {
                     let _navigation = self.shell.navigation.lock().await;
-                    match self.shell.switch(server, Save::Yes).await {
+                    let switched = match (server, without_token) {
+                        (Some(server), true) => {
+                            self.shell.switch_without_token(server, Save::Yes).await
+                        }
+                        (server, _) => self.shell.switch(server, Save::Yes).await,
+                    };
+                    match switched {
                         Ok(proxy) => {
                             // Under the lock, so a later switch can't open first.
                             qt::load(&proxy.entry_url());
