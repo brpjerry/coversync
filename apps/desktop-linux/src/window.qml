@@ -30,11 +30,18 @@ Window {
     title: "coversync"
     color: pageColor
 
-    WebEngineProfilePrototype {
-        id: prototype
+    // Named and not off the record, so the HTTP cache (the covers) and local storage are kept on disk.
+    // Declared outright, not through a WebEngineProfilePrototype: its instance() gives nothing until
+    // the window is complete, after the view has asked for it, and the view then stayed on Qt's
+    // default profile, which keeps everything in memory only.
+    WebEngineProfile {
+        id: appProfile
         storageName: "coversync"
+        offTheRecord: false
         persistentStoragePath: appStoragePath
         cachePath: appCachePath
+        // The sign-in is kept by the app's proxy, not by the view.
+        persistentCookiesPolicy: WebEngineProfile.NoPersistentCookies
     }
 
     WebEngineView {
@@ -49,7 +56,7 @@ Window {
         backgroundColor: window.pageColor
         // Nothing else of the view's may be set before this takes effect (so no plain values for its settings
         // here: they'd be applied first, to a view on the default profile, and changing the profile then crashes).
-        profile: prototype.instance()
+        profile: appProfile
 
         onNewWindowRequested: function (request) {
             backend.openInBrowser(request.requestedUrl);

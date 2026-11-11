@@ -277,6 +277,10 @@ int run(const Options &options)
         std::fprintf(stderr, "coversync: the window has no web view\n");
         return 1;
     }
+    // Said rather than left to be noticed: the view once ran on Qt's default profile unseen, and
+    // fetched every cover again on each visit.
+    if (profile->isOffTheRecord())
+        std::fprintf(stderr, "coversync: the web view keeps nothing on disk (its profile is off the record)\n");
 
     // The app's own pages, before the view loads anything.
     auto *pages = new AppPages(bytes(options.csp), bytes(options.origin), QUrl(qstring(options.bridge_url)),
