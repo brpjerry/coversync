@@ -30,78 +30,91 @@ Window {
     title: "coversync"
     color: pageColor
 
-    // Named and not off the record, so the HTTP cache (the covers) and local storage are kept on disk.
-    // Declared outright, not through a WebEngineProfilePrototype: its instance() gives nothing until
-    // the window is complete, after the view has asked for it, and the view then stayed on Qt's
-    // default profile, which keeps everything in memory only.
-    WebEngineProfile {
-        id: appProfile
+    // The web view, once there is one (see viewLoader).
+    readonly property Item view: viewLoader.item
+
+    // The view's profile. Named, so the HTTP cache (the covers) and local storage are kept on disk.
+    WebEngineProfilePrototype {
+        id: prototype
         storageName: "coversync"
-        offTheRecord: false
         persistentStoragePath: appStoragePath
         cachePath: appCachePath
         // The sign-in is kept by the app's proxy, not by the view.
         persistentCookiesPolicy: WebEngineProfile.NoPersistentCookies
     }
 
-    WebEngineView {
-        id: view
+    // The view is made only once the window is complete. The prototype has no profile to give before
+    // that: a view declared here outright asked too soon, got none, and stayed on Qt's default profile,
+    // which is off the record and keeps everything in memory only.
+    Loader {
+        id: viewLoader
 
-        // The page's file input that the desktop's file chooser is open for.
-        property var fileRequest: null
-
-        objectName: "view"
         anchors.fill: parent
         focus: true
-        backgroundColor: window.pageColor
-        // Nothing else of the view's may be set before this takes effect (so no plain values for its settings
-        // here: they'd be applied first, to a view on the default profile, and changing the profile then crashes).
-        profile: appProfile
+        active: false
+        sourceComponent: viewComponent
+    }
+    Component.onCompleted: viewLoader.active = true
 
-        onNewWindowRequested: function (request) {
-            backend.openInBrowser(request.requestedUrl);
-        }
-        onRenderProcessTerminated: function (terminationStatus, exitCode) {
-            backend.renderTerminated(terminationStatus, exitCode);
-        }
-        onJavaScriptConsoleMessage: function (level, message, lineNumber, sourceID) {
-            backend.consoleMessage(level, message, lineNumber, sourceID);
-        }
-        // A page's alert(), confirm() and prompt(): drawn here, so Enter and Escape answer them.
-        onJavaScriptDialogRequested: function (request) {
-            request.accepted = true;
-            dialog.ask(request);
-        }
-        // The desktop's file chooser, when there is one; Qt's own otherwise, and for saving.
-        onFileDialogRequested: function (request) {
-            const multiple = request.mode === FileDialogRequest.FileModeOpenMultiple;
-            if (!backend.hasFileChooser || (!multiple && request.mode !== FileDialogRequest.FileModeOpen))
-                return;
-            request.accepted = true;
-            if (fileRequest)
-                fileRequest.dialogReject();
-            fileRequest = request;
-            backend.chooseFiles(multiple, request.acceptedMimeTypes);
-        }
-        // A menu only where it has something for the app's user: text to edit or copy, a link.
-        onContextMenuRequested: function (request) {
-            if (!request.isContentEditable && request.selectedText === "" && request.linkUrl.toString() === "")
+    Component {
+        id: viewComponent
+
+        WebEngineView {
+            // The page's file input that the desktop's file chooser is open for.
+            property var fileRequest: null
+
+            objectName: "view"
+            focus: true
+            backgroundColor: window.pageColor
+            // Nothing else of the view's may be set before this takes effect (so no plain values for its settings
+            // here: they'd be applied first, to a view on the default profile, and changing the profile then crashes).
+            profile: prototype.instance()
+
+            onNewWindowRequested: function (request) {
+                backend.openInBrowser(request.requestedUrl);
+            }
+            onRenderProcessTerminated: function (terminationStatus, exitCode) {
+                backend.renderTerminated(terminationStatus, exitCode);
+            }
+            onJavaScriptConsoleMessage: function (level, message, lineNumber, sourceID) {
+                backend.consoleMessage(level, message, lineNumber, sourceID);
+            }
+            // A page's alert(), confirm() and prompt(): drawn here, so Enter and Escape answer them.
+            onJavaScriptDialogRequested: function (request) {
                 request.accepted = true;
-        }
+                dialog.ask(request);
+            }
+            // The desktop's file chooser, when there is one; Qt's own otherwise, and for saving.
+            onFileDialogRequested: function (request) {
+                const multiple = request.mode === FileDialogRequest.FileModeOpenMultiple;
+                if (!backend.hasFileChooser || (!multiple && request.mode !== FileDialogRequest.FileModeOpen))
+                    return;
+                request.accepted = true;
+                if (fileRequest)
+                    fileRequest.dialogReject();
+                fileRequest = request;
+                backend.chooseFiles(multiple, request.acceptedMimeTypes);
+            }
+            // A menu only where it has something for the app's user: text to edit or copy, a link.
+            onContextMenuRequested: function (request) {
+                if (!request.isContentEditable && request.selectedText === "" && request.linkUrl.toString() === "")
+                    request.accepted = true;
+            }
 
-        Component.onCompleted: {
-            // A page may put text on the clipboard (the pairing link's "Copy"); reading it stays off.
-            settings.javascriptCanAccessClipboard = true;
-            // In a script world of its own: a page's own scripts can't see it.
-            userScripts.collection = [
-                {
-                    name: "coversync-relay",
-                    sourceCode: relayScript,
-                    injectionPoint: WebEngineScript.DocumentCreation,
-                    worldId: WebEngineScript.ApplicationWorld,
-                    runsOnSubFrames: false
-                }
-            ];
+            Component.onCompleted: {
+                // A page may put text on the clipboard (the pairing link's "Copy"); reading it stays off.
+                settings.javascriptCanAccessClipboard = true;
+                // In a script world of its own: a page's own scripts can't see it.
+                userScripts.collection = [
+                    {
+                        name: "coversync-relay",
+                        sourceCode: relayScript,
+                        injectionPoint: WebEngineScript.DocumentCreation,
+                        worldId: WebEngineScript.ApplicationWorld,
+                        runsOnSubFrames: false
+                    }
+                ];
+            }
         }
     }
 
