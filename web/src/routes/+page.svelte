@@ -965,15 +965,26 @@
 			scanFinishes++;
 			if (status) status = { ...status, scan };
 			scanFinished();
-			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'}`;
+			// The scan's count is of the Inbox's albums.
+			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'} in the Inbox`;
 			const unread = scan.errors
 				? `, ${count(scan.errors)} ${scan.errors === 1 ? 'file' : 'files'} couldn’t be read`
 				: '';
 			notify('Scan finished', found + unread, 'scan');
 		},
 		imported({ album_id, inbox_id }) {
-			// By its Inbox entry, which the reload below takes away.
-			notify('Imported to the Library', named(inbox_id), `import-${album_id}`);
+			if (desktopApp.has('notify')) {
+				// As the Library has it: the import may have changed its tags. Failing that, by
+				// its Inbox entry, if the grid still has it.
+				const before = named(inbox_id);
+				api
+					.album(album_id)
+					.then(
+						(album) => `${album.artist} · ${album.title}`,
+						() => before
+					)
+					.then((name) => notify('Imported to the Library', name, `import-${album_id}`));
+			}
 			// Copies hide the Inbox files, which Inbox setup counts.
 			inboxSetup.refresh();
 			inboxChanged();

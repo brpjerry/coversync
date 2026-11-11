@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use coversync_desktop_core::bridge::{Commands, Feature, Features, Host};
 use coversync_desktop_core::tokens::Keychain;
@@ -38,11 +37,6 @@ pub const APP_ID: &str = "io.github.brpjerry.coversync";
 const TERMINATED_NORMALLY: i32 = 0;
 const TERMINATED_KILLED: i32 = 3;
 
-/// How long a page's question about the app's features waits to hear
-/// whether the desktop shows notifications, which the window finds out as
-/// it opens.
-const FEATURES_WAIT: Duration = Duration::from_secs(3);
-
 static APP: OnceLock<App> = OnceLock::new();
 
 /// The app, as the commands for the servers' pages see it
@@ -54,15 +48,19 @@ struct Desktop {
 }
 
 impl Host for Desktop {
+    /// Waits for the window to find out whether the desktop shows
+    /// notifications, however long that takes: the page asks once and keeps
+    /// the answer, so an early "no" would stand until it's reloaded. The
+    /// window always finds out; a desktop that doesn't answer is a "no"
+    /// once the call to it times out.
     fn features(&self) -> Features {
         let mut notifications = self.notifications.clone();
         Box::pin(async move {
-            let known =
-                tokio::time::timeout(FEATURES_WAIT, notifications.wait_for(Option::is_some))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .and_then(|known| *known);
+            let known = notifications
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|known| *known);
             let mut features = Vec::new();
             if known == Some(true) {
                 features.push(Feature::Notify);
@@ -456,4 +454,42 @@ fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|name| name.trim().to_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_features_wait_for_the_window_to_find_out() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let features = |found: Option<bool>| async move {
+                let (notifications, heard) = watch::channel(None);
+                let desktop = Desktop {
+                    notifications: heard,
+                };
+                let asked = desktop.features();
+                tokio::pin!(asked);
+                // However long the page has waited, there's no answer until
+                // the window has one: the page keeps what it's told.
+                let early = tokio::time::timeout(Duration::from_millis(50), &mut asked).await;
+                assert!(early.is_err(), "answered before the window knew");
+                match found {
+                    Some(found) => drop(notifications.send(Some(found))),
+                    // The window is gone without ever finding out.
+                    None => drop(notifications),
+                }
+                asked.await
+            };
+            assert_eq!(features(Some(true)).await, [Feature::Notify]);
+            assert_eq!(features(Some(false)).await, []);
+            assert_eq!(features(None).await, []);
+        });
+    }
 }

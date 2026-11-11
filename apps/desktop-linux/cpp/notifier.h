@@ -56,6 +56,7 @@ private:
     void showOnDesktop(const QString &key);
     void showInPortal(const QString &key);
     void withdraw(const QString &key);
+    void failed(const QString &key, QWebEngineNotification *notification, const QString &why);
     void choose(const QString &key, const QByteArray &token);
     QString keyOf(uint desktopId) const;
     QString bodyText(const QString &text) const;
