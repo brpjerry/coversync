@@ -134,7 +134,8 @@ Window {
             // with black text, whatever the page looks like.
             onTooltipRequested: function (request) {
                 request.accepted = true;
-                if (request.type === TooltipRequest.Show)
+                // None over the window's dialog: the page is out of reach while it shows.
+                if (request.type === TooltipRequest.Show && !dialog.visible)
                     tip.show(request.text, request.x, request.y);
                 else
                     tip.hide();
@@ -191,7 +192,8 @@ Window {
         }
     }
 
-    // A page's tooltip, by the pointer, until the page takes it back or a while has passed.
+    // A page's tooltip, by the pointer, until the page takes it back, a dialog comes up or a while has passed.
+    // Declared before the dialog, which is drawn over it.
     Rectangle {
         id: tip
 
@@ -211,7 +213,6 @@ Window {
         }
 
         visible: false
-        z: 5
         width: Math.min(tipText.implicitWidth, 360) + 18
         height: tipText.height + 12
         radius: 7
@@ -228,7 +229,19 @@ Window {
             // As written: a title is the page's to choose, and is never markup.
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
+            // A title can be as long as the page likes (a tag's whole value): no taller than fits the window,
+            // and cut short with an ellipsis beyond that.
+            maximumLineCount: Math.max(1, Math.min(12, Math.floor((window.height - 36) / tipLine.height)))
+            elide: Text.ElideRight
             font.pixelSize: 13
+        }
+        // One line of the tooltip's text, for counting how many fit.
+        Text {
+            id: tipLine
+
+            visible: false
+            text: "x"
+            font.pixelSize: tipText.font.pixelSize
         }
         Timer {
             id: tipTimer
@@ -290,6 +303,8 @@ Window {
             }
             if (request)
                 request.dialogReject();
+            // The page's tooltip, if one is up, goes: nothing of the page's sits by the question.
+            tip.hide();
             request = asked;
             shownAt = Date.now();
             input.text = asked.defaultText;
