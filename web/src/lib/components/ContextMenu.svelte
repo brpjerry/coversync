@@ -168,7 +168,6 @@
 		max-width: 300px;
 		max-height: calc(100dvh - 16px);
 		overflow-y: auto;
-		scrollbar-width: thin;
 		padding: 6px;
 		border-radius: 14px;
 		background: var(--bg-raised);
