@@ -77,6 +77,8 @@ pub(crate) fn from_upstream(headers: &mut HeaderMap, local_origin: &str, upstrea
     headers.remove(STRICT_TRANSPORT_SECURITY);
     headers.remove(ALT_SVC);
     headers.insert(SERVER, upstream.named().clone());
+    // Only the proxy says the app is there (on `/api/hello`).
+    headers.remove(crate::app::HEADER);
     // The server's own absolute URLs ("https://n5pro.internal/…" or
     // "//n5pro.internal/…") would take the window out of the proxy.
     if let Some(location) = headers.get(LOCATION).and_then(|l| l.to_str().ok())

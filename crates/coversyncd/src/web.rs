@@ -7,7 +7,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use base64::Engine;
 use rust_embed::RustEmbed;
 use sha2::{Digest, Sha256};
@@ -124,16 +124,78 @@ async fn static_files(req: Request) -> Response {
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
+/// The desktop app's own path. The app's window loads the UI through a
+/// proxy in the app, and the UI asks the app for what only an app can do at
+/// this path on the page's origin, which that proxy answers itself and
+/// never forwards (`crates/coversync-proxy/src/app.rs`). The proxy keeps the
+/// server's paths as they are, so for a server at the root of its domain
+/// this path is one of the server's own: nothing may ever be served here.
+/// The UI never asks for it in a browser.
+const APP_PATH: &str = "/__coversync-app";
+
+async fn app_path() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/", get(static_files))
+        .route(APP_PATH, any(app_path))
+        .route(&format!("{APP_PATH}/"), any(app_path))
+        .route(&format!("{APP_PATH}/{{*rest}}"), any(app_path))
         .fallback(get(static_files))
         .layer(middleware::from_fn(csp))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::inline_script_hashes;
+    use axum::body::Body;
+    use axum::extract::{ConnectInfo, Request};
+    use axum::http::{Method, StatusCode};
+    use tower::ServiceExt;
+
+    use super::{APP_PATH, inline_script_hashes};
+
+    /// The desktop app's proxy answers this path on the page's origin; the
+    /// server, which that origin stands for, must never use it.
+    #[tokio::test]
+    async fn nothing_is_served_at_the_desktop_apps_path() {
+        let dir = std::env::temp_dir().join(format!("coversyncd-app-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = crate::app(crate::test_state(&dir));
+        let status = async |method: &Method, path: &str| {
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let peer: std::net::SocketAddr = "192.168.1.20:40000".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            app.clone().oneshot(req).await.unwrap().status()
+        };
+        assert_eq!(APP_PATH, "/__coversync-app", "the app's proxy has it too");
+        for path in [
+            "/__coversync-app",
+            "/__coversync-app/",
+            "/__coversync-app/v1/capabilities",
+            "/__coversync-app/v2/later",
+        ] {
+            for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                assert_eq!(
+                    status(&method, path).await,
+                    StatusCode::NOT_FOUND,
+                    "{method} {path}"
+                );
+            }
+        }
+        // Next to it, a path of the UI's still gets the UI's shell (or, in a
+        // build without the UI, its plain 404): GET is allowed there.
+        assert_ne!(
+            status(&Method::POST, "/library").await,
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hashes_only_inline_scripts() {

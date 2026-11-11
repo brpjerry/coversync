@@ -2,6 +2,7 @@
 
 #include "backend.h"
 #include "momentum.h"
+#include "notifier.h"
 #include "pages.h"
 
 #include "coversync-desktop-linux/src/ffi.cxx.h"
@@ -17,6 +18,7 @@
 #include <QtCore/QSet>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
+#include <QtWebEngineCore/QWebEngineNotification>
 #include <QtWebEngineQuick/QQuickWebEngineProfile>
 #include <QtWebEngineQuick/QtWebEngineQuick>
 
@@ -62,6 +64,23 @@ void onMainThread(Work &&work)
     const std::lock_guard<std::mutex> lock(g_lock);
     if (g_app)
         QMetaObject::invokeMethod(g_app, std::forward<Work>(work), Qt::QueuedConnection);
+}
+
+// Brings the window up. `token` is what the desktop gave for that (a launch's, or a chosen notification's), or
+// empty.
+void raiseWindow(const QByteArray &token)
+{
+    if (!g_window)
+        return;
+    // Qt's Wayland plugin activates the window with the token it finds here, and removes it.
+    if (!token.isEmpty())
+        qputenv("XDG_ACTIVATION_TOKEN", token);
+    if (g_window->visibility() == QWindow::Minimized)
+        g_window->showNormal();
+    else
+        g_window->show();
+    g_window->raise();
+    g_window->requestActivate();
 }
 
 // QML's complaints go to stderr, whatever Qt's own logging is set to (the journal, under systemd).
@@ -287,6 +306,21 @@ int run(const Options &options)
                                [view = QPointer<QObject>(view)] { return view ? view->property("url").toUrl() : QUrl(); }, &app);
     profile->installUrlSchemeHandler(bytes(options.scheme), pages);
 
+    // A page's notifications, as the desktop's: only a server's UI gets to show any (window.qml grants it the
+    // permission), and only while the window is in the background.
+    auto *notifier = new Notifier(qstring(options.app_id), qstring(options.icon_file), [](bool available) { notifications_found(available); },
+                                  &app);
+    QObject::connect(profile, &QQuickWebEngineProfile::presentNotification, notifier,
+                     [notifier, window](QWebEngineNotification *notification) {
+                         const QByteArray origin = notification->origin().toString(QUrl::FullyEncoded).toUtf8();
+                         const rust::Str from(origin.constData(), static_cast<std::size_t>(origin.size()));
+                         if (shows_notification(from, window->isActive()))
+                             notifier->present(notification);
+                         else
+                             notifier->dismiss(notification);
+                     });
+    QObject::connect(notifier, &Notifier::chosen, &app, [](const QByteArray &token) { raiseWindow(token); });
+
     if (Momentum::enabled())
         new Momentum(window);
     if (auto *item = qobject_cast<QQuickItem *>(view))
@@ -356,19 +390,7 @@ void load(rust::Str url)
 
 void raise(rust::Str activationToken)
 {
-    onMainThread([token = QByteArray(activationToken.data(), static_cast<qsizetype>(activationToken.size()))] {
-        if (!g_window)
-            return;
-        // Qt's Wayland plugin activates the window with the token it finds here, and removes it.
-        if (!token.isEmpty())
-            qputenv("XDG_ACTIVATION_TOKEN", token);
-        if (g_window->visibility() == QWindow::Minimized)
-            g_window->showNormal();
-        else
-            g_window->show();
-        g_window->raise();
-        g_window->requestActivate();
-    });
+    onMainThread([token = QByteArray(activationToken.data(), static_cast<qsizetype>(activationToken.size()))] { raiseWindow(token); });
 }
 
 void bridge_reply(std::uint64_t id, rust::Slice<const std::uint8_t> body)

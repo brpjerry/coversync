@@ -41,6 +41,15 @@ pub fn cache_dir() -> PathBuf {
         .join("webengine")
 }
 
+/// The app's icon as a file (`~/.cache/io.github.brpjerry.coversync/icon.svg`),
+/// for a desktop that has no icon by the app's ID: see
+/// [`crate::pages::icon_file`].
+pub fn icon_file() -> PathBuf {
+    base("XDG_CACHE_HOME", ".cache", from_env)
+        .join(APP_ID)
+        .join("icon.svg")
+}
+
 /// The session's runtime folder (`$XDG_RUNTIME_DIR`), which only the user
 /// can reach; none if the session has none. There is no falling back to
 /// the temporary folder, which everyone shares.

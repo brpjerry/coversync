@@ -48,6 +48,8 @@
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
+	import { desktopApp } from '#lib/desktop.svelte.ts';
+	import { notify } from '#lib/notify.ts';
 	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
 	import SortMenu from '#lib/components/SortMenu.svelte';
@@ -615,7 +617,24 @@
 		live = up;
 		// Down: poll again straight away. Up: the safety poll takes over after a resync.
 		if (!up) poll();
+		// The server answers: the app can be found now, if it couldn't before.
+		else findApp();
 	}
+
+	/**
+	 * In the desktop app, which notifies of what finishes while its window is
+	 * in the background, the page hears of it while hidden too.
+	 */
+	async function findApp() {
+		await desktopApp.detect();
+		if (desktopApp.has('notify')) listening?.stayOpen();
+	}
+
+	/** An album as a notification names it. */
+	const named = (id: string) => {
+		const album = albums.find((a) => a.id === id);
+		return album ? `${album.artist} · ${album.title}` : '';
+	};
 
 	/** The open album's id as of the latest notice (a held sheet's album may have a new one). */
 	const openNow = () => holding?.next ?? openId;
@@ -946,8 +965,26 @@
 			scanFinishes++;
 			if (status) status = { ...status, scan };
 			scanFinished();
+			// The scan's count is of the Inbox's albums.
+			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'} in the Inbox`;
+			const unread = scan.errors
+				? `, ${count(scan.errors)} ${scan.errors === 1 ? 'file' : 'files'} couldn’t be read`
+				: '';
+			notify('Scan finished', found + unread, 'scan');
 		},
 		imported({ album_id, inbox_id }) {
+			if (desktopApp.has('notify')) {
+				// As the Library has it: the import may have changed its tags. Failing that, by
+				// its Inbox entry, if the grid still has it.
+				const before = named(inbox_id);
+				api
+					.album(album_id)
+					.then(
+						(album) => `${album.artist} · ${album.title}`,
+						() => before
+					)
+					.then((name) => notify('Imported to the Library', name, `import-${album_id}`));
+			}
 			// Copies hide the Inbox files, which Inbox setup counts.
 			inboxSetup.refresh();
 			inboxChanged();
@@ -960,6 +997,13 @@
 			});
 		},
 		album_changed: albumChanged,
+		lookup_finished({ album_id, state }) {
+			notify(
+				state === 'done' ? 'Suggestions are ready' : 'Looking for suggestions failed',
+				named(album_id),
+				`lookup-${album_id}`
+			);
+		},
 		setup_saved({ setup: saved }) {
 			// Each can change which albums need attention, or what sorts and filters show.
 			if (saved === 'library') setup.refresh();
@@ -1157,6 +1201,7 @@
 	onMount(() => {
 		// Listen first, then read: see onfirst.
 		listening = listen(notices, onlive, onfirst);
+		findApp();
 		const wait = setTimeout(() => startReads(), OPEN_WAIT_MS);
 		startReads = () => {
 			if (readsStarted) return;

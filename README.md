@@ -490,6 +490,28 @@ file chooser behind a page's "Choose image". The app runs on Qt's
 says: a theme meant for Qt's widgets (qt6ct, say) would hand pages its own
 palette instead of the desktop's preference.
 
+The UI comes from the server, so it asks the app around it what that app
+can do. It finds the app by a `Coversync-App` header the proxy adds to
+`/api/hello`, and then asks once, at `POST /__coversync-app/v1/capabilities`
+on its own origin, for a list of features; what depends on one shows only
+when it's listed, so an older app works with a newer UI and the other way
+round. The proxy answers that path itself and never forwards it
+(`crates/coversync-proxy/src/app.rs`; the commands are in
+`crates/coversync-desktop-core/src/bridge.rs`), and coversyncd serves nothing
+there. Only a page of the server's own UI can ask: a request needs the
+proxy's cookie, `Sec-Fetch-Site: same-origin`, the proxy's own `Origin` and a
+JSON body, so a page from elsewhere, a frame of another origin or of none, or
+another server's page in the same window is refused. The commands are safe for any script on the page:
+none takes a file's path, gives out a sign-in, or changes the server the app
+uses. In a browser there is no such header, and the UI never asks.
+
+While its window is in the background, the app shows a finished scan, import
+or suggestions lookup as a desktop notification. The UI sends these with the
+web's own `Notification`, only in an app that lists `notify`; the app lets a
+server's UI send them without asking, and hands them to the desktop's
+notification service (`org.freedesktop.Notifications`), or to the portal in a
+sandbox. Clicking one brings the window up, where the desktop allows that.
+
 Qt WebEngine has no momentum for two-finger scrolling on Linux, so the app
 carries a scroll on itself once the fingers lift (`cpp/momentum.h`, which
 lists the environment variables that tune it; `COVERSYNC_MOMENTUM=0` turns it

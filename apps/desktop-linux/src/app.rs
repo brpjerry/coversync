@@ -10,12 +10,14 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use coversync_desktop_core::bridge::{Commands, Feature, Features, Host};
 use coversync_desktop_core::{
     ConfigLock, EarlyLaunches, Problem, Save, Shell, Store, config, server_arg, with_env_server,
 };
 use coversync_proxy::Cookies;
 use serde::Serialize;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 use url::Url;
 
 use crate::bridge::{self, Reply, Request};
@@ -32,6 +34,37 @@ const TERMINATED_NORMALLY: i32 = 0;
 const TERMINATED_KILLED: i32 = 3;
 
 static APP: OnceLock<App> = OnceLock::new();
+
+/// The app, as the commands for the servers' pages see it
+/// ([`coversync_desktop_core::bridge`]).
+struct Desktop {
+    /// Whether the desktop has anything to show notifications with, once
+    /// the window knows.
+    notifications: watch::Receiver<Option<bool>>,
+}
+
+impl Host for Desktop {
+    /// Waits for the window to find out whether the desktop shows
+    /// notifications, however long that takes: the page asks once and keeps
+    /// the answer, so an early "no" would stand until it's reloaded. The
+    /// window always finds out; a desktop that doesn't answer is a "no"
+    /// once the call to it times out.
+    fn features(&self) -> Features {
+        let mut notifications = self.notifications.clone();
+        Box::pin(async move {
+            let known = notifications
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|known| *known);
+            let mut features = Vec::new();
+            if known == Some(true) {
+                features.push(Feature::Notify);
+            }
+            features
+        })
+    }
+}
 
 /// What the fallback page shows.
 #[derive(Serialize)]
@@ -54,6 +87,9 @@ pub struct App {
     runtime: Handle,
     shell: Arc<Shell>,
     early: Mutex<EarlyLaunches<Launch>>,
+    /// Whether the desktop shows notifications: `None` until the window has
+    /// found out.
+    notifications: watch::Sender<Option<bool>>,
     /// Held for the whole run: see [`ConfigLock`].
     _lock: ConfigLock,
 }
@@ -81,17 +117,24 @@ impl App {
             .or(env_server)
             .or(saved.server);
 
-        let shell = Arc::new(Shell::new(
-            config,
-            Cookies::open(Some(config_dir.join("cookies.json"))),
-            Url::parse(FALLBACK).expect("the fallback page's URL is valid"),
-            // The proxy logs it.
-            Arc::new(|unreachable| {
-                if let Some(app) = App::get() {
-                    app.show_fallback(Problem::unreachable(unreachable));
-                }
-            }),
-        ));
+        let (notifications, found) = watch::channel(None);
+        let desktop = Desktop {
+            notifications: found,
+        };
+        let shell = Arc::new(
+            Shell::new(
+                config,
+                Cookies::open(Some(config_dir.join("cookies.json"))),
+                Url::parse(FALLBACK).expect("the fallback page's URL is valid"),
+                // The proxy logs it.
+                Arc::new(|unreachable| {
+                    if let Some(app) = App::get() {
+                        app.show_fallback(Problem::unreachable(unreachable));
+                    }
+                }),
+            )
+            .with_commands(Arc::new(Commands::new(Arc::new(desktop)))),
+        );
         // Straight to the server's UI when there's a server; the fallback
         // page takes over if it can't be reached.
         let first_url = match server.map(|server| runtime.block_on(shell.open(&server))) {
@@ -107,6 +150,7 @@ impl App {
             runtime,
             shell,
             early: Mutex::new(EarlyLaunches::default()),
+            notifications,
             _lock: lock,
         };
         if APP.set(app).is_err() {
@@ -224,6 +268,37 @@ impl App {
         }
     }
 
+    /// Whether the page at `origin` may show notifications: a server's UI,
+    /// from one of the app's proxies. Any other page the window comes to
+    /// show (a link followed out of the UI) may not.
+    pub fn may_notify(&self, origin: &str) -> bool {
+        Url::parse(origin).is_ok_and(|origin| self.shell.is_proxied(&origin))
+    }
+
+    /// Whether a notification from the page at `origin` is shown now: only
+    /// while the window is in the background. In front, the page's own
+    /// messages are in view.
+    pub fn shows_notification(&self, origin: &str, window_active: bool) -> bool {
+        let shown = !window_active && self.may_notify(origin);
+        if !shown {
+            let why = if window_active {
+                "the window has the focus"
+            } else {
+                "it isn't a server's page"
+            };
+            tracing::debug!("not showing a notification from {origin}: {why}");
+        }
+        shown
+    }
+
+    /// The window has found out whether the desktop shows notifications.
+    pub fn notifications_found(&self, available: bool) {
+        if !available {
+            tracing::info!("no notifications: the desktop has nothing that shows them");
+        }
+        self.notifications.send_replace(Some(available));
+    }
+
     /// The process that draws the page ended (`status` is Qt's
     /// `RenderProcessTerminationStatus`): the view would keep its last frame,
     /// or a blank one, and never come back.
@@ -239,5 +314,43 @@ impl App {
         };
         tracing::error!("{message} (status {status}, exit code {exit_code})");
         self.show_fallback(Problem::new("The page stopped working", message));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_features_wait_for_the_window_to_find_out() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let features = |found: Option<bool>| async move {
+                let (notifications, heard) = watch::channel(None);
+                let desktop = Desktop {
+                    notifications: heard,
+                };
+                let asked = desktop.features();
+                tokio::pin!(asked);
+                // However long the page has waited, there's no answer until
+                // the window has one: the page keeps what it's told.
+                let early = tokio::time::timeout(Duration::from_millis(50), &mut asked).await;
+                assert!(early.is_err(), "answered before the window knew");
+                match found {
+                    Some(found) => drop(notifications.send(Some(found))),
+                    // The window is gone without ever finding out.
+                    None => drop(notifications),
+                }
+                asked.await
+            };
+            assert_eq!(features(Some(true)).await, [Feature::Notify]);
+            assert_eq!(features(Some(false)).await, []);
+            assert_eq!(features(None).await, []);
+        });
     }
 }

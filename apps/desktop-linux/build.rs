@@ -18,6 +18,8 @@ fn main() {
         .cpp_file("cpp/backend.h")
         .cpp_file("cpp/backend.cpp")
         .cpp_file("cpp/momentum.cpp")
+        .cpp_file("cpp/notifier.h")
+        .cpp_file("cpp/notifier.cpp")
         .cpp_file("cpp/pages.cpp")
         .cpp_file("cpp/shell.cpp")
         .build();

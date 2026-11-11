@@ -6,6 +6,8 @@
 //! CORS-enabled, which module scripts need. The fallback page's commands
 //! travel the same way: a POST to [`BRIDGE`] (see [`crate::bridge`]).
 
+use std::path::Path;
+
 pub const SCHEME: &str = "coversync";
 /// The fallback page.
 pub const FALLBACK: &str = "coversync://app/index.html";
@@ -52,6 +54,27 @@ pub fn find(path: &str) -> Option<&'static Page> {
     PAGES.iter().find(|page| page.path == path)
 }
 
+/// The app's icon, written to `file` unless it's there already: a
+/// notification names its icon, and until the app is installed the desktop
+/// has none by the app's ID. `None` if it couldn't be written.
+pub fn icon_file(file: &Path) -> Option<&Path> {
+    let icon = find("/logo.svg")?.body;
+    if std::fs::read(file).is_ok_and(|there| there == icon) {
+        return Some(file);
+    }
+    let written = file
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(file, icon));
+    match written {
+        Ok(()) => Some(file),
+        Err(err) => {
+            tracing::warn!("couldn't write the app's icon to {}: {err}", file.display());
+            None
+        }
+    }
+}
+
 /// Whether `uri` is one of the app's own pages.
 pub fn is_app_page(uri: &str) -> bool {
     uri.starts_with("coversync://app/")
@@ -87,6 +110,29 @@ mod tests {
         );
         assert!(find("/../Cargo.toml").is_none());
         assert!(find("index.html").is_none());
+    }
+
+    #[test]
+    fn writes_the_icon_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache").join("icon.svg");
+        assert_eq!(icon_file(&file), Some(file.as_path()));
+        let written = std::fs::read(&file).unwrap();
+        assert_eq!(written, find("/logo.svg").unwrap().body);
+        // There already: left as it is.
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(icon_file(&file), Some(file.as_path()));
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+        // Another build's: replaced.
+        std::fs::write(&file, "old").unwrap();
+        icon_file(&file);
+        assert_eq!(std::fs::read(&file).unwrap(), written);
+        // Nowhere to write it.
+        let blocked = file.join("under-a-file").join("icon.svg");
+        assert_eq!(icon_file(&blocked), None);
     }
 
     #[test]

@@ -688,22 +688,36 @@ export const musicbrainzArtUrl = (release_id: string) =>
 	`${BASE}/api/musicbrainz/art/${release_id}/image`;
 export const streamUrl = (trackId: number) => `${BASE}/api/tracks/${trackId}/stream`;
 
-let address: Promise<string> | undefined;
+/** What the desktop app's proxy adds to `/api/hello`'s answer; both null in a browser. */
+export interface Hello {
+	/** `Coversync-Server`: the server the proxy stands for. */
+	server: string | null;
+	/** `Coversync-App`: the versions of the app's interface the app speaks (desktop.svelte.ts). */
+	app: string | null;
+}
+
+let greeting: Promise<Hello> | undefined;
+/**
+ * Read `/api/hello` once. Fails when it can't be read (the proxy's 502 while
+ * the server is down, say), and is asked again next time.
+ */
+export function hello(): Promise<Hello> {
+	if (!greeting) {
+		greeting = fetch(`${BASE}/api/hello`, { cache: 'no-store' }).then((res) => {
+			if (!res.ok) throw new Error(`/api/hello: ${res.status}`);
+			return { server: res.headers.get('coversync-server'), app: res.headers.get('coversync-app') };
+		});
+		greeting.catch(() => (greeting = undefined));
+	}
+	return greeting;
+}
+
 /**
  * The address other devices reach coversync at: this page's own, with its
  * path prefix. In the desktop app the page comes from a proxy on 127.0.0.1,
- * which names the server it stands for in a `Coversync-Server` header. Fails
- * when `/api/hello` can't be read (the proxy's 502 while the server is down,
- * say), and is asked again next time.
+ * which names the server it stands for. Fails when `hello` does.
  */
-export function serverAddress(): Promise<string> {
-	if (!address) {
-		address = fetch(`${BASE}/api/hello`, { cache: 'no-store' }).then((res) => {
-			if (!res.ok) throw new Error(`/api/hello: ${res.status}`);
-			const named = res.headers.get('coversync-server');
-			return named && URL.canParse(named) ? named : `${location.origin}${BASE}/`;
-		});
-		address.catch(() => (address = undefined));
-	}
-	return address;
-}
+export const serverAddress = (): Promise<string> =>
+	hello().then(({ server }) =>
+		server && URL.canParse(server) ? server : `${location.origin}${BASE}/`
+	);
