@@ -179,6 +179,11 @@ void Backend::renderTerminated(int status, int exitCode)
     render_terminated(status, exitCode);
 }
 
+void Backend::answered(const QString &id, bool accepted)
+{
+    ::answered(id.toULongLong(), accepted);
+}
+
 bool Backend::mayNotify(const QUrl &origin)
 {
     const QByteArray asked = origin.toString(QUrl::FullyEncoded).toUtf8();

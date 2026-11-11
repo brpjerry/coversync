@@ -2,7 +2,7 @@
 // here, and the layout shows the login view. A session that ends while the
 // app is open keeps the app, and its unsaved edits, under the login view.
 
-import { api, ApiError, BASE, onUnauthorized } from './api';
+import { api, ApiError, BASE, onUnauthorized, type Access } from './api';
 
 /** Why the login view is up: the API's `code` for its 401. */
 export type SignedOut = 'no_password' | 'login_required' | 'session_expired';
@@ -25,6 +25,11 @@ class Session {
 	shown = $state(false);
 	/** Bumped by each sign-in once the app has been shown, so it can reload what failed meanwhile. */
 	generation = $state(0);
+	/**
+	 * How the API was last seen to take this page's requests. `token` in a desktop app paired
+	 * with the server: its window is signed in as that device, with nothing to sign out of here.
+	 */
+	via = $state<Access['via'] | null>(null);
 
 	constructor() {
 		onUnauthorized((code) => this.lost(code));
@@ -33,7 +38,7 @@ class Session {
 	/** Ask the API whether this browser is signed in. */
 	async check() {
 		try {
-			await api.session();
+			this.via = (await api.session()).via;
 			this.#signedIn();
 		} catch (e) {
 			// A 401 has called lost(). Otherwise coversyncd can't be reached:

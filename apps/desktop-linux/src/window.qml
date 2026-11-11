@@ -1,5 +1,5 @@
-// The app's window: one web view, and the little the window draws itself (a page's alert, confirm and prompt, and
-// its tooltips).
+// The app's window: one web view, and the little the window draws itself (a page's alert, confirm and prompt, the
+// app's own questions, and a page's tooltips).
 // cpp/shell.cpp loads this, with these names set:
 //   backend         what the view's signals are passed to, and the desktop's file chooser (cpp/backend.h)
 //   appStoragePath  where the view keeps local storage and the like
@@ -35,6 +35,25 @@ Window {
 
     // The web view, once there is one (see viewLoader).
     readonly property Item view: viewLoader.item
+
+    // The app's own question (whether to pair, from a link), in the dialog a page's confirm() gets. The backend
+    // hears the answer, with `id`. Without `cancel` it only tells: there is one button.
+    function askForApp(id, message, accept, cancel) {
+        dialog.ask({
+            "fromApp": true,
+            "type": cancel === "" ? JavaScriptDialogRequest.DialogTypeAlert : JavaScriptDialogRequest.DialogTypeConfirm,
+            "message": message,
+            "defaultText": "",
+            "acceptLabel": accept,
+            "cancelLabel": cancel,
+            "dialogAccept": function () {
+                backend.answered(id, true);
+            },
+            "dialogReject": function () {
+                backend.answered(id, false);
+            }
+        });
+    }
 
     // The view's profile. Named, so the HTTP cache (the covers) and local storage are kept on disk.
     WebEngineProfilePrototype {
@@ -129,6 +148,9 @@ Window {
             Component.onCompleted: {
                 // A page may put text on the clipboard (the pairing link's "Copy"); reading it stays off.
                 settings.javascriptCanAccessClipboard = true;
+                // A page's link to another app's scheme (mailto:, or coversync://pair, the app's own pairing
+                // link) goes nowhere: Qt would hand it to the desktop, which would open that app.
+                settings.unknownUrlSchemePolicy = WebEngineSettings.DisallowUnknownUrlSchemes;
                 // In a script world of its own: a page's own scripts can't see it.
                 userScripts.collection = [
                     {
@@ -234,6 +256,7 @@ Window {
             id: label
             anchors.centerIn: parent
             color: button.primary ? window.accentTextColor : window.textColor
+            textFormat: Text.PlainText
             font.pixelSize: 14
             font.weight: Font.Medium
         }
@@ -244,25 +267,38 @@ Window {
         }
     }
 
-    // A page's alert(), confirm() or prompt(), over the page until it's answered.
+    // A page's alert(), confirm() or prompt(), or a question of the app's own, over the page until it's answered.
     Item {
         id: dialog
 
+        // A page's request (a JavaScriptDialogRequest), or the app's (see askForApp), which has the same parts.
         property var request: null
+        // When it came up. The app's question can't be agreed to in its first second: a key or a click meant for
+        // the page mustn't answer it.
+        property double shownAt: 0
+        readonly property bool fromApp: request !== null && request.fromApp === true
         readonly property int kind: request ? request.type : -1
         readonly property bool isAlert: kind === JavaScriptDialogRequest.DialogTypeAlert
         readonly property bool isPrompt: kind === JavaScriptDialogRequest.DialogTypePrompt
         readonly property bool isLeave: kind === JavaScriptDialogRequest.DialogTypeBeforeUnload
 
         function ask(asked) {
+            // A page can't put a dialog of its own in place of the app's question.
+            if (fromApp && asked.fromApp !== true) {
+                asked.dialogReject();
+                return;
+            }
             if (request)
                 request.dialogReject();
             request = asked;
+            shownAt = Date.now();
             input.text = asked.defaultText;
             (isPrompt ? input : card).forceActiveFocus();
         }
 
         function answer(accept) {
+            if (accept && fromApp && !isAlert && Date.now() - shownAt < 1000)
+                return;
             const asked = request;
             request = null;
             if (!asked)
@@ -327,6 +363,9 @@ Window {
                         return dialog.isLeave ? "Leave this page? Changes you made may not be saved." : "";
                     }
                     color: window.textColor
+                    // As written: a page's message, or a pairing link's address, is never markup (which could
+                    // also fetch an image).
+                    textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     font.pixelSize: 15
                     lineHeight: 1.25
@@ -365,13 +404,13 @@ Window {
                     layoutDirection: Qt.RightToLeft
 
                     DialogButton {
-                        text: dialog.isLeave ? "Leave" : "OK"
+                        text: dialog.fromApp ? dialog.request.acceptLabel : dialog.isLeave ? "Leave" : "OK"
                         primary: true
                         onClicked: dialog.answer(true)
                     }
                     DialogButton {
                         visible: !dialog.isAlert
-                        text: dialog.isLeave ? "Stay" : "Cancel"
+                        text: dialog.fromApp ? dialog.request.cancelLabel : dialog.isLeave ? "Stay" : "Cancel"
                         onClicked: dialog.answer(false)
                     }
                 }

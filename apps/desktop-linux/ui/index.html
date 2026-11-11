@@ -40,6 +40,35 @@
 					own CA (mkcert, say) needs that CA installed in the system's certificate store.
 				</p>
 			</form>
+			<form id="pair-form" hidden>
+				<p id="pair-server" class="address"></p>
+				<label for="code">Pairing code</label>
+				<div class="row">
+					<input
+						id="code"
+						type="text"
+						placeholder="K7QM-4ZTD"
+						autocomplete="off"
+						autocapitalize="characters"
+						spellcheck="false"
+						maxlength="32"
+						required
+					/>
+					<button id="pair" type="submit" class="primary">Pair</button>
+				</div>
+				<p class="hint">
+					Add device, in the server's Sync setup, makes a code for this computer. Once paired, it
+					has an entry of its own among the server's devices, which can be removed there without
+					changing the password.
+				</p>
+				<div class="row">
+					<button id="password" type="button">Sign in with the password instead</button>
+					<button id="other" type="button">Another server</button>
+				</div>
+			</form>
+			<div id="forget-row" class="row" hidden>
+				<button id="forget" type="button" class="quiet">Forget this server</button>
+			</div>
 			<p id="busy" class="busy" hidden></p>
 		</main>
 	</body>

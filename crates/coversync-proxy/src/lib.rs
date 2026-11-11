@@ -20,6 +20,9 @@
 //!   port. The window opens [`Proxy::entry_url`], which carries a secret
 //!   made for this launch. The proxy trades it for an HttpOnly cookie and
 //!   refuses every request without that cookie.
+//! - Pairing gives the app a token of its own for a server
+//!   ([`Proxy::pair`]). If the server later refuses it (the device was
+//!   removed there), the app is told ([`Builder::on_rejected`]).
 //! - The UI's requests to the app itself, under `/__coversync-app/`, are
 //!   answered here and never forwarded ([`AppCommands`]).
 
@@ -27,6 +30,7 @@ mod app;
 mod headers;
 mod jar;
 mod pages;
+mod pair;
 mod unreachable;
 mod upstream;
 
@@ -54,6 +58,7 @@ use url::Url;
 pub use app::{AppAnswer, AppCommands, AppError, HEADER as APP_HEADER, RESERVED as APP_PATH};
 pub use headers::SERVER as SERVER_HEADER;
 pub use jar::Cookies;
+pub use pair::{AboutApp, PairError, Paired, Token};
 pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};
 
@@ -64,6 +69,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 type UnreachableHandler = Arc<dyn Fn(Unreachable) + Send + Sync>;
+type RejectedHandler = Arc<dyn Fn(Upstream) + Send + Sync>;
 
 /// Sets up a [`Proxy`].
 pub struct Builder {
@@ -73,6 +79,7 @@ pub struct Builder {
     cookies: Option<Cookies>,
     page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
+    on_rejected: Option<RejectedHandler>,
     commands: Option<Arc<dyn AppCommands>>,
 }
 
@@ -85,6 +92,7 @@ impl Default for Builder {
             cookies: None,
             page_timeout: PAGE_TIMEOUT,
             on_unreachable: None,
+            on_rejected: None,
             commands: None,
         }
     }
@@ -141,6 +149,21 @@ impl Builder {
         self
     }
 
+    /// Called when the server refuses the app's own `Authorization`
+    /// ([`Upstream::with_authorization`]): its token isn't valid any more,
+    /// as after the device was removed on the server. That is a 401 that
+    /// says `invalid_token`, to a request that carried the token; another
+    /// 401 (a wrong password at the server's login, say) isn't about the
+    /// token. Where a 401's body can't be read on its way to the page
+    /// (compressed or sent in chunks by a reverse proxy), the proxy asks
+    /// the server itself. It's given the server as the request went to it,
+    /// token and all, and may be called once for each request refused; the
+    /// answer goes on to the page as it is.
+    pub fn on_rejected(mut self, handler: impl Fn(Upstream) + Send + Sync + 'static) -> Self {
+        self.on_rejected = Some(Arc::new(handler));
+        self
+    }
+
     /// The app's commands for the server's pages, which the proxy answers
     /// under [`APP_PATH`] and says it has in [`APP_HEADER`]. Without them it
     /// has none, and doesn't say so; the path is never forwarded either way.
@@ -175,6 +198,7 @@ impl Builder {
             addr,
             page_timeout: self.page_timeout,
             on_unreachable: self.on_unreachable,
+            on_rejected: self.on_rejected,
             commands: self.commands,
         });
         let app = Router::new()
@@ -255,6 +279,19 @@ impl Proxy {
             Err(_) => Err(Unreachable::too_slow(upstream, timeout)),
             Ok(answer) => answer,
         }
+    }
+
+    /// Trades a pairing code from `upstream`'s Add device for this app's
+    /// token there. Nothing else changes: the token is the caller's to
+    /// keep, and to give the proxy with [`Upstream::with_authorization`].
+    pub async fn pair(
+        &self,
+        upstream: &Upstream,
+        code: &str,
+        about: &AboutApp,
+    ) -> Result<Paired, PairError> {
+        let shared = &self.shared;
+        pair::pair(&shared.client, upstream, code, about, shared.page_timeout).await
     }
 
     async fn hello(&self, upstream: &Upstream) -> Result<(), Unreachable> {
@@ -356,6 +393,7 @@ struct Shared {
     host: HeaderValue,
     page_timeout: Duration,
     on_unreachable: Option<UnreachableHandler>,
+    on_rejected: Option<RejectedHandler>,
     /// The app's commands for the server's pages.
     commands: Option<Arc<dyn AppCommands>>,
 }
@@ -384,7 +422,7 @@ impl Shared {
         }
     }
 
-    async fn forward(&self, upstream: &Upstream, req: Request) -> Response {
+    async fn forward(self: &Arc<Self>, upstream: &Upstream, req: Request) -> Response {
         let document = is_document(&req);
         let (mut parts, body) = req.into_parts();
         // Where the UI looks for the app.
@@ -431,6 +469,40 @@ impl Shared {
         tracing::debug!("{method} {url} -> {}", res.status());
         let (mut parts, body) = res.into_parts();
         self.jar.take(upstream.origin(), &url, &mut parts.headers);
+        let mut body = Body::new(body);
+        // The app's token, refused: the device was removed on the server.
+        if parts.status == StatusCode::UNAUTHORIZED
+            && upstream.authorization().is_some()
+            && let Some(handler) = &self.on_rejected
+        {
+            let refused = |upstream: &Upstream| {
+                tracing::warn!("{} refused the app's token", upstream.url());
+                handler(upstream.clone());
+            };
+            if let Some(refusal) = pair::small_json(&parts.headers) {
+                // The server's refusals are a line of JSON: read whole, and
+                // passed on as it came.
+                let read = Limited::new(body, refusal).collect().await;
+                let bytes = read.map(|body| body.to_bytes()).unwrap_or_default();
+                if pair::says_invalid_token(&bytes) {
+                    refused(upstream);
+                }
+                body = Body::from(bytes);
+            } else {
+                // One that can't be read here goes on untouched, and the
+                // server is asked directly, without holding the answer up.
+                let (proxy, upstream) = (Arc::clone(self), upstream.clone());
+                tokio::spawn(async move {
+                    let timeout = proxy.page_timeout;
+                    if pair::token_refused(&proxy.client, &upstream, timeout).await
+                        && let Some(handler) = &proxy.on_rejected
+                    {
+                        tracing::warn!("{} refused the app's token", upstream.url());
+                        handler(upstream);
+                    }
+                });
+            }
+        }
         if document {
             if let Some(down) = Unreachable::from_status(upstream, parts.status) {
                 tracing::warn!("{down}");
@@ -446,7 +518,7 @@ impl Shared {
         if hello {
             parts.headers.insert(app::HEADER, app::VERSIONS);
         }
-        Response::from_parts(parts, Body::new(body))
+        Response::from_parts(parts, body)
     }
 }
 

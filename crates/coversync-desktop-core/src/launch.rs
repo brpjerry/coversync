@@ -3,6 +3,7 @@
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
+use url::Url;
 
 /// A server for this run only, like `--server`. Neither is saved.
 pub const SERVER_ENV: &str = "COVERSYNC_SERVER";
@@ -20,6 +21,54 @@ pub fn server_arg(args: impl IntoIterator<Item = String>) -> Option<String> {
         }
     }
     None
+}
+
+/// A pairing link, as the server's Add device makes it and the desktop
+/// hands it to the app as an argument:
+/// `coversync://pair?server=https%3A%2F%2Fn5pro.internal%2Fcoversync%2F&code=K7QM4ZTD`.
+///
+/// It can come from anywhere (a web page can make the desktop open one), so
+/// it only ever leads to a question: the app names the server and asks
+/// before it pairs. Its `ca=`, for apps that bring their own certificate
+/// store, is ignored: this app trusts the system's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairLink {
+    /// The server's address, as the link gives it: not checked yet.
+    pub server: String,
+    pub code: String,
+}
+
+impl PairLink {
+    /// Reads one argument. `None` for anything but a pairing link with a
+    /// server and a code; `coversync://app/…`, the window's own pages, is
+    /// none.
+    pub fn parse(arg: &str) -> Option<Self> {
+        let url = Url::parse(arg.trim()).ok()?;
+        let plain = url.username().is_empty() && url.password().is_none() && url.port().is_none();
+        if url.scheme() != "coversync"
+            || url.host_str() != Some("pair")
+            || !matches!(url.path(), "" | "/")
+            || !plain
+        {
+            return None;
+        }
+        let value = |name: &str| {
+            let mut values = url.query_pairs().filter(|(key, _)| key == name);
+            let value = values.next()?.1.trim().to_owned();
+            // Given twice, it's unclear which is meant.
+            (values.next().is_none() && !value.is_empty()).then_some(value)
+        };
+        Some(Self {
+            server: value("server")?,
+            code: value("code")?,
+        })
+    }
+
+    /// The first pairing link among a launch's arguments, after the
+    /// program's name.
+    pub fn among(args: impl IntoIterator<Item = String>) -> Option<Self> {
+        args.into_iter().find_map(|arg| Self::parse(&arg))
+    }
 }
 
 /// A later launch's arguments, with its `COVERSYNC_SERVER` as `--server`
@@ -96,6 +145,63 @@ pub fn log_filter(rust_log: &str) -> EnvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_pairing_link() {
+        let link =
+            "coversync://pair?server=https%3A%2F%2Fn5pro.internal%2Fcoversync%2F&code=K7QM4ZTD";
+        let read = PairLink::parse(link).unwrap();
+        assert_eq!(read.server, "https://n5pro.internal/coversync/");
+        assert_eq!(read.code, "K7QM4ZTD");
+        // With the certificate's hash for other apps, which this one ignores.
+        let with_ca = PairLink::parse(&format!("{link}&ca=sha256%3Aabcd")).unwrap();
+        assert_eq!(with_ca, read);
+        assert_eq!(
+            PairLink::parse("coversync://pair/?code=K7QM-4ZTD&server=http://127.0.0.1:8770/"),
+            Some(PairLink {
+                server: "http://127.0.0.1:8770/".into(),
+                code: "K7QM-4ZTD".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_whole_pairing_link_is_one() {
+        for not_one in [
+            "",
+            "--server",
+            "https://n5pro.internal/coversync/",
+            // The window's own pages.
+            "coversync://app/index.html",
+            "coversync://app/__bridge?server=https://a/&code=K7QM4ZTD",
+            // Another host, a path, a port or a user in the pairing link's place.
+            "coversync://pairing?server=https://a/&code=K7QM4ZTD",
+            "coversync://pair/now?server=https://a/&code=K7QM4ZTD",
+            "coversync://pair:1?server=https://a/&code=K7QM4ZTD",
+            "coversync://user@pair?server=https://a/&code=K7QM4ZTD",
+            "coversyncs://pair?server=https://a/&code=K7QM4ZTD",
+            // A part missing, empty, or given twice.
+            "coversync://pair",
+            "coversync://pair?server=https://a/",
+            "coversync://pair?code=K7QM4ZTD",
+            "coversync://pair?server=&code=K7QM4ZTD",
+            "coversync://pair?server=https://a/&code=",
+            "coversync://pair?server=https://a/&server=https://b/&code=K7QM4ZTD",
+            "coversync://pair?server=https://a/&code=K7QM4ZTD&code=00000000",
+        ] {
+            assert_eq!(PairLink::parse(not_one), None, "{not_one}");
+        }
+    }
+
+    #[test]
+    fn finds_the_link_among_a_launchs_arguments() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let link = "coversync://pair?server=https://a/&code=K7QM4ZTD";
+        assert!(PairLink::among(args(&[link])).is_some());
+        assert!(PairLink::among(args(&["--server", "https://b/", link])).is_some());
+        assert_eq!(PairLink::among(args(&["--server", "https://b/"])), None);
+        assert_eq!(PairLink::among(args(&[])), None);
+    }
 
     #[test]
     fn keeps_warnings_whatever_rust_log_adds() {

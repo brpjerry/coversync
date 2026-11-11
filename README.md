@@ -490,6 +490,43 @@ file chooser behind a page's "Choose image". The app runs on Qt's
 says: a theme meant for Qt's widgets (qt6ct, say) would hand pages its own
 palette instead of the desktop's preference.
 
+The app can be paired with a server, which gives this computer an entry of
+its own among the server's devices and a token of its own, in place of a
+password login in the window. The device can be removed in the server's Sync
+setup without changing the password.
+
+- **By code:** after the address is checked, the app's page asks for a code
+  from the server's Add device (or to sign in with the password instead, as
+  in a browser).
+- **By link:** Add device also shows a `coversync://pair?server=…&code=…`
+  link. Opening it starts the app, or reaches the one running, which names
+  the server and asks before it pairs. A link can come from anywhere, so
+  nothing is sent before that. The link's `ca=` part is ignored: the app
+  trusts the system's certificate store. A page in the window can't open
+  such a link, or any other app's.
+- **The token** is kept in the desktop's keychain (the Secret Service:
+  GNOME Keyring, KeePassXC, KWallet), under the server's address, and goes
+  with every request to that server. It is never written to `config.json`,
+  `cookies.json` or a log. Without a keychain the app doesn't pair, and
+  says why before a code is spent.
+- **Pairing again** after a reinstall or with a new keychain: make the code
+  with Replace an existing device, so the computer keeps its entry.
+- **Removed on the server**, the app shows its own page again, saying so,
+  with the choice to pair again or sign in with the password.
+- **Forget this server**, on the app's page, removes the server's token from
+  the keychain, its cookies and its port.
+
+For the desktop to hand pairing links to the app, the app's desktop entry
+(`apps/desktop-linux/io.github.brpjerry.coversync.desktop`) has to be
+installed, with `coversync-desktop` on the `PATH`. There is no package that
+does that yet; for a build of your own:
+
+```sh
+install -Dm644 apps/desktop-linux/io.github.brpjerry.coversync.desktop \
+  ~/.local/share/applications/io.github.brpjerry.coversync.desktop
+xdg-mime default io.github.brpjerry.coversync.desktop x-scheme-handler/coversync
+```
+
 The UI comes from the server, so it asks the app around it what that app
 can do. It finds the app by a `Coversync-App` header the proxy adds to
 `/api/hello`, and then asks once, at `POST /__coversync-app/v1/capabilities`

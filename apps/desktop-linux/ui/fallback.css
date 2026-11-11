@@ -173,6 +173,29 @@ input:disabled {
 	cursor: default;
 }
 
+/* The server the pairing form is for. */
+form > .address {
+	margin: 0 0 4px;
+	color: var(--text);
+	font-weight: 550;
+	overflow-wrap: anywhere;
+}
+
+/* An action that shouldn't draw the eye: forgetting the server. */
+button.quiet {
+	padding: 4px 0;
+	border-color: transparent;
+	background: none;
+	color: var(--text-3);
+	font-size: 13px;
+	font-weight: 450;
+}
+
+button.quiet:hover:not(:disabled) {
+	color: var(--text);
+	text-decoration: underline;
+}
+
 .hint,
 .busy {
 	color: var(--text-3);
