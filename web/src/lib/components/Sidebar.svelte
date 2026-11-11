@@ -323,7 +323,6 @@
 		padding: 18px 12px 0;
 		/* Too short for everything, the whole sidebar scrolls. */
 		overflow: hidden auto;
-		scrollbar-width: thin;
 		transition: opacity 260ms;
 	}
 	.collapsed .inner {
@@ -342,7 +341,6 @@
 		margin: 0 -12px;
 		padding: 0 12px;
 		overflow: hidden auto;
-		scrollbar-width: thin;
 		transition: opacity 240ms;
 	}
 	.filter.idle {
@@ -512,7 +510,6 @@
 		margin: 0 -12px;
 		padding: 2px 12px 12px;
 		overflow: hidden auto;
-		scrollbar-width: thin;
 	}
 	.value {
 		display: grid;

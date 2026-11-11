@@ -138,7 +138,6 @@
 				{onmenu}
 				flag={f?.text}
 				flagTitle={f?.title}
-				{scrolling}
 			/>
 		</div>
 	{/each}

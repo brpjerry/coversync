@@ -759,8 +759,6 @@
 		/* One column that may shrink below its content's widest line: long
 		   release names wrap or truncate instead of widening the dialog. */
 		grid-template-columns: minmax(0, 1fr);
-		scrollbar-width: thin;
-		scrollbar-color: var(--border-strong) transparent;
 		padding: 16px 22px 8px;
 		display: grid;
 		gap: 20px;
