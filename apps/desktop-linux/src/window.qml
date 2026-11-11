@@ -203,6 +203,8 @@ Window {
             y: 6
             width: Math.min(implicitWidth, 360)
             color: window.textColor
+            // As written: a title is the page's to choose, and is never markup.
+            textFormat: Text.PlainText
             wrapMode: Text.Wrap
             font.pixelSize: 13
         }
