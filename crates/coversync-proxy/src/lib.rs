@@ -149,10 +149,12 @@ impl Builder {
         self
     }
 
-    /// Called when the server answers 401 to a request that carried the
-    /// app's own `Authorization` ([`Upstream::with_authorization`]): its
-    /// token isn't valid any more, as after the device was removed on the
-    /// server. It's given the server as the request went to it, token and
+    /// Called when the server refuses the app's own `Authorization`
+    /// ([`Upstream::with_authorization`]): its token isn't valid any more,
+    /// as after the device was removed on the server. That is a 401 that
+    /// says `invalid_token`, to a request that carried the token; another
+    /// 401 (a wrong password at the server's login, say) isn't about the
+    /// token. It's given the server as the request went to it, token and
     /// all, and may be called once for each request refused; the answer
     /// goes on to the page as it is.
     pub fn on_rejected(mut self, handler: impl Fn(Upstream) + Send + Sync + 'static) -> Self {
@@ -465,13 +467,22 @@ impl Shared {
         tracing::debug!("{method} {url} -> {}", res.status());
         let (mut parts, body) = res.into_parts();
         self.jar.take(upstream.origin(), &url, &mut parts.headers);
+        let mut body = Body::new(body);
         // The app's token, refused: the device was removed on the server.
         if parts.status == StatusCode::UNAUTHORIZED
             && upstream.authorization().is_some()
             && let Some(handler) = &self.on_rejected
+            && let Some(refusal) = pair::small_json(&parts.headers)
         {
-            tracing::warn!("{} refused the app's token", upstream.url());
-            handler(upstream.clone());
+            // The server's refusals are a line of JSON: read whole, and
+            // passed on as it came.
+            let read = Limited::new(body, refusal).collect().await;
+            let bytes = read.map(|body| body.to_bytes()).unwrap_or_default();
+            if pair::says_invalid_token(&bytes) {
+                tracing::warn!("{} refused the app's token", upstream.url());
+                handler(upstream.clone());
+            }
+            body = Body::from(bytes);
         }
         if document {
             if let Some(down) = Unreachable::from_status(upstream, parts.status) {
@@ -488,7 +499,7 @@ impl Shared {
         if hello {
             parts.headers.insert(app::HEADER, app::VERSIONS);
         }
-        Response::from_parts(parts, Body::new(body))
+        Response::from_parts(parts, body)
     }
 }
 

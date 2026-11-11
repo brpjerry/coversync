@@ -225,9 +225,16 @@ async fn a_server_that_cant_be_reached_says_why() {
     assert!(err.message.contains("didn't answer"), "{}", err.message);
 }
 
-/// A server that takes only the token `cst_good`.
+/// A server that takes only the token `cst_good`, with a login that takes no
+/// password at all.
 fn guarded(log: Log) -> Router {
-    Router::new().fallback(move |req: Request| {
+    let login = || async {
+        json_answer(
+            StatusCode::UNAUTHORIZED,
+            &json!({ "error": "That password isn't right.", "code": "wrong_password" }),
+        )
+    };
+    Router::new().route("/api/login", post(login)).fallback(move |req: Request| {
         let log = log.clone();
         async move {
             log.record(&req);
@@ -273,6 +280,19 @@ async fn tells_the_app_when_its_token_is_refused() {
     assert_eq!(window.send(own).await.status(), StatusCode::OK);
     assert_eq!(log.last().headers[AUTHORIZATION], "Bearer cst_good");
     assert!(rejected.lock().unwrap().is_empty());
+
+    // A 401 that isn't about the token: a wrong password at the server's
+    // login, which the token goes with as with every request.
+    let login = window
+        .request(Method::POST, "/api/login")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"password":"guess"}"#))
+        .unwrap();
+    let res = window.send(login).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_str(&text(res).await).unwrap();
+    assert_eq!(body["code"], "wrong_password");
+    assert!(rejected.lock().unwrap().is_empty(), "the token is fine");
 
     // The device is removed on the server: the token it has stops working.
     let removed = with_token(&server, "cst_removed");

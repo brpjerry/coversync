@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::header::{ACCEPT, CONTENT_TYPE, HOST};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use serde_json::{Value, json};
 
@@ -113,6 +113,25 @@ impl PairError {
     }
 }
 
+/// The length of an answer that is JSON and short enough to be one of the
+/// server's refusals, which says so in `Content-Length`; `None` for any
+/// other, which isn't read.
+pub(crate) fn small_json(headers: &HeaderMap) -> Option<usize> {
+    let json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"));
+    let length: usize = headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()?;
+    (json && length <= ANSWER_LIMIT).then_some(length)
+}
+
+/// Whether a 401's body is the server refusing a token: its `code` is
+/// `invalid_token`. A wrong password at its login is a 401 too.
+pub(crate) fn says_invalid_token(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok_and(|refusal| refusal["code"] == "invalid_token")
+}
+
 /// Trades `code` for a token at `upstream`'s `/api/pair`. Redirects aren't
 /// followed: a code goes to the address the user named and nowhere else.
 pub(crate) async fn pair(
@@ -213,6 +232,44 @@ mod tests {
             token,
         };
         assert!(!format!("{paired:?}").contains("cst_"));
+    }
+
+    #[test]
+    fn tells_a_refused_token_from_other_refusals() {
+        assert!(says_invalid_token(
+            br#"{"error":"This app's token isn't valid; pair it again.","code":"invalid_token"}"#
+        ));
+        for other in [
+            &br#"{"error":"That password isn't right.","code":"wrong_password"}"#[..],
+            br#"{"error":"Sign in to continue.","code":"login_required"}"#,
+            br#"{"code":["invalid_token"]}"#,
+            b"invalid_token",
+            b"",
+        ] {
+            assert!(
+                !says_invalid_token(other),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+
+        let headers = |content_type: &'static str, length: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+            headers
+        };
+        assert_eq!(small_json(&headers("application/json", "83")), Some(83));
+        assert_eq!(
+            small_json(&headers("application/json; charset=utf-8", "0")),
+            Some(0)
+        );
+        // A page, a stream without a length, or more than a refusal comes to.
+        assert_eq!(small_json(&headers("text/html", "83")), None);
+        assert_eq!(small_json(&headers("application/json", "70000")), None);
+        let mut unsized_ = headers("application/json", "1");
+        unsized_.remove(CONTENT_LENGTH);
+        assert_eq!(small_json(&unsized_), None);
     }
 
     #[test]
