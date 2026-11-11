@@ -19,19 +19,8 @@
 		/** Shown as a warning badge, e.g. "Genre" or "3 missing", with `flagTitle` as tooltip. */
 		flag?: string | null;
 		flagTitle?: string;
-		/** The grid is scrolling: a cover that arrives meanwhile shows at once, without fading in. */
-		scrolling?: boolean;
 	}
-	let {
-		album,
-		width,
-		onopen,
-		onplay,
-		onmenu,
-		flag = null,
-		flagTitle,
-		scrolling = false
-	}: Props = $props();
+	let { album, width, onopen, onplay, onmenu, flag = null, flagTitle }: Props = $props();
 
 	function menuKey(e: KeyboardEvent) {
 		if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
@@ -84,13 +73,14 @@
 					alt=""
 					loading="lazy"
 					decoding="async"
-					onload={() => {
-						// A cover that fades in is drawn on a layer of its own until it has. A row of
-						// them arriving while the grid scrolls cost frames: in the desktop app, fast
-						// two-finger scrolls had 20-30 late frames in about 830 with the fade and 1
-						// without. It isn't seen fading at that speed anyway.
-						if (scrolling) cached = true;
-						loaded = true;
+					onload={(e) => {
+						const show = () => (loaded = true);
+						// Shown only once decoded. Chromium otherwise draws the card without the
+						// cover first and adds it when the decoding is done, and that second drawing
+						// could go missing when a fast scroll stopped abruptly (at the top of the
+						// list, or under a new touch): a cover shown without a fade stayed blank
+						// until its card was hovered.
+						(e.currentTarget as HTMLImageElement).decode().then(show, show);
 					}}
 					onerror={() => (failed = true)}
 					{@attach (img: HTMLImageElement) => {
@@ -180,18 +170,18 @@
 		   thread and are painted with the rest of the page. A border radius
 		   would do the same there, but antialiases the corners twice. */
 		background: var(--tint);
+		/* Covers fade in by opacity alone, so that they can while the grid scrolls
+		   too. They used to sharpen from a blur and settle from a slight zoom as
+		   well, and the zoom cost frames when a fast scroll brought in rows of them:
+		   in the desktop app, four fast two-finger scrolls had 27-32 late frames in
+		   about 800-1040 with the zoom (blurred or not), 4-9 with the blur alone,
+		   some of them several refreshes long, and 3-6 with opacity alone, as many
+		   as with no fade at all. */
 		opacity: 0;
-		filter: blur(8px);
-		transform: scale(1.04);
-		transition:
-			opacity 520ms var(--ease-out),
-			filter 520ms var(--ease-out),
-			transform 700ms var(--ease-out);
+		transition: opacity 520ms var(--ease-out);
 	}
 	.loaded img {
 		opacity: 1;
-		filter: none;
-		transform: none;
 	}
 	.cached img {
 		transition: none;
