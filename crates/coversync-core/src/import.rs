@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::art::{Art, Placement};
@@ -544,34 +545,59 @@ pub fn execute(
 
     let mut sources = Vec::new();
     let mut written: Vec<PathBuf> = Vec::new();
+    let mut hashes = HashMap::new();
     let mut art_files: Vec<PathBuf> = Vec::new();
     let mut embedded = 0;
     let copied = (|| -> Result<()> {
-        for track in &plan.tracks {
-            let (src, _) = lib.track_root(track.id)?.ok_or(Error::NotFound)?;
-            let dest = PathBuf::from(
-                track
-                    .dest
-                    .as_deref()
-                    .expect("ready plans have destinations"),
-            );
-            // Autofilled tags first, then the user's edits on top (an emptied
-            // value removes the tag from the copy, as the plan assumed).
-            let mut values: Vec<(&str, String)> = track
-                .autofilled
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            for (k, v) in edits.get(&track.id).into_iter().flatten() {
-                if let Some(kind) = rules::kind(k) {
-                    values.retain(|(x, _)| *x != kind.id);
-                    values.push((kind.id, v.trim().to_string()));
+        let copies: Vec<_> = plan
+            .tracks
+            .par_iter()
+            .map(|track| -> Result<_> {
+                let (src, _) = lib.track_root(track.id)?.ok_or(Error::NotFound)?;
+                let dest = PathBuf::from(
+                    track
+                        .dest
+                        .as_deref()
+                        .expect("ready plans have destinations"),
+                );
+                // Autofilled tags first, then the user's edits on top (an emptied
+                // value removes the tag from the copy, as the plan assumed).
+                let mut values: Vec<(&str, String)> = track
+                    .autofilled
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                for (k, v) in edits.get(&track.id).into_iter().flatten() {
+                    if let Some(kind) = rules::kind(k) {
+                        values.retain(|(x, _)| *x != kind.id);
+                        values.push((kind.id, v.trim().to_string()));
+                    }
+                }
+                let (added, hash) =
+                    tags::copy_with_tags_hashed(&src, &dest, &values, picture.as_ref(), replace)?;
+                Ok((src, dest, added, hash))
+            })
+            .collect();
+        // Join every copy before rolling back: another worker must never
+        // publish a file after failure cleanup has already visited it.
+        let mut failed = None;
+        for copy in copies {
+            match copy {
+                Ok((src, dest, added, hash)) => {
+                    hashes.insert(dest.clone(), hash);
+                    embedded += usize::from(added);
+                    written.push(dest);
+                    sources.push(src);
+                }
+                Err(e) => {
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
                 }
             }
-            let added = tags::copy_with_tags(&src, &dest, &values, picture.as_ref(), replace)?;
-            embedded += usize::from(added);
-            written.push(dest);
-            sources.push(src);
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         // The cover file goes in every folder the tracks landed in (one per
         // disc, say), under the rule's name, unless one is already there.
@@ -613,8 +639,14 @@ pub fn execute(
         .unwrap_or(0);
     // Index the copies before the originals leave the Inbox, so a failure
     // here leaves them where they were, and takes the copies back out.
-    let stats = imported_stats(&written, &folder, now);
-    if let Err(e) = scan::index_files(lib, stats, progress) {
+    let stats = imported_stats(&written, &folder, now)
+        .into_iter()
+        .map(|mut stat| {
+            stat.hash = hashes.remove(&stat.path);
+            stat
+        })
+        .collect();
+    if let Err(e) = scan::index_written_files(lib, stats, progress) {
         // Rows are kept by the resolved Library folder plus each file's path
         // under it as written (folders below it aren't resolved).
         let indexed: Vec<PathBuf> = match folder.canonicalize() {

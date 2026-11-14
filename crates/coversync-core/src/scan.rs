@@ -100,6 +100,8 @@ pub fn stat(path: PathBuf, root: &Path, collection: Collection) -> Option<FileSt
         .ok()?
         .as_secs() as i64;
     Some(FileStat {
+        mtime_ns: crate::hashes::mtime_ns(&meta).unwrap_or(-1),
+        hash: None,
         path,
         root: root.to_path_buf(),
         mtime,
@@ -163,6 +165,34 @@ pub fn index_files(lib: &Library, files: Vec<FileStat>, progress: &Progress) -> 
     Ok(())
 }
 
+/// Files just written by an import get their final digest before the same
+/// index transaction publishes them. Scans and tag edits leave this to the
+/// worker (tag edits invalidate the old digest before answering).
+pub fn index_written_files(
+    lib: &Library,
+    mut files: Vec<FileStat>,
+    progress: &Progress,
+) -> Result<()> {
+    files.par_iter_mut().for_each(|stat| {
+        if stat.collection != Collection::Library {
+            return;
+        }
+        if stat.hash.as_ref().is_some_and(|h| h.size != stat.size || h.mtime_ns != stat.mtime_ns) {
+            stat.hash = None;
+        }
+        if stat.hash.is_none() {
+            match crate::hashes::file(&stat.path) {
+                Ok(hash) if hash.size == stat.size && hash.mtime_ns == stat.mtime_ns => stat.hash = Some(hash),
+                Ok(_) => tracing::warn!(path = %stat.path.display(), "file changed while indexing its hash"),
+                Err(e) => tracing::warn!(path = %stat.path.display(), "hash after write: {e}"),
+            }
+        }
+        // A hash failure must not hide a completed write from the index or
+        // retain its previous digest. The background pass can retry it.
+    });
+    index_files(lib, files, progress)
+}
+
 /// Full incremental scan of the Inbox and Library folders, then the cover
 /// pass. The index ends up holding exactly the files under `roots`.
 pub fn scan(
@@ -180,6 +210,7 @@ pub fn scan(
     });
     let files = walk(roots, progress);
     let known = lib.file_stats()?;
+    let times = lib.file_mtimes_ns()?;
     let on_disk: HashSet<&Path> = files.iter().map(|f| f.path.as_path()).collect();
     let removed: Vec<PathBuf> = known
         .keys()
@@ -189,7 +220,10 @@ pub fn scan(
     let total = files.len() as u64;
     let changed: Vec<FileStat> = files
         .into_iter()
-        .filter(|f| known.get(&f.path) != Some(&(f.mtime, f.size, f.collection)))
+        .filter(|f| {
+            known.get(&f.path) != Some(&(f.mtime, f.size, f.collection))
+                || times.get(&f.path) != Some(&f.mtime_ns)
+        })
         .collect();
     tracing::info!(
         total,
