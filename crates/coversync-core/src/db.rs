@@ -17,6 +17,7 @@ use rusqlite::{Connection, OptionalExtension, Row, ToSql, params, params_from_it
 use crate::appearance::AppearanceSetup;
 use crate::autofill::{self, Autofill, TrackInfo};
 use crate::cover::Cover;
+use crate::hashes::{FileHash, HashJob};
 use crate::inbox::{HiddenStats, InboxSetup};
 use crate::model::{
     Album, AlbumDetail, Attention, ChangedTrack, Collection, InboxVersion, IndexVersions,
@@ -120,6 +121,7 @@ const DATA_COLUMNS: &[&str] = &[
     "tag_keys",
     "tag_values",
     "generation",
+    "mtime_ns",
 ];
 
 /// Change counters, under these keys in each database's settings: the
@@ -356,15 +358,17 @@ fn temp_schema() -> String {
                 r.root AS root,
                 CASE t.album_dir WHEN '' THEN r.root ELSE r.root || '/' || t.album_dir END
                     AS album_dir,
-                'library' AS collection, {lib_data}, t.added_at
+                'library' AS collection, {lib_data}, t.added_at,
+                COALESCE(t.content_generation, t.generation) AS content_generation
             FROM lib.tracks t JOIN temp.lib_root r;
          -- An Inbox file counts as added when it was last modified.
-         CREATE TEMP VIEW inbox_tracks AS SELECT *, mtime AS added_at FROM main.tracks;
+         CREATE TEMP VIEW inbox_tracks AS SELECT *, mtime AS added_at,
+            generation AS content_generation FROM main.tracks;
          CREATE TEMP VIEW indexed_tracks AS
-            SELECT id, path, root, album_dir, collection, {data}, added_at
+            SELECT id, path, root, album_dir, collection, {data}, added_at, content_generation
                 FROM temp.inbox_tracks
             UNION ALL
-            SELECT id, path, root, album_dir, collection, {data}, added_at
+            SELECT id, path, root, album_dir, collection, {data}, added_at, content_generation
                 FROM temp.library_tracks;"
     )
 }
@@ -492,12 +496,21 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         if carry.is_some() {
             // The index carries on, as clients may have seen it: the same
             // rows, generations and removals, under the same id and counter.
-            let cols = ["id", "path", "album_dir", "added_at"]
-                .iter()
-                .chain(DATA_COLUMNS)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ");
+            let cols = [
+                "id",
+                "path",
+                "album_dir",
+                "added_at",
+                "hash",
+                "hash_size",
+                "hash_mtime_ns",
+                "content_generation",
+            ]
+            .iter()
+            .chain(DATA_COLUMNS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
             let removed = "track_id, path, album_id, generation, removed_at";
             conn.execute_batch(&format!(
                 "INSERT OR IGNORE INTO lib_new.tracks ({cols}) SELECT {cols} FROM lib.tracks;
@@ -581,6 +594,54 @@ fn remember_library(conn: &Connection) {
     }
 }
 
+/// Add columns transactionally; checking each column also supports a database
+/// whose schema version was reset by an older installation.
+fn hash_schema(
+    conn: &Connection,
+    schema: &str,
+    library: bool,
+    version: i64,
+) -> rusqlite::Result<()> {
+    let mut columns = vec![("mtime_ns", "INTEGER NOT NULL DEFAULT -1")];
+    if library {
+        columns.extend([
+            ("hash", "TEXT"),
+            ("hash_size", "INTEGER"),
+            ("hash_mtime_ns", "INTEGER"),
+            ("content_generation", "INTEGER"),
+        ]);
+    }
+    let mut sql = String::from("BEGIN;");
+    for (name, ty) in columns {
+        if !conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('tracks', '{schema}') WHERE name = ?1"
+            ))?
+            .exists([name])?
+        {
+            sql.push_str(&format!(
+                "ALTER TABLE {schema}.tracks ADD COLUMN {name} {ty};"
+            ));
+        }
+    }
+    if library {
+        // An older daemon also invalidates hashes whenever it rewrites a row,
+        // including tag edits that preserve size and the old second timestamp.
+        sql.push_str(&format!(
+            "CREATE TRIGGER IF NOT EXISTS {schema}.tracks_hash_invalidated
+            AFTER UPDATE OF mtime, size, mtime_ns, tag_values ON tracks
+            BEGIN UPDATE tracks SET hash = NULL, hash_size = NULL, hash_mtime_ns = NULL,
+                content_generation = NULL WHERE id = NEW.id; END;"
+        ));
+    }
+    sql.push_str(&format!(
+        "PRAGMA {schema}.user_version = {version}; COMMIT;"
+    ));
+    conn.execute_batch(&sql).inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK");
+    })
+}
+
 /// Bring a Library database up to the current schema (its own `user_version`).
 fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     let version: i64 =
@@ -643,6 +704,9 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
             let _ = conn.execute_batch("ROLLBACK");
         })?;
     }
+    if version < 4 {
+        hash_schema(conn, schema, true, 4)?;
+    }
     Ok(())
 }
 
@@ -695,6 +759,8 @@ fn own_setup(setup: &LibrarySetup) -> LibrarySetup {
 /// A file found on disk, with the stat data used to skip unchanged files.
 #[derive(Debug, Clone)]
 pub struct FileStat {
+    pub mtime_ns: i64,
+    pub hash: Option<FileHash>,
     pub path: PathBuf,
     pub root: PathBuf,
     pub mtime: i64,
@@ -897,7 +963,9 @@ fn filter_values<'a>(
 }
 
 /// An album's version (see [`AlbumDetail::version`]) from its tracks' ids
-/// and generations. Every write to a track gives it a higher generation,
+/// and content generations. Hash publication advances the sync counter but
+/// preserves this value, so backfilling a digest cannot cause a tag-save
+/// conflict. Every content write to a track gives it a higher generation,
 /// and a track leaving or joining the album changes the ids, so the
 /// digest changes with either, whichever of the tracks it was. (The
 /// highest generation alone wouldn't: a track removed that wasn't the
@@ -1106,6 +1174,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         .inspect_err(|_| {
             let _ = conn.execute_batch("ROLLBACK");
         })?;
+    }
+    if version < 7 {
+        hash_schema(conn, "main", false, 7)?;
     }
     Ok(())
 }
@@ -1397,6 +1468,115 @@ impl Library {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Nanosecond timestamps for incremental scanning, including old rows (-1).
+    pub fn file_mtimes_ns(&self) -> Result<HashMap<PathBuf, i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT path, mtime_ns FROM temp.indexed_tracks")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok((PathBuf::from(r.get::<_, String>(0)?), r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Missing or stale digests, read as one snapshot with their row leases.
+    pub fn hash_jobs(&self) -> Result<Vec<HashJob>> {
+        let conn = self.conn();
+        let (Some(version), Some(root)) = (library_version(&conn)?, library_root(&conn)?) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare("SELECT id, path, generation, size, mtime_ns FROM lib.tracks
+            WHERE mtime_ns >= 0 AND (hash IS NULL OR hash_size IS NOT size OR hash_mtime_ns IS NOT mtime_ns)
+            ORDER BY path")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(HashJob {
+                    library_id: version.id.clone(),
+                    root: root.clone(),
+                    id: r.get(0)?,
+                    path: root.join(r.get::<_, String>(1)?),
+                    generation: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                    mtime_ns: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Publish a batch only while each row still names the file hashed. A
+    /// generation bump makes newly available digests visible to sync clients.
+    pub fn store_hashes(&self, batch: &[(&HashJob, FileHash)]) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let (Some(version), Some(root)) = (library_version(&tx)?, library_root(&tx)?) else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        for (job, hash) in batch {
+            if job.library_id != version.id
+                || job.root != root
+                || hash.size != job.size
+                || hash.mtime_ns != job.mtime_ns
+            {
+                continue;
+            }
+            let Ok(meta) = job.path.metadata() else {
+                continue;
+            };
+            if meta.len() != job.size || crate::hashes::mtime_ns(&meta).ok() != Some(job.mtime_ns) {
+                continue;
+            }
+            count += tx.execute(
+                "UPDATE lib.tracks SET hash = ?1, hash_size = ?2,
+                hash_mtime_ns = ?3, content_generation = COALESCE(content_generation, generation),
+                generation = ?4 WHERE id = ?5 AND path = ?6
+                AND generation = ?7 AND size = ?2 AND mtime_ns = ?3",
+                params![
+                    hash.hash,
+                    hash.size as i64,
+                    hash.mtime_ns,
+                    version.generation + 1,
+                    job.id,
+                    job.path
+                        .strip_prefix(&root)
+                        .map_err(|e| Error::Invalid(e.to_string()))?
+                        .to_string_lossy(),
+                    job.generation
+                ],
+            )?;
+        }
+        if count > 0 {
+            bump(&tx, "lib", GENERATION)?;
+        }
+        tx.commit()?;
+        if count > 0 {
+            remember_library(&conn);
+        }
+        Ok(count)
+    }
+
+    /// Stored digests with the size and timestamp they cover, keyed by relative
+    /// path. Consumers must still check disk metadata before serving a file.
+    pub fn library_hashes(&self) -> Result<HashMap<PathBuf, FileHash>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT path, hash, hash_size, hash_mtime_ns FROM lib.tracks
+            WHERE hash IS NOT NULL AND hash_size = size AND hash_mtime_ns = mtime_ns",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok((
+                    PathBuf::from(r.get::<_, String>(0)?),
+                    FileHash {
+                        hash: r.get(1)?,
+                        size: r.get::<_, i64>(2)? as u64,
+                        mtime_ns: r.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Store indexed files, each in its collection's database. Library files
     /// are stored relative to the folder they were found in, which must be
     /// the attached one: a scan of a folder Library setup has since moved
@@ -1443,7 +1623,7 @@ impl Library {
                     Collection::Inbox => inbox_next,
                     Collection::Library => lib_next,
                 };
-                let data: [&dyn ToSql; 22] = [
+                let data: [&dyn ToSql; 23] = [
                     &stat.mtime,
                     &size,
                     album_id,
@@ -1466,6 +1646,7 @@ impl Library {
                     &keys,
                     &values,
                     &generation,
+                    &stat.mtime_ns,
                 ];
                 debug_assert_eq!(data.len(), DATA_COLUMNS.len());
                 match stat.collection {
@@ -1497,6 +1678,16 @@ impl Library {
                         let added = stat.added.unwrap_or(stat.mtime);
                         let tail: [&dyn ToSql; 2] = [&added, &stat.added.is_some()];
                         lib.execute(params_from_iter(head.iter().chain(&data).chain(&tail)))?;
+                        if let Some(hash) = &stat.hash
+                            && hash.size == stat.size
+                            && hash.mtime_ns == stat.mtime_ns
+                        {
+                            tx.execute(
+                                "UPDATE lib.tracks SET hash = ?1, hash_size = ?2,
+                                hash_mtime_ns = ?3 WHERE path = ?4",
+                                params![hash.hash, hash.size as i64, hash.mtime_ns, path],
+                            )?;
+                        }
                         lib_wrote = true;
                     }
                 }
@@ -1671,7 +1862,7 @@ impl Library {
                 let (t, d) = track_from_row(r)?;
                 dir = d;
                 added.push(r.get::<_, i64>("added_at")?);
-                generations.push((t.id, r.get::<_, i64>("generation")?));
+                generations.push((t.id, r.get::<_, i64>("content_generation")?));
                 tracks.push(t);
             }
             // Read with the tracks, so a Library attached meanwhile can't
@@ -2154,6 +2345,8 @@ mod tests {
 
     fn file(path: &str, album: &str, keys: &[&'static str]) -> IndexedFile {
         let stat = FileStat {
+            mtime_ns: -1,
+            hash: None,
             path: path.into(),
             root: "/m".into(),
             mtime: 1,
@@ -2213,7 +2406,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         // The Inbox's counter starts with the rows already there.
         assert_eq!(lib.index_versions().unwrap().inbox.generation, 0);
         let generation: i64 = lib
@@ -2546,6 +2739,8 @@ mod tests {
         let path = root.join(rel);
         let dir = path.parent().unwrap().to_path_buf();
         let stat = FileStat {
+            mtime_ns: -1,
+            hash: None,
             path,
             root: root.to_path_buf(),
             mtime,
@@ -2718,7 +2913,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     /// Turn a Library database this build made into what v2 left: no
@@ -2868,7 +3063,7 @@ mod tests {
         let journal: String = conn
             .query_row("PRAGMA lib.journal_mode", [], |r| r.get(0))
             .unwrap();
-        assert_eq!((version, journal.as_str()), (3, "delete"));
+        assert_eq!((version, journal.as_str()), (4, "delete"));
         drop(conn);
         // The rows there start at generation 0, with the counter: nothing
         // has changed since.

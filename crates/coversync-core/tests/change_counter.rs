@@ -604,3 +604,241 @@ fn an_albums_tracks_find_it_under_a_new_id() {
     );
     assert_eq!(s.lib.track_path(i64::MIN).unwrap(), None);
 }
+
+#[test]
+fn imports_and_background_tag_rehashes_publish_hashes_of_the_final_bytes() {
+    use coversync_core::hashes;
+    let s = setup("hash-import");
+    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
+    s.scan();
+    let album = s.import(&s.inbox_album()).album_id;
+    let path = s
+        .lib
+        .track_path(s.lib.album_track_ids(&album).unwrap()[0])
+        .unwrap()
+        .unwrap();
+    let rel = path.strip_prefix(&s.root).unwrap();
+    let before = s.lib.library_hashes().unwrap()[rel].clone();
+    assert_eq!(before, hashes::file(&path).unwrap());
+    assert!(before.hash.starts_with("blake3:"));
+    assert!(s.lib.hash_jobs().unwrap().is_empty());
+    let generation = s.library().generation;
+    s.scan();
+    assert_eq!(s.lib.library_hashes().unwrap()[rel], before);
+    assert_eq!(s.library().generation, generation);
+
+    regenre(&path, "Jazz");
+    scan::index_files(
+        &s.lib,
+        vec![scan::stat(path.clone(), &s.root, Collection::Library).unwrap()],
+        &s.progress,
+    )
+    .unwrap();
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    let saved_version = s.version(&album);
+    hashes::run(&s.lib, &Default::default()).unwrap();
+    assert_eq!(
+        s.version(&album),
+        saved_version,
+        "rehashing must not cause a tag-save conflict"
+    );
+    let after = s.lib.library_hashes().unwrap()[rel].clone();
+    assert_ne!(after.hash, before.hash);
+    assert_eq!(after, hashes::file(&path).unwrap());
+    assert_eq!(s.library().generation, generation + 2);
+}
+
+#[test]
+fn scans_notice_same_size_changes_within_one_second_and_backfill_hashes() {
+    use coversync_core::hashes;
+    use std::time::{Duration, UNIX_EPOCH};
+    let s = setup("hash-scan");
+    let path = s.root.join("A/1.wav");
+    wav(&path, "One", "A", 1);
+    let timestamp = |ns| {
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::new(1_700_000_000, ns))
+            .unwrap()
+    };
+    timestamp(100);
+    s.scan();
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    let progress = hashes::Progress::default();
+    let album = s.album(Collection::Library, "A");
+    let version = s.version(&album);
+    hashes::run(&s.lib, &progress).unwrap();
+    assert_eq!(s.version(&album), version);
+    let before = s.lib.library_hashes().unwrap()[Path::new("A/1.wav")].clone();
+    let generation = s.library().generation;
+    assert_eq!(progress.read().unwrap().files_done, 1);
+    assert!(!progress.read().unwrap().running);
+    // Replace just an audio byte: tags and file length stay unchanged.
+    let mut bytes = fs::read(&path).unwrap();
+    let offset = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+    bytes[offset] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    timestamp(200);
+    s.scan();
+    assert!(
+        s.lib.library_hashes().unwrap().is_empty(),
+        "stale digest was invalidated"
+    );
+    hashes::run(&s.lib, &progress).unwrap();
+    let after = s.lib.library_hashes().unwrap()[Path::new("A/1.wav")].clone();
+    assert_eq!(after.size, before.size);
+    assert_ne!(after.hash, before.hash);
+    assert_eq!(after, hashes::file(&path).unwrap());
+    assert!(s.library().generation > generation);
+    let generation = s.library().generation;
+    s.scan();
+    hashes::run(&s.lib, &progress).unwrap();
+    assert_eq!(progress.read().unwrap().files_done, 0);
+    assert_eq!(s.library().generation, generation);
+}
+
+#[test]
+fn a_background_hash_cannot_overwrite_a_newer_row_or_another_library() {
+    use coversync_core::hashes;
+    let s = setup("hash-lease");
+    let path = s.root.join("A/1.wav");
+    wav(&path, "One", "A", 1);
+    s.scan();
+    let job = s.lib.hash_jobs().unwrap().pop().unwrap();
+    let hash = hashes::file(&path).unwrap();
+    // A newer index transaction can preserve the exact metadata.
+    scan::index_files(
+        &s.lib,
+        vec![scan::stat(path.clone(), &s.root, Collection::Library).unwrap()],
+        &s.progress,
+    )
+    .unwrap();
+    assert_eq!(s.lib.store_hashes(&[(&job, hash.clone())]).unwrap(), 0);
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    let job = s.lib.hash_jobs().unwrap().pop().unwrap();
+    let other = s.root.with_file_name("Other");
+    fs::create_dir_all(&other).unwrap();
+    let mut setup = s.lib.library_setup().unwrap();
+    setup.folder = Some(other.display().to_string());
+    s.lib.set_library_setup(setup).unwrap();
+    assert_eq!(s.lib.store_hashes(&[(&job, hash)]).unwrap(), 0);
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+}
+
+#[test]
+fn hash_publication_rechecks_disk_and_survives_persisting_the_library() {
+    use coversync_core::hashes;
+    let s = setup("hash-persist");
+    let path = s.root.join("A/1.wav");
+    wav(&path, "One", "A", 1);
+    s.scan();
+    let job = s.lib.hash_jobs().unwrap().pop().unwrap();
+    let hash = hashes::file(&path).unwrap();
+    regenre(&path, "Rock");
+    assert_eq!(s.lib.store_hashes(&[(&job, hash)]).unwrap(), 0);
+    s.scan();
+    hashes::run(&s.lib, &Default::default()).unwrap();
+    let hashes = s.lib.library_hashes().unwrap();
+    assert_eq!(hashes.len(), 1);
+    s.lib.prepare_library(&s.root).unwrap();
+    assert_eq!(s.lib.library_hashes().unwrap(), hashes);
+    s.lib.refresh_library().unwrap();
+    assert_eq!(s.lib.library_hashes().unwrap(), hashes);
+}
+
+#[test]
+fn old_daemon_writes_invalidate_hashes_and_a_cancelled_pass_can_resume() {
+    use coversync_core::hashes;
+    use std::sync::atomic::AtomicBool;
+    let s = setup("hash-compat");
+    let path = s.root.join("A/1.wav");
+    wav(&path, "One", "A", 1);
+    s.scan();
+    s.lib.prepare_library(&s.root).unwrap();
+    let progress = Default::default();
+    hashes::run_cancellable(&s.lib, &progress, &AtomicBool::new(true)).unwrap();
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    assert_eq!(progress.read().unwrap().files_done, 0);
+    assert_eq!(progress.read().unwrap().errors, 0);
+    assert!(!progress.read().unwrap().running);
+    hashes::run(&s.lib, &progress).unwrap();
+    assert_eq!(s.lib.library_hashes().unwrap().len(), 1);
+    let own = rusqlite::Connection::open(s.root.join(coversync_core::db::LIBRARY_DB)).unwrap();
+    // The old upsert writes these columns, even when its second timestamp
+    // and size did not notice a tag edit. It knows nothing about hash columns.
+    own.execute("UPDATE tracks SET mtime = mtime, size = size", [])
+        .unwrap();
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    drop(own);
+    s.lib.refresh_library().unwrap();
+    hashes::run(&s.lib, &progress).unwrap();
+    assert_eq!(s.lib.library_hashes().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_parallel_import_joins_workers_before_removing_their_copies() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup("hash-import-rollback");
+    let mut setup = s.lib.library_setup().unwrap();
+    setup.structure = "{album}/CD{disc_number}/{track_number} - {title}".into();
+    s.lib.set_library_setup(setup).unwrap();
+    for disc in 1..=2 {
+        let path = s.inbox.join(format!("Record/CD{disc}/1.wav"));
+        wav(&path, "One", "Record", 1);
+        retag(
+            &path,
+            TagEdit {
+                disc_no: Some(disc.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    s.scan();
+    let readonly = s.root.join("Record/CD2");
+    fs::create_dir_all(&readonly).unwrap();
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::File::create(readonly.join("probe")).is_ok() {
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
+        return; // Root bypasses permissions.
+    }
+    assert!(
+        import::plan(&s.lib, &s.inbox_album(), &Edits::new(), None)
+            .unwrap()
+            .ready()
+    );
+    let result = import::execute(
+        &s.lib,
+        &s.covers,
+        &s.inbox_album(),
+        &Edits::new(),
+        None,
+        &s.progress,
+    );
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    assert!(!s.root.join("Record/CD1/01 - One.wav").exists());
+    assert!(!s.root.join("Record/CD2/01 - One.wav").exists());
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    assert_eq!(
+        s.lib.album(&s.inbox_album()).unwrap().unwrap().tracks.len(),
+        2
+    );
+}
+
+#[test]
+fn an_unreadable_hash_job_does_not_prevent_other_files_from_finishing() {
+    use coversync_core::hashes;
+    let s = setup("hash-error");
+    for n in 1..=2 {
+        wav(&s.root.join(format!("A/{n}.wav")), "One", "A", n);
+    }
+    s.scan();
+    fs::rename(s.root.join("A/1.wav"), s.root.join("A/1.gone")).unwrap();
+    let progress = Default::default();
+    hashes::run(&s.lib, &progress).unwrap();
+    let p = progress.read().unwrap();
+    assert_eq!((p.files_total, p.files_done, p.errors), (2, 2, 1));
+    assert!(!p.running);
+    assert_eq!(s.lib.library_hashes().unwrap().len(), 1);
+}

@@ -5,6 +5,7 @@ pub mod art;
 pub mod autofill;
 pub mod cover;
 pub mod db;
+pub mod hashes;
 pub mod identify;
 pub mod import;
 pub mod inbox;

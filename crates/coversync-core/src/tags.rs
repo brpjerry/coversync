@@ -483,6 +483,18 @@ pub fn copy_with_tags(
     art: Option<&Picture>,
     replace: bool,
 ) -> Result<bool> {
+    copy_with_tags_hashed(src, dest, values, art, replace).map(|(embedded, _)| embedded)
+}
+
+/// Import variant that returns the digest of the final bytes. Plain copies
+/// hash during the copy; Lofty's seek-based tag rewrites require a final read.
+pub fn copy_with_tags_hashed(
+    src: &Path,
+    dest: &Path,
+    values: &[(&str, String)],
+    art: Option<&Picture>,
+    replace: bool,
+) -> Result<(bool, crate::hashes::FileHash)> {
     if dest.exists() {
         return Err(Error::Invalid(format!("{} already exists", dest.display())));
     }
@@ -491,7 +503,12 @@ pub fn copy_with_tags(
     let name = dest.file_name().ok_or(Error::NotFound)?.to_string_lossy();
     let tmp = dest.with_file_name(format!(".coversync-tmp-{name}"));
     let result = (|| {
-        fs::copy(src, &tmp)?;
+        let copied_hash = if values.is_empty() && art.is_none() {
+            Some(crate::hashes::copy(src, &tmp)?)
+        } else {
+            fs::copy(src, &tmp)?;
+            None
+        };
         let mut embedded = false;
         if !values.is_empty() || art.is_some() {
             let mut file = probe(&tmp, true)?;
@@ -528,11 +545,15 @@ pub fn copy_with_tags(
             }
         }
         fs::File::open(&tmp)?.sync_all()?;
+        let hash = match copied_hash {
+            Some(hash) => hash,
+            None => crate::hashes::file(&tmp)?,
+        };
         if dest.exists() {
             return Err(Error::Invalid(format!("{} already exists", dest.display())));
         }
         fs::rename(&tmp, dest)?;
-        Ok(embedded)
+        Ok((embedded, hash))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

@@ -68,6 +68,10 @@ pub struct AppState {
     /// AcoustID's and MusicBrainz's answers, so lookups aren't made twice.
     pub lookups: LookupCache,
     pub progress: Progress,
+    pub hashes: coversync_core::hashes::Progress,
+    pub hash_jobs: Mutex<()>,
+    pub hash_pending: AtomicBool,
+    pub closing: AtomicBool,
     pub allow_writes: bool,
     /// Serializes everything that writes tracks or changes which are
     /// shown: scans, tag writes, imports, setup saves (which can switch the
@@ -190,7 +194,35 @@ pub fn spawn_scan(state: Shared) {
             p.clone()
         };
         state.events.publish(events::Notice::ScanFinished(progress));
+        spawn_hashes(state.clone());
         release_memory();
+    });
+}
+
+/// Hashing has its own queue, independent of scans and interactive writes.
+/// A request during a pass queues another pass; later requests join that one.
+pub fn spawn_hashes(state: Shared) {
+    if state.closing.load(Ordering::Relaxed) || state.hash_pending.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _guard = state.hash_jobs.lock().await;
+        state.hash_pending.store(false, Ordering::SeqCst);
+        let s = state.clone();
+        match tokio::task::spawn_blocking(move || {
+            coversync_core::hashes::run_cancellable(&s.lib, &s.hashes, &s.closing)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("hash pass failed: {e}"),
+            Err(e) => tracing::error!("hash pass panicked: {e}"),
+        }
+        state
+            .hashes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .running = false;
     });
 }
 
@@ -258,6 +290,10 @@ async fn run() -> anyhow::Result<()> {
         mb_art: cache_dir.join("musicbrainz"),
         lookups: LookupCache::open_or_memory(&cache_dir.join(lookups::FILE)),
         progress: Arc::new(RwLock::new(ScanProgress::default())),
+        hashes: Default::default(),
+        hash_jobs: Mutex::new(()),
+        hash_pending: AtomicBool::new(false),
+        closing: AtomicBool::new(false),
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
         rescan: AtomicBool::new(false),
@@ -285,6 +321,7 @@ async fn run() -> anyhow::Result<()> {
                 _ = term.recv() => {}
             }
             // Event streams never end on their own, and would hold up the shutdown.
+            closing.closing.store(true, Ordering::Relaxed);
             closing.events.close();
         })
         .await?;
@@ -303,6 +340,10 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         mb_art: dir.join("musicbrainz"),
         lookups: LookupCache::open_or_memory(&dir.join(lookups::FILE)),
         progress: Arc::new(RwLock::new(ScanProgress::default())),
+        hashes: Default::default(),
+        hash_jobs: Mutex::new(()),
+        hash_pending: AtomicBool::new(false),
+        closing: AtomicBool::new(false),
         allow_writes: false,
         jobs: Mutex::new(()),
         rescan: AtomicBool::new(false),

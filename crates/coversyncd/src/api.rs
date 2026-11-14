@@ -108,7 +108,9 @@ async fn exclusively<T: Send + 'static>(
     let state = state.clone();
     tokio::spawn(async move {
         let _guard = state.jobs.lock().await;
-        blocking(&state, f).await
+        let result = blocking(&state, f).await;
+        crate::spawn_hashes(state.clone());
+        result
     })
     .await?
 }
@@ -127,6 +129,7 @@ struct Status {
     version: &'static str,
     allow_writes: bool,
     scan: coversync_core::ScanProgress,
+    hashes: coversync_core::hashes::HashProgress,
     /// `library`: the Library's id and change counter (null without a
     /// Library folder); `inbox`: the Inbox's counter.
     #[serde(flatten)]
@@ -144,6 +147,11 @@ async fn status(State(state): State<Shared>) -> ApiResult<Json<Status>> {
         version: env!("CARGO_PKG_VERSION"),
         allow_writes: state.allow_writes,
         scan,
+        hashes: state
+            .hashes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         index,
     }))
 }
@@ -1066,6 +1074,8 @@ async fn write_tags(
             .collect();
         let count = stats.len();
         let first = stats.first().map(|f| (f.path.clone(), f.root.clone()));
+        // Publishing the edit invalidates old digests immediately. The hash
+        // worker queued by exclusively() rehashes after the save can return.
         scan::index_files(&s.lib, stats, &s.progress)?;
         s.lib.remove_paths(&[])?;
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
@@ -2070,6 +2080,7 @@ mod tests {
                 version: "0",
                 allow_writes: false,
                 scan: Default::default(),
+                hashes: Default::default(),
                 index: lib.index_versions().unwrap(),
             })
             .unwrap()
@@ -2082,7 +2093,14 @@ mod tests {
         let v = status(&lib);
         assert_eq!(
             keys(&v),
-            ["allow_writes", "inbox", "library", "scan", "version"]
+            [
+                "allow_writes",
+                "hashes",
+                "inbox",
+                "library",
+                "scan",
+                "version"
+            ]
         );
         assert_eq!(v["library"], serde_json::Value::Null);
         assert_eq!(v["inbox"], serde_json::json!({ "generation": 0 }));
