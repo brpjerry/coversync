@@ -842,3 +842,121 @@ fn an_unreadable_hash_job_does_not_prevent_other_files_from_finishing() {
     assert!(!p.running);
     assert_eq!(s.lib.library_hashes().unwrap().len(), 1);
 }
+
+#[test]
+fn out_of_range_nanoseconds_do_not_remove_readable_tracks() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let s = setup("hash-future-time");
+    let paths = [s.inbox.join("Inbox/1.wav"), s.root.join("Library/1.wav")];
+    for path in &paths {
+        wav(path, "Song", "Album", 1);
+    }
+    s.scan();
+    assert_eq!(s.lib.file_stats().unwrap().len(), 2);
+    let future = UNIX_EPOCH + Duration::from_secs(10_413_792_000); // 2300-01-01
+    for path in &paths {
+        fs::File::open(path).unwrap().set_modified(future).unwrap();
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), future);
+    }
+    s.scan();
+    let stats = s.lib.file_stats().unwrap();
+    assert_eq!(stats.len(), 2);
+    for path in &paths {
+        assert_eq!(stats[path].0, 10_413_792_000);
+        assert_eq!(s.lib.file_mtimes_ns().unwrap()[path], -1);
+    }
+    assert!(s.lib.hash_jobs().unwrap().is_empty());
+    assert!(s.removed(0).is_empty());
+    let generation = s.library().generation;
+    s.scan();
+    assert_eq!(s.library().generation, generation);
+}
+
+#[test]
+fn written_files_rehash_stale_supplied_digests_and_index_even_when_hashing_fails() {
+    use coversync_core::hashes;
+    use std::time::{Duration, UNIX_EPOCH};
+    let s = setup("hash-written-mismatch");
+    let path = s.root.join("A/1.wav");
+    wav(&path, "One", "A", 1);
+    s.scan();
+    let old = hashes::file(&path).unwrap();
+    regenre(&path, "Jazz");
+    let mut stat = scan::stat(path.clone(), &s.root, Collection::Library).unwrap();
+    stat.hash = Some(old);
+    scan::index_written_files(&s.lib, vec![stat], &s.progress).unwrap();
+    assert_eq!(
+        s.lib.library_hashes().unwrap()[Path::new("A/1.wav")],
+        hashes::file(&path).unwrap()
+    );
+    regenre(&path, "Rock");
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(10_413_792_000))
+        .unwrap();
+    let stat = scan::stat(path, &s.root, Collection::Library).unwrap();
+    scan::index_written_files(&s.lib, vec![stat], &s.progress).unwrap();
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    let album = s.album(Collection::Library, "A");
+    assert_eq!(
+        s.lib.album(&album).unwrap().unwrap().album.genre.as_deref(),
+        Some("Rock")
+    );
+}
+
+#[test]
+fn a_v3_library_gets_nanosecond_metadata_then_hashes_after_its_next_scan() {
+    use coversync_core::hashes;
+    let mut s = setup("hash-v3");
+    wav(&s.root.join("A/1.wav"), "One", "A", 1);
+    s.scan();
+    s.lib.prepare_library(&s.root).unwrap();
+    let state_dir = s.root.parent().unwrap().join("state");
+    drop(s.lib);
+    let own = rusqlite::Connection::open(s.root.join(coversync_core::db::LIBRARY_DB)).unwrap();
+    own.execute_batch(
+        "DROP TRIGGER tracks_hash_invalidated;
+        ALTER TABLE tracks DROP COLUMN hash;
+        ALTER TABLE tracks DROP COLUMN hash_size;
+        ALTER TABLE tracks DROP COLUMN hash_mtime_ns;
+        ALTER TABLE tracks DROP COLUMN content_generation;
+        ALTER TABLE tracks DROP COLUMN mtime_ns;
+        PRAGMA user_version = 3;",
+    )
+    .unwrap();
+    drop(own);
+    s.lib = Library::open_in(&state_dir).unwrap();
+    assert_eq!(s.lib.file_mtimes_ns().unwrap()[&s.root.join("A/1.wav")], -1);
+    assert!(s.lib.library_hashes().unwrap().is_empty());
+    assert!(s.lib.hash_jobs().unwrap().is_empty());
+    s.scan();
+    assert_eq!(s.lib.hash_jobs().unwrap().len(), 1);
+    hashes::run(&s.lib, &Default::default()).unwrap();
+    assert_eq!(
+        s.lib.library_hashes().unwrap()[Path::new("A/1.wav")],
+        hashes::file(&s.root.join("A/1.wav")).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_parallel_import_publishes_every_final_digest_and_preserves_permissions() {
+    use coversync_core::hashes;
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup("hash-multi-import");
+    for n in 1..=5 {
+        let path = s.inbox.join(format!("Rec/{n}.wav"));
+        wav(&path, &format!("Track {n}"), "Record", n);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    s.scan();
+    let album = s.import(&s.inbox_album()).album_id;
+    let hashes = s.lib.library_hashes().unwrap();
+    assert_eq!(hashes.len(), 5);
+    assert_eq!(s.lib.album_track_ids(&album).unwrap().len(), 5);
+    for (rel, digest) in hashes {
+        let path = s.root.join(rel);
+        assert_eq!(digest, hashes::file(&path).unwrap());
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}

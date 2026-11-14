@@ -202,12 +202,7 @@ pub fn spawn_scan(state: Shared) {
 /// Hashing has its own queue, independent of scans and interactive writes.
 /// A request during a pass queues another pass; later requests join that one.
 pub fn spawn_hashes(state: Shared) {
-    if state.closing.load(Ordering::Relaxed) || state.hash_pending.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    tokio::spawn(async move {
-        let _guard = state.hash_jobs.lock().await;
-        state.hash_pending.store(false, Ordering::SeqCst);
+    queue_hashes(state, |state| async move {
         let s = state.clone();
         match tokio::task::spawn_blocking(move || {
             coversync_core::hashes::run_cancellable(&s.lib, &s.hashes, &s.closing)
@@ -218,6 +213,23 @@ pub fn spawn_hashes(state: Shared) {
             Ok(Err(e)) => tracing::error!("hash pass failed: {e}"),
             Err(e) => tracing::error!("hash pass panicked: {e}"),
         }
+    });
+}
+
+/// Keep scheduling separate from file I/O, so a pass remains serialized even
+/// when its caller leaves, and requests during it queue one subsequent pass.
+fn queue_hashes<F, Work>(state: Shared, pass: F)
+where
+    F: FnOnce(Shared) -> Work + Send + 'static,
+    Work: std::future::Future<Output = ()> + Send,
+{
+    if state.closing.load(Ordering::Relaxed) || state.hash_pending.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _guard = state.hash_jobs.lock().await;
+        state.hash_pending.store(false, Ordering::SeqCst);
+        pass(state.clone()).await;
         state
             .hashes
             .write()

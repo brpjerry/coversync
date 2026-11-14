@@ -1479,6 +1479,17 @@ impl Library {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether jobs captured together still belong to the attached Library.
+    /// Generation changes are expected during a pass; identity/root changes
+    /// mean its remaining reads cannot be published and should stop.
+    pub(crate) fn hash_library_matches(&self, job: &HashJob) -> Result<bool> {
+        let conn = self.conn();
+        Ok(
+            library_version(&conn)?.is_some_and(|v| v.id == job.library_id)
+                && library_root(&conn)?.as_ref() == Some(&job.root),
+        )
+    }
+
     /// Missing or stale digests, read as one snapshot with their row leases.
     pub fn hash_jobs(&self) -> Result<Vec<HashJob>> {
         let conn = self.conn();

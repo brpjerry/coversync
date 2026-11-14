@@ -100,7 +100,7 @@ pub fn stat(path: PathBuf, root: &Path, collection: Collection) -> Option<FileSt
         .ok()?
         .as_secs() as i64;
     Some(FileStat {
-        mtime_ns: crate::hashes::mtime_ns(&meta).ok()?,
+        mtime_ns: crate::hashes::mtime_ns(&meta).unwrap_or(-1),
         hash: None,
         path,
         root: root.to_path_buf(),
@@ -165,8 +165,9 @@ pub fn index_files(lib: &Library, files: Vec<FileStat>, progress: &Progress) -> 
     Ok(())
 }
 
-/// Files just written by an import or tag edit get their final digest before
-/// the same index transaction publishes them. Scans leave this to the worker.
+/// Files just written by an import get their final digest before the same
+/// index transaction publishes them. Scans and tag edits leave this to the
+/// worker (tag edits invalidate the old digest before answering).
 pub fn index_written_files(
     lib: &Library,
     mut files: Vec<FileStat>,
@@ -186,7 +187,7 @@ pub fn index_written_files(
                 Err(e) => tracing::warn!(path = %stat.path.display(), "hash after write: {e}"),
             }
         }
-        // A hash failure must not hide a completed tag edit from the index or
+        // A hash failure must not hide a completed write from the index or
         // retain its previous digest. The background pass can retry it.
     });
     index_files(lib, files, progress)

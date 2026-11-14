@@ -390,9 +390,14 @@ Scans invalidate stale hashes and queue a separate parallel pass at low CPU and 
 That pass leaves scans, imports and tag edits free to run, rejects results
 from superseded rows or another Library, and stops during daemon shutdown.
 `/api/status` includes `hashes` with `running`, `files_total`, `files_done`,
-`bytes_hashed` and `errors`. Publishing a batch of hashes advances the
-Library's change counter too, while leaving the album's tag-edit version
-unchanged. The Inbox does not get file hashes.
+`bytes_hashed`, `errors`, and `skipped` (files or rows changed during the pass).
+A Library switch stops the previous pass at its next batch boundary. Publishing
+a batch of hashes advances the Library's change counter too, while leaving the
+album's tag-edit version
+unchanged. The Inbox does not get file hashes. Files with modification times
+outside the supported nanosecond range remain indexed, but have no digest until
+their timestamp is representable. A Library indexed only in memory keeps its
+hashes there too; an import persists both the index and its existing hashes.
 
 For a scratch Library, `cargo run --release -p coversync-core --example
 hash_bench -- STATE read` measures plain parallel reads; the `hash` mode

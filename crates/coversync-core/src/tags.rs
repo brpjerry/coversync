@@ -487,7 +487,8 @@ pub fn copy_with_tags(
 }
 
 /// Import variant that returns the digest of the final bytes. Plain copies
-/// hash during the copy; Lofty's seek-based tag rewrites require a final read.
+/// hash while streaming or after a reflink; Lofty's seek-based tag rewrites
+/// require a final read.
 pub fn copy_with_tags_hashed(
     src: &Path,
     dest: &Path,
@@ -564,6 +565,18 @@ pub fn copy_with_tags_hashed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_plain_copy_removes_its_staging_file() {
+        let dir =
+            std::env::temp_dir().join(format!("coversync-copy-failure-{}", std::process::id()));
+        let src = dir.join("not-a-file");
+        fs::create_dir_all(&src).unwrap();
+        let dest = dir.join("failed.wav");
+        assert!(copy_with_tags_hashed(&src, &dest, &[], None, false).is_err());
+        assert!(!dest.exists());
+        assert!(!dir.join(".coversync-tmp-failed.wav").exists());
+    }
 
     #[test]
     fn years() {

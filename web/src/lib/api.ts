@@ -81,6 +81,7 @@ export interface Status {
 		files_done: number;
 		bytes_hashed: number;
 		errors: number;
+		skipped: number;
 	};
 	/** null while no Library folder is set up. */
 	library: { id: string; generation: number } | null;
