@@ -108,7 +108,9 @@ async fn exclusively<T: Send + 'static>(
     let state = state.clone();
     tokio::spawn(async move {
         let _guard = state.jobs.lock().await;
-        blocking(&state, f).await
+        let result = blocking(&state, f).await;
+        crate::spawn_hashes(state.clone());
+        result
     })
     .await?
 }
@@ -127,6 +129,7 @@ struct Status {
     version: &'static str,
     allow_writes: bool,
     scan: coversync_core::ScanProgress,
+    hashes: coversync_core::hashes::HashProgress,
     /// `library`: the Library's id and change counter (null without a
     /// Library folder); `inbox`: the Inbox's counter.
     #[serde(flatten)]
@@ -144,6 +147,11 @@ async fn status(State(state): State<Shared>) -> ApiResult<Json<Status>> {
         version: env!("CARGO_PKG_VERSION"),
         allow_writes: state.allow_writes,
         scan,
+        hashes: state
+            .hashes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         index,
     }))
 }
@@ -824,7 +832,9 @@ pub(crate) async fn serve_file(path: PathBuf, req: Request, cache: &'static str)
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             res.into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        // ServeFile reports file errors as HTTP responses; its service error
+        // type is Infallible. Newer Rust rejects trying to format that value.
+        Err(never) => match never {},
     }
 }
 
@@ -1066,6 +1076,8 @@ async fn write_tags(
             .collect();
         let count = stats.len();
         let first = stats.first().map(|f| (f.path.clone(), f.root.clone()));
+        // Publishing the edit invalidates old digests immediately. The hash
+        // worker queued by exclusively() rehashes after the save can return.
         scan::index_files(&s.lib, stats, &s.progress)?;
         s.lib.remove_paths(&[])?;
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
@@ -1760,6 +1772,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scans_and_tag_saves_hash_automatically_and_queue_behind_an_active_pass() {
+        use coversync_core::hashes;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        async fn wait_idle(state: &Shared) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let guard = state.hash_jobs.lock().await;
+                    if !state.hash_pending.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    drop(guard);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("hash queue drains");
+        }
+
+        let (state, inbox) = editing_daemon("hash-queue");
+        with_library(&state, &inbox);
+        let root = std::path::PathBuf::from(state.lib.library_setup().unwrap().folder.unwrap());
+        for n in 1..=3 {
+            track(&root, "Library album", n);
+        }
+        let mut heard = state.events.subscribe();
+        crate::spawn_scan(state.clone());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(heard.recv().await.unwrap(), Notice::ScanFinished(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Scan completion schedules the pass before yielding its task.
+        wait_idle(&state).await;
+        let before = state.lib.library_hashes().unwrap();
+        assert_eq!(before.len(), 3, "scan automatically queues hashing");
+        let report = status(State(state.clone())).await.unwrap().0;
+        assert_eq!(
+            (
+                report.hashes.files_total,
+                report.hashes.files_done,
+                report.hashes.errors,
+                report.hashes.skipped
+            ),
+            (3, 3, 0, 0)
+        );
+        assert_eq!(
+            report.hashes.bytes_hashed,
+            before.values().map(|h| h.size).sum::<u64>()
+        );
+        assert!(!report.hashes.running);
+        let id = state
+            .lib
+            .albums(Collection::Library, &[], &[], "", &[], None)
+            .unwrap()[0]
+            .id
+            .clone();
+        let base = state.lib.album(&id).unwrap().unwrap();
+
+        // Hold a pass in the queue after its snapshot has finished. An API
+        // save during it must arrange a subsequent pass, even when several
+        // requests coalesce before the current pass releases its slot.
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        crate::queue_hashes(state.clone(), move |_| async move {
+            started.send(()).unwrap();
+            wait_release.await.unwrap();
+        });
+        wait_started.await.unwrap();
+        let saved = put(&state, &id, save_on(&base, genre("Rock")))
+            .await
+            .unwrap()
+            .album
+            .unwrap();
+        assert!(state.lib.library_hashes().unwrap().is_empty());
+        assert!(state.hash_pending.load(Ordering::SeqCst));
+        for _ in 0..5 {
+            crate::spawn_hashes(state.clone());
+        }
+        release.send(()).unwrap();
+        wait_idle(&state).await;
+        let after = state.lib.library_hashes().unwrap();
+        assert_eq!(after.len(), 3, "tag save automatically queues its rehash");
+        for (rel, hash) in &after {
+            assert_eq!(*hash, hashes::file(&root.join(rel)).unwrap());
+            assert_ne!(hash.hash, before[rel].hash);
+        }
+        assert_eq!(
+            state.lib.album(&id).unwrap().unwrap().version,
+            saved.version
+        );
+        let report = status(State(state.clone())).await.unwrap().0;
+        assert_eq!(
+            (
+                report.hashes.files_done,
+                report.hashes.errors,
+                report.hashes.skipped
+            ),
+            (3, 0, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn a_partly_failed_save_still_changes_the_albums_version() {
         let (state, inbox) = editing_daemon("conflict-partial");
         let base = detail(&state, "Record");
@@ -2070,6 +2190,7 @@ mod tests {
                 version: "0",
                 allow_writes: false,
                 scan: Default::default(),
+                hashes: Default::default(),
                 index: lib.index_versions().unwrap(),
             })
             .unwrap()
@@ -2082,7 +2203,14 @@ mod tests {
         let v = status(&lib);
         assert_eq!(
             keys(&v),
-            ["allow_writes", "inbox", "library", "scan", "version"]
+            [
+                "allow_writes",
+                "hashes",
+                "inbox",
+                "library",
+                "scan",
+                "version"
+            ]
         );
         assert_eq!(v["library"], serde_json::Value::Null);
         assert_eq!(v["inbox"], serde_json::json!({ "generation": 0 }));

@@ -380,6 +380,30 @@ start over rather than trust it. A Library moved to another installation
 keeps its id. An older coversyncd still opens a database a newer one has
 upgraded, and the changes it makes are counted too.
 
+Library tracks also keep a whole-file BLAKE3 digest (`blake3:` followed by
+64 hexadecimal characters), with the size and nanosecond modification time
+it covers. Imports copy tracks in parallel, preserving filesystem reflinks
+where available and otherwise hashing as bytes stream. Files whose tags are
+rewritten are hashed after Lofty finishes its seek-based writes. Tag edits
+invalidate the old digest immediately and queue a rehash after writing.
+Scans invalidate stale hashes and queue a separate parallel pass at low CPU and I/O priority on Linux.
+That pass leaves scans, imports and tag edits free to run, rejects results
+from superseded rows or another Library, and stops during daemon shutdown.
+`/api/status` includes `hashes` with `running`, `files_total`, `files_done`,
+`bytes_hashed`, `errors`, and `skipped` (files or rows changed during the pass).
+A Library switch stops the previous pass at its next batch boundary. Publishing
+a batch of hashes advances the Library's change counter too, while leaving the
+album's tag-edit version
+unchanged. The Inbox does not get file hashes. Files with modification times
+outside the supported nanosecond range remain indexed, but have no digest until
+their timestamp is representable. A Library indexed only in memory keeps its
+hashes there too; an import persists both the index and its existing hashes.
+
+For a scratch Library, `cargo run --release -p coversync-core --example
+hash_bench -- STATE read` measures plain parallel reads; the `hash` mode
+measures and stores missing digests. Use a scratch database and protect any
+live source files from writes when benchmarking.
+
 ### As a systemd user service
 
 The Arch package installs this unit, with `/usr/bin/coversyncd`.

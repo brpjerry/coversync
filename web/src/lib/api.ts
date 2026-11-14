@@ -75,6 +75,14 @@ export interface Status {
 	version: string;
 	allow_writes: boolean;
 	scan: ScanProgress;
+	hashes: {
+		running: boolean;
+		files_total: number;
+		files_done: number;
+		bytes_hashed: number;
+		errors: number;
+		skipped: number;
+	};
 	/** null while no Library folder is set up. */
 	library: { id: string; generation: number } | null;
 	inbox: { generation: number };
