@@ -832,7 +832,9 @@ pub(crate) async fn serve_file(path: PathBuf, req: Request, cache: &'static str)
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             res.into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        // ServeFile reports file errors as HTTP responses; its service error
+        // type is Infallible. Newer Rust rejects trying to format that value.
+        Err(never) => match never {},
     }
 }
 
