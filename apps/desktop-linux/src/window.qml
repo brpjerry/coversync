@@ -1,5 +1,5 @@
-// The app's window: one web view, and the little the window draws itself (a page's alert, confirm and prompt, and
-// the app's own questions).
+// The app's window: one web view, and the little the window draws itself (a page's alert, confirm and prompt, the
+// app's own questions, and a page's tooltips).
 // cpp/shell.cpp loads this, with these names set:
 //   backend         what the view's signals are passed to, and the desktop's file chooser (cpp/backend.h)
 //   appStoragePath  where the view keeps local storage and the like
@@ -15,7 +15,9 @@ Window {
 
     // The fallback page's colours (ui/fallback.css), for what shows before a page has drawn and
     // for the dialogs.
-    readonly property bool dark: Qt.styleHints.colorScheme !== Qt.Light
+    // Dark only when the desktop says dark: with no preference (or no portal to ask) the page gets light, and
+    // what the window draws goes with the page.
+    readonly property bool dark: Qt.styleHints.colorScheme === Qt.Dark
     readonly property color pageColor: dark ? "#0a0b0e" : "#f5f5f7"
     readonly property color cardColor: dark ? "#17181c" : "#ffffff"
     readonly property color lineColor: dark ? "#29ffffff" : "#29000000"
@@ -128,6 +130,16 @@ Window {
                 else
                     permission.deny();
             }
+            // A tooltip (an element's title): drawn here, in the window's colours. Qt's own is a pale yellow box
+            // with black text, whatever the page looks like.
+            onTooltipRequested: function (request) {
+                request.accepted = true;
+                // None over the window's dialog: the page is out of reach while it shows.
+                if (request.type === TooltipRequest.Show && !dialog.visible)
+                    tip.show(request.text, request.x, request.y);
+                else
+                    tip.hide();
+            }
             // A menu only where it has something for the app's user: text to edit or copy, a link.
             onContextMenuRequested: function (request) {
                 if (!request.isContentEditable && request.selectedText === "" && request.linkUrl.toString() === "")
@@ -177,6 +189,65 @@ Window {
                 request.dialogAccept(files);
             else
                 request.dialogReject();
+        }
+    }
+
+    // A page's tooltip, by the pointer, until the page takes it back, a dialog comes up or a while has passed.
+    // Declared before the dialog, which is drawn over it.
+    Rectangle {
+        id: tip
+
+        // Below the pointer and a little right of it, as tooltips sit, and kept inside the window.
+        function show(text, x, y) {
+            tipText.text = text;
+            tip.x = Math.max(8, Math.min(x + 12, window.width - width - 8));
+            const below = y + 22;
+            tip.y = below + height + 8 <= window.height ? below : Math.max(8, y - height - 10);
+            visible = text !== "";
+            tipTimer.restart();
+        }
+
+        function hide() {
+            visible = false;
+            tipTimer.stop();
+        }
+
+        visible: false
+        width: Math.min(tipText.implicitWidth, 360) + 18
+        height: tipText.height + 12
+        radius: 7
+        color: window.cardColor
+        border.color: window.lineColor
+
+        Text {
+            id: tipText
+
+            x: 9
+            y: 6
+            width: Math.min(implicitWidth, 360)
+            color: window.textColor
+            // As written: a title is the page's to choose, and is never markup.
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            // A title can be as long as the page likes (a tag's whole value): no taller than fits the window,
+            // and cut short with an ellipsis beyond that.
+            maximumLineCount: Math.max(1, Math.min(12, Math.floor((window.height - 36) / tipLine.height)))
+            elide: Text.ElideRight
+            font.pixelSize: 13
+        }
+        // One line of the tooltip's text, for counting how many fit.
+        Text {
+            id: tipLine
+
+            visible: false
+            text: "x"
+            font.pixelSize: tipText.font.pixelSize
+        }
+        Timer {
+            id: tipTimer
+
+            interval: 8000
+            onTriggered: tip.hide()
         }
     }
 
@@ -232,6 +303,8 @@ Window {
             }
             if (request)
                 request.dialogReject();
+            // The page's tooltip, if one is up, goes: nothing of the page's sits by the question.
+            tip.hide();
             request = asked;
             shownAt = Date.now();
             input.text = asked.defaultText;
