@@ -393,9 +393,8 @@ impl Memory {
         let written = file
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| {
-                std::fs::write(file, serde_json::to_vec(&state).expect("state serializes"))
-            });
+            .and_then(|()| serde_json::to_vec(&state).map_err(std::io::Error::other))
+            .and_then(|state| std::fs::write(file, state));
         match written {
             Ok(()) => self.saved = true,
             Err(e) => tracing::warn!("couldn't note the sync in {}: {e}", file.display()),
@@ -774,6 +773,19 @@ impl Session<'_> {
                             cancel.cancel();
                         }
                         _ => {}
+                    }
+                }
+                // The device's settings can change under a sync as well
+                // (the watch hears of it without a word): looked at now
+                // and then, like the desktop's.
+                _ = tokio::time::sleep(self.settings.look_again), if hold.is_none() => {
+                    let conditions = *self.system.conditions.borrow();
+                    if let Err(why) = may_sync(reason, self.watch.auto(), conditions, false)
+                        && why != Hold::Off
+                    {
+                        tracing::info!("stopping the sync: {}", why.text());
+                        hold = Some(why);
+                        cancel.cancel();
                     }
                 }
                 nudge = self.system.nudges.recv(), if !self.nudges_gone => match nudge {

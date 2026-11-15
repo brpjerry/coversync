@@ -57,7 +57,10 @@ impl Config {
         let failed = |e: io::Error| format!("{} can't be written: {e}.", file.display());
         let dir = file.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(dir).map_err(failed)?;
-        let mut text = serde_json::to_vec_pretty(&config).expect("settings serialize");
+        // A path that isn't valid UTF-8 has no place in JSON: [`path`]
+        // turns those away before they get here.
+        let mut text = serde_json::to_vec_pretty(&config)
+            .map_err(|e| format!("{} can't be written: {e}.", file.display()))?;
         text.push(b'\n');
         let tmp = file.with_extension("json.new");
         let mut out = fs::File::create(&tmp).map_err(failed)?;
@@ -74,12 +77,26 @@ pub fn server_url(input: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A path to keep in the settings, made absolute. One that isn't valid
+/// UTF-8 can't be written there (the file is JSON), nor remembered between
+/// runs, so it's turned away.
+pub fn path(input: &Path) -> Result<PathBuf, String> {
+    let path = std::path::absolute(input)
+        .map_err(|e| format!("{} isn't a usable path: {e}.", input.display()))?;
+    if path.to_str().is_none() {
+        return Err(format!(
+            "{} can't be kept in the settings: its name isn't valid UTF-8.",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 /// A folder to sync into, as an absolute path. It has to be there already:
 /// a folder made here by mistake (a disk that isn't mounted) would get the
 /// whole Library.
 pub fn folder(input: &Path) -> Result<PathBuf, String> {
-    let path = std::path::absolute(input)
-        .map_err(|e| format!("{} isn't a usable path: {e}.", input.display()))?;
+    let path = path(input)?;
     match fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => Ok(path),
         Ok(_) => Err(format!("{} isn't a folder.", path.display())),
@@ -196,6 +213,32 @@ mod tests {
                 .unwrap_err()
                 .contains("isn't a folder")
         );
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_path_that_json_cant_hold_is_turned_away_not_crashed_on() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("not-utf8");
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        fs::create_dir(&odd).unwrap();
+        assert!(path(&odd).unwrap_err().contains("UTF-8"));
+        assert!(folder(&odd).unwrap_err().contains("UTF-8"));
+        assert_eq!(path(&dir.join("café")).unwrap(), dir.join("café"));
+        // One that got into the settings some other way fails the save,
+        // and leaves the file as it was.
+        let file = dir.join("sync.json");
+        let good = Config {
+            root: Some(dir.clone()),
+            ..Default::default()
+        };
+        good.save(&file).unwrap();
+        let bad = Config {
+            root: Some(odd),
+            ..Default::default()
+        };
+        assert!(bad.save(&file).is_err());
+        assert_eq!(Config::load(&file).unwrap().root, Some(dir.clone()));
     }
 
     // Bugs caught: 0, False positives: 0
