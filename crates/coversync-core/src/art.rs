@@ -313,6 +313,7 @@ mod tests {
         assert!(Art::new(b"not an image".to_vec()).is_err());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn device_files_are_scaled_only_when_too_wide() {
         let png = Art::new(image(ImageFormat::Png)).unwrap();
