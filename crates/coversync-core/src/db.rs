@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, ToSql, params, params_from_it
 
 use crate::appearance::AppearanceSetup;
 use crate::autofill::{self, Autofill, TrackInfo};
+#[cfg(feature = "server")]
 use crate::cover::Cover;
 use crate::hashes::{FileHash, HashJob};
 use crate::inbox::{HiddenStats, InboxSetup};
@@ -797,6 +798,7 @@ pub enum CoverSource {
 }
 
 impl CoverSource {
+    #[cfg(feature = "server")]
     fn encode(&self) -> String {
         match self {
             CoverSource::File(p) => format!("file:{}", p.display()),
@@ -2056,6 +2058,7 @@ impl Library {
     }
 
     /// What the cover pass found for an album (nothing, if it has no art).
+    #[cfg(feature = "server")]
     pub fn set_cover(&self, album_id: &str, cover: Option<&Cover>, signature: &str) -> Result<()> {
         self.conn().execute(
             "INSERT INTO covers (album_id, source, color, version, signature)
@@ -2391,6 +2394,7 @@ mod tests {
         (stat, album.into(), PathBuf::from("/m/a"), tags)
     }
 
+    #[cfg(feature = "server")]
     fn found(source: CoverSource, version: &str) -> Cover {
         Cover {
             source,
@@ -2590,6 +2594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn albums_without_art_need_attention_when_art_is_required() {
         let lib = Library::open(&temp_db("art")).unwrap();
         lib.upsert(&[
@@ -3670,6 +3675,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn covers_are_found_again_after_the_library_moves() {
         let dir = temp_dir("libcovers", &["state", "Lib"]);
         let root = dir.join("Lib");
@@ -3698,6 +3704,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn albums_carry_their_recorded_cover_version() {
         let lib = Library::open(&temp_db("coverversion")).unwrap();
         lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();

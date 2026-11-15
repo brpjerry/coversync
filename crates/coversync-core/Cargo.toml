@@ -5,11 +5,25 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# Clients (the sync engine, Android) build without default features: the
+# index and its queries, file hashes and the settings types, and nothing
+# that decodes images or calls MusicBrainz. `server` adds what only
+# coversyncd runs: imports, identifying albums online, uploads into the
+# Inbox, and the cover pass with its thumbnails. CI builds the client set
+# for Android, ARM Linux and Windows.
+[features]
+default = ["server"]
+server = ["dep:flate2", "dep:getrandom", "dep:image", "dep:ureq", "dep:walkdir"]
+
+# It imports albums and runs the cover pass.
+[[test]]
+name = "change_counter"
+required-features = ["server"]
+
 [dependencies]
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-flate2 = "1.1.10"
-getrandom = "0.4.3"
-libc = "0.2.191"
+image = { version = "0.25.10", optional = true, default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+flate2 = { version = "1.1.10", optional = true }
+getrandom = { version = "0.4.3", optional = true }
 lofty = "0.25.5"
 rayon = "1.12.0"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
@@ -18,6 +32,10 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 tracing = "0.1.44"
-ureq = { version = "3.5.0", features = ["json"] }
-walkdir = "2.5.0"
+ureq = { version = "3.5.0", optional = true, features = ["json"] }
+walkdir = { version = "2.5.0", optional = true }
 blake3 = "1.8.7"
+
+# Linux file clones and I/O priority, access(2) and the uploads' disk calls.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"

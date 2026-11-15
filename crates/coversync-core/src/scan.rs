@@ -1,18 +1,25 @@
 //! Library scanning: find audio files, read changed ones, then refresh covers.
 
+#[cfg(feature = "server")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "server")]
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "server")]
 use walkdir::WalkDir;
 
+#[cfg(feature = "server")]
 use crate::cover::CoverCache;
 use crate::db::FileStat;
 use crate::model::{Collection, ScanProgress};
-use crate::{Library, Result, tags, upload};
+#[cfg(feature = "server")]
+use crate::upload;
+use crate::{Library, Result, tags};
 
 const BATCH: usize = 256;
 
@@ -22,6 +29,7 @@ fn update(progress: &Progress, f: impl FnOnce(&mut ScanProgress)) {
     f(&mut progress.write().unwrap_or_else(|e| e.into_inner()));
 }
 
+#[cfg(feature = "server")]
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -111,6 +119,7 @@ pub fn stat(path: PathBuf, root: &Path, collection: Collection) -> Option<FileSt
     })
 }
 
+#[cfg(feature = "server")]
 fn walk(roots: &[(PathBuf, Collection)], progress: &Progress) -> Vec<FileStat> {
     let mut files = Vec::new();
     for (root, collection) in roots {
@@ -195,6 +204,7 @@ pub fn index_written_files(
 
 /// Full incremental scan of the Inbox and Library folders, then the cover
 /// pass. The index ends up holding exactly the files under `roots`.
+#[cfg(feature = "server")]
 pub fn scan(
     lib: &Library,
     covers: &CoverCache,
@@ -252,6 +262,7 @@ pub fn scan(
     Ok(())
 }
 
+#[cfg(feature = "server")]
 pub fn refresh_covers(lib: &Library, covers: &CoverCache, progress: &Progress) -> Result<()> {
     let jobs = lib.cover_jobs()?;
     let total = jobs.len() as u64;

@@ -142,11 +142,18 @@ pub fn creatable(path: &Path) -> bool {
 }
 
 /// `access(2)` rather than mode bits, so read-only mounts count as not writable.
+#[cfg(unix)]
 pub fn writable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes())
         // SAFETY: a valid NUL-terminated path; access only reads it.
         .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
+}
+
+/// Without `access(2)`, the read-only attribute is all there is to go by.
+#[cfg(not(unix))]
+pub fn writable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// Tag kinds every file must have before it can be imported: the rules'
