@@ -133,9 +133,8 @@ impl Agent {
     }
 
     /// Waits until the agent has said nothing new for a while: whatever it
-    /// was still doing is done. (After its first sync a second, empty one
-    /// can follow: the watch's status check, made while the first ran, saw
-    /// work pending.)
+    /// was still doing is done, and so is a sync that something heard
+    /// during the last one brought on.
     async fn at_rest(&self) {
         let said = || self.lines.0.lock().unwrap().len();
         let mut last = said();

@@ -104,6 +104,11 @@ pub struct Watch {
     etag: Option<String>,
     /// The first status check is the device waking.
     woke: bool,
+    /// The next status check is the one the event stream's opening asked
+    /// for: it refreshes the settings and catches Sync now, but leaves
+    /// pending work to the stream's first event, which tells of the current
+    /// target (and is dropped if a sync under way reaches it).
+    refresh: bool,
 }
 
 impl Watch {
@@ -126,6 +131,7 @@ impl Watch {
             next_status: now,
             etag: None,
             woke: true,
+            refresh: false,
         }
     }
 
@@ -152,6 +158,7 @@ impl Watch {
     pub fn check_soon(&mut self) {
         // Pending work is looked at afresh, not answered "unchanged".
         self.etag = None;
+        self.refresh = false;
         self.next_status = Instant::now();
     }
 
@@ -200,11 +207,13 @@ impl Watch {
                     Ok(events) => {
                         tracing::debug!("listening for the server's events");
                         self.stream = Some(events);
-                        // The stream tells of changes from now on: the
-                        // status, read again, has the settings as they are
-                        // (they may have changed during a first sync) and
-                        // anything missed while away.
+                        // The stream tells of changes from now on, its first
+                        // event of the target now: the status, read again,
+                        // has the settings as they are (they may have
+                        // changed during a first sync) and a Sync now asked
+                        // for meanwhile.
                         self.check_soon();
+                        self.refresh = true;
                         self.failures = 0;
                     }
                     Err(Error::Unauthorized) => return Err(Error::Unauthorized),
@@ -291,14 +300,17 @@ impl Watch {
     }
 
     async fn check(&mut self, reason: Reason) -> Result<Option<Trigger>, Error> {
+        let refresh = self.refresh;
         match status(&self.api, self.etag.as_deref()).await {
             Ok(StatusCheck::Unchanged) => {
                 self.woke = false;
+                self.refresh = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 Ok(None)
             }
             Ok(StatusCheck::Changed { status, etag }) => {
                 self.woke = false;
+                self.refresh = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 // Only a status that asked for nothing may come back as
                 // "unchanged": one with work pending must be looked at
@@ -315,7 +327,8 @@ impl Watch {
                 // On waking, a session is worth starting even with nothing
                 // pending: only it checks the folder's marker (a new or
                 // emptied folder, which the server can't know of).
-                if (status.pending.files > 0 || reason == Reason::Wake) && status.auto.enabled {
+                let pending = status.pending.files > 0 && !refresh;
+                if (pending || reason == Reason::Wake) && status.auto.enabled {
                     // A quiet period under way runs out first: a run of
                     // edits still becomes one sync.
                     if self.due.is_none() {
