@@ -27,6 +27,11 @@ export interface Notices {
 	setup_saved: { setup: 'library' | 'inbox' | 'appearance' | 'sync' };
 	/** A Smart suggestions lookup ended. */
 	lookup_finished: { album_id: string; state: 'done' | 'failed' };
+	/**
+	 * A device's sync moved on: a sync started, made progress (about once a
+	 * second) or ended, or Sync setup asked for something.
+	 */
+	device_sync: { device: number };
 	/** Notices were missed, so everything should be reloaded. */
 	resync: Record<string, never>;
 }
@@ -55,6 +60,7 @@ const NAMES = [
 	'album_changed',
 	'setup_saved',
 	'lookup_finished',
+	'device_sync',
 	'resync'
 ] as const satisfies readonly (keyof Notices)[];
 

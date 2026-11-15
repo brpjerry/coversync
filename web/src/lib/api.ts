@@ -475,10 +475,107 @@ export interface DeviceSettings {
 		cover_file: boolean;
 		/** Without extension ("cover" → cover.jpg). */
 		cover_name: string;
-		/** The widest the cover file and embedded art may be, in pixels; null for no limit. */
+		/**
+		 * The widest the cover file may be, in pixels; null for no limit. Art
+		 * inside the tracks isn't shrunk yet (SYN-12).
+		 */
 		max_width: number | null;
 	};
+	auto: AutoSync;
 }
+
+/** When a device syncs by itself. Each kind of device applies what fits it. */
+export interface AutoSync {
+	enabled: boolean;
+	/** How long to wait after the last change, so a run of edits becomes one sync: 0 to 3600. */
+	quiet_seconds: number;
+	wifi_only: boolean;
+	charging_only: boolean;
+}
+
+/** Files, and their size in bytes. */
+export interface FileCount {
+	files: number;
+	bytes: number;
+}
+
+/** What started a sync: someone asked, a change, a periodic check, the device waking. */
+export type SyncReason = 'user' | 'event' | 'timer' | 'wake' | 'other';
+
+/** How a sync ended. `partial`: stopped for space, time or a lost network, with work left. */
+export type SyncResult = 'complete' | 'partial' | 'cancelled' | 'failed';
+
+/** A file a device couldn't sync. `error`: no_space, path_too_long, protected, changed, gone, io, … */
+export interface SyncFailure {
+	path: string;
+	hash: string;
+	op: string;
+	error: string;
+	detail: string | null;
+	at: number;
+}
+
+/** A device's sync as Sync setup shows it (`GET /api/devices/{id}/sync/state`). Times are Unix seconds. */
+export interface DeviceSyncState {
+	/** A sync under way. */
+	running: {
+		started_at: number;
+		reason: SyncReason;
+		/** What it has done so far; `rate` in bytes a second, lately. */
+		progress: { files: number; bytes: number; rate: number | null };
+		/** The whole sync's size, once it's planned. */
+		totals: {
+			delete: number;
+			move: number;
+			rmdir: number;
+			mkdir: number;
+			put: number;
+			put_bytes: number;
+			preparing: number;
+			short_bytes: number;
+		} | null;
+		/** Looking through the device's folder before planning. */
+		reconciling: boolean;
+	} | null;
+	last: {
+		started_at: number;
+		ended_at: number;
+		reason: SyncReason;
+		report: {
+			result: SyncResult;
+			message?: string | null;
+			files: number;
+			bytes: number;
+			seconds: number;
+			free_bytes: number | null;
+		};
+	} | null;
+	/** Its folder has been looked through once at least. */
+	reconciled: boolean;
+	/** What the device holds, as far as coversync knows. */
+	held: FileCount;
+	/** What it still needs: files to copy, move or delete, and the bytes to copy. */
+	pending: FileCount;
+	/** Files not ready to send yet. */
+	preparing: number;
+	/** Files whose paths are too long for the device. */
+	too_long: number;
+	/** Room it would still need, from the free space it last reported. */
+	short_bytes: number;
+	/** At most 50 of them listed, newest first. */
+	failed: { count: number; files: SyncFailure[] };
+	/** Files in its folder that coversync didn't put there. */
+	other: FileCount;
+	/** Those are removed when it syncs. */
+	remove_other: boolean;
+	check_requested: boolean;
+	sync_requested: boolean;
+	/** The Library folder isn't available: there's nothing to sync. */
+	no_library: boolean;
+}
+
+/** What Sync setup can ask of a device's sync (a password login only). */
+export type SyncAction = 'sync' | 'check' | 'retry' | 'remove_other' | 'keep_other';
 
 /** A device's sync settings, and their version (0 until first saved). */
 export interface DeviceSync {
@@ -760,6 +857,10 @@ export const api = {
 	removeDevice: (id: number) => request<void>(`/api/devices/${id}`, { method: 'DELETE' }),
 	saveDeviceSync: (id: number, settings: DeviceSettings) =>
 		request<DeviceSync>(`/api/devices/${id}/sync/settings`, json('PUT', settings)),
+	/** A password login reads any device's; an app only its own. */
+	deviceSyncState: (id: number) => request<DeviceSyncState>(`/api/devices/${id}/sync/state`),
+	deviceSyncAction: (id: number, action: SyncAction) =>
+		request<void>(`/api/devices/${id}/sync/action`, json('POST', { action })),
 	/** Add device: a code for a device to pair with, replacing `replace`'s entry if given. */
 	newPairing: (name: string, scope: Scope, replace: number | null) =>
 		request<NewPairing>('/api/pairings', json('POST', { name, scope, replace })),
