@@ -25,7 +25,7 @@ use crate::model::{
     KindCoverage, LibraryChanges, LibraryVersion, RemovedTrack, TagCoverage, Track,
 };
 use crate::rules::{self, LibrarySetup};
-use crate::sync::{Catalog, CatalogTrack, SyncSetup};
+use crate::sync::{Catalog, CatalogTrack, Content, SyncSetup};
 use crate::tags::TrackTags;
 use crate::{Error, Result};
 
@@ -1452,9 +1452,10 @@ impl Library {
         }))
     }
 
-    /// Every Library track's id, album and path, and with `values` its tag
-    /// values, read at once with the Library version they belong to (see
-    /// [`crate::sync::device_paths`]). None without a Library folder.
+    /// Every Library track's id, album, path and content, and with `values`
+    /// its tag values, read at once with the Library version they belong to
+    /// (see [`crate::sync::device_paths`]). None without a Library folder.
+    /// A hash counts only while it's for the file's size and time as indexed.
     pub fn sync_catalog(&self, values: bool) -> Result<Option<Catalog>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1463,7 +1464,9 @@ impl Library {
         };
         let tracks = tx
             .prepare(
-                "SELECT id, path, album_id, CASE WHEN ?1 THEN tag_values ELSE '' END
+                "SELECT id, path, album_id, CASE WHEN ?1 THEN tag_values ELSE '' END,
+                    size, mtime_ns, added_at,
+                    CASE WHEN hash_size = size AND hash_mtime_ns = mtime_ns THEN hash END
                 FROM lib.tracks ORDER BY path",
             )?
             .query_map([values], |r| {
@@ -1472,11 +1475,23 @@ impl Library {
                     path: r.get(1)?,
                     album_id: r.get(2)?,
                     values: r.get(3)?,
+                    content: Content {
+                        size: r.get::<_, i64>(4)? as u64,
+                        mtime_ns: r.get(5)?,
+                        added_at: r.get(6)?,
+                        hash: r
+                            .get::<_, Option<String>>(7)?
+                            .and_then(|h| h.strip_prefix("blake3:").map(str::to_string)),
+                    },
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
         tx.commit()?;
-        Ok(Some(Catalog { library, tracks }))
+        Ok(Some(Catalog {
+            library,
+            root: a.root,
+            tracks,
+        }))
     }
 
     /// Path -> (mtime, size, collection) for every indexed file.
@@ -2385,6 +2400,31 @@ impl Library {
             )
             .optional()?;
         Ok(s.flatten().as_deref().and_then(CoverSource::decode))
+    }
+
+    /// Every album's art as the cover pass last found it: where it is, and
+    /// its version (a digest of the art). Albums without art are left out.
+    pub fn cover_versions(&self) -> Result<HashMap<String, (CoverSource, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT album_id, source, version FROM covers
+             WHERE source IS NOT NULL AND version IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut covers = HashMap::new();
+        for row in rows {
+            let (album, source, version) = row?;
+            if let Some(source) = CoverSource::decode(&source) {
+                covers.insert(album, (source, version));
+            }
+        }
+        Ok(covers)
     }
 }
 

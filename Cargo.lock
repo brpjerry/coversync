@@ -448,6 +448,7 @@ name = "coversync-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "coversync-protocol",
  "flate2",
  "getrandom 0.4.3",
  "image",
@@ -476,6 +477,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "coversync-protocol"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -509,6 +519,7 @@ dependencies = [
  "base64",
  "clap",
  "coversync-core",
+ "coversync-protocol",
  "futures-util",
  "getrandom 0.4.3",
  "libc",

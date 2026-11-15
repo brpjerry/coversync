@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod events;
 mod suggest;
+mod sync;
 mod uploads;
 mod web;
 
