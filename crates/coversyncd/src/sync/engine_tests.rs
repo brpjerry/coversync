@@ -889,7 +889,14 @@ async fn a_sync_that_never_finished_has_its_folder_checked() {
     // A facts journal that can't be read whole may have lost what an
     // earlier sync did: checked too.
     std::fs::write(root.join(".coversync-replica/facts"), b"{not a fact\n").unwrap();
+    // Cancelled before its check could happen, the sync still owes it: the
+    // note stays, and the next sync checks.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(e.sync(Reason::User, Arc::new(()), cancel).await.is_err());
+    assert!(note.exists());
     assert!(sync(&e).await.reconciled.is_some());
+    assert!(!note.exists());
     assert!(sync(&e).await.reconciled.is_none());
 }
 

@@ -58,26 +58,22 @@ pub(crate) async fn sync(
         tracing::info!("the last sync never finished: checking the folder");
     }
     let mut check = unfinished;
+    // A check this sync owes: the last one never finished, or the facts
+    // journal couldn't be read. Until one happens, the note stays.
+    let mut owed = unfinished;
     let mut checked = false;
     // Facts the journal couldn't keep and the server never confirmed: the
     // folder can't be trusted to match what the server knows.
     let mut lost = false;
     let result = loop {
-        let mut lost_facts = false;
+        let mut flags = Flags::default();
         let session = session(
-            &api,
-            &storage,
-            &options,
-            reason,
-            check,
-            &observer,
-            &cancel,
-            began,
-            &mut lost_facts,
+            &api, &storage, &options, reason, check, &observer, &cancel, began, &mut flags,
         )
         .await;
         // Whatever ended the session, the token refused included.
-        lost |= lost_facts;
+        lost |= flags.lost;
+        owed |= flags.damaged;
         let (report, refused) = match session {
             Ok(r) => r,
             Err(e) => break Err(e),
@@ -95,7 +91,7 @@ pub(crate) async fn sync(
     // Everything this sync did is made durable before the note goes, unless
     // a check it owed didn't happen, or facts were lost: then the note stays
     // and the next sync checks the folder.
-    if (!unfinished || checked) && !lost {
+    if (!owed || checked) && !lost {
         let s = storage.clone();
         match blocking(move || s.end_changes()).await {
             Ok(Ok(())) => {}
@@ -324,8 +320,16 @@ impl Ctx {
     }
 }
 
-/// One session. Returns its report and whether a step was refused; `lost`
-/// says whether facts the journal couldn't keep never reached the server.
+/// What a session leaves the sync to know, however it ended.
+#[derive(Default)]
+struct Flags {
+    /// Facts the journal couldn't keep never reached the server.
+    lost: bool,
+    /// The facts journal couldn't be read whole: a check is owed.
+    damaged: bool,
+}
+
+/// One session. Returns its report and whether a step was refused.
 #[allow(clippy::too_many_arguments)]
 async fn session(
     api: &Arc<Api>,
@@ -336,7 +340,7 @@ async fn session(
     observer: &Arc<dyn Observer>,
     cancel: &CancellationToken,
     began: Instant,
-    lost: &mut bool,
+    flags: &mut Flags,
 ) -> Result<(Report, bool), Error> {
     observer.phase(Phase::Starting);
     let s = storage.clone();
@@ -353,7 +357,8 @@ async fn session(
     .await?;
     // A journal that couldn't be read whole may have lost facts of what an
     // earlier sync did: the folder is checked.
-    let check = check || facts.damaged();
+    flags.damaged = facts.damaged();
+    let check = check || flags.damaged;
     // Partial files are room the engine can take back: counted as free, so
     // that a download cut short still fits the plan when only its rest does.
     let free = free.map(|f| f.saturating_add(spare.values().sum()));
@@ -400,7 +405,7 @@ async fn session(
     };
 
     let ran = run(&ctx, &started, &mut report).await;
-    *lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
     let stop = ctx.stop.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = &ctx.stats;
     report.files = s.puts.load(Ordering::Relaxed);
@@ -530,7 +535,7 @@ async fn session(
         }
     }
     tracing::info!(?report, "sync session ended");
-    *lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
     Ok((report, matches!(stop, Some(Stop::Refused))))
 }
 
