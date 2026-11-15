@@ -127,6 +127,8 @@ fn sample(
                 w.ranges.iter().map(|[a, b]| b.saturating_sub(*a)).sum(),
                 Ordering::Relaxed,
             );
+            // A large range (embedded art) on slow storage stops at a cancel.
+            let mut f = Cancellable { inner: f, cancel };
             coversync_protocol::sample(&mut f, size, &w.ranges).map(|s| Sampled {
                 path: w.path.clone(),
                 sample: Some(s),
@@ -142,7 +144,11 @@ fn sample(
                     if cancel.is_cancelled() {
                         return Err(std::io::Error::other("cancelled"));
                     }
-                    let n = f.read(&mut buf)?;
+                    let n = match f.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -162,6 +168,28 @@ fn sample(
             tracing::debug!(path = w.path, "couldn't sample a file: {e}");
             Ok(None)
         }
+    }
+}
+
+/// A file read that fails once the sync is cancelled (not as Interrupted,
+/// which `read_exact` would retry).
+struct Cancellable<'a, R> {
+    inner: R,
+    cancel: &'a CancellationToken,
+}
+
+impl<R: Read> Read for Cancellable<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for Cancellable<'_, R> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 

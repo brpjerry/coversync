@@ -163,28 +163,11 @@ async fn run(
     token_file: Option<PathBuf>,
 ) -> Done {
     let config = Config::load(file).map_err(setup_error)?;
-    let server = server.or(config.server).ok_or_else(|| {
-        setup_error(
-            "No server is set. Turn sync on in the coversync app's settings, or run \
-             `coversync setup --server <url> --root <folder>`."
-                .into(),
-        )
-    })?;
-    let server = config::server_url(&server).map_err(setup_error)?;
-    let root = root.or(config.root).ok_or_else(|| {
-        setup_error(
-            "No folder is set. Choose one in the coversync app's settings, or run \
-             `coversync setup --root <folder>`."
-                .into(),
-        )
-    })?;
-    // Not checked for being there: a folder on a disk that isn't mounted
-    // yet is waited for.
-    let root = std::path::absolute(&root)
-        .map_err(|e| setup_error(format!("{} isn't a usable path: {e}.", root.display())))?;
-    let tokens = token_file
-        .or(config.token_file)
-        .map_or(Source::Keychain, Source::File);
+    let Resolved {
+        server,
+        root,
+        tokens,
+    } = resolve(config, server, root, token_file).map_err(setup_error)?;
     tracing::info!(server, root = %root.display(), "the sync agent is starting");
 
     let status = Arc::new(Status(Notifier::from_env()));
@@ -235,6 +218,44 @@ async fn run(
     }
 }
 
+/// What the agent runs with, once the command's options and the settings
+/// file are put together.
+#[derive(Debug, PartialEq)]
+struct Resolved {
+    server: String,
+    root: PathBuf,
+    tokens: Source,
+}
+
+/// Puts `run`'s options over the settings file's: an option given wins.
+fn resolve(
+    config: Config,
+    server: Option<String>,
+    root: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+) -> Result<Resolved, String> {
+    let server = server.or(config.server).ok_or(
+        "No server is set. Turn sync on in the coversync app's settings, or run `coversync \
+         setup --server <url> --root <folder>`.",
+    )?;
+    let server = config::server_url(&server)?;
+    let root = root.or(config.root).ok_or(
+        "No folder is set. Choose one in the coversync app's settings, or run `coversync setup \
+         --root <folder>`.",
+    )?;
+    // Not checked for being there: a folder on a disk that isn't mounted
+    // yet is waited for.
+    let root = config::path(&root)?;
+    let tokens = token_file
+        .or(config.token_file)
+        .map_or(Source::Keychain, Source::File);
+    Ok(Resolved {
+        server,
+        root,
+        tokens,
+    })
+}
+
 fn setup(
     file: &Path,
     server: Option<String>,
@@ -251,13 +272,7 @@ fn setup(
         config.root = Some(config::folder(&root).map_err(setup_error)?);
     }
     if let Some(token_file) = token_file {
-        let path = std::path::absolute(&token_file).map_err(|e| {
-            setup_error(format!(
-                "{} isn't a usable path: {e}.",
-                token_file.display()
-            ))
-        })?;
-        config.token_file = Some(path);
+        config.token_file = Some(config::path(&token_file).map_err(setup_error)?);
     }
     if keychain {
         config.token_file = None;
@@ -291,13 +306,12 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
     let mut config = Config::load(file).map_err(setup_error)?;
     let upstream = Upstream::parse(server).map_err(|e| setup_error(e.to_string()))?;
     let url = upstream.url();
-    let token_file =
-        match token_file {
-            Some(path) => Some(std::path::absolute(&path).map_err(|e| {
-                setup_error(format!("{} isn't a usable path: {e}.", path.display()))
-            })?),
-            None => config.token_file.clone(),
-        };
+    // Before the code is spent: a path the settings can't hold would leave
+    // a token nobody finds again.
+    let token_file = match token_file {
+        Some(path) => Some(config::path(&path).map_err(setup_error)?),
+        None => config.token_file.clone(),
+    };
     let tokens = token_file.clone().map_or(Source::Keychain, Source::File);
     // Before the code is spent: there has to be somewhere for the token.
     tokens.ready().await.map_err(setup_error)?;
@@ -333,4 +347,89 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
         None => println!("Choose its folder next: coversync setup --root <folder>"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn an_option_given_wins_over_the_settings_file() {
+        let saved = || Config {
+            server: Some("https://saved.example/".into()),
+            root: Some("/saved".into()),
+            token_file: Some("/saved/token".into()),
+            ..Default::default()
+        };
+        // Nothing given: the file's, with the token where the file says.
+        assert_eq!(
+            resolve(saved(), None, None, None),
+            Ok(Resolved {
+                server: "https://saved.example/".into(),
+                root: "/saved".into(),
+                tokens: Source::File("/saved/token".into()),
+            })
+        );
+        // Each option alone replaces just its own setting, and a server is
+        // read as the app reads one.
+        let given = resolve(
+            saved(),
+            Some("given.example/music".into()),
+            Some("/given".into()),
+            Some("/given/token".into()),
+        )
+        .unwrap();
+        assert_eq!(given.server, "https://given.example/music/");
+        assert_eq!(given.root, Path::new("/given"));
+        assert_eq!(given.tokens, Source::File("/given/token".into()));
+        let one = resolve(saved(), None, Some("/given".into()), None).unwrap();
+        assert_eq!(one.server, "https://saved.example/");
+        assert_eq!(one.root, Path::new("/given"));
+
+        // No token file anywhere: the keychain.
+        let keychain = Config {
+            token_file: None,
+            ..saved()
+        };
+        assert_eq!(
+            resolve(keychain, None, None, None).unwrap().tokens,
+            Source::Keychain
+        );
+        // Nothing set up says what's missing.
+        let missing = resolve(Config::default(), None, None, None).unwrap_err();
+        assert!(missing.contains("No server is set"), "{missing}");
+        let no_folder = Config {
+            root: None,
+            ..saved()
+        };
+        let missing = resolve(no_folder, None, None, None).unwrap_err();
+        assert!(missing.contains("No folder is set"), "{missing}");
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn switching_between_a_token_file_and_the_keychain_is_kept() {
+        let dir = std::env::temp_dir().join(format!("coversync-cli-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sync.json");
+        let token = dir.join("token");
+        setup(&file, None, Some(dir.clone()), Some(token.clone()), false).unwrap();
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.token_file.as_deref(), Some(token.as_path()));
+        assert_eq!(saved.root.as_deref(), Some(dir.as_path()));
+        // Back to the keychain: the folder stays.
+        setup(&file, None, None, None, true).unwrap();
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.token_file, None);
+        assert_eq!(saved.root.as_deref(), Some(dir.as_path()));
+        // Only looking changes nothing.
+        let before = std::fs::read(&file).unwrap();
+        setup(&file, None, None, None, false).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // A folder that isn't there is refused, and the settings stay.
+        assert!(setup(&file, None, Some(dir.join("missing")), None, false).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
 }
