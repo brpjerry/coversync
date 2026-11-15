@@ -73,6 +73,8 @@ pub enum Error {
     /// The sync folder as a whole: unreadable, read-only.
     #[error("the sync folder: {0}")]
     Storage(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl Error {
@@ -255,15 +257,24 @@ impl Engine {
         observer: Arc<dyn Observer>,
         cancel: CancellationToken,
     ) -> Result<Report, Error> {
-        run::sync(
+        // On a task of its own, which keeps the folder's lock until its
+        // work has stopped: dropping this future cancels the sync rather
+        // than abandoning it half-way.
+        let cancel = cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let worker = tokio::spawn(run::sync(
             self.api.clone(),
             self.storage.clone(),
             self.options.clone(),
             reason,
             observer,
             cancel,
-        )
-        .await
+        ));
+        match worker.await {
+            Ok(result) => result,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(Error::Storage(format!("the sync stopped: {e}"))),
+        }
     }
 
     /// Whether there's anything to sync: [`StatusCheck::Unchanged`] when

@@ -60,6 +60,11 @@ impl Facts {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Facts done and not yet confirmed.
+    pub(crate) fn unconfirmed(&self) -> usize {
+        self.lock().unconfirmed.len()
+    }
+
     /// Facts waiting, from this sync or an earlier one.
     pub(crate) fn waiting(&self) -> usize {
         let i = self.lock();

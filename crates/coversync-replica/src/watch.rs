@@ -141,6 +141,8 @@ impl Watch {
 
     /// Ask for a status check soon, say when the device joined a network.
     pub fn check_soon(&mut self) {
+        // Pending work is looked at afresh, not answered "unchanged".
+        self.etag = None;
         self.next_status = Instant::now();
     }
 
@@ -275,7 +277,11 @@ impl Watch {
             }
             Ok(StatusCheck::Changed { status, etag }) => {
                 self.next_status = Instant::now() + self.options.status_every;
-                self.etag = etag;
+                // Only a status that asked for nothing may come back as
+                // "unchanged": one with work pending must be looked at
+                // again, say once the client's conditions allow a sync.
+                let idle = status.pending.files == 0 && !status.requested && reason != Reason::Wake;
+                self.etag = if idle { etag } else { None };
                 self.auto = Some(status.auto);
                 if status.requested {
                     self.due = None;
@@ -283,12 +289,16 @@ impl Watch {
                         reason: Reason::User,
                     }));
                 }
-                if status.pending.files > 0 {
-                    if status.auto.enabled {
-                        self.due = None;
+                // On waking, a session is worth starting even with nothing
+                // pending: only it checks the folder's marker (a new or
+                // emptied folder, which the server can't know of).
+                if (status.pending.files > 0 || reason == Reason::Wake) && status.auto.enabled {
+                    // A quiet period under way runs out first: a run of
+                    // edits still becomes one sync.
+                    if self.due.is_none() {
                         return Ok(Some(Trigger { reason }));
                     }
-                } else {
+                } else if status.pending.files == 0 {
                     // Nothing to do for this target.
                     self.synced = Some(status.target);
                 }

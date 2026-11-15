@@ -53,8 +53,10 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Every file in the sync folder, with its size, except the client's own
     /// folder ([`coversync_protocol::CLIENT_DIR`]). Links aren't followed or
-    /// listed.
-    fn list(&self, each: &mut dyn FnMut(Listed)) -> io::Result<()>;
+    /// listed. A file or folder whose path `skip` takes is left out, and a
+    /// folder isn't even entered (a player's `.rockbox`, or everything once
+    /// the sync is cancelled).
+    fn list(&self, skip: &dyn Fn(&str) -> bool, each: &mut dyn FnMut(Listed)) -> io::Result<()>;
 
     /// What's at `path`, without following a link. None if nothing is.
     fn stat(&self, path: &str) -> io::Result<Option<Entry>>;
@@ -97,8 +99,21 @@ pub trait Storage: Send + Sync + 'static {
     /// way: the folder belongs to coversync.
     fn publish(&self, name: &str, path: &str, replace: bool) -> io::Result<()>;
 
+    /// Every partial file, with its size: room the client can take back.
+    fn partials(&self) -> io::Result<Vec<(String, u64)>>;
+
     /// Remove every partial file (after a sync that finished).
     fn clear_partials(&self) -> io::Result<()>;
+
+    /// A sync is about to change the folder: note it durably. Returns
+    /// whether an earlier sync noted it and never finished (a crash, or the
+    /// power cut), after which the folder may not be what the server was
+    /// told, so it gets checked.
+    fn begin_changes(&self) -> io::Result<bool>;
+
+    /// The sync is done changing the folder: make everything it did durable
+    /// (renames, removals and the facts journal alike), then clear the note.
+    fn end_changes(&self) -> io::Result<()>;
 
     // The client's own small files.
 

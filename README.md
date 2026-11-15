@@ -224,8 +224,9 @@ until the command is run on the server.
 - **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
   (see [Pairing devices](#pairing-devices)), one per device, each with a
   scope: `manage` (everything a browser can do, except managing devices) or
-  `sync` (syncing only; refused with 403 for now, but for `GET /api/session`
-  and its own `GET /api/devices/{id}/sync/settings` and `/sync/paths`).
+  `sync` (syncing only: the sync API under `/api/sync/v1/`, `GET
+  /api/session`, and its own `GET /api/devices/{id}/sync/settings`,
+  `/sync/paths` and `/sync/state`; everything else is refused with 403).
   `POST /api/login/token` trades a token for a session cookie, for an app's
   web view; that session has the device's scope and isn't a password login.
 - **Everything under `/api` needs one or the other**, except `GET /api/hello`
@@ -418,8 +419,9 @@ The database also gives the Library a random id and a change counter, which
 coversyncd commits: an import, a tag edit, or a scan that finds files added,
 changed or removed (a large scan or import commits in several batches). The
 tracks each batch wrote, and the files it removed, carry the new value. There
-is no endpoint yet to ask for the changes since a given value; that comes
-with sync. If a Library's counter is ever lower than the highest one this
+is no endpoint to ask for the changes since a given value: devices learn of
+changes from the sync API's `target`, which the counter is part of. If a
+Library's counter is ever lower than the highest one this
 installation has seen it reach, as when its folder is restored from an older
 backup, coversyncd gives it a new id, so clients that knew the later state
 start over rather than trust it. A Library moved to another installation

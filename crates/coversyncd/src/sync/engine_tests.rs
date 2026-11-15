@@ -11,8 +11,8 @@ use std::time::Duration;
 use coversync_core::sync::DeviceSettings;
 use coversync_protocol::{AutoSync, Capabilities, Fact, Listed};
 use coversync_replica::{
-    CancellationToken, Engine, Entry, FsStorage, Options, Outcome, Partial, Reason, ReconcileBy,
-    Report, Server, Source, Storage, Tls, Token, Trigger, WatchOptions,
+    CancellationToken, Engine, Entry, Error, FsStorage, Options, Outcome, Partial, Reason,
+    ReconcileBy, Report, Server, Source, Storage, Tls, Token, Trigger, WatchOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -360,8 +360,8 @@ impl Storage for Tight {
             .saturating_sub(self.used.load(Ordering::SeqCst));
         Ok(Some(self.claims.unwrap_or(free)))
     }
-    fn list(&self, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
-        self.inner.list(each)
+    fn list(&self, skip: &dyn Fn(&str) -> bool, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
+        self.inner.list(skip, each)
     }
     fn stat(&self, path: &str) -> io::Result<Option<Entry>> {
         self.inner.stat(path)
@@ -406,8 +406,17 @@ impl Storage for Tight {
     fn publish(&self, name: &str, path: &str, replace: bool) -> io::Result<()> {
         self.inner.publish(name, path, replace)
     }
+    fn partials(&self) -> io::Result<Vec<(String, u64)>> {
+        self.inner.partials()
+    }
     fn clear_partials(&self) -> io::Result<()> {
         self.inner.clear_partials()
+    }
+    fn begin_changes(&self) -> io::Result<bool> {
+        self.inner.begin_changes()
+    }
+    fn end_changes(&self) -> io::Result<()> {
+        self.inner.end_changes()
     }
     fn read_marker(&self) -> io::Result<Option<Vec<u8>>> {
         self.inner.read_marker()
@@ -571,8 +580,8 @@ impl Storage for Hooked {
     fn free_bytes(&self) -> io::Result<Option<u64>> {
         self.inner.free_bytes()
     }
-    fn list(&self, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
-        self.inner.list(each)
+    fn list(&self, skip: &dyn Fn(&str) -> bool, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
+        self.inner.list(skip, each)
     }
     fn stat(&self, path: &str) -> io::Result<Option<Entry>> {
         self.inner.stat(path)
@@ -611,8 +620,17 @@ impl Storage for Hooked {
         }
         self.inner.publish(name, path, replace)
     }
+    fn partials(&self) -> io::Result<Vec<(String, u64)>> {
+        self.inner.partials()
+    }
     fn clear_partials(&self) -> io::Result<()> {
         self.inner.clear_partials()
+    }
+    fn begin_changes(&self) -> io::Result<bool> {
+        self.inner.begin_changes()
+    }
+    fn end_changes(&self) -> io::Result<()> {
+        self.inner.end_changes()
     }
     fn read_marker(&self) -> io::Result<Option<Vec<u8>>> {
         self.inner.read_marker()
@@ -764,6 +782,24 @@ async fn the_watch_says_when_to_sync() {
         }
     );
     assert_eq!(w.auto().map(|a| a.quiet_seconds), Some(1));
+
+    // The same device in a new, empty folder, while the server thinks it
+    // has everything: waking still syncs, which finds the folder new.
+    let (root2, storage2) = folder(&d, "laptop-2");
+    let e2 = engine(addr, &token, storage2, options());
+    let mut w2 = e2.watch(WatchOptions {
+        heartbeat: 15,
+        ..Default::default()
+    });
+    assert_eq!(
+        next(&mut w2).await,
+        Trigger {
+            reason: Reason::Wake
+        }
+    );
+    let r = sync(&e2).await;
+    assert!(r.reconciled.is_some());
+    assert_eq!(tree(&root2), d.files());
 }
 
 #[tokio::test]
@@ -775,6 +811,17 @@ async fn names_the_device_keeps_are_never_touched() {
     let (root, storage) = folder(&d, "player");
     std::fs::create_dir_all(root.join(".rockbox")).unwrap();
     std::fs::write(root.join(".rockbox/config.cfg"), b"volume: -20").unwrap();
+    // A folder in it the sync couldn't even read: never entered.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root.join(".rockbox/locked")).unwrap();
+        std::fs::set_permissions(
+            root.join(".rockbox/locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
     std::fs::write(root.join("notes.txt"), b"mine").unwrap();
     let e = engine(
         addr,
@@ -800,4 +847,80 @@ async fn names_the_device_keeps_are_never_touched() {
         std::fs::read(root.join(".rockbox/config.cfg")).unwrap(),
         b"volume: -20"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join(".rockbox/locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_sync_that_never_finished_has_its_folder_checked() {
+    let d = Daemon::new("engine-unfinished");
+    let (_, token) = d.device(Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    let (root, storage) = folder(&d, "laptop");
+    let e = engine(addr, &token, storage, options());
+    assert!(sync(&e).await.reconciled.is_some());
+    assert!(sync(&e).await.reconciled.is_none());
+    let note = root.join(".coversync-replica/dirty");
+    assert!(!note.exists());
+
+    // A crash, or the power cut, mid-sync leaves its note: the next sync
+    // checks the folder, whose changes the server may not have heard of.
+    std::fs::write(&note, b"").unwrap();
+    let r = sync(&e).await;
+    assert!(r.reconciled.is_some(), "{r:?}");
+    assert!(!note.exists());
+
+    // Cancelled, a sync still ends: nothing to check after it.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let cancelled = e.sync(Reason::User, Arc::new(()), cancel).await;
+    assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
+    assert!(!note.exists());
+    assert!(sync(&e).await.reconciled.is_none());
+}
+
+#[tokio::test]
+async fn old_partial_files_give_their_room_back() {
+    let d = Daemon::new("engine-spare");
+    let (_, token) = d.device(Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    let files: u64 = d.files().values().map(|v| v.len() as u64).sum();
+    let reserve = coversync_protocol::RESERVE_BYTES;
+    let root = d.dir.join("small");
+    std::fs::create_dir_all(&root).unwrap();
+    let inner = FsStorage::open(&root).unwrap();
+    // Left by earlier syncs: half of a file still to come, and a whole file
+    // of content that has since left the Library, which fill the room the
+    // rest needs.
+    let path = "Artist A/Album One/01 - One.flac";
+    let data = std::fs::read(d.library.join(path)).unwrap();
+    let hash = blake3::hash(&data).to_hex().to_string();
+    let partials = root.join(".coversync-replica/partial");
+    let half = &data[..data.len() / 2];
+    let resumable = format!("{hash}-{}", &blake3::hash(path.as_bytes()).to_hex()[..16]);
+    std::fs::write(partials.join(resumable), half).unwrap();
+    let old = 150_000u64;
+    let obsolete = format!("{}-0000000000000000", "0".repeat(64));
+    std::fs::write(partials.join(obsolete), vec![7; old as usize]).unwrap();
+    let used = Arc::new(AtomicU64::new(half.len() as u64 + old));
+    let small = Arc::new(Tight {
+        inner,
+        room: Arc::new(AtomicU64::new(reserve + files + 20_000)),
+        used,
+        claims: None,
+    });
+    let e = engine(addr, &token, small, options());
+    let r = sync(&e).await;
+    assert_eq!(r.outcome, Some(Outcome::Complete), "{r:?}");
+    assert_eq!(tree(&root), d.files());
+    assert_eq!(std::fs::read_dir(&partials).unwrap().count(), 0);
 }

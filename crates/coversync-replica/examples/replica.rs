@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use coversync_replica::{
-    CancellationToken, Engine, FsStorage, Observer, Options, Phase, Progress, Reason, ReconcileBy,
-    Server, Tls, Token, WatchOptions,
+    Again, CancellationToken, Engine, Error, FsStorage, Observer, Options, Outcome, Phase,
+    Progress, Reason, ReconcileBy, Server, Tls, Token, Trigger, WatchOptions,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -118,11 +118,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let mut w = engine.watch(WatchOptions::default());
+    // A sync the report asks to try again (the network or server away, or
+    // files still being prepared), and when.
+    let mut retry_at: Option<tokio::time::Instant> = None;
     loop {
+        let retry = async {
+            match retry_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         let trigger = tokio::select! {
             t = w.next() => t?,
+            _ = retry => Trigger { reason: Reason::Timer },
             _ = cancel.cancelled() => return Ok(()),
         };
+        retry_at = None;
         eprintln!("syncing: {trigger:?}");
         match engine
             .sync(trigger.reason, show(Instant::now()), cancel.clone())
@@ -138,9 +149,24 @@ async fn main() -> Result<()> {
                     report.seconds,
                     report.again
                 );
-                w.synced(report.target.as_deref());
+                // Only a target fully reached is nothing new when the
+                // server tells of it again.
+                if report.outcome == Some(Outcome::Complete) {
+                    w.synced(report.target.as_deref());
+                }
+                if let Again::After(wait) = report.again {
+                    retry_at = Some(tokio::time::Instant::now() + wait);
+                }
             }
-            Err(e) => eprintln!("sync failed: {e}"),
+            Err(Error::Unauthorized) => {
+                return Err("the server refused the token: pair again".into());
+            }
+            Err(e) => {
+                eprintln!("sync failed: {e}");
+                if e.is_transient() {
+                    retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                }
+            }
         }
     }
 }

@@ -538,15 +538,24 @@ async fn samples(
     })??;
     let matched = blocking(move || {
         use rayon::prelude::*;
-        // Each size's contents once, however many listed files share it.
+        // Each size's contents once, however many listed files share it,
+        // and which sizes a file was sampled in (rather than hashed).
         let mut groups: HashMap<*const Wanted, &Wanted> = HashMap::new();
-        for (_, w) in &work {
+        let mut sampled_groups = std::collections::HashSet::new();
+        for (x, w) in &work {
             groups.entry(Arc::as_ptr(w)).or_insert(w);
+            if x.hash.is_none() {
+                sampled_groups.insert(Arc::as_ptr(w));
+            }
         }
         // Each candidate's own sample, read once however many listed files
-        // it might be (a content's size, and so its ranges, are one).
+        // it might be (a content's size, and so its ranges, are one), and
+        // only for sizes some file was sampled in.
         let mut wanted: HashMap<&str, &Vec<[u64; 2]>> = HashMap::new();
-        for w in groups.values() {
+        for (key, w) in &groups {
+            if !sampled_groups.contains(key) {
+                continue;
+            }
             for c in &w.candidates {
                 wanted.entry(c.as_str()).or_insert(&w.ranges);
             }

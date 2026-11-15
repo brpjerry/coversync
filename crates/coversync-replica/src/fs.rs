@@ -21,6 +21,8 @@ const MARKER: &str = "device.json";
 const JOURNAL: &str = "facts";
 /// Partial downloads' folder in the client's folder.
 const PARTIAL: &str = "partial";
+/// There while a sync changes the folder.
+const DIRTY: &str = "dirty";
 
 fn not_a_path(path: &str) -> io::Error {
     io::Error::new(
@@ -75,7 +77,7 @@ mod imp {
     };
     use rustix::io::Errno;
 
-    use super::{JOURNAL, MARKER, PARTIAL, base_capabilities, checked, split};
+    use super::{DIRTY, JOURNAL, MARKER, PARTIAL, base_capabilities, checked, split};
     use crate::storage::{Entry, Partial, Source, Storage};
 
     const DIR: OFlags = OFlags::RDONLY
@@ -251,8 +253,17 @@ mod imp {
             Ok(Some(v.f_bavail.saturating_mul(v.f_frsize)))
         }
 
-        fn list(&self, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
-            fn walk(dir: OwnedFd, prefix: &str, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
+        fn list(
+            &self,
+            skip: &dyn Fn(&str) -> bool,
+            each: &mut dyn FnMut(Listed),
+        ) -> io::Result<()> {
+            fn walk(
+                dir: OwnedFd,
+                prefix: &str,
+                skip: &dyn Fn(&str) -> bool,
+                each: &mut dyn FnMut(Listed),
+            ) -> io::Result<()> {
                 let mut entries = Dir::read_from(&dir)?;
                 while let Some(e) = entries.read() {
                     let e = e?;
@@ -275,6 +286,9 @@ mod imp {
                     } else {
                         format!("{prefix}/{name}")
                     };
+                    if skip(&path) {
+                        continue;
+                    }
                     let kind = match e.file_type() {
                         FileType::Unknown => match statat(&dir, raw, AtFlags::SYMLINK_NOFOLLOW) {
                             Ok(st) => entry(&st),
@@ -293,7 +307,7 @@ mod imp {
                     match kind {
                         Entry::File { size } => each(Listed { path, size }),
                         Entry::Dir => match openat(&dir, raw, DIR, Mode::empty()) {
-                            Ok(sub) => walk(sub, &path, each)?,
+                            Ok(sub) => walk(sub, &path, skip, each)?,
                             // Gone meanwhile, or swapped for a link.
                             Err(e) if not_found(&e) || e == Errno::LOOP => {}
                             Err(e) => return Err(e.into()),
@@ -304,7 +318,7 @@ mod imp {
                 Ok(())
             }
             let root = openat(&self.root, ".", DIR, Mode::empty())?;
-            walk(root, "", each)
+            walk(root, "", skip, each)
         }
 
         fn stat(&self, path: &str) -> io::Result<Option<Entry>> {
@@ -415,6 +429,48 @@ mod imp {
             Ok(renameat(&self.partial, name, self.fd(&at), to)?)
         }
 
+        fn partials(&self) -> io::Result<Vec<(String, u64)>> {
+            let mut out = Vec::new();
+            let mut entries = Dir::read_from(&self.partial)?;
+            while let Some(e) = entries.read() {
+                let e = e?;
+                let Ok(name) = e.file_name().to_str() else {
+                    continue;
+                };
+                if name == "." || name == ".." {
+                    continue;
+                }
+                if let Ok(st) = statat(&self.partial, name, AtFlags::SYMLINK_NOFOLLOW)
+                    && let Entry::File { size } = entry(&st)
+                {
+                    out.push((name.to_string(), size));
+                }
+            }
+            Ok(out)
+        }
+
+        fn begin_changes(&self) -> io::Result<bool> {
+            let was = statat(&self.own, DIRTY, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+            let f = File::from(openat(&self.own, DIRTY, WRITE, file_mode()).map_err(link_error)?);
+            f.sync_all()?;
+            rustix::fs::fsync(&self.own)?;
+            Ok(was)
+        }
+
+        fn end_changes(&self) -> io::Result<()> {
+            // One flush of the whole file system, rather than one per
+            // rename: everything the sync did is on the disk before the
+            // note goes.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            rustix::fs::syncfs(&self.root)?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            rustix::fs::sync();
+            match unlinkat(&self.own, DIRTY, AtFlags::empty()) {
+                Ok(()) | Err(Errno::NOENT) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+
         fn clear_partials(&self) -> io::Result<()> {
             let mut entries = Dir::read_from(&self.partial)?;
             while let Some(e) = entries.read() {
@@ -486,7 +542,7 @@ mod imp {
 
     use coversync_protocol::{CLIENT_DIR, Capabilities, Listed};
 
-    use super::{JOURNAL, MARKER, PARTIAL, base_capabilities, checked, split};
+    use super::{DIRTY, JOURNAL, MARKER, PARTIAL, base_capabilities, checked, split};
     use crate::storage::{Entry, Partial, Source, Storage};
 
     pub struct FsStorage {
@@ -514,6 +570,18 @@ mod imp {
         }
     }
 
+    /// `path`, unless it's a link: the client's own files are never reached
+    /// through one.
+    fn no_link(path: PathBuf) -> io::Result<PathBuf> {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a symbolic link in the client's folder",
+            )),
+            _ => Ok(path),
+        }
+    }
+
     fn entry(m: &fs::Metadata) -> Entry {
         let t = m.file_type();
         if t.is_symlink() {
@@ -532,8 +600,12 @@ mod imp {
             let root = fs::canonicalize(root)?;
             let own = root.join(CLIENT_DIR);
             let partial = own.join(PARTIAL);
-            fs::create_dir_all(&partial)?;
+            // Each checked before anything is made in it.
             for p in [&own, &partial] {
+                match fs::create_dir(p) {
+                    Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                    _ => {}
+                }
                 if fs::symlink_metadata(p)?.file_type().is_symlink() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -541,7 +613,7 @@ mod imp {
                     ));
                 }
             }
-            let probe = own.join("case-probe");
+            let probe = no_link(own.join("case-probe"))?;
             File::create(&probe)?;
             let case_insensitive = own.join("CASE-PROBE").exists();
             let _ = fs::remove_file(&probe);
@@ -576,7 +648,7 @@ mod imp {
                     OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(self.own.join(JOURNAL))?,
+                        .open(no_link(self.own.join(JOURNAL))?)?,
                 );
             }
             f(journal.as_mut().expect("opened above"))
@@ -584,6 +656,22 @@ mod imp {
     }
 
     impl Storage for FsStorage {
+        fn lock(&self) -> io::Result<Option<Box<dyn Send>>> {
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(no_link(self.own.join("lock"))?)?;
+            lock.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another sync is running in this folder",
+                ),
+                std::fs::TryLockError::Error(e) => e,
+            })?;
+            Ok(Some(Box::new(lock)))
+        }
+
         fn capabilities(&self) -> Capabilities {
             self.capabilities.clone()
         }
@@ -592,8 +680,17 @@ mod imp {
             Ok(None)
         }
 
-        fn list(&self, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
-            fn walk(dir: &Path, prefix: &str, each: &mut dyn FnMut(Listed)) -> io::Result<()> {
+        fn list(
+            &self,
+            skip: &dyn Fn(&str) -> bool,
+            each: &mut dyn FnMut(Listed),
+        ) -> io::Result<()> {
+            fn walk(
+                dir: &Path,
+                prefix: &str,
+                skip: &dyn Fn(&str) -> bool,
+                each: &mut dyn FnMut(Listed),
+            ) -> io::Result<()> {
                 for e in fs::read_dir(dir)? {
                     let e = e?;
                     let Ok(name) = e.file_name().into_string() else {
@@ -607,15 +704,18 @@ mod imp {
                     } else {
                         format!("{prefix}/{name}")
                     };
+                    if skip(&path) {
+                        continue;
+                    }
                     match entry(&fs::symlink_metadata(e.path())?) {
                         Entry::File { size } => each(Listed { path, size }),
-                        Entry::Dir => walk(&e.path(), &path, each)?,
+                        Entry::Dir => walk(&e.path(), &path, skip, each)?,
                         Entry::Other => {}
                     }
                 }
                 Ok(())
             }
-            walk(&self.root, "", each)
+            walk(&self.root, "", skip, each)
         }
 
         fn stat(&self, path: &str) -> io::Result<Option<Entry>> {
@@ -653,6 +753,10 @@ mod imp {
         fn partial_len(&self, name: &str) -> io::Result<Option<u64>> {
             match fs::symlink_metadata(self.partial.join(name)) {
                 Ok(m) if m.is_file() => Ok(Some(m.len())),
+                Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a symbolic link in the client's folder",
+                )),
                 Ok(_) => Ok(None),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
@@ -667,11 +771,13 @@ mod imp {
             } else {
                 o.write(true).truncate(true);
             }
-            Ok(Box::new(PartialFile(o.open(self.partial.join(name))?)))
+            Ok(Box::new(PartialFile(
+                o.open(no_link(self.partial.join(name))?)?,
+            )))
         }
 
         fn read_partial(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
-            Ok(Box::new(File::open(self.partial.join(name))?))
+            Ok(Box::new(File::open(no_link(self.partial.join(name))?)?))
         }
 
         fn remove_partial(&self, name: &str) -> io::Result<()> {
@@ -686,7 +792,35 @@ mod imp {
             if let (Some(dirs), _) = split(path) {
                 fs::create_dir_all(self.resolve(dirs)?)?;
             }
-            fs::rename(self.partial.join(name), to)
+            fs::rename(no_link(self.partial.join(name))?, to)
+        }
+
+        fn partials(&self) -> io::Result<Vec<(String, u64)>> {
+            let mut out = Vec::new();
+            for e in fs::read_dir(&self.partial)? {
+                let e = e?;
+                if let (Ok(name), Ok(m)) =
+                    (e.file_name().into_string(), fs::symlink_metadata(e.path()))
+                    && m.is_file()
+                {
+                    out.push((name, m.len()));
+                }
+            }
+            Ok(out)
+        }
+
+        fn begin_changes(&self) -> io::Result<bool> {
+            let dirty = no_link(self.own.join(DIRTY))?;
+            let was = dirty.exists();
+            File::create(&dirty)?.sync_all()?;
+            Ok(was)
+        }
+
+        fn end_changes(&self) -> io::Result<()> {
+            match fs::remove_file(self.own.join(DIRTY)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
         }
 
         fn clear_partials(&self) -> io::Result<()> {
@@ -697,7 +831,7 @@ mod imp {
         }
 
         fn read_marker(&self) -> io::Result<Option<Vec<u8>>> {
-            match fs::read(self.own.join(MARKER)) {
+            match fs::read(no_link(self.own.join(MARKER))?) {
                 Ok(b) => Ok(Some(b)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
@@ -705,16 +839,16 @@ mod imp {
         }
 
         fn write_marker(&self, bytes: &[u8]) -> io::Result<()> {
-            let tmp = self.own.join("device.json.new");
+            let tmp = no_link(self.own.join("device.json.new"))?;
             let mut f = File::create(&tmp)?;
             f.write_all(bytes)?;
             f.sync_data()?;
-            fs::rename(tmp, self.own.join(MARKER))
+            fs::rename(tmp, no_link(self.own.join(MARKER))?)
         }
 
         fn read_journal(&self) -> io::Result<Vec<u8>> {
             let mut out = Vec::new();
-            match File::open(self.own.join(JOURNAL)) {
+            match File::open(no_link(self.own.join(JOURNAL))?) {
                 Ok(mut f) => {
                     f.read_to_end(&mut out)?;
                 }
@@ -792,7 +926,8 @@ mod tests {
         assert_eq!(s.stat("A/B").unwrap(), None);
 
         let mut listed = Vec::new();
-        s.list(&mut |l| listed.push((l.path, l.size))).unwrap();
+        s.list(&|_| false, &mut |l| listed.push((l.path, l.size)))
+            .unwrap();
         listed.sort();
         assert_eq!(
             listed,
@@ -826,12 +961,18 @@ mod tests {
 
         // One sync in a folder at a time.
         let held = s.lock().unwrap();
+        assert!(held.is_some());
         let other = FsStorage::open(&dir).unwrap();
-        if held.is_some() {
-            assert!(other.lock().is_err());
-            drop(held);
-            assert!(other.lock().unwrap().is_some());
-        }
+        assert!(other.lock().is_err());
+        drop(held);
+        assert!(other.lock().unwrap().is_some());
+
+        // A sync that never got to its end is told so by the next.
+        assert!(!s.begin_changes().unwrap());
+        assert!(s.begin_changes().unwrap());
+        s.end_changes().unwrap();
+        assert!(!s.begin_changes().unwrap());
+        s.end_changes().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -861,7 +1002,7 @@ mod tests {
 
         // Not listed either.
         let mut listed = Vec::new();
-        s.list(&mut |l| listed.push(l.path)).unwrap();
+        s.list(&|_| false, &mut |l| listed.push(l.path)).unwrap();
         assert!(listed.is_empty(), "{listed:?}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);

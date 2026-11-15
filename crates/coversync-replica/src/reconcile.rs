@@ -10,6 +10,7 @@ use bytes::Bytes;
 use coversync_protocol::{Listed, ReconcileDone, SampleRequest, Sampled};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::http::Api;
 use crate::storage::Storage;
@@ -24,19 +25,20 @@ pub(crate) async fn reconcile(
     storage: &Arc<dyn Storage>,
     options: &Arc<Options>,
     observer: &dyn Observer,
+    cancel: &CancellationToken,
 ) -> Result<ReconcileDone, Error> {
     let (by, readers) = (options.reconcile_by, options.readers);
     observer.phase(Phase::Listing);
     let s = storage.clone();
     let o = options.clone();
+    let c = cancel.clone();
     let listing = blocking(move || {
         let mut lines = Vec::new();
         let mut files = 0u64;
-        s.list(&mut |l: Listed| {
-            // Names the device keeps are never the server's business.
-            if crate::run::protected(&o, &l.path) {
-                return;
-            }
+        // Names the device keeps are never the server's business, nor
+        // entered; once cancelled, nothing more is.
+        let skip = |path: &str| c.is_cancelled() || crate::run::protected(&o, path);
+        s.list(&skip, &mut |l: Listed| {
             serde_json::to_writer(&mut lines, &l).expect("listings serialize");
             lines.push(b'\n');
             files += 1;
@@ -45,11 +47,14 @@ pub(crate) async fn reconcile(
     })
     .await?
     .map_err(|e| Error::Storage(format!("couldn't list the folder: {e}")))?;
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let (listing, files) = listing;
     tracing::info!(files, "listed the folder");
 
     let base = format!("{}/sessions/{session}", coversync_protocol::PREFIX);
-    let wanted = send_lines(api, &format!("{base}/reconcile"), &listing).await?;
+    let wanted = send_lines(api, &format!("{base}/reconcile"), &listing, cancel).await?;
     let wanted: Vec<SampleRequest> = wanted
         .split(|&b| b == b'\n')
         .filter(|l| !l.trim_ascii().is_empty())
@@ -63,12 +68,14 @@ pub(crate) async fn reconcile(
     let gate = Arc::new(Semaphore::new(readers.max(1)));
     let mut tasks = JoinSet::new();
     for w in wanted {
-        let (s, gate, read) = (storage.clone(), gate.clone(), read.clone());
+        let (s, gate, read, c) = (storage.clone(), gate.clone(), read.clone(), cancel.clone());
         tasks.spawn(async move {
             let _permit = gate.acquire_owned().await.expect("never closed");
-            blocking(move || sample(&*s, w, by, &read)).await
+            blocking(move || sample(&*s, w, by, &read, &c)).await
         });
     }
+    // Every reader runs to its end (quickly, once cancelled: each checks)
+    // before the sync lets the folder go.
     let mut sampled = Vec::new();
     while let Some(done) = tasks.join_next().await {
         let done = done.map_err(|e| Error::Storage(e.to_string()))???;
@@ -77,11 +84,14 @@ pub(crate) async fn reconcile(
             sampled.push(b'\n');
         }
     }
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     tracing::info!(
         bytes_read = read.load(Ordering::Relaxed),
         "sampled the folder"
     );
-    let done = send_lines(api, &format!("{base}/reconcile/samples"), &sampled).await?;
+    let done = send_lines(api, &format!("{base}/reconcile/samples"), &sampled, cancel).await?;
     crate::http::parse(&done)
 }
 
@@ -92,7 +102,11 @@ fn sample(
     w: SampleRequest,
     by: ReconcileBy,
     read: &AtomicU64,
+    cancel: &CancellationToken,
 ) -> Result<Option<Sampled>, Error> {
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     let mut f = match storage.open(&w.path) {
         Ok(f) => f,
         Err(e) => {
@@ -125,6 +139,9 @@ fn sample(
                 let mut h = blake3::Hasher::new();
                 let mut buf = vec![0; 1 << 20];
                 loop {
+                    if cancel.is_cancelled() {
+                        return Err(std::io::Error::other("cancelled"));
+                    }
                     let n = f.read(&mut buf)?;
                     if n == 0 {
                         break;
@@ -150,7 +167,12 @@ fn sample(
 
 /// NDJSON sent in parts, the last with `?last=1` (sent even when there's
 /// nothing): the last reply.
-async fn send_lines(api: &Api, path: &str, lines: &[u8]) -> Result<Bytes, Error> {
+async fn send_lines(
+    api: &Api,
+    path: &str,
+    lines: &[u8],
+    cancel: &CancellationToken,
+) -> Result<Bytes, Error> {
     let mut rest = lines;
     loop {
         let cut = if rest.len() <= REQUEST_BYTES {
@@ -169,7 +191,10 @@ async fn send_lines(api: &Api, path: &str, lines: &[u8]) -> Result<Bytes, Error>
         } else {
             path.to_string()
         };
-        let reply = api.post_lines(&url, Bytes::copy_from_slice(part)).await?;
+        let reply = tokio::select! {
+            r = api.post_lines(&url, Bytes::copy_from_slice(part)) => r?,
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+        };
         if last {
             return Ok(reply);
         }

@@ -1,6 +1,7 @@
 //! One sync: a session, a reconcile if the server asks for one, then the
 //! plan, page by page.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,8 @@ const DOWNLOAD_TRIES: u32 = 4;
 const SEND_TRIES: u32 = 4;
 /// Fresh plans in one session, when the Library keeps changing under it.
 const MAX_PLANS: usize = 20;
+/// The longest the server goes without hearing from a session.
+const KEEPALIVE: Duration = Duration::from_secs(60);
 
 pub(crate) async fn sync(
     api: Arc<Api>,
@@ -44,12 +47,28 @@ pub(crate) async fn sync(
     let _lock = blocking(move || s.lock())
         .await?
         .map_err(|e| Error::Storage(e.to_string()))?;
-    let mut check = false;
-    loop {
-        let (mut report, refused) = session(
+    // A sync that never got to its end (a crash, the power cut) may have
+    // changed the folder without the server hearing of it, or without the
+    // changes reaching the disk: the folder is checked.
+    let s = storage.clone();
+    let unfinished = blocking(move || s.begin_changes())
+        .await?
+        .map_err(|e| Error::Storage(format!("couldn't note the sync in the folder: {e}")))?;
+    if unfinished {
+        tracing::info!("the last sync never finished: checking the folder");
+    }
+    let mut check = unfinished;
+    let mut checked = false;
+    let result = loop {
+        let (mut report, refused) = match session(
             &api, &storage, &options, reason, check, &observer, &cancel, began,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => break Err(e),
+        };
+        checked |= report.reconciled.is_some();
         // A step the folder refused (a file that wasn't what the server
         // thought): the server's idea of the folder is wrong, so check it.
         if refused && !check && !cancel.is_cancelled() {
@@ -58,7 +77,29 @@ pub(crate) async fn sync(
             continue;
         }
         report.seconds = began.elapsed().as_secs_f64();
-        return Ok(report);
+        break Ok(report);
+    };
+    // Everything this sync did is made durable before the note goes, unless
+    // a check it owed didn't happen: then the note stays for the next.
+    if !unfinished || checked {
+        let s = storage.clone();
+        match blocking(move || s.end_changes()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("couldn't flush the folder: {e}"),
+            Err(e) => tracing::warn!("couldn't flush the folder: {e}"),
+        }
+    }
+    result
+}
+
+/// `fut`, unless the sync is cancelled first.
+async fn unless_cancelled<T>(
+    cancel: &CancellationToken,
+    fut: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    tokio::select! {
+        r = fut => r,
+        _ = cancel.cancelled() => Err(Error::Cancelled),
     }
 }
 
@@ -71,6 +112,8 @@ enum Stop {
     Unauthorized,
     /// A step the folder refused.
     Refused,
+    /// The target kept changing until the session's plans ran out.
+    Changing,
 }
 
 impl Stop {
@@ -81,7 +124,7 @@ impl Stop {
             Stop::Storage(_) => 3,
             Stop::Network(_) => 2,
             Stop::NoSpace => 1,
-            Stop::Refused => 0,
+            Stop::Refused | Stop::Changing => 0,
         }
     }
 }
@@ -121,6 +164,9 @@ struct Ctx {
     net: Arc<Semaphore>,
     disk: Arc<Semaphore>,
     sending: tokio::sync::Mutex<Sending>,
+    /// Partial files from earlier syncs that no download of this one has
+    /// taken up yet, with their sizes: room the engine can take back.
+    spare: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Default)]
@@ -157,9 +203,33 @@ impl Ctx {
         }
     }
 
-    /// Send the facts so far, with progress. `always`: even with nothing
-    /// new (the end of a phase, to keep the session alive).
+    /// Free space as the server should count it: what the storage has,
+    /// and what spare partial files hold, which the engine can take back.
+    async fn free_bytes(&self) -> Result<Option<u64>, Error> {
+        let s = self.storage.clone();
+        let free = blocking(move || s.free_bytes()).await?.ok().flatten();
+        let spare: u64 = self
+            .spare
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum();
+        Ok(free.map(|f| f.saturating_add(spare)))
+    }
+
+    /// Send facts, with progress. `always`, at the end of a phase or to
+    /// keep the session alive: send even with nothing new, and every fact
+    /// waiting, however many batches that takes. Otherwise one batch.
     async fn send(&self, always: bool) -> Result<(), Error> {
+        loop {
+            self.send_one(always).await?;
+            if !always || self.facts.unconfirmed() == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn send_one(&self, always: bool) -> Result<(), Error> {
         let mut sending = self.sending.lock().await;
         let mut progress = self.progress();
         let now = Instant::now();
@@ -183,8 +253,7 @@ impl Ctx {
         sending.last_bytes = progress.bytes;
         sending.last_at = Some(now);
         self.observer.progress(&progress);
-        let s = self.storage.clone();
-        let free = blocking(move || s.free_bytes()).await?.ok().flatten();
+        let free = self.free_bytes().await?;
         let n = batch.done.len();
         let body = FactsBatch {
             done: batch.done,
@@ -196,10 +265,12 @@ impl Ctx {
             }),
             free_bytes: free,
         };
-        match self
-            .api
-            .post_json::<_, FactsReply>(&format!("{}/facts", self.base), &body)
-            .await
+        let url = format!("{}/facts", self.base);
+        match unless_cancelled(
+            &self.cancel,
+            self.api.post_json::<_, FactsReply>(&url, &body),
+        )
+        .await
         {
             Ok(reply) => {
                 sending.failures = 0;
@@ -215,6 +286,7 @@ impl Ctx {
             Err(e) => {
                 self.facts.unsent(batch.failed);
                 match &e {
+                    Error::Cancelled => {}
                     Error::Unauthorized => self.stop(Stop::Unauthorized),
                     e if e.is_transient() => {
                         sending.failures += 1;
@@ -246,33 +318,34 @@ async fn session(
 ) -> Result<(Report, bool), Error> {
     observer.phase(Phase::Starting);
     let s = storage.clone();
-    let (marker, free, facts) = blocking(move || {
+    let (marker, free, spare, facts) = blocking(move || {
         let marker = s
             .read_marker()
             .ok()
             .flatten()
             .and_then(|b| serde_json::from_slice::<Marker>(&b).ok());
         let free = s.free_bytes().ok().flatten();
-        (marker, free, Facts::load(s))
+        let spare: HashMap<String, u64> = s.partials().unwrap_or_default().into_iter().collect();
+        (marker, free, spare, Facts::load(s))
     })
     .await?;
+    // Partial files are room the engine can take back: counted as free, so
+    // that a download cut short still fits the plan when only its rest does.
+    let free = free.map(|f| f.saturating_add(spare.values().sum()));
     let capabilities = options
         .capabilities
         .clone()
         .unwrap_or_else(|| storage.capabilities());
-    let started: SessionStarted = api
-        .post_json(
-            &format!("{PREFIX}/sessions"),
-            &SessionStart {
-                client: options.client.clone(),
-                capabilities,
-                marker,
-                check,
-                free_bytes: free,
-                reason,
-            },
-        )
-        .await?;
+    let start = SessionStart {
+        client: options.client.clone(),
+        capabilities,
+        marker,
+        check,
+        free_bytes: free,
+        reason,
+    };
+    let url = format!("{PREFIX}/sessions");
+    let started: SessionStarted = unless_cancelled(cancel, api.post_json(&url, &start)).await?;
     tracing::info!(
         session = started.session,
         reconcile = started.reconcile,
@@ -294,6 +367,7 @@ async fn session(
         net: Arc::new(Semaphore::new(options.downloads.max(1))),
         disk: Arc::new(Semaphore::new(options.downloads.max(1) * 2)),
         sending: Default::default(),
+        spare: Mutex::new(spare),
     });
     let mut report = Report {
         target: Some(started.target.clone()),
@@ -310,10 +384,12 @@ async fn session(
     report.failed = s.failed.load(Ordering::Relaxed);
     report.gone = s.gone.load(Ordering::Relaxed);
 
+    let cancelled = cancel.is_cancelled();
     let (outcome, message, again) = match (&ran, &stop) {
         (Err(Error::Unauthorized), _) | (_, Some(Stop::Unauthorized)) => {
             return Err(Error::Unauthorized);
         }
+        _ if cancelled => (Outcome::Cancelled, None, Again::No),
         // The server is still hashing or making files a listed file might
         // be: the check waits for them.
         (Err(Error::Server { code, .. }), _) if code == "preparing" => (
@@ -327,7 +403,6 @@ async fn session(
             Again::After(Duration::from_secs(30)),
         ),
         (Err(e), _) => (Outcome::Failed, Some(e.to_string()), Again::No),
-        (Ok(()), _) if cancel.is_cancelled() => (Outcome::Cancelled, None, Again::No),
         (Ok(()), Some(Stop::Network(m))) => (
             Outcome::Partial,
             Some(format!("lost the connection: {m}")),
@@ -343,6 +418,11 @@ async fn session(
             Outcome::Partial,
             Some("files changed on the device".into()),
             Again::No,
+        ),
+        (Ok(()), Some(Stop::Changing)) => (
+            Outcome::Partial,
+            Some("the Library kept changing during the sync".into()),
+            Again::After(Duration::from_secs(15)),
         ),
         (Ok(()), None) if report.short_bytes > 0 => (
             Outcome::Partial,
@@ -372,15 +452,16 @@ async fn session(
     // journaled for next time.
     let reachable = !matches!(stop, Some(Stop::Network(_)))
         && !matches!(&ran, Err(e) if e.is_transient() && e.code() != Some("preparing"));
-    if reachable {
+    // Cancelled, the user wants it over: what's left is tried briefly.
+    let (files, bytes) = (report.files, report.bytes);
+    let ending = async {
         let _ = ctx.send(true).await;
-        let s = storage.clone();
-        let free = blocking(move || s.free_bytes()).await?.ok().flatten();
+        let free = ctx.free_bytes().await.ok().flatten();
         let end = EndReport {
             result: outcome,
             message,
-            files: report.files,
-            bytes: report.bytes,
+            files,
+            bytes,
             seconds: began.elapsed().as_secs(),
             free_bytes: free,
         };
@@ -397,9 +478,19 @@ async fn session(
         {
             tracing::debug!("couldn't send the end report: {e}");
         }
+    };
+    if reachable {
+        if cancelled {
+            // The facts' own send stops at the cancel: they stay journaled.
+            let _ = tokio::time::timeout(Duration::from_secs(5), ending).await;
+        } else {
+            ending.await;
+        }
     }
-    // Nothing is under way: leftovers are of contents that left the target.
-    if outcome == Outcome::Complete {
+    // The plan ran to its end, so nothing is under way and no later page
+    // wants a partial file: leftovers are of contents that left the target,
+    // or of puts that failed.
+    if ran.is_ok() && stop.is_none() && !cancelled {
         let s = storage.clone();
         if let Err(e) = blocking(move || s.clear_partials()).await? {
             tracing::debug!("couldn't clear partial files: {e}");
@@ -414,12 +505,46 @@ async fn run(ctx: &Arc<Ctx>, started: &SessionStarted, report: &mut Report) -> R
         // The server rebuilds what it knows from the folder: facts from
         // before are moot.
         ctx.facts.forget();
+    }
+    // Facts every couple of seconds while the plan runs, and something at
+    // least every minute (a long reconcile included), so the server keeps
+    // the session.
+    let ticking = CancellationToken::new();
+    let ticker = {
+        let (ctx, ticking) = (ctx.clone(), ticking.clone());
+        tokio::spawn(async move {
+            let mut last = Instant::now();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(FACTS_EVERY) => {}
+                    _ = ticking.cancelled() => return,
+                }
+                let keepalive = last.elapsed() >= KEEPALIVE;
+                if ctx.send(keepalive).await.is_ok() && keepalive {
+                    last = Instant::now();
+                }
+            }
+        })
+    };
+    let result = run_plans(ctx, started, report).await;
+    ticking.cancel();
+    let _ = ticker.await;
+    result
+}
+
+async fn run_plans(
+    ctx: &Arc<Ctx>,
+    started: &SessionStarted,
+    report: &mut Report,
+) -> Result<(), Error> {
+    if started.reconcile {
         let done = crate::reconcile::reconcile(
             &ctx.api,
             &started.session,
             &ctx.storage,
             &ctx.options,
             &*ctx.observer,
+            &ctx.cancel,
         )
         .await?;
         tracing::info!(?done, "reconciled");
@@ -433,28 +558,12 @@ async fn run(ctx: &Arc<Ctx>, started: &SessionStarted, report: &mut Report) -> R
             .await?
             .map_err(|e| Error::Storage(format!("couldn't write the marker: {e}")))?;
         report.reconciled = Some(done);
-    } else {
+    } else if ctx.facts.waiting() > 0 {
         // Facts an earlier sync couldn't send go first, so this plan
         // doesn't repeat their work.
-        while ctx.facts.waiting() > 0 {
-            ctx.send(true).await?;
-        }
+        ctx.send(true).await?;
     }
 
-    // Facts every couple of seconds, while the plan runs.
-    let ticking = CancellationToken::new();
-    let ticker = {
-        let (ctx, ticking) = (ctx.clone(), ticking.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(FACTS_EVERY) => {}
-                    _ = ticking.cancelled() => return,
-                }
-                let _ = ctx.send(false).await;
-            }
-        })
-    };
     let mut result = Ok(());
     for _ in 0..MAX_PLANS {
         ctx.changed.store(false, Ordering::Relaxed);
@@ -472,8 +581,11 @@ async fn run(ctx: &Arc<Ctx>, started: &SessionStarted, report: &mut Report) -> R
             break;
         }
     }
-    ticking.cancel();
-    let _ = ticker.await;
+    // Plans ran out with the target still moving (a long import): what's
+    // left waits for a later sync, which the report asks for.
+    if result.is_ok() && !ctx.halt.is_cancelled() && ctx.changed.load(Ordering::Relaxed) {
+        ctx.stop(Stop::Changing);
+    }
     result
 }
 
@@ -522,11 +634,15 @@ async fn plan(ctx: &Arc<Ctx>, report: &mut Report) -> Result<(), Error> {
     let mut next = Some(fetch(None));
     let mut puts = JoinSet::new();
     let mut first = true;
+    let mut putting = false;
     let result: Result<(), Error> = async {
         while let Some(fetching) = next.take() {
-            let page = fetching
-                .await
-                .map_err(|e| Error::Protocol(format!("fetching the plan: {e}")))??;
+            let page = unless_cancelled(&ctx.cancel, async {
+                fetching
+                    .await
+                    .map_err(|e| Error::Protocol(format!("fetching the plan: {e}")))?
+            })
+            .await?;
             if first {
                 first = false;
                 let header = page
@@ -568,10 +684,13 @@ async fn plan(ctx: &Arc<Ctx>, report: &mut Report) -> Result<(), Error> {
                             }
                             // The end of a phase: the server hears of it.
                             let _ = ctx.send(true).await;
-                            ctx.observer.phase(Phase::Putting);
                         }
                         if ctx.pausing() {
                             return Ok(());
+                        }
+                        if !putting {
+                            putting = true;
+                            ctx.observer.phase(Phase::Putting);
                         }
                         start_put(
                             ctx,
@@ -774,17 +893,39 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
         p = ctx.disk.clone().acquire_owned() => p.expect("never closed"),
         _ = ctx.halt.cancelled() => return,
     };
+    // Collect finished downloads, so the set stays small.
+    while puts.try_join_next().is_some() {}
+    // The plan counts on spare partial files going, and on each replacement
+    // freeing its old file once it's done: take the spares back, then wait
+    // for downloads under way, before calling the storage full.
+    loop {
+        if ctx.pausing() {
+            return;
+        }
+        if room_for(ctx, &put).await {
+            break;
+        }
+        if reclaim(ctx).await {
+            continue;
+        }
+        let done = tokio::select! {
+            done = puts.join_next() => done,
+            _ = ctx.halt.cancelled() => return,
+        };
+        match done {
+            None => {
+                ctx.stop(Stop::NoSpace);
+                return;
+            }
+            Some(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Some(_) => {}
+        }
+    }
     let net = tokio::select! {
         p = ctx.net.clone().acquire_owned() => p.expect("never closed"),
         _ = ctx.halt.cancelled() => return,
     };
-    // Collect finished downloads, so the set stays small.
-    while puts.try_join_next().is_some() {}
     if ctx.pausing() {
-        return;
-    }
-    if !room_for(ctx, &put).await {
-        ctx.stop(Stop::NoSpace);
         return;
     }
     ctx.stats.owed.fetch_add(put.size, Ordering::Relaxed);
@@ -834,6 +975,33 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
         }
         drop(disk);
     });
+}
+
+/// Remove the spare partial files no download has taken up; whether there
+/// were any.
+async fn reclaim(ctx: &Ctx) -> bool {
+    let spare: Vec<String> = ctx
+        .spare
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .map(|(name, _)| name)
+        .collect();
+    if spare.is_empty() {
+        return false;
+    }
+    tracing::info!(
+        files = spare.len(),
+        "taking back room from old partial files"
+    );
+    let s = ctx.storage.clone();
+    let _ = blocking(move || {
+        for name in spare {
+            let _ = s.remove_partial(&name);
+        }
+    })
+    .await;
+    true
 }
 
 /// Whether the storage has room for `put`, beside the downloads under way.
@@ -914,6 +1082,11 @@ async fn download(
         ));
     }
     let name = partial_name(&put.hash, &put.path);
+    // Its own partial file, if an earlier sync left one, is no spare.
+    ctx.spare
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&name);
     let verify = ctx.options.verify_hashes;
     let mut net = Some(net);
     let mut tries = 0;
