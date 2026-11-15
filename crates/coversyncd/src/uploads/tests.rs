@@ -432,7 +432,8 @@ async fn an_uploads_albums_are_found_where_it_went() {
     let lone = app.album_appears("Lone Disc").await;
     let app = &app;
     let albums = |path: String| async move {
-        let path = format!("/api/uploads/albums?path={}", path.replace(' ', "%20"));
+        let encoded: String = path.bytes().map(|b| format!("%{b:02X}")).collect();
+        let path = format!("/api/uploads/albums?path={encoded}");
         app.call(Method::GET, &path, None).await
     };
     let at = |done: &Value| done["path"].as_str().unwrap().to_owned();

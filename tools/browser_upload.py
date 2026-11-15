@@ -238,11 +238,12 @@ def main():
         d.wait("return !!document.querySelector('input[webkitdirectory]')"
                " && !document.querySelector('[aria-busy=true]')", 60)
         info = d.run("const [path, done] = arguments; fetch(path + 'api/uploads').then((r) => r.json()).then(done)", path)
-        files = files_in(folders, set(info["extensions"]))
-        # For --raw, each file's path under its folder, numbered by folder:
-        # CD1/01.flac and CD2/01.flac stay apart.
-        relative = [f"{i}/{os.path.relpath(f, folder)}" for i, folder in enumerate(folders)
+        # Each file with its path under its folder, numbered by folder, from
+        # one walk: for --raw, so CD1/01.flac and CD2/01.flac stay apart.
+        selected = [(f, f"{i}/{os.path.relpath(f, folder)}") for i, folder in enumerate(folders)
                     for f in files_in([folder], set(info["extensions"]))]
+        files = [f for f, _ in selected]
+        relative = [rel for _, rel in selected]
         size = sum(os.path.getsize(f) for f in files)
         proto = d.js("return performance.getEntriesByType('navigation')[0].nextHopProtocol")
         print(f"{args.browser} over {proto}: {len(files)} files, {size} bytes", flush=True)
