@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use coversync_proxy::{
-    AboutApp, AppCommands, Cookies, PairError, Proxy, Unreachable, Upstream, UpstreamError,
+    AboutApp, AppCommands, Cookies, LocalFiles, PairError, Proxy, Unreachable, Upstream,
+    UpstreamError,
 };
 use serde::Serialize;
 use url::Url;
@@ -36,6 +37,8 @@ pub struct Shell {
     on_unreachable: UnreachableHandler,
     /// What the servers' pages may ask of the app, through their proxies.
     commands: Option<Arc<dyn AppCommands>>,
+    /// What this computer holds of a server's Library, for every proxy.
+    local: Option<Arc<dyn LocalFiles>>,
     /// Where the servers' tokens are kept, and what the app says of itself
     /// as it pairs. Without them the app can't pair.
     pairing: Option<Pairing>,
@@ -163,6 +166,7 @@ impl Shell {
             fallback,
             on_unreachable,
             commands: None,
+            local: None,
             pairing: None,
             proxies: Mutex::new(HashMap::new()),
             current: Arc::new(Mutex::new(None)),
@@ -175,6 +179,13 @@ impl Shell {
     /// now on answers them (see [`crate::bridge::Commands`]).
     pub fn with_commands(mut self, commands: Arc<dyn AppCommands>) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    /// Lets every proxy started from here on play the tracks this computer
+    /// holds from its own copy (see [`crate::local`]).
+    pub fn with_local_files(mut self, local: Arc<dyn LocalFiles>) -> Self {
+        self.local = Some(local);
         self
     }
 
@@ -222,6 +233,9 @@ impl Shell {
         let mut builder = Proxy::builder();
         if let Some(commands) = &self.commands {
             builder = builder.app_commands(commands.clone());
+        }
+        if let Some(local) = &self.local {
+            builder = builder.local_files(local.clone());
         }
         if let Some(pairing) = &self.pairing {
             let on_rejected = pairing.on_rejected.clone();

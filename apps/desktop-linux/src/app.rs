@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use coversync_desktop_core::bridge::{Commands, Feature, Features, Host};
+use coversync_desktop_core::local::Local;
 use coversync_desktop_core::sync::{self, Panel, Systemd};
 use coversync_desktop_core::tokens::Keychain;
 use coversync_desktop_core::{
@@ -120,6 +121,8 @@ pub struct App {
     next_question: AtomicU64,
     /// Background sync, as the settings page works it.
     sync: Panel,
+    /// This computer's copy, as the proxies play from it.
+    local: Arc<Local>,
     /// Whether the desktop shows notifications: `None` until the window has
     /// found out.
     notifications: watch::Sender<Option<bool>>,
@@ -151,6 +154,9 @@ impl App {
             .or(env_server)
             .or(saved.server);
 
+        // Tracks this computer holds a copy of are played from the copy,
+        // while sync is on.
+        let local = Arc::new(Local::new(sync::file(), Arc::new(Systemd)));
         let (notifications, found) = watch::channel(None);
         let desktop = Desktop {
             notifications: found,
@@ -168,6 +174,7 @@ impl App {
                 }),
             )
             .with_commands(Arc::new(Commands::new(Arc::new(desktop))))
+            .with_local_files(local.clone())
             .with_pairing(
                 Arc::new(Keychain::new(APP_ID)),
                 AboutApp {
@@ -202,6 +209,7 @@ impl App {
             folders: Mutex::new(HashMap::new()),
             next_question: AtomicU64::new(1),
             sync: Panel::new(sync::file(), Arc::new(Systemd)),
+            local,
             notifications,
             _lock: lock,
         };
@@ -485,7 +493,10 @@ impl App {
             Request::SyncTurn { on } => {
                 self.runtime.spawn_blocking(move || {
                     let (server, paired) = self.shown_server();
-                    match self.sync.turn(on, server.as_deref(), paired) {
+                    let turned = self.sync.turn(on, server.as_deref(), paired);
+                    // Whether tracks play from the copy follows.
+                    self.local.forget();
+                    match turned {
                         Ok(()) => self.settings(reply),
                         Err(problem) => reply.err(problem),
                     }
@@ -509,7 +520,9 @@ impl App {
                         }
                     };
                     self.runtime.spawn_blocking(move || {
-                        match self.sync.set_folder(folder.as_ref()) {
+                        let set = self.sync.set_folder(folder.as_ref());
+                        self.local.forget();
+                        match set {
                             Ok(()) => self.settings(reply),
                             Err(problem) => reply.err(problem),
                         }

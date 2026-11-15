@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod config;
 pub mod launch;
 pub mod links;
+pub mod local;
 pub mod shell;
 pub mod sync;
 pub mod tokens;

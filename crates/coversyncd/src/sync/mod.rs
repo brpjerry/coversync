@@ -13,6 +13,8 @@ mod agent_tests;
 mod api;
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod local_tests;
 mod plan;
 mod ranges;
 mod setup;

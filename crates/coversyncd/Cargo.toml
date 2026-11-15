@@ -33,4 +33,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 coversync-cli = { version = "0.1.0", path = "../coversync-cli" }
+coversync-desktop-core = { version = "0.1.0", path = "../coversync-desktop-core" }
+coversync-proxy = { version = "0.1.0", path = "../coversync-proxy" }
 coversync-replica = { version = "0.1.0", path = "../coversync-replica" }
