@@ -189,12 +189,9 @@ async fn run(
 
     let status = Arc::new(Status(Notifier::from_env()));
     let shutdown = CancellationToken::new();
-    let mut signals = [SignalKind::terminate(), SignalKind::interrupt()]
-        .map(|kind| signal(kind).map_err(|e| setup_error(format!("Couldn't start: {e}."))));
-    let [Ok(terminate), Ok(interrupt)] = &mut signals else {
-        let [terminate, interrupt] = signals;
-        return Err(terminate.and(interrupt).unwrap_err());
-    };
+    let listening = |kind| signal(kind).map_err(|e| setup_error(format!("Couldn't start: {e}.")));
+    let mut terminate = listening(SignalKind::terminate())?;
+    let mut interrupt = listening(SignalKind::interrupt())?;
     let settings = Settings {
         server,
         root,
