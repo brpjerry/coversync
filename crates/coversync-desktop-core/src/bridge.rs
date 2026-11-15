@@ -30,6 +30,10 @@ pub enum Feature {
     /// The page's notifications (the web's `Notification`) are shown as the
     /// desktop's, without asking the user first.
     Notify,
+    /// The app has a settings page of its own (where this computer's copy
+    /// of the Library is kept, say), which `open-settings` shows over the
+    /// server's page.
+    Settings,
 }
 
 /// The app's features, once it knows them.
@@ -39,6 +43,11 @@ pub type Features = Pin<Box<dyn Future<Output = Vec<Feature>> + Send>>;
 pub trait Host: Send + Sync {
     /// What this app can do now, on this desktop.
     fn features(&self) -> Features;
+
+    /// Shows the app's own settings page, over the server's. The page
+    /// asking learns nothing from it and can't reach into it: what's on it
+    /// is for the app's user alone.
+    fn open_settings(&self);
 }
 
 /// The commands, for an app that is `host`.
@@ -61,6 +70,10 @@ impl AppCommands for Commands {
                     async move { Ok(json!({ "version": VERSION, "features": features.await })) },
                 )
             }
+            "open-settings" => {
+                self.host.open_settings();
+                Box::pin(async { Ok(json!({})) })
+            }
             _ => Box::pin(async { Err(AppError::Unknown) }),
         }
     }
@@ -70,17 +83,29 @@ impl AppCommands for Commands {
 mod tests {
     use super::*;
 
-    struct Fixed(Vec<Feature>);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An app with these features, counting how often its settings were
+    /// opened.
+    struct Fixed(Vec<Feature>, AtomicUsize);
 
     impl Host for Fixed {
         fn features(&self) -> Features {
             let features = self.0.clone();
             Box::pin(async move { features })
         }
+
+        fn open_settings(&self) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn ask(features: Vec<Feature>, command: &str) -> Result<Value, AppError> {
-        let commands = Commands::new(Arc::new(Fixed(features)));
+        ask_app(&Arc::new(Fixed(features, AtomicUsize::new(0))), command)
+    }
+
+    fn ask_app(app: &Arc<Fixed>, command: &str) -> Result<Value, AppError> {
+        let commands = Commands::new(app.clone());
         let server = Upstream::parse("https://music.example/coversync/").unwrap();
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -101,9 +126,33 @@ mod tests {
         );
     }
 
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn open_settings_shows_the_page_and_tells_the_asker_nothing() {
+        let app = Arc::new(Fixed(
+            vec![Feature::Notify, Feature::Settings],
+            AtomicUsize::new(0),
+        ));
+        assert_eq!(
+            ask_app(&app, "capabilities"),
+            Ok(json!({ "version": 1, "features": ["notify", "settings"] }))
+        );
+        assert_eq!(app.1.load(Ordering::Relaxed), 0);
+        assert_eq!(ask_app(&app, "open-settings"), Ok(json!({})));
+        assert_eq!(app.1.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn the_fallback_pages_commands_arent_among_them() {
-        for command in ["connect", "status", "pair", "upload"] {
+        for command in [
+            "connect",
+            "status",
+            "pair",
+            "upload",
+            "sync_status",
+            "sync_turn",
+            "sync_choose_folder",
+        ] {
             assert_eq!(
                 ask(vec![Feature::Notify], command),
                 Err(AppError::Unknown),

@@ -1,10 +1,11 @@
-// The app's window: one web view, and the little the window draws itself (a page's alert, confirm and prompt, the
-// app's own questions, and a page's tooltips).
+// The app's window: one web view, the app's settings page in a view of its own over it, and the little the
+// window draws itself (a page's alert, confirm and prompt, the app's own questions, and a page's tooltips).
 // cpp/shell.cpp loads this, with these names set:
 //   backend         what the view's signals are passed to, and the desktop's file chooser (cpp/backend.h)
 //   appStoragePath  where the view keeps local storage and the like
 //   appCachePath    where it keeps its HTTP cache
-//   relayScript     the script that passes the fallback page's commands on (relay.js)
+//   relayScript     the script that passes the app's own pages' commands on (relay.js)
+//   settingsUrl     the app's settings page
 // and then gives the view its first page.
 import QtQuick
 import QtQuick.Window
@@ -35,6 +36,17 @@ Window {
 
     // The web view, once there is one (see viewLoader).
     readonly property Item view: viewLoader.item
+    // The settings page's address while it is up, and nothing otherwise: the app takes its pages' commands
+    // only from a page the window shows (cpp/shell.cpp).
+    readonly property url settingsPage: settingsPane.visible && settingsLoader.item ? settingsLoader.item.url : ""
+
+    // The app's settings page, over the page the window is on, which stays as it is (and goes on playing).
+    function openSettings() {
+        settingsPane.open();
+    }
+    function closeSettings() {
+        settingsPane.close();
+    }
 
     // The app's own question (whether to pair, from a link), in the dialog a page's confirm() gets. The backend
     // hears the answer, with `id`. Without `cancel` it only tells: there is one button.
@@ -192,6 +204,138 @@ Window {
         }
     }
 
+    // The settings page: a view of its own, made when it's opened and gone when it's closed, so the page
+    // under it is never moved away from. Declared before the tooltip and the dialog, which are drawn over it.
+    Shortcut {
+        sequences: [StandardKey.Preferences, "Ctrl+,"]
+        context: Qt.ApplicationShortcut
+        onActivated: window.openSettings()
+    }
+    Shortcut {
+        sequence: "Escape"
+        enabled: settingsPane.visible && !dialog.visible
+        onActivated: window.closeSettings()
+    }
+
+    Item {
+        id: settingsPane
+
+        function open() {
+            visible = true;
+            settingsLoader.active = true;
+            if (settingsLoader.item)
+                settingsLoader.item.forceActiveFocus();
+        }
+
+        function close() {
+            if (!visible)
+                return;
+            visible = false;
+            // The page goes with its view: opened again, it reads everything anew.
+            settingsLoader.active = false;
+            tip.hide();
+            if (view)
+                view.forceActiveFocus();
+        }
+
+        anchors.fill: parent
+        visible: false
+
+        // The page behind, dimmed and out of reach; a click on it closes the settings.
+        Rectangle {
+            anchors.fill: parent
+            color: "#80000000"
+
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.AllButtons
+                hoverEnabled: true
+                onClicked: settingsPane.close()
+                onWheel: function (wheel) {
+                    wheel.accepted = true;
+                }
+            }
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(600, parent.width - 48)
+            height: Math.min(640, parent.height - 48)
+            radius: 12
+            color: window.cardColor
+            border.color: window.lineColor
+
+            // Keeps clicks on the card's edge from closing it.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.AllButtons
+            }
+
+            Loader {
+                id: settingsLoader
+
+                anchors.fill: parent
+                // Inside the card's rounded corners, which a view can't have.
+                anchors.margins: 10
+                active: false
+                sourceComponent: settingsComponent
+            }
+        }
+    }
+
+    Component {
+        id: settingsComponent
+
+        WebEngineView {
+            focus: true
+            backgroundColor: window.cardColor
+            // The same profile, set before anything else of the view's (see the view above).
+            profile: prototype.instance()
+
+            onNewWindowRequested: function (request) {
+                backend.openInBrowser(request.requestedUrl);
+            }
+            onJavaScriptConsoleMessage: function (level, message, lineNumber, sourceID) {
+                backend.consoleMessage(level, message, lineNumber, sourceID);
+            }
+            onJavaScriptDialogRequested: function (request) {
+                request.accepted = true;
+                dialog.ask(request);
+            }
+            onTooltipRequested: function (request) {
+                request.accepted = true;
+                if (request.type === TooltipRequest.Show && !dialog.visible)
+                    tip.show(request.text, request.x + parent.x + settingsLoader.parent.x, request.y + parent.y + settingsLoader.parent.y);
+                else
+                    tip.hide();
+            }
+            onContextMenuRequested: function (request) {
+                if (!request.isContentEditable && request.selectedText === "")
+                    request.accepted = true;
+            }
+            // The page is the app's own and never leaves: anything else it's sent to is refused.
+            onNavigationRequested: function (request) {
+                if (request.url.toString().indexOf("coversync://app/") !== 0)
+                    request.reject();
+            }
+
+            Component.onCompleted: {
+                settings.unknownUrlSchemePolicy = WebEngineSettings.DisallowUnknownUrlSchemes;
+                userScripts.collection = [
+                    {
+                        name: "coversync-relay",
+                        sourceCode: relayScript,
+                        injectionPoint: WebEngineScript.DocumentCreation,
+                        worldId: WebEngineScript.ApplicationWorld,
+                        runsOnSubFrames: false
+                    }
+                ];
+                url = settingsUrl;
+                forceActiveFocus();
+            }
+        }
+    }
+
     // A page's tooltip, by the pointer, until the page takes it back, a dialog comes up or a while has passed.
     // Declared before the dialog, which is drawn over it.
     Rectangle {
@@ -322,7 +466,7 @@ Window {
                 asked.dialogAccept(input.text);
             else
                 asked.dialogReject();
-            view.forceActiveFocus();
+            (settingsPane.visible && settingsLoader.item ? settingsLoader.item : view).forceActiveFocus();
         }
 
         anchors.fill: parent

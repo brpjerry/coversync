@@ -1,4 +1,5 @@
-//! How the fallback page calls the app's commands.
+//! How the app's own pages (the fallback page and the settings page) call
+//! the app's commands.
 //!
 //! The page side is `ui/bridge.js`: it sends each command as an event. A script of the app's own
 //! (`relay.js`), which the window runs in a script world apart from the
@@ -18,7 +19,7 @@ use coversync_desktop_core::Problem;
 use crate::ffi::qt;
 use crate::pages;
 
-/// A command from the fallback page.
+/// A command from one of the app's own pages.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", content = "args", rename_all = "snake_case")]
 pub enum Request {
@@ -48,6 +49,19 @@ pub enum Request {
     Forget {
         server: String,
     },
+    /// What the settings page shows: sync on this computer
+    /// ([`coversync_desktop_core::sync::Overview`]).
+    Settings {},
+    /// Turns background sync on, with the server the window shows, or off.
+    SyncTurn {
+        on: bool,
+    },
+    /// Opens the desktop's folder chooser for the folder the copy of the
+    /// Library is kept in, and keeps what's chosen. The page never names a
+    /// path itself.
+    SyncChooseFolder {},
+    /// Closes the settings page, back to the page under it.
+    CloseSettings {},
 }
 
 impl Request {
@@ -58,7 +72,8 @@ impl Request {
 }
 
 /// Whether a command may run: sent from the app's own origin, while the
-/// window shows one of the app's pages.
+/// window shows one of the app's pages (the settings page over a server's
+/// counts: `page` is then the settings page's address).
 pub fn allowed(initiator: &str, page: &str) -> bool {
     initiator.trim_end_matches('/') == pages::ORIGIN && pages::is_app_page(page)
 }
@@ -124,6 +139,26 @@ mod tests {
             read(r#"{"cmd":"forget","args":{"server":"https://a/"}}"#),
             Ok(Request::Forget { server }) if server == "https://a/"
         ));
+        assert!(matches!(
+            read(r#"{"cmd":"settings","args":{}}"#),
+            Ok(Request::Settings {})
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"sync_turn","args":{"on":true}}"#),
+            Ok(Request::SyncTurn { on: true })
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"sync_choose_folder","args":{}}"#),
+            Ok(Request::SyncChooseFolder {})
+        ));
+        assert!(matches!(
+            read(r#"{"cmd":"close_settings","args":{}}"#),
+            Ok(Request::CloseSettings {})
+        ));
+        // Turning sync needs to say which way; a folder is never named by
+        // the page.
+        assert!(read(r#"{"cmd":"sync_turn","args":{}}"#).is_err());
+        assert!(read(r#"{"cmd":"sync_set_folder","args":{"path":"/etc"}}"#).is_err());
         // A pairing needs both its parts.
         assert!(read(r#"{"cmd":"pair","args":{"server":"https://a/"}}"#).is_err());
         assert!(read(r#"{"cmd":"rm","args":{}}"#).is_err());
@@ -134,6 +169,7 @@ mod tests {
     fn only_the_apps_own_pages_may_send_commands() {
         let page = "coversync://app/index.html";
         assert!(allowed("coversync://app", page));
+        assert!(allowed("coversync://app", pages::SETTINGS));
         assert!(allowed("coversync://app/", page));
         // A server's page, whatever the window shows.
         assert!(!allowed("http://127.0.0.1:40000", page));

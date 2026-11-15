@@ -16,6 +16,8 @@ use std::path::Path;
 pub const SCHEME: &str = "coversync";
 /// The fallback page.
 pub const FALLBACK: &str = "coversync://app/index.html";
+/// The settings page, which the window shows over the page it's on.
+pub const SETTINGS: &str = "coversync://app/settings.html";
 /// The origin of the app's pages.
 pub const ORIGIN: &str = "coversync://app";
 /// Where the fallback page's commands are sent.
@@ -49,6 +51,9 @@ const PAGES: &[Page] = &[
     ui!("fallback.css", "text/css; charset=utf-8"),
     ui!("fallback.js", "text/javascript; charset=utf-8"),
     ui!("bridge.js", "text/javascript; charset=utf-8"),
+    ui!("settings.html", "text/html; charset=utf-8"),
+    ui!("settings.css", "text/css; charset=utf-8"),
+    ui!("settings.js", "text/javascript; charset=utf-8"),
     ui!("logo.svg", "image/svg+xml"),
     ui!("fonts/inter-latin-wght-normal.woff2", "font/woff2"),
 ];
@@ -157,6 +162,14 @@ mod tests {
         let script = std::str::from_utf8(find("/fallback.js").unwrap().body).unwrap();
         assert!(script.contains("./bridge.js"));
         assert!(find("/bridge.js").is_some());
+        let settings = std::str::from_utf8(find("/settings.html").unwrap().body).unwrap();
+        for wanted in ["fallback.css", "settings.css", "settings.js"] {
+            assert!(settings.contains(wanted), "{wanted}");
+            assert!(find(&format!("/{wanted}")).is_some(), "{wanted}");
+        }
+        let script = std::str::from_utf8(find("/settings.js").unwrap().body).unwrap();
+        assert!(script.contains("./bridge.js"));
+        assert!(SETTINGS.ends_with("/settings.html") && is_app_page(SETTINGS));
     }
 
     #[test]

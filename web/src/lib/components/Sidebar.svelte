@@ -11,6 +11,7 @@
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
 	import LogOut from '@lucide/svelte/icons/log-out';
+	import MonitorCog from '@lucide/svelte/icons/monitor-cog';
 	import type { Album } from '#lib/api.ts';
 	import { isSetup, readPref, writePref, type View } from '#lib/browse.ts';
 	import {
@@ -28,6 +29,7 @@
 	import { ago, devices } from '#lib/devices.svelte.ts';
 	import { drafts } from '#lib/drafts.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
+	import { desktopApp } from '#lib/desktop.svelte.ts';
 	import { sortIcon } from '#lib/sort-icons.ts';
 	import { toast } from '#lib/toast.svelte.ts';
 
@@ -108,6 +110,15 @@
 	);
 
 	const pick = (k: string, value: string) => (filters = toggled(filters, k, value));
+
+	/** The desktop app's own settings, which it shows over this page. */
+	async function appSettings() {
+		try {
+			await desktopApp.openSettings();
+		} catch {
+			toast("The app's settings couldn't be opened", 'error');
+		}
+	}
 
 	async function signOut() {
 		// Signing out starts the page afresh: ask before unsaved edits go with it.
@@ -290,6 +301,13 @@
 						{item.label}
 					</button>
 				{/each}
+				<!-- In the desktop app: its own settings (this computer's sync folder), which aren't the server's. -->
+				{#if desktopApp.has('settings')}
+					<button class="nav-item" onclick={appSettings}>
+						<span class="icon"><MonitorCog size={17} strokeWidth={1.8} /></span>
+						This app
+					</button>
+				{/if}
 			</nav>
 			<!-- A desktop app paired with the server is signed in as a device of its own: there's no session to end. -->
 			{#if session.via !== 'token'}

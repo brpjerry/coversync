@@ -14,7 +14,7 @@
 import { hello } from './api';
 
 /** The features this UI knows how to use. */
-export type AppFeature = 'notify';
+export type AppFeature = 'notify' | 'settings';
 
 /** The version of the app's interface this UI speaks. */
 const VERSION = '1';
@@ -51,6 +51,15 @@ class DesktopApp {
 			this.#asking = undefined;
 		});
 		return this.#asking;
+	}
+
+	/**
+	 * Show the app's own settings page (where this computer's copy of the
+	 * Library is kept, say) over this one. Only in an app that lists
+	 * `settings`. The page is the app's: nothing of it comes back here.
+	 */
+	async openSettings(): Promise<void> {
+		await command('open-settings');
 	}
 
 	async #ask() {

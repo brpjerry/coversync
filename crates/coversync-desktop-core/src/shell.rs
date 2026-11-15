@@ -1664,6 +1664,8 @@ mod tests {
             fn features(&self) -> Features {
                 Box::pin(async { vec![Feature::Notify] })
             }
+
+            fn open_settings(&self) {}
         }
 
         let (a, b) = (server("200 OK"), server("200 OK"));

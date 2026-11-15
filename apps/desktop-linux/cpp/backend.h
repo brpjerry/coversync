@@ -37,6 +37,9 @@ public:
     // Opens the desktop's file chooser for a page: `accepted` is what its input takes (MIME types, or
     // extensions as ".png"). filesChosen follows, with the files' paths, or none if it was closed.
     Q_INVOKABLE void chooseFiles(bool multiple, const QStringList &accepted);
+    // Opens the desktop's file chooser for a folder, for the app itself (the settings page's sync folder).
+    // folder_chosen(id, …) follows (src/ffi.rs), with the folder's path, or none if it was closed.
+    void chooseFolder(quint64 id);
 
 signals:
     void hasFileChooserChanged();
@@ -53,9 +56,12 @@ private:
     void setFileChooser(bool there);
     void forgetRequest();
     void closeRequest();
+    QString openChooser(const QString &title, QVariantMap options);
+    void folderChosen(const QString &path, bool available);
 
     bool m_console;
     bool m_fileChooser = false;
     quint32 m_requests = 0;
     QString m_request; // the file chooser request under way: its object path
+    quint64 m_folder = 0; // the app's question that request is for, if it's for a folder; 0 for a page's files
 };

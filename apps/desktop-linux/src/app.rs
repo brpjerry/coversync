@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use coversync_desktop_core::bridge::{Commands, Feature, Features, Host};
+use coversync_desktop_core::sync::{self, Panel, Systemd};
 use coversync_desktop_core::tokens::Keychain;
 use coversync_desktop_core::{
     ConfigLock, EarlyLaunches, PairLink, Problem, Save, Shell, Store, config, server_arg,
@@ -65,9 +66,23 @@ impl Host for Desktop {
             if known == Some(true) {
                 features.push(Feature::Notify);
             }
+            features.push(Feature::Settings);
             features
         })
     }
+
+    fn open_settings(&self) {
+        qt::open_settings();
+    }
+}
+
+/// What the desktop's folder chooser came to.
+enum Chosen {
+    Folder(String),
+    /// Closed without choosing.
+    Nothing,
+    /// The desktop has no chooser to open.
+    Unavailable,
 }
 
 /// What the fallback page shows.
@@ -99,7 +114,12 @@ pub struct App {
     /// The questions the window is asking for the app, each waiting for its
     /// answer.
     questions: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    /// The folder choosers the window has open for the app (one at a time,
+    /// as the window keeps it), each waiting for what's chosen.
+    folders: Mutex<HashMap<u64, oneshot::Sender<Chosen>>>,
     next_question: AtomicU64,
+    /// Background sync, as the settings page works it.
+    sync: Panel,
     /// Whether the desktop shows notifications: `None` until the window has
     /// found out.
     notifications: watch::Sender<Option<bool>>,
@@ -179,7 +199,9 @@ impl App {
             early: Mutex::new(EarlyLaunches::default()),
             first_link: Mutex::new(first_link),
             questions: Mutex::new(HashMap::new()),
+            folders: Mutex::new(HashMap::new()),
             next_question: AtomicU64::new(1),
+            sync: Panel::new(sync::file(), Arc::new(Systemd)),
             notifications,
             _lock: lock,
         };
@@ -263,6 +285,49 @@ impl App {
         }
     }
 
+    /// Opens the desktop's folder chooser and waits for what's chosen.
+    async fn choose_folder(&self) -> Chosen {
+        let id = self.next_question.fetch_add(1, Ordering::Relaxed);
+        let (answer, answered) = oneshot::channel();
+        self.folders.lock().unwrap().insert(id, answer);
+        qt::choose_folder(id);
+        answered.await.unwrap_or(Chosen::Nothing)
+    }
+
+    /// The window's answer to [`App::choose_folder`].
+    pub fn folder_chosen(&self, id: u64, path: &str, available: bool) {
+        if let Some(answer) = self.folders.lock().unwrap().remove(&id) {
+            let _ = answer.send(match (available, path) {
+                (false, _) => Chosen::Unavailable,
+                (true, "") => Chosen::Nothing,
+                (true, path) => Chosen::Folder(path.to_owned()),
+            });
+        }
+    }
+
+    /// The server the window shows, as sync names it, and whether this
+    /// computer is paired with it.
+    fn shown_server(&self) -> (Option<String>, bool) {
+        let server = self
+            .shell
+            .current()
+            .and_then(|proxy| proxy.upstream())
+            .map(|upstream| upstream.url());
+        let paired = server
+            .as_ref()
+            .is_some_and(|url| self.shell.config.get().paired.contains_key(url));
+        (server, paired)
+    }
+
+    /// What the settings page shows, as the answer to one of its commands.
+    fn settings(&self, reply: Reply) {
+        let (server, paired) = self.shown_server();
+        match self.sync.overview(server.as_deref(), paired) {
+            Ok(overview) => reply.ok(overview),
+            Err(problem) => reply.err(problem),
+        }
+    }
+
     /// A pairing link was opened (`coversync://pair?server=…&code=…`, from
     /// the server's Add device): pairs this computer with its server, once
     /// the user has said so. A link can come from anywhere, so nothing
@@ -335,8 +400,8 @@ impl App {
         });
     }
 
-    /// A command from the fallback page. Only the app's own pages may use
-    /// them: see [`bridge::allowed`].
+    /// A command from the fallback page or the settings page. Only the
+    /// app's own pages may use them: see [`bridge::allowed`].
     pub fn on_request(&'static self, id: u64, initiator: &str, page: &str, body: &[u8]) {
         let reply = Reply::new(id);
         if !bridge::allowed(initiator, page) {
@@ -412,6 +477,49 @@ impl App {
                     }
                 });
             }
+            // systemctl is waited for off the main thread, which is where
+            // commands arrive.
+            Request::Settings {} => {
+                self.runtime.spawn_blocking(move || self.settings(reply));
+            }
+            Request::SyncTurn { on } => {
+                self.runtime.spawn_blocking(move || {
+                    let (server, paired) = self.shown_server();
+                    match self.sync.turn(on, server.as_deref(), paired) {
+                        Ok(()) => self.settings(reply),
+                        Err(problem) => reply.err(problem),
+                    }
+                });
+            }
+            Request::SyncChooseFolder {} => {
+                self.runtime.spawn(async move {
+                    let folder = match self.choose_folder().await {
+                        Chosen::Folder(folder) => folder,
+                        Chosen::Nothing => {
+                            self.runtime.spawn_blocking(move || self.settings(reply));
+                            return;
+                        }
+                        Chosen::Unavailable => {
+                            return reply.err(Problem::new(
+                                "No folder chooser",
+                                "This desktop has no folder chooser to open (the desktop \
+                                 portal's). `coversync setup --root <folder>` sets the folder \
+                                 from a terminal.",
+                            ));
+                        }
+                    };
+                    self.runtime.spawn_blocking(move || {
+                        match self.sync.set_folder(folder.as_ref()) {
+                            Ok(()) => self.settings(reply),
+                            Err(problem) => reply.err(problem),
+                        }
+                    });
+                });
+            }
+            Request::CloseSettings {} => {
+                qt::close_settings();
+                reply.ok(());
+            }
         }
     }
 
@@ -478,6 +586,8 @@ mod tests {
 
     use super::*;
 
+    // Bugs caught: 0, False positives: 1
+    // (It listed the features exactly, and failed when the app gained one.)
     #[test]
     fn the_features_wait_for_the_window_to_find_out() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -503,9 +613,13 @@ mod tests {
                 }
                 asked.await
             };
-            assert_eq!(features(Some(true)).await, [Feature::Notify]);
-            assert_eq!(features(Some(false)).await, []);
-            assert_eq!(features(None).await, []);
+            // The settings page is the app's own, whatever the desktop has.
+            assert_eq!(
+                features(Some(true)).await,
+                [Feature::Notify, Feature::Settings]
+            );
+            assert_eq!(features(Some(false)).await, [Feature::Settings]);
+            assert_eq!(features(None).await, [Feature::Settings]);
         });
     }
 }

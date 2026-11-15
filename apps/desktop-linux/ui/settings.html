@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Settings</title>
+		<link rel="stylesheet" href="fallback.css" />
+		<link rel="stylesheet" href="settings.css" />
+		<script type="module" src="settings.js"></script>
+	</head>
+	<body class="settings">
+		<main>
+			<header>
+				<h1>Settings</h1>
+				<button id="close" type="button" class="quiet" aria-label="Close settings">Close</button>
+			</header>
+			<section aria-labelledby="sync-title">
+				<h2 id="sync-title">Sync</h2>
+				<p class="lead">
+					Keeps a copy of the Library on this computer, in step with the server in the background,
+					whether or not the app is open.
+				</p>
+				<p id="notice" class="problem" hidden></p>
+				<div class="setting">
+					<div class="about">
+						<span class="name">Folder</span>
+						<span id="folder" class="value">Not chosen</span>
+					</div>
+					<button id="choose" type="button">Choose…</button>
+				</div>
+				<p class="hint">
+					Where the copy is kept. It stays on this computer: the server is never told where it is.
+				</p>
+				<div class="setting">
+					<div class="about">
+						<span class="name" id="sync-name">Sync this computer</span>
+						<span id="server" class="value"></span>
+					</div>
+					<button id="toggle" type="button" role="switch" aria-checked="false" aria-labelledby="sync-name">
+						<span class="knob"></span>
+					</button>
+				</div>
+				<p id="status" class="status" aria-live="polite"></p>
+				<p class="hint">
+					What this computer gets, and when it syncs by itself, is set on the server: Setup, then
+					Sync, under this computer's name.
+				</p>
+			</section>
+			<p id="busy" class="busy" hidden></p>
+		</main>
+	</body>
+</html>

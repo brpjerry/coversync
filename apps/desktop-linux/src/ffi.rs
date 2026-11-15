@@ -34,6 +34,8 @@ pub mod qt {
         origin: String,
         /// Where the fallback page's commands are sent.
         bridge_url: String,
+        /// The settings page, which the window shows over the page it's on.
+        settings_url: String,
         /// The app's icon as a file, for notifications on a desktop that has
         /// no icon by the app's ID; empty if there is none.
         icon_file: String,
@@ -120,6 +122,16 @@ pub mod qt {
         /// follows.
         fn ask(id: u64, message: &str, accept: &str, cancel: &str);
 
+        /// Shows the app's settings page over the page the window is on.
+        fn open_settings();
+
+        /// Takes the settings page away again.
+        fn close_settings();
+
+        /// Opens the desktop's folder chooser. `folder_chosen(id, …)`
+        /// follows.
+        fn choose_folder(id: u64);
+
         /// Closes the window, which ends [`run`].
         fn quit();
     }
@@ -155,6 +167,11 @@ pub mod qt {
         /// The user answered the question `id` (see `ask`): with its accept
         /// button, or not.
         fn answered(id: u64, accepted: bool);
+
+        /// The folder chosen for `choose_folder(id)`: its path, or nothing
+        /// if the chooser was closed. `available` is false when the desktop
+        /// has no folder chooser to open.
+        fn folder_chosen(id: u64, path: &str, available: bool);
 
         /// Whether the page at `origin` may show notifications: asked when
         /// it asks for the permission.
@@ -237,6 +254,12 @@ fn started() {
 fn answered(id: u64, accepted: bool) {
     if let Some(app) = App::get() {
         app.answered(id, accepted);
+    }
+}
+
+fn folder_chosen(id: u64, path: &str, available: bool) {
+    if let Some(app) = App::get() {
+        app.folder_chosen(id, path, available);
     }
 }
 
