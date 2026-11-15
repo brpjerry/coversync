@@ -6,10 +6,17 @@ import type { Picked } from './upload-files';
 const KiB = 1024;
 const MiB = 1024 * KiB;
 
-/** Bytes that differ at every offset, so a chunk written in the wrong place shows. */
+/** Bytes that don't repeat, so a chunk written in the wrong place shows. */
 function bytes(n: number, seed: number) {
 	const out = new Uint8Array(n);
-	for (let i = 0; i < n; i++) out[i] = (i * 31 + seed + (i >> 10)) & 0xff;
+	// xorshift32
+	let x = seed + 1;
+	for (let i = 0; i < n; i++) {
+		x ^= x << 13;
+		x ^= x >>> 17;
+		x ^= x << 5;
+		out[i] = x & 0xff;
+	}
 	return out;
 }
 
@@ -53,6 +60,8 @@ class FakeServer implements Transport {
 	cut: { index: number; offset: number; after: number } | null = null;
 	/** Answers a chunk with this status instead. */
 	refuse: { index: number; status: number } | null = null;
+	/** Finishing fails this many times, as if the connection dropped. */
+	failFinish = 0;
 	/** While set, starts wait for it. */
 	holdStarts: Promise<void> | null = null;
 	/** While set, chunks wait for it. */
@@ -135,6 +144,10 @@ class FakeServer implements Transport {
 	}
 
 	async finish(id: string): Promise<FinishedUpload> {
+		if (this.failFinish > 0) {
+			this.failFinish--;
+			throw new HttpError(0);
+		}
 		const u = this.uploads.get(id);
 		if (!u) throw new HttpError(404);
 		const missing = u.files.find(
@@ -165,13 +178,13 @@ function merge(ranges: [number, number][], [start, end]: [number, number]) {
 }
 
 /** An uploader on `server`, recording the progress it reports. */
-function uploader(server: FakeServer, parallel = 4, budget?: number) {
+function uploader(server: FakeServer, parallel = 4, budget?: number, delay = 1) {
 	const progress: number[] = [];
 	const engine = new Uploader(server, {
 		parallel,
 		budget,
 		chunk: MiB,
-		delays: [1],
+		delays: [delay],
 		changed: (u) => progress.push(u.received)
 	});
 	const until = (u: Upload, phase: Upload['phase']) =>
@@ -235,6 +248,19 @@ describe('Uploader', () => {
 		});
 		// Shown progress held while it reconnected.
 		expect(progress).toEqual([...progress].sort((a, b) => a - b));
+	});
+
+	it('uploads queued behind one that retries go on once it is done', async () => {
+		const server = new FakeServer();
+		server.failFinish = 1;
+		const { engine, until } = uploader(server, 4, undefined, 30);
+		const first = engine.add(album(['01.flac', 2 * MiB]));
+		await until(first, 'retrying');
+		// Not started while the server can't be reached.
+		const second = engine.add({ ...album(['01.flac', MiB]), folder: 'Second' });
+		expect(second.phase).toBe('queued');
+		await until(second, 'done');
+		expect(server.finished.map((f) => f.folder)).toEqual(['Album', 'Second']);
 	});
 
 	it('cancelling stops the chunks in flight and leaves nothing on the server', async () => {

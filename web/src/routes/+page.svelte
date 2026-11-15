@@ -566,6 +566,8 @@
 	}
 	/** A scan ended: show what it found. */
 	function scanFinished() {
+		// Uploads finished before it have their albums in the Inbox now, if any.
+		uploads.scanFinished();
 		dataGeneration++;
 		// The Inbox folder may have come or gone; the empty Inbox's message says which.
 		inboxSetup.refresh();
@@ -974,7 +976,6 @@
 			pushedScan = scan;
 			scanFinishes++;
 			if (status) status = { ...status, scan };
-			uploads.scanFinished();
 			scanFinished();
 			// The scan's count is of the Inbox's albums.
 			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'} in the Inbox`;
@@ -1148,9 +1149,7 @@
 	let dragDepth = 0;
 	/** Ends `dragging` if dragover stops without a dragleave (which browsers sometimes skip). */
 	let dragTimer: ReturnType<typeof setTimeout> | undefined;
-	/** A drag of files no element took for itself (the import dialog's art takes an image). */
-	const carriesFiles = (e: DragEvent) =>
-		!e.defaultPrevented && !!e.dataTransfer?.types.includes('Files');
+	const carriesFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
 	function dragEnded() {
 		clearTimeout(dragTimer);
 		dragDepth = 0;
@@ -1164,13 +1163,15 @@
 	}
 	function ondragover(e: DragEvent) {
 		if (!carriesFiles(e)) return;
-		// Taken everywhere, so files dropped outside the Inbox don't open in
-		// the page's place.
-		e.preventDefault();
-		e.dataTransfer!.dropEffect = canDrop ? 'copy' : 'none';
 		dragging = true;
 		clearTimeout(dragTimer);
 		dragTimer = setTimeout(dragEnded, 1000);
+		// An element took it for itself: the import dialog's album art takes an image.
+		if (e.defaultPrevented) return;
+		// Taken everywhere else, so files dropped outside the Inbox don't open
+		// in the page's place.
+		e.preventDefault();
+		e.dataTransfer!.dropEffect = canDrop ? 'copy' : 'none';
 	}
 	function ondragleave(e: DragEvent) {
 		if (!carriesFiles(e)) return;
@@ -1178,9 +1179,9 @@
 		if (!dragDepth) dragEnded();
 	}
 	function ondrop(e: DragEvent) {
-		if (!carriesFiles(e)) return;
-		e.preventDefault();
 		dragEnded();
+		if (!carriesFiles(e) || e.defaultPrevented) return;
+		e.preventDefault();
 		if (!canDrop) return;
 		// Only to be had while the drop is handled.
 		const entries = [...e.dataTransfer!.items]

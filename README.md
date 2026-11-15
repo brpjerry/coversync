@@ -265,6 +265,11 @@ changing it.
    while it runs, gives the same answer, for a day (until coversyncd
    restarts).
    `DELETE /api/uploads/{id}` cancels.
+5. `GET /api/uploads/albums?folder=NAME` names the Inbox albums with files in
+   that folder of the uploads folder (the one finishing answered with), once
+   a scan has found them: `{"albums": [id, …]}`. A folder such as `CD1`
+   uploaded on its own counts too, though its album is filed under the
+   folder above.
 
 Until it's finished, an upload is kept in `.coversync-uploads` in the uploads
 folder, which the scanner skips. Chunks are written straight into the files
@@ -286,6 +291,7 @@ once (up to 32 requests and 128 MiB over HTTP/2, four requests over HTTP/1.1,
 which leaves room for the page's own), one upload after another without a
 pause between them. If the connection drops or coversyncd restarts, it asks
 how far each file got and sends the rest, for as long as the page stays open.
+Once an upload is in the Inbox, the panel's Show opens its album.
 A page can't read the files again after a reload, so leaving the page asks
 first, and cancels the uploads under way on the server as it goes.
 

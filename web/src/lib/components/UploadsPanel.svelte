@@ -153,8 +153,11 @@
 						<div class="line">
 							<span
 								class="text tabular"
-								title={item.phase === 'retrying' ? (item.error ?? undefined) : undefined}
-								>{line(item)}</span
+								title={item.phase === 'retrying'
+									? (item.error ?? undefined)
+									: item.phase === 'done'
+										? (item.path ?? undefined)
+										: undefined}>{line(item)}</span
 							>
 							{#if item.phase === 'retrying'}
 								<button class="act" onclick={() => uploads.retry(item.key)}>Retry now</button>
@@ -187,7 +190,8 @@
 		right: 20px;
 		/* Above the player, when it's showing. */
 		bottom: calc(var(--dock, 0px) + 20px);
-		z-index: 45;
+		/* Over the player (40), under dialogs (45). */
+		z-index: 44;
 		width: 380px;
 		max-width: calc(100vw - 32px);
 		display: grid;

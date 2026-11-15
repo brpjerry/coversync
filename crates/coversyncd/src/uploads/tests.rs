@@ -397,6 +397,59 @@ async fn an_album_uploads_in_chunks_resumes_and_appears_in_the_inbox() {
     );
 }
 
+/// Upload `files` whole into `folder`, and finish.
+async fn upload(app: &App, folder: &str, files: &[(&str, &[u8])]) -> Value {
+    let (status, up) = app.start(folder, files).await;
+    assert_eq!(status, StatusCode::CREATED, "{up}");
+    let id = up["id"].as_str().unwrap();
+    for (i, (_, bytes)) in files.iter().enumerate() {
+        assert_eq!(app.put(id, i, 0, bytes).await.0, StatusCode::OK);
+    }
+    let (status, done) = app
+        .call(Method::POST, &format!("/api/uploads/{id}/finish"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    done
+}
+
+#[tokio::test]
+async fn an_uploads_albums_are_found_by_its_folder() {
+    let app = app("albums");
+    let src = app.dir.join("src");
+    let one = wav(&src, "One", "Two Discs", 1);
+    let two = wav(&src, "Two", "Two Discs", 1);
+    upload(
+        &app,
+        "Two Discs",
+        &[("CD1/01 One.wav", &one), ("CD2/01 Two.wav", &two)],
+    )
+    .await;
+    let both = app.album_appears("Two Discs").await;
+    // A disc folder uploaded on its own: the scan files its album under the
+    // folder above, the uploads folder.
+    let solo = wav(&src, "Solo", "Lone Disc", 1);
+    let done = upload(&app, "CD1", &[("01 Solo.wav", &solo)]).await;
+    assert_eq!(done["folder"], "CD1");
+    let lone = app.album_appears("Lone Disc").await;
+    let app = &app;
+    let albums = |folder: &'static str| async move {
+        let path = format!("/api/uploads/albums?folder={folder}");
+        app.call(Method::GET, &path, None).await
+    };
+    assert_eq!(
+        albums("Two%20Discs").await,
+        (StatusCode::OK, json!({ "albums": [both["id"]] }))
+    );
+    assert_eq!(
+        albums("CD1").await,
+        (StatusCode::OK, json!({ "albums": [lone["id"]] }))
+    );
+    // Not a prefix of another folder's name, and nothing outside the uploads folder.
+    assert_eq!(albums("Two").await.1, json!({ "albums": [] }));
+    assert_eq!(albums("..").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(albums("a%2F..").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn bad_paths_and_chunks_are_refused() {
     let app = app("refused");

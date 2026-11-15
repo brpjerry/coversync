@@ -6,8 +6,7 @@
 It signs in, hands the folders to the page the way a person would, and
 prints each upload's phases from the uploads panel (sending, finishing, done)
 with its rate over the whole upload, finishing included. It is what WEB-01's
-speed numbers were measured with. Needs geckodriver or chromedriver, and
-python-websocket-client for Firefox.
+speed numbers were measured with. Needs geckodriver or chromedriver.
 
 How the folders reach the page (--via):
   drop   dropped on the Inbox, as from a file manager: a real drop through
@@ -42,6 +41,8 @@ import urllib.request
 from pathlib import Path
 
 ELEMENT = "element-6066-11e4-a52e-4f735466cecf"
+# The longest an upload, or a script running one, may take.
+SCRIPT_MS = 1_800_000
 
 
 def free_port():
@@ -73,9 +74,12 @@ class Driver:
             args = ["--headless=new", "--window-size=1440,1000", f"--user-data-dir={profile}",
                     "--no-first-run", "--disable-gpu"]
             if http1:
-                args.append("--disable-http2")
+                # HTTP/3 too, which a profile that has seen the server may try.
+                args += ["--disable-http2", "--disable-quic"]
             caps = {"acceptInsecureCerts": True, "goog:chromeOptions": {"args": args},
                     "goog:loggingPrefs": {"browser": "ALL"}}
+        # --raw uploads in one script, which may take longer than the default 30 s.
+        caps["timeouts"] = {"script": SCRIPT_MS}
         self.sid = self.cmd("POST", "/session", {"capabilities": {"alwaysMatch": caps}})["sessionId"]
         self.browser = browser
 
@@ -84,7 +88,7 @@ class Driver:
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"content-type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=900) as r:
+            with urllib.request.urlopen(req, timeout=SCRIPT_MS / 1000 + 60) as r:
                 return json.load(r)["value"]
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"{method} {path}: {e.code} {e.read()[:400]!r}") from None
@@ -166,7 +170,8 @@ const CHUNK = 16 << 20;
   const worker = async () => { while (jobs.length) await put(jobs.shift()); };
   await Promise.all(Array.from({length: K}, worker));
   const sent = performance.now();
-  await fetch(`${base}api/uploads/${start.id}/finish`, {method: 'POST'});
+  const finished = await fetch(`${base}api/uploads/${start.id}/finish`, {method: 'POST'});
+  if (!finished.ok) throw `finishing: ${finished.status} ${await finished.text()}`;
   const end = performance.now();
   const bytes = files.reduce((n, f) => n + f.size, 0);
   done({total: (end - t0) / 1000, sending: (sent - t0) / 1000, finishing: (end - sent) / 1000, bytes});
@@ -228,7 +233,10 @@ def main():
         if status != 204:
             sys.exit(f"signing in: {status}")
         d.s("POST", "/url", {"url": args.url})
-        d.wait("return document.querySelectorAll('[data-album]').length > 0", 60)
+        # The Upload button's pickers, there in an empty Inbox too, once the
+        # grid has loaded rather than while its loading competes.
+        d.wait("return !!document.querySelector('input[webkitdirectory]')"
+               " && !document.querySelector('[aria-busy=true]')", 60)
         info = d.run("const [path, done] = arguments; fetch(path + 'api/uploads').then((r) => r.json()).then(done)", path)
         files = files_in(folders, set(info["extensions"]))
         size = sum(os.path.getsize(f) for f in files)
@@ -284,7 +292,7 @@ def main():
             print(f"[{time.time() - began:.2f} s] pressed Cancel", flush=True)
 
         over = "['done', 'failed', 'cancelled'].includes(p.phase)"
-        d.wait(f"return (window.__phases || []).filter((p) => {over}).length >= {expected}", 1800)
+        d.wait(f"return (window.__phases || []).filter((p) => {over}).length >= {expected}", SCRIPT_MS / 1000)
         by = {}
         for p in d.js("return window.__phases"):
             by.setdefault(p["id"], []).append(p)

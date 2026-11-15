@@ -9,8 +9,9 @@
 //
 // Once an upload is done, the server scans it in, and its albums show up in
 // the Inbox: the page tells this list when the Inbox reloads
-// (`albumsLoaded`) and when a scan ends (`scanFinished`), and the albums
-// found under the upload's folder are the ones the panel offers to show.
+// (`albumsLoaded`) and when a scan ends (`scanFinished`), and the server
+// names the Inbox albums with files in the upload's folder, for the panel to
+// show.
 
 import { api, ApiError, sendChunk, type Album, type UploadsInfo } from './api';
 import { notify } from './notify';
@@ -72,8 +73,6 @@ const TICK_MS = 250;
 const RATE_MS = 2000;
 /** A finished upload's albums are looked for this long, through later scans. */
 const LOOK_MS = 30 * 60_000;
-/** New Inbox albums looked at, at most, each time the Inbox reloads. */
-const LOOK_AT = 40;
 
 /** Problems with where uploads go, which Inbox setup fixes. */
 export class UploadsUnavailable extends Error {}
@@ -103,8 +102,6 @@ function limits(chunk: number) {
 		: { parallel: 4 };
 }
 
-const under = (dir: string, path: string) => dir === path || dir.startsWith(`${path}/`);
-
 class Uploads {
 	items = $state<UploadItem[]>([]);
 	/** Something is still under way. */
@@ -124,16 +121,12 @@ class Uploads {
 	/** For rates: each item's bytes and time at the last tick. */
 	#last = new Map<number, { at: number; received: number }>();
 
-	/** The Inbox's album ids as last loaded; null until it has. */
-	#known: Set<string> | null = null;
-	/** The Inbox's albums when each upload was done, to tell its own from them; null if not loaded then. */
-	#before = new Map<number, Set<string> | null>();
+	/** The Inbox's album ids as last loaded. */
+	#shown = new Set<string>();
 	/** When each was done. */
 	#doneAt = new Map<number, number>();
-	/** Album ids looked at for each upload. */
-	#seen = new Map<number, Set<string>>();
-	/** Each album's folder, as its details say. */
-	#dirs = new Map<string, Promise<string | null>>();
+	/** Counts each upload's album lookups, so only the latest answer lands. */
+	#lookups = new Map<number, number>();
 	/** Uploads done before the last scan ended, waiting for the Inbox to reload after it. */
 	#scanning = new Set<number>();
 
@@ -198,14 +191,7 @@ class Uploads {
 		const item = this.#item(key);
 		if (!item || isActive(item.phase)) return;
 		this.#controls.get(key)?.forget?.();
-		for (const map of [
-			this.#controls,
-			this.#own,
-			this.#last,
-			this.#before,
-			this.#doneAt,
-			this.#seen
-		])
+		for (const map of [this.#controls, this.#own, this.#last, this.#doneAt, this.#lookups])
 			map.delete(key);
 		this.#scanning.delete(key);
 		this.items = this.items.filter((i) => i.key !== key);
@@ -233,34 +219,37 @@ class Uploads {
 		return this.#send(fromFiles(files, new Set(info.extensions)));
 	}
 
-	/** The Inbox's albums were loaded: look for finished uploads' albums among the new ones. */
+	/** The Inbox's albums were loaded: find finished uploads' albums in it. */
 	async albumsLoaded(inbox: Album[]) {
-		const ids = new Set(inbox.map((a) => a.id));
-		this.#known = ids;
+		this.#shown = new Set(inbox.map((a) => a.id));
 		const scanned = [...this.#scanning];
 		this.#scanning.clear();
-		const now = Date.now();
-		await Promise.all(
-			this.items.map(async (item) => {
-				const done = this.#doneAt.get(item.key);
-				if (item.phase !== 'done' || !item.path || done === undefined || now - done > LOOK_MS)
-					return;
-				const before = this.#before.get(item.key);
-				// The Inbox wasn't loaded when it was done: what it has now is the baseline.
-				if (!before) return void this.#before.set(item.key, ids);
-				const seen = this.#seen.get(item.key) ?? new Set();
-				this.#seen.set(item.key, seen);
-				const fresh = [...ids].filter((id) => !before.has(id) && !seen.has(id)).slice(0, LOOK_AT);
-				for (const id of fresh) seen.add(id);
-				const dirs = await Promise.all(fresh.map((id) => this.#dir(id)));
-				const found = fresh.filter((_, i) => dirs[i] && under(dirs[i]!, item.path!));
-				// Albums since gone (imported, renamed) leave the list.
-				const kept = item.albums.filter((id) => ids.has(id));
-				if (found.length || kept.length !== item.albums.length)
-					this.#update(item.key, { albums: [...kept, ...found] });
-			})
-		);
+		await Promise.all(this.items.map((item) => this.#look(item)));
 		for (const key of scanned) this.#update(key, { scanned: true });
+	}
+
+	/**
+	 * The albums a finished upload became, as the Inbox shows them: asked of
+	 * the server for a while after it's done, and after that only those still
+	 * in the Inbox kept (not imported or renamed since).
+	 */
+	async #look(item: UploadItem) {
+		const done = this.#doneAt.get(item.key);
+		if (item.phase !== 'done' || done === undefined) return;
+		let albums = item.albums;
+		if (Date.now() - done < LOOK_MS) {
+			const n = (this.#lookups.get(item.key) ?? 0) + 1;
+			this.#lookups.set(item.key, n);
+			const found = await api.uploadAlbums(item.folder).then(
+				(r) => r.albums,
+				() => null
+			);
+			// A later lookup answered first, or it couldn't be had: leave it.
+			if (this.#lookups.get(item.key) !== n || !found) return;
+			albums = found;
+		}
+		const shown = albums.filter((id) => this.#shown.has(id));
+		if (shown.join() !== item.albums.join()) this.#update(item.key, { albums: shown });
 	}
 
 	/** A scan ended: once the Inbox has reloaded after it, uploads done before it have been scanned. */
@@ -285,21 +274,9 @@ class Uploads {
 		item.received = item.size;
 		item.rate = 0;
 		this.#doneAt.set(item.key, Date.now());
-		this.#before.set(item.key, this.#known && new Set(this.#known));
+		// The scan may have shown its albums before the finish was answered.
+		void this.#look(item);
 		notify('Uploaded to the Inbox', item.folder || 'Upload', `upload-${item.key}`);
-	}
-
-	/** An album's folder on the server, from its details; null if it couldn't be read. */
-	#dir(id: string) {
-		let dir = this.#dirs.get(id);
-		if (!dir) {
-			dir = api.album(id).then(
-				(a) => a.dir,
-				() => null
-			);
-			this.#dirs.set(id, dir);
-		}
-		return dir;
 	}
 
 	/** Bring progress and rates up to date every tick while something is under way. */

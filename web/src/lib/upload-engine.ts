@@ -75,8 +75,6 @@ interface Flight {
 
 /** Retried failures that aren't the connection's: after this many in a row, the upload fails. */
 const SERVER_FAILURES = 3;
-/** Tries at cancelling on the server, so a cancelled upload leaves nothing behind there. */
-const CANCEL_TRIES = 5;
 const DELAYS = [1000, 2000, 4000, 8000, 15000];
 
 const statusOf = (e: unknown) =>
@@ -121,6 +119,8 @@ export class Upload {
 	held = 0;
 	/** Asking the server how far it got, to carry on. */
 	asking = false;
+	/** The server lost bytes it had (a 409 at finishing): show what it has once it says. */
+	recount = false;
 	timer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(readonly picked: Picked) {
@@ -155,6 +155,8 @@ export class Uploader {
 	#load = 0;
 	/** Uploads being started. */
 	#starting = 0;
+	/** Uploads being cancelled on the server, asked again while it can't be reached. */
+	#deleting = new Set<string>();
 
 	constructor(
 		private transport: Transport,
@@ -210,6 +212,7 @@ export class Uploader {
 	 * so the server doesn't keep half an upload until it expires.
 	 */
 	abandon() {
+		for (const id of this.#deleting) this.transport.cancel(id, true).catch(() => {});
 		for (const u of this.#uploads) {
 			if (!u.active || u.phase === 'finishing') continue;
 			const id = u.id;
@@ -389,6 +392,10 @@ export class Uploader {
 		u.asking = false;
 		if (u.phase !== 'retrying') return;
 		this.#plan(u, server);
+		if (u.recount) {
+			u.recount = false;
+			u.held = 0;
+		}
 		u.phase = 'sending';
 		u.error = null;
 		this.#changed(u);
@@ -413,13 +420,15 @@ export class Uploader {
 		} catch (e) {
 			if (u.phase !== 'finishing') return;
 			// Bytes missing after all (lost in a reboot of the server, say): send
-			// them, showing what the server has.
+			// them, holding the progress shown until the server says what it has.
 			if (statusOf(e) === 409) {
-				u.confirmed = u.held = 0;
+				u.recount = true;
 				this.#trouble(u, 'resume', e, true);
 			} else this.#trouble(u, 'finish', e);
 		}
 		this.#changed(u);
+		// Uploads queued while it retried go on.
+		this.#pump();
 	}
 
 	/** Fail, and remove what the server has of it: trying again starts over. */
@@ -444,17 +453,27 @@ export class Uploader {
 		if (phase !== 'retrying') u.held = 0;
 	}
 
-	/** Cancel upload `id` on the server, trying a few times if it can't be reached. */
+	/**
+	 * Cancel upload `id` on the server, asking again while it can't be
+	 * reached, for as long as the page is open (and once more as it goes).
+	 */
 	async #drop(id: string) {
+		if (this.#deleting.has(id)) return;
+		this.#deleting.add(id);
 		const delays = this.options.delays ?? DELAYS;
-		for (let i = 0; i < CANCEL_TRIES; i++) {
-			try {
-				return await this.transport.cancel(id);
-			} catch (e) {
-				const status = statusOf(e);
-				if (status === 404 || !transient(status)) return;
-				await new Promise((r) => setTimeout(r, delays[Math.min(i, delays.length - 1)]));
+		try {
+			for (let i = 0; ; i++) {
+				try {
+					return await this.transport.cancel(id);
+				} catch (e) {
+					const status = statusOf(e);
+					if (status === 404 || !transient(status)) return;
+					if (!unlimited(status) && i >= SERVER_FAILURES) return;
+					await new Promise((r) => setTimeout(r, delays[Math.min(i, delays.length - 1)]));
+				}
 			}
+		} finally {
+			this.#deleting.delete(id);
 		}
 	}
 }

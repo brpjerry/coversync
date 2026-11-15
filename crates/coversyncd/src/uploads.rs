@@ -11,6 +11,9 @@
 //! - `POST /api/uploads/{id}/finish` moves the files into the uploads folder
 //!   and starts a scan, so the album shows up in the Inbox.
 //!   `DELETE /api/uploads/{id}` cancels.
+//! - `GET /api/uploads/albums?folder=NAME` names the Inbox albums with files
+//!   in that folder of the uploads folder, once a scan has found them: the
+//!   albums a finished upload became.
 //!
 //! Uploads take no lock that other uploads, scans or imports wait on, and
 //! never the jobs lock: chunks stream from the network to their file at
@@ -50,6 +53,7 @@ pub fn router() -> Router<Shared> {
             // Room for the paths of many files.
             get(list).post(start).layer(DefaultBodyLimit::max(8 << 20)),
         )
+        .route("/api/uploads/albums", get(albums))
         .route("/api/uploads/{id}", get(status).delete(cancel))
         // The body streams to disk, bounded by the file's size, not
         // collected: no body limit applies.
@@ -104,6 +108,44 @@ async fn status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<UploadStatus>> {
     Ok(Json(state.uploads.get(&id)?.status(true)))
+}
+
+#[derive(Deserialize)]
+struct AlbumsQuery {
+    /// A folder in the uploads folder, as finishing named it.
+    folder: String,
+}
+
+#[derive(Serialize)]
+struct AlbumsResponse {
+    albums: Vec<String>,
+}
+
+/// The Inbox albums with files in a folder of the uploads folder, such as the
+/// one a finished upload went into, as the last scan found them.
+async fn albums(
+    State(state): State<Shared>,
+    Query(q): Query<AlbumsQuery>,
+) -> ApiResult<Json<AlbumsResponse>> {
+    blocking(&state, move |s| {
+        let name = q.folder;
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+            return Err(coversync_core::Error::Invalid(format!(
+                "“{name}” isn't a folder name in the uploads folder."
+            )));
+        }
+        let Some(uploads) = s.uploads.folder() else {
+            return Ok(AlbumsResponse { albums: Vec::new() });
+        };
+        // As the scan found it: links followed.
+        let dir = uploads.join(&name);
+        let dir = dir.canonicalize().unwrap_or(dir);
+        Ok(AlbumsResponse {
+            albums: s.lib.inbox_albums_under(&dir)?,
+        })
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
