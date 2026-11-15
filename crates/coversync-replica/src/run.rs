@@ -405,7 +405,7 @@ async fn session(
     };
 
     let ran = run(&ctx, &started, &mut report).await;
-    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost();
     let stop = ctx.stop.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = &ctx.stats;
     report.files = s.puts.load(Ordering::Relaxed);
@@ -535,7 +535,7 @@ async fn session(
         }
     }
     tracing::info!(?report, "sync session ended");
-    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost();
     Ok((report, matches!(stop, Some(Stop::Refused))))
 }
 
@@ -801,11 +801,9 @@ async fn ordered_steps(ctx: &Arc<Ctx>, ops: Vec<Op>) -> Result<(), Error> {
 }
 
 pub(crate) fn protected(options: &Options, path: &str) -> bool {
-    let first = path.split('/').next().unwrap_or(path);
-    options
-        .protected
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(first))
+    // As the server compares names on storage that ignores case.
+    let first = path.split('/').next().unwrap_or(path).to_uppercase();
+    options.protected.iter().any(|p| p.to_uppercase() == first)
 }
 
 /// One step; false if the folder refused it.
@@ -1241,12 +1239,15 @@ async fn download(
         let (tx, rx) = mpsc::channel::<Bytes>(4);
         let s = ctx.storage.clone();
         let n = name.clone();
-        let writer = tokio::task::spawn_blocking(move || write(&*s, &n, resume, verify, rx));
+        let cancel = ctx.cancel.clone();
+        let writer =
+            tokio::task::spawn_blocking(move || write(&*s, &n, resume, verify, &cancel, rx));
         let streamed = stream(ctx, res.into_body(), tx, put.size - start, counted).await;
         let written = writer
             .await
             .map_err(|e| Halt::Stop(Stop::Storage(e.to_string())))?;
         match (streamed, written) {
+            (_, Err(_)) if ctx.cancel.is_cancelled() => return Err(Halt::Cancelled),
             (_, Err(e)) => {
                 if matches!(
                     e.kind(),
@@ -1385,6 +1386,26 @@ async fn stream(
 
 type Written = (Box<dyn Partial>, Option<blake3::Hasher>, u64);
 
+/// Hash what `r` holds, a MiB at a time, stopping if the sync is cancelled
+/// (a large partial file on a slow card takes a while).
+fn hash_into(
+    h: &mut blake3::Hasher,
+    mut r: impl io::Read,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    let mut buf = vec![0; 1 << 20];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        h.update(&buf[..n]);
+    }
+}
+
 /// The writer: the partial file, appended to or begun again, hashed as it
 /// goes (from its start, when resumed).
 fn write(
@@ -1392,11 +1413,12 @@ fn write(
     name: &str,
     resume: bool,
     verify: bool,
+    cancel: &CancellationToken,
     mut rx: mpsc::Receiver<Bytes>,
 ) -> io::Result<Written> {
     let mut hasher = verify.then(blake3::Hasher::new);
     if resume && let Some(h) = hasher.as_mut() {
-        h.update_reader(storage.read_partial(name)?)?;
+        hash_into(h, storage.read_partial(name)?, cancel)?;
     }
     let mut file = storage.write_partial(name, resume)?;
     let mut n = 0u64;
@@ -1433,9 +1455,17 @@ fn finish(
                 .map_err(|e| storage_halt(&e, "a partial file"))?;
             let hasher = if verify {
                 let mut h = blake3::Hasher::new();
-                s.read_partial(name)
-                    .and_then(|r| h.update_reader(r).map(|_| ()))
-                    .map_err(|e| storage_halt(&e, "a partial file"))?;
+                if let Err(e) = s
+                    .read_partial(name)
+                    .and_then(|r| hash_into(&mut h, r, &ctx.cancel))
+                {
+                    // Cancelled, the partial stays for next time.
+                    return Err(if ctx.cancel.is_cancelled() {
+                        Halt::Cancelled
+                    } else {
+                        storage_halt(&e, "a partial file")
+                    });
+                }
                 Some(h)
             } else {
                 None

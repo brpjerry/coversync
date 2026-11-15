@@ -753,6 +753,10 @@ async fn the_watch_says_when_to_sync() {
     let r = sync(&e).await;
     w.synced(r.target.as_deref());
     assert_eq!(tree(&root), d.files());
+    // Listening now (the stream opened, and the status read again finds
+    // nothing new).
+    let quiet = tokio::time::timeout(Duration::from_millis(500), w.next()).await;
+    assert!(quiet.is_err(), "{quiet:?}");
 
     // A change in the Library: once it's been quiet a second.
     let mut edited = tags("Two", "A", "Album One", 2);
@@ -763,6 +767,8 @@ async fn the_watch_says_when_to_sync() {
         60_000,
     );
     d.rescan();
+    // What the server's watcher, polling every 2 s, does.
+    d.state.sync.changed();
     assert_eq!(
         next(&mut w).await,
         Trigger {
@@ -790,6 +796,8 @@ async fn the_watch_says_when_to_sync() {
     jazz.push("GENRE=Jazz".into());
     write_track(&two, &jazz, 60_000);
     d.rescan();
+    // What the server's watcher, polling every 2 s, does.
+    d.state.sync.changed();
     let heard = tokio::time::timeout(Duration::from_millis(300), w.next()).await;
     assert!(heard.is_err(), "{heard:?}");
     let r = sync(&e).await;
@@ -813,6 +821,8 @@ async fn the_watch_says_when_to_sync() {
     blues.push("GENRE=Blues".into());
     write_track(&two, &blues, 60_000);
     d.rescan();
+    // What the server's watcher, polling every 2 s, does.
+    d.state.sync.changed();
     let off = tokio::time::timeout(Duration::from_secs(3), w.next()).await;
     assert!(off.is_err(), "{off:?}");
     d.settings(id, auto(true));

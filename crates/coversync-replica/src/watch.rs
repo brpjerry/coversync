@@ -198,10 +198,11 @@ impl Watch {
                     Ok(events) => {
                         tracing::debug!("listening for the server's events");
                         self.stream = Some(events);
-                        // Anything missed while away shows in the status.
-                        if self.failures > 0 {
-                            self.next_status = Instant::now();
-                        }
+                        // The stream tells of changes from now on: the
+                        // status, read again, has the settings as they are
+                        // (they may have changed during a first sync) and
+                        // anything missed while away.
+                        self.check_soon();
                         self.failures = 0;
                     }
                     Err(Error::Unauthorized) => return Err(Error::Unauthorized),
@@ -259,6 +260,9 @@ impl Watch {
                     return;
                 };
                 if self.synced.as_deref() == Some(event.target.as_str()) {
+                    // Reached already: an older change's wait goes too.
+                    self.due = None;
+                    self.due_for = None;
                     return;
                 }
                 // Each change starts the quiet period again: a run of edits
@@ -315,7 +319,7 @@ impl Watch {
                     }
                 } else if status.pending.files == 0 {
                     // Nothing to do for this target.
-                    self.synced = Some(status.target);
+                    self.synced(Some(&status.target));
                 }
                 Ok(None)
             }
@@ -412,5 +416,68 @@ impl Events {
                 None => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Server, Tls, Token};
+
+    fn watch() -> Watch {
+        let server = Server {
+            url: "http://127.0.0.1:9".into(),
+            token: Token::new("cst_test").unwrap(),
+            tls: Tls::System,
+        };
+        Watch::new(
+            Arc::new(Api::new(&server, 1).unwrap()),
+            WatchOptions::default(),
+        )
+    }
+
+    fn target(w: &mut Watch, t: &str) {
+        w.heard(
+            "target",
+            &format!(r#"{{"target":"{t}","changed_at":null}}"#),
+        );
+    }
+
+    #[test]
+    fn a_sync_clears_the_wait_for_what_it_reached_and_no_other() {
+        // Reaching an older target leaves the wait for a newer one.
+        let mut w = watch();
+        target(&mut w, "t_a");
+        target(&mut w, "t_b");
+        w.synced(Some("t_a"));
+        assert!(w.due.is_some());
+        w.synced(Some("t_b"));
+        assert!(w.due.is_none());
+
+        // Events queued during a sync, read after it reached the newest:
+        // the older one's wait goes when the newest is read.
+        let mut w = watch();
+        w.synced(Some("t_2"));
+        target(&mut w, "t_1");
+        assert!(w.due.is_some());
+        target(&mut w, "t_2");
+        assert!(w.due.is_none());
+    }
+
+    #[test]
+    fn auto_sync_turned_back_on_checks_at_once() {
+        let mut w = watch();
+        let later = Instant::now() + Duration::from_secs(600);
+        w.next_status = later;
+        w.heard(
+            "settings",
+            r#"{"enabled":false,"quiet_seconds":60,"wifi_only":true,"charging_only":false}"#,
+        );
+        assert_eq!(w.next_status, later);
+        w.heard(
+            "settings",
+            r#"{"enabled":true,"quiet_seconds":60,"wifi_only":true,"charging_only":false}"#,
+        );
+        assert!(w.next_status <= Instant::now());
     }
 }
