@@ -59,8 +59,11 @@ pub(crate) async fn sync(
     }
     let mut check = unfinished;
     let mut checked = false;
+    // Facts the journal couldn't keep and the server never confirmed: the
+    // folder can't be trusted to match what the server knows.
+    let mut lost = false;
     let result = loop {
-        let (mut report, refused) = match session(
+        let (report, refused, lost_facts) = match session(
             &api, &storage, &options, reason, check, &observer, &cancel, began,
         )
         .await
@@ -69,6 +72,7 @@ pub(crate) async fn sync(
             Err(e) => break Err(e),
         };
         checked |= report.reconciled.is_some();
+        lost |= lost_facts;
         // A step the folder refused (a file that wasn't what the server
         // thought): the server's idea of the folder is wrong, so check it.
         if refused && !check && !cancel.is_cancelled() {
@@ -76,20 +80,26 @@ pub(crate) async fn sync(
             check = true;
             continue;
         }
-        report.seconds = began.elapsed().as_secs_f64();
         break Ok(report);
     };
     // Everything this sync did is made durable before the note goes, unless
-    // a check it owed didn't happen: then the note stays for the next.
-    if !unfinished || checked {
+    // a check it owed didn't happen, or facts were lost: then the note stays
+    // and the next sync checks the folder.
+    if (!unfinished || checked) && !lost {
         let s = storage.clone();
         match blocking(move || s.end_changes()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!("couldn't flush the folder: {e}"),
             Err(e) => tracing::warn!("couldn't flush the folder: {e}"),
         }
+    } else if lost {
+        tracing::warn!("facts couldn't be journaled: the next sync checks the folder");
     }
-    result
+    // The flush is part of the sync's time.
+    result.map(|mut report| {
+        report.seconds = began.elapsed().as_secs_f64();
+        report
+    })
 }
 
 /// `fut`, unless the sync is cancelled first.
@@ -304,7 +314,8 @@ impl Ctx {
     }
 }
 
-/// One session. Returns its report, and whether a step was refused.
+/// One session. Returns its report, whether a step was refused, and whether
+/// facts the journal couldn't keep never reached the server.
 #[allow(clippy::too_many_arguments)]
 async fn session(
     api: &Arc<Api>,
@@ -315,7 +326,7 @@ async fn session(
     observer: &Arc<dyn Observer>,
     cancel: &CancellationToken,
     began: Instant,
-) -> Result<(Report, bool), Error> {
+) -> Result<(Report, bool, bool), Error> {
     observer.phase(Phase::Starting);
     let s = storage.clone();
     let (marker, free, spare, facts) = blocking(move || {
@@ -480,11 +491,18 @@ async fn session(
         }
     };
     if reachable {
+        // Cancelled before or during these, they get a few seconds more.
+        let brief = Duration::from_secs(5);
         if cancelled {
-            // The facts' own send stops at the cancel: they stay journaled.
-            let _ = tokio::time::timeout(Duration::from_secs(5), ending).await;
+            let _ = tokio::time::timeout(brief, ending).await;
         } else {
-            ending.await;
+            tokio::pin!(ending);
+            tokio::select! {
+                _ = &mut ending => {}
+                _ = cancel.cancelled() => {
+                    let _ = tokio::time::timeout(brief, ending).await;
+                }
+            }
         }
     }
     // The plan ran to its end, so nothing is under way and no later page
@@ -497,7 +515,8 @@ async fn session(
         }
     }
     tracing::info!(?report, "sync session ended");
-    Ok((report, matches!(stop, Some(Stop::Refused))))
+    let lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    Ok((report, matches!(stop, Some(Stop::Refused)), lost))
 }
 
 async fn run(ctx: &Arc<Ctx>, started: &SessionStarted, report: &mut Report) -> Result<(), Error> {
@@ -636,13 +655,16 @@ async fn plan(ctx: &Arc<Ctx>, report: &mut Report) -> Result<(), Error> {
     let mut first = true;
     let mut putting = false;
     let result: Result<(), Error> = async {
-        while let Some(fetching) = next.take() {
-            let page = unless_cancelled(&ctx.cancel, async {
-                fetching
-                    .await
-                    .map_err(|e| Error::Protocol(format!("fetching the plan: {e}")))?
-            })
-            .await?;
+        while let Some(mut fetching) = next.take() {
+            let page = tokio::select! {
+                page = &mut fetching => {
+                    page.map_err(|e| Error::Protocol(format!("fetching the plan: {e}")))??
+                }
+                _ = ctx.cancel.cancelled() => {
+                    fetching.abort();
+                    return Err(Error::Cancelled);
+                }
+            };
             if first {
                 first = false;
                 let header = page
@@ -928,6 +950,14 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     if ctx.pausing() {
         return;
     }
+    // Its own partial file, if an earlier sync left one, is no spare: taken
+    // now, before a later put could reclaim it.
+    if valid_path(&put.path) && is_hash(&put.hash) && !protected(&ctx.options, &put.path) {
+        ctx.spare
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partial_name(&put.hash, &put.path));
+    }
     ctx.stats.owed.fetch_add(put.size, Ordering::Relaxed);
     let c = ctx.clone();
     puts.spawn(async move {
@@ -1082,11 +1112,6 @@ async fn download(
         ));
     }
     let name = partial_name(&put.hash, &put.path);
-    // Its own partial file, if an earlier sync left one, is no spare.
-    ctx.spare
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&name);
     let verify = ctx.options.verify_hashes;
     let mut net = Some(net);
     let mut tries = 0;

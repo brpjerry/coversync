@@ -16,6 +16,7 @@ const BATCH: usize = 5000;
 pub(crate) struct Facts {
     storage: Arc<dyn Storage>,
     inner: Mutex<Inner>,
+    lost: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -53,6 +54,7 @@ impl Facts {
                 unconfirmed,
                 failed: Vec::new(),
             }),
+            lost: Default::default(),
         }
     }
 
@@ -87,9 +89,16 @@ impl Facts {
         line.push(b'\n');
         let mut i = self.lock();
         if let Err(e) = self.storage.append_journal(&line) {
-            tracing::debug!("couldn't journal a fact: {e}");
+            tracing::warn!("couldn't journal a fact: {e}");
+            self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         i.unconfirmed.push(fact);
+    }
+
+    /// A fact couldn't be journaled: it lives only in memory until the
+    /// server confirms it.
+    pub(crate) fn lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn failed(&self, failure: Failure) {
