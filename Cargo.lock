@@ -444,6 +444,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "coversync-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coversync-desktop-core",
+ "coversync-proxy",
+ "coversync-replica",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "coversync-core"
 version = "0.1.0"
 dependencies = [
@@ -542,6 +559,7 @@ dependencies = [
  "base64",
  "blake3",
  "clap",
+ "coversync-cli",
  "coversync-core",
  "coversync-protocol",
  "coversync-replica",

@@ -2,26 +2,28 @@
 #
 # Builds from the release tarball. packaging/arch/build.sh puts a tarball of
 # the checkout in its place, so CI packages exactly the commit it tested.
+#
+# Two packages: the server (coversync), and the sync agent for a computer
+# that keeps a copy of a server's Library (coversync-agent). The agent needs
+# no server of its own.
 
-pkgname=coversync
+pkgbase=coversync
+pkgname=(coversync coversync-agent)
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Music library manager and tag editor that serves its UI to the browser'
 arch=('x86_64')
 url='https://github.com/brpjerry/coversync'
 license=('AGPL-3.0-or-later')
-depends=('glibc' 'libgcc')
 makedepends=('cargo' 'cargo-about' 'nodejs' 'pnpm')
-optdepends=('chromaprint: audio fingerprints (fpcalc) for Smart suggestions')
 # makepkg's LTO flags turn the C in ring and SQLite into GCC bitcode that
 # rust-lld can't link; the release profile has LTO of its own. And nothing
 # would publish a -debug package.
 options=('!lto' '!debug')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   # Every platform's crates: cargo-about reads the whole lockfile's metadata.
   cargo fetch --locked
@@ -29,26 +31,44 @@ prepare() {
 }
 
 build() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   # The daemon embeds web/build, so the UI comes first.
   pnpm --dir web build
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p coversyncd
+  cargo build --frozen --release -p coversyncd -p coversync-cli
   packaging/notices/generate.sh THIRD-PARTY-NOTICES
+  packaging/notices/generate.sh --agent THIRD-PARTY-NOTICES-agent
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  cd "$pkgbase-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo test --frozen --release --workspace
 }
 
-package() {
-  cd "$pkgname-$pkgver"
+package_coversync() {
+  pkgdesc='Music library manager and tag editor that serves its UI to the browser'
+  depends=('glibc' 'libgcc')
+  optdepends=('chromaprint: audio fingerprints (fpcalc) for Smart suggestions')
+
+  cd "$pkgbase-$pkgver"
   install -Dm755 target/release/coversyncd -t "$pkgdir/usr/bin/"
   install -Dm644 packaging/arch/coversyncd.service -t "$pkgdir/usr/lib/systemd/user/"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 THIRD-PARTY-NOTICES -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_coversync-agent() {
+  pkgdesc="Keeps a folder in step with a coversync server's Library, in the background"
+  depends=('glibc' 'libgcc')
+  optdepends=('networkmanager: auto sync on unmetered networks only'
+              'upower: auto sync while charging only'
+              'gnome-keyring: a keychain for the token (KeePassXC and KWallet do too)')
+
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/coversync -t "$pkgdir/usr/bin/"
+  install -Dm644 packaging/arch/coversync-agent.service -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 THIRD-PARTY-NOTICES-agent "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES"
 }

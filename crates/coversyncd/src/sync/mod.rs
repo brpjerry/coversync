@@ -8,6 +8,8 @@
 //! difference, in the order the device carries it out. Devices make
 //! outgoing requests only; nothing here reaches out to them.
 
+#[cfg(test)]
+mod agent_tests;
 mod api;
 #[cfg(test)]
 mod engine_tests;

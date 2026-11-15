@@ -99,7 +99,7 @@ impl fmt::Display for PairError {
 impl std::error::Error for PairError {}
 
 impl PairError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: None,
