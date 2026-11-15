@@ -757,6 +757,16 @@ async fn the_watch_says_when_to_sync() {
             reason: Reason::Wake
         }
     );
+    // The stream opening (say while that sync runs) reads the status again
+    // for the settings, but leaves the work it finds to the stream's first
+    // event: no second sync straight after the first, only the event's,
+    // once quiet, which the sync reaching that target would drop.
+    assert_eq!(
+        next(&mut w).await,
+        Trigger {
+            reason: Reason::Event
+        }
+    );
     let r = sync(&e).await;
     w.synced(r.target.as_deref());
     assert_eq!(tree(&root), d.files());
