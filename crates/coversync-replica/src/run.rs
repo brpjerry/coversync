@@ -153,6 +153,8 @@ struct Stats {
     deleted: AtomicU64,
     failed: AtomicU64,
     gone: AtomicU64,
+    /// Gone in the last plan, which no fresh plan has made up for.
+    gone_last: AtomicU64,
     puts_total: AtomicU64,
     bytes_total: AtomicU64,
     /// Bytes still to arrive for the downloads under way.
@@ -463,6 +465,16 @@ async fn session(
             )),
             Again::No,
         ),
+        // Files that changed on the server mid-sync come in a later plan,
+        // once the server has hashed them again.
+        (Ok(()), None) if s.gone_last.load(Ordering::Relaxed) > 0 => (
+            Outcome::Partial,
+            Some(format!(
+                "{} files changed on the server during the sync",
+                s.gone_last.load(Ordering::Relaxed)
+            )),
+            Again::After(Duration::from_secs(15)),
+        ),
         (Ok(()), None) if report.failed > 0 => (
             Outcome::Partial,
             Some(format!("{} files failed", report.failed)),
@@ -606,6 +618,7 @@ async fn run_plans(
     let mut result = Ok(());
     for _ in 0..MAX_PLANS {
         ctx.changed.store(false, Ordering::Relaxed);
+        ctx.stats.gone_last.store(0, Ordering::Relaxed);
         result = plan(ctx, report).await;
         if result.is_err() || ctx.halt.is_cancelled() {
             break;
@@ -1026,6 +1039,7 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
             Ok(()) => {}
             Err(Halt::Gone) => {
                 c.stats.gone.fetch_add(1, Ordering::Relaxed);
+                c.stats.gone_last.fetch_add(1, Ordering::Relaxed);
             }
             Err(Halt::File(error, detail)) => {
                 tracing::info!(path = put.path, error, detail, "a download failed");
@@ -1237,7 +1251,13 @@ async fn download(
                 }
                 true
             }
-            StatusCode::GONE => return Err(Halt::Gone),
+            StatusCode::GONE => {
+                // Of content that left the target: its room goes back.
+                let s = ctx.storage.clone();
+                let n = name.clone();
+                let _ = blocking(move || s.remove_partial(&n)).await;
+                return Err(Halt::Gone);
+            }
             StatusCode::UNAUTHORIZED => return Err(Halt::Stop(Stop::Unauthorized)),
             StatusCode::RANGE_NOT_SATISFIABLE => {
                 let s = ctx.storage.clone();
@@ -1253,9 +1273,10 @@ async fn download(
                 continue;
             }
             status => {
-                let body = read_all(res.into_body(), IDLE_TIMEOUT)
-                    .await
-                    .unwrap_or_default();
+                let body = tokio::select! {
+                    body = read_all(res.into_body(), IDLE_TIMEOUT) => body.unwrap_or_default(),
+                    _ = ctx.cancel.cancelled() => return Err(Halt::Cancelled),
+                };
                 let e = refusal(status, &body);
                 if e.is_transient() {
                     tries += 1;
@@ -1435,7 +1456,11 @@ fn hash_into(
         if cancel.is_cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
-        let n = r.read(&mut buf)?;
+        let n = match r.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(());
         }
@@ -1530,3 +1555,20 @@ fn finish(
 }
 
 use std::io::Write as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_names_ignore_case_in_any_script() {
+        let options = Options {
+            protected: vec![".rockbox".into(), "MÚSICA".into()],
+            ..Default::default()
+        };
+        assert!(protected(&options, ".ROCKBOX/config.cfg"));
+        assert!(protected(&options, "música/track.flac"));
+        assert!(!protected(&options, "musica/track.flac"));
+        assert!(!protected(&options, "Artist/.rockbox"));
+    }
+}

@@ -356,6 +356,9 @@ struct Events {
     buf: Vec<u8>,
     event: String,
     data: String,
+    /// When bytes last came: the idle limit runs from then, however often
+    /// a wait for them is cut short (a status check, the caller's select!).
+    heard_at: Instant,
 }
 
 impl Events {
@@ -381,6 +384,7 @@ impl Events {
             buf: Vec::new(),
             event: String::new(),
             data: String::new(),
+            heard_at: Instant::now(),
         })
     }
 
@@ -427,8 +431,12 @@ impl Events {
             if self.buf.len() > 1 << 20 {
                 return Err(Error::Protocol("an event too long".into()));
             }
-            match next_chunk(&mut self.body, idle).await? {
-                Some(chunk) => self.buf.extend_from_slice(&chunk),
+            let left = (self.heard_at + idle).saturating_duration_since(Instant::now());
+            match next_chunk(&mut self.body, left).await? {
+                Some(chunk) => {
+                    self.heard_at = Instant::now();
+                    self.buf.extend_from_slice(&chunk);
+                }
                 None => return Ok(None),
             }
         }
