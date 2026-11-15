@@ -285,10 +285,12 @@ async fn save_sync_settings(
     let sync = blocking(move || {
         let saved = s.auth.store.set_device_sync(id, &settings)?;
         if saved.is_some() {
-            // Other browsers showing Sync setup read it again.
+            // Other browsers showing Sync setup read it again, and the
+            // device, if it's listening, hears its target may have changed.
             s.events.publish(Notice::SetupSaved {
                 setup: events::Setup::Sync,
             });
+            s.sync.changed();
         }
         Ok::<_, rusqlite::Error>(saved)
     })
@@ -405,6 +407,7 @@ async fn remove(
     // A code that would have brought it back goes too, as do its paths.
     state.auth.pairings().forget_device(id);
     state.device_paths.forget(id);
+    state.sync.forget(id);
     tracing::info!(device = id, "removed a device");
     Ok(StatusCode::NO_CONTENT.into_response())
 }

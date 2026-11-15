@@ -161,6 +161,8 @@ fn registered_paths() -> Vec<String> {
         include_str!("mod.rs"),
         include_str!("devices.rs"),
         include_str!("../uploads.rs"),
+        include_str!("../sync/api.rs"),
+        include_str!("../sync/setup.rs"),
     ] {
         for (at, _) in source.match_indices(".route(") {
             let Some(rest) = source[at + ".route(".len()..]

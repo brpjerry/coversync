@@ -49,8 +49,6 @@ pub struct Device<'a> {
 pub struct Plan {
     pub ops: Vec<Op>,
     pub totals: Totals,
-    /// Puts left out because they failed before.
-    pub held_back: u64,
 }
 
 /// Every folder `path` is in, nearest last ("a/b/c" gives "a", "a/b").
@@ -92,7 +90,6 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     let mut moves = Vec::new();
     let mut puts = Vec::new();
     let mut moved: HashSet<&str> = HashSet::new();
-    let mut held_back = 0;
     for entry in target {
         if inventory
             .get(&entry.path)
@@ -104,7 +101,6 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
             .held_back
             .contains(&(entry.path.clone(), entry.hash.clone()))
         {
-            held_back += 1;
             continue;
         }
         if let Some(from) = sources.get_mut(entry.hash.as_str()).and_then(|list| {
@@ -274,11 +270,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     }));
     ops.extend(rmdirs.into_iter().map(|p| Op::Rmdir { path: p.into() }));
     ops.extend(put_ops);
-    Plan {
-        ops,
-        totals,
-        held_back,
-    }
+    Plan { ops, totals }
 }
 
 /// Moves in an order where each goes into a free path: one whose file is
@@ -576,6 +568,5 @@ mod tests {
             },
         );
         assert_eq!(plan.ops.iter().map(short).collect::<Vec<_>>(), ["put b"]);
-        assert_eq!(plan.held_back, 1);
     }
 }

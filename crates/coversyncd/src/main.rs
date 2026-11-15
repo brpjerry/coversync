@@ -90,6 +90,8 @@ pub struct AppState {
     pub events: events::Events,
     /// Each device's Library paths, as last worked out.
     pub device_paths: coversync_core::sync::PathCache,
+    /// Devices' syncs: their targets, inventories and sessions.
+    pub sync: sync::SyncState,
 }
 
 impl AppState {
@@ -143,6 +145,7 @@ pub type Shared = Arc<AppState>;
 fn app(state: Shared) -> Router {
     api::router()
         .merge(uploads::router())
+        .merge(sync::router())
         .merge(auth::router())
         .merge(web::router())
         // Every /api route but the few auth::router opens needs a login.
@@ -298,6 +301,7 @@ async fn run() -> anyhow::Result<()> {
     }
     let covers = CoverCache::new(cache_dir.join("covers"))?;
     let auth = auth::Auth::open(&state_dir)?;
+    let sync = sync::SyncState::open(&state_dir, &cache_dir)?;
 
     let state = Arc::new(AppState {
         lib,
@@ -317,9 +321,11 @@ async fn run() -> anyhow::Result<()> {
         uploads: Uploads::default(),
         events: events::Events::default(),
         device_paths: Default::default(),
+        sync,
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
     uploads::follow_folder(&state);
+    sync::spawn_watcher(state.clone());
     spawn_scan(state.clone());
     tokio::spawn(uploads::housekeeping(state.clone()));
 
@@ -368,6 +374,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         uploads: Uploads::default(),
         events: events::Events::default(),
         device_paths: Default::default(),
+        sync: sync::SyncState::open(&state_dir, &dir.join("cache")).unwrap(),
     })
 }
 

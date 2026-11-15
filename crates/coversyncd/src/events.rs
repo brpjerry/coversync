@@ -79,6 +79,10 @@ pub enum Notice {
         /// "done" or "failed", as `/api/identify/{album_id}` reports it.
         state: &'static str,
     },
+    /// A device's sync moved on: a session started, progressed or ended,
+    /// or Sync setup changed something. Its state is at
+    /// `/api/devices/{device}/sync/state`.
+    DeviceSync { device: i64 },
 }
 
 impl Notice {
@@ -91,6 +95,7 @@ impl Notice {
             Notice::AlbumChanged { .. } => "album_changed",
             Notice::SetupSaved { .. } => "setup_saved",
             Notice::LookupFinished { .. } => "lookup_finished",
+            Notice::DeviceSync { .. } => "device_sync",
         }
     }
 
@@ -132,6 +137,11 @@ impl Events {
     #[cfg(test)]
     pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
         self.notices.subscribe()
+    }
+
+    /// Becomes true when the daemon is shutting down.
+    pub fn closed(&self) -> watch::Receiver<bool> {
+        self.closed.subscribe()
     }
 
     /// Notices from now on, ending when [`Events::close`] is called.

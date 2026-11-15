@@ -199,6 +199,25 @@ impl Art {
         Ok(self.encoded(FILE_FORMATS)?.0)
     }
 
+    /// The cover file a device gets, and its extension: the image as a
+    /// cover file keeps it, or, when it's wider than `max_width`, scaled
+    /// down to that width, keeping its shape, as a baseline JPEG.
+    pub fn device_file(&self, max_width: Option<u32>) -> Result<(Vec<u8>, &'static str)> {
+        let Some(width) = max_width.filter(|w| self.width > *w) else {
+            return Ok((self.file_bytes()?, self.file_extension()));
+        };
+        let height = (u64::from(self.height) * u64::from(width) + u64::from(self.width) / 2)
+            / u64::from(self.width);
+        let img = image::load_from_memory(&self.data)?.resize_exact(
+            width,
+            (height as u32).max(1),
+            image::imageops::FilterType::Lanczos3,
+        );
+        let mut out = Cursor::new(Vec::new());
+        JpegEncoder::new_with_quality(&mut out, 90).encode_image(&img.to_rgb8())?;
+        Ok((out.into_inner(), "jpg"))
+    }
+
     /// The image as an embedded front cover.
     pub fn picture(&self) -> Result<Picture> {
         let (data, format) = self.encoded(EMBED_FORMATS)?;
@@ -292,5 +311,15 @@ mod tests {
         assert!(image::load_from_memory_with_format(pic.data(), ImageFormat::Jpeg).is_ok());
 
         assert!(Art::new(b"not an image".to_vec()).is_err());
+    }
+
+    #[test]
+    fn device_files_are_scaled_only_when_too_wide() {
+        let png = Art::new(image(ImageFormat::Png)).unwrap();
+        let (bytes, ext) = png.device_file(Some(8)).unwrap();
+        assert_eq!((ext, bytes), ("png", png.file_bytes().unwrap()));
+        let (bytes, ext) = png.device_file(Some(4)).unwrap();
+        let scaled = Art::new(bytes).unwrap();
+        assert_eq!((ext, scaled.width, scaled.height), ("jpg", 4, 3));
     }
 }

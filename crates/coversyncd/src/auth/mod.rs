@@ -19,7 +19,7 @@ mod limit;
 mod pairing;
 pub mod store;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{BufRead, IsTerminal};
 use std::net::{IpAddr, SocketAddr};
@@ -34,6 +34,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use coversync_core::sync::DeviceSync;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -119,6 +120,16 @@ impl Auth {
             #[cfg(test)]
             probe: Probe::default(),
         })
+    }
+
+    /// A device's sync settings, if there is such a device.
+    pub fn device_sync(&self, id: i64) -> rusqlite::Result<Option<DeviceSync>> {
+        self.store.device_sync(id)
+    }
+
+    /// Every device's sync settings, by device.
+    pub fn device_syncs(&self) -> rusqlite::Result<HashMap<i64, DeviceSync>> {
+        self.store.device_syncs()
     }
 
     /// The time the rate limits count by.
@@ -499,6 +510,7 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         Ok(access)
             if access.scope == Scope::Sync
                 && !SYNC_OPEN.contains(&req.uri().path())
+                && !req.uri().path().starts_with(crate::sync::DEVICE_ROUTES)
                 && !devices::sync_readable(req.method(), req.uri().path()) =>
         {
             error(

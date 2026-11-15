@@ -49,6 +49,10 @@ fn folder_image(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The art a source points at, as stored.
+pub fn read_art(source: &CoverSource) -> Result<Vec<u8>> {
+    read(source)
+}
+
 fn read(source: &CoverSource) -> Result<Vec<u8>> {
     match source {
         CoverSource::File(p) => Ok(fs::read(p)?),
