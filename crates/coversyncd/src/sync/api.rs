@@ -737,22 +737,26 @@ async fn plan_page(
 pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> Answer<Snapshot> {
     let target = target(state, device)?;
     let mut files = state.sync.store.files(device)?;
+    // Paths an earlier build took that the rules now refuse: left alone,
+    // as the device couldn't report doing anything with them.
+    files.inventory.retain(|path, _| valid_path(path));
+    files.other.retain(|path, _| valid_path(path));
     let st = state.sync.store.device(device)?;
     // A file already where it should be takes the owner the target gives
     // it now: an album retagged keeps its cover's path and bytes, but not
     // its id, which waiting for a new cover goes by.
-    let owners: Vec<(String, Option<i64>, String)> = files
+    let owners: Vec<(String, String, Option<i64>, String)> = files
         .inventory
         .iter()
         .filter_map(|(path, held)| {
             let e = target.at(path).filter(|e| e.hash == held.hash)?;
             (held.track != e.track || held.album.as_deref() != Some(e.album.as_str()))
-                .then(|| (path.clone(), e.track, e.album.clone()))
+                .then(|| (path.clone(), held.hash.clone(), e.track, e.album.clone()))
         })
         .collect();
     if !owners.is_empty() {
         state.sync.store.set_owners(device, &owners)?;
-        for (path, track, album) in owners {
+        for (path, _, track, album) in owners {
             if let Some(held) = files.inventory.get_mut(&path) {
                 held.track = track;
                 held.album = Some(album);
@@ -781,7 +785,7 @@ pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> 
                 held_back: &files.held_back,
                 remove_other: st.remove_other,
                 free_bytes,
-                keep: &|held| target.waits(held),
+                keep: &|path, held| target.waits(path, held),
                 fold_case: st.capabilities.case_insensitive,
             },
         )

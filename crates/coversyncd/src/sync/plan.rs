@@ -53,7 +53,7 @@ pub struct Device<'a> {
     /// Files whose copy on the device stays where it is: the new content
     /// of their track or cover is still being hashed or made, so it isn't
     /// in the target yet.
-    pub keep: &'a dyn Fn(&Held) -> bool,
+    pub keep: &'a dyn Fn(&str, &Held) -> bool,
     /// The device's storage ignores case in names.
     pub fold_case: bool,
 }
@@ -113,7 +113,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     let in_place = |path: &str, held: &Held| by_path.get(path).is_some_and(|e| e.hash == held.hash);
     // A file with no place in the target that stays all the same.
     let kept = |path: &str| {
-        !by_path.contains_key(path) && inventory.get(path).is_some_and(|h| (device.keep)(h))
+        !by_path.contains_key(path) && inventory.get(path).is_some_and(|h| (device.keep)(path, h))
     };
 
     let mut held: Vec<(&String, &Held)> = inventory.iter().collect();
@@ -503,7 +503,7 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: false,
                 free_bytes: None,
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: false,
             },
         );
@@ -612,7 +612,7 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: true,
                 free_bytes: None,
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: false,
             },
         );
@@ -641,7 +641,7 @@ mod tests {
                 remove_other: false,
                 // With the delete, 30 MB free after the 64 MB reserve.
                 free_bytes: Some(84 * mb),
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: false,
             },
         );
@@ -677,7 +677,7 @@ mod tests {
                 held_back: &held_back,
                 remove_other: false,
                 free_bytes: None,
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: false,
             },
         );
@@ -715,7 +715,7 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: false,
                 free_bytes: None,
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: true,
             },
         );
@@ -758,7 +758,7 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: false,
                 free_bytes: None,
-                keep: &|h| h.track == Some(7),
+                keep: &|_, h| h.track == Some(7),
                 fold_case: false,
             },
         );
@@ -782,7 +782,7 @@ mod tests {
                 remove_other: false,
                 // Only the reserve is free.
                 free_bytes: Some(64 * mb),
-                keep: &|_| false,
+                keep: &|_, _| false,
                 fold_case: false,
             },
         );

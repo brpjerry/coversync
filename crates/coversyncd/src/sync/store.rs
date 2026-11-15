@@ -170,6 +170,8 @@ impl Store {
         // the user's own, like any other.
         conn.execute_batch(
             "BEGIN;
+             UPDATE sync_devices SET remove_other = 0 WHERE device_id IN
+                (SELECT device_id FROM sync_inventory WHERE hash = 'unknown');
              INSERT OR REPLACE INTO sync_other (device_id, path, size)
                 SELECT device_id, path, size FROM sync_inventory WHERE hash = 'unknown';
              DELETE FROM sync_inventory WHERE hash = 'unknown';
@@ -351,21 +353,23 @@ impl Store {
         .collect()
     }
 
-    /// Say what files the device holds are of, by path: (path, track,
-    /// album).
+    /// Say what files the device holds are of: (path, the content seen
+    /// there, track, album). A file whose content changed meanwhile (a
+    /// report since) is left as that report made it.
     pub fn set_owners(
         &self,
         id: i64,
-        owners: &[(String, Option<i64>, String)],
+        owners: &[(String, String, Option<i64>, String)],
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         {
             let mut set = tx.prepare_cached(
-                "UPDATE sync_inventory SET track = ?3, album = ?4 WHERE device_id = ?1 AND path = ?2",
+                "UPDATE sync_inventory SET track = ?4, album = ?5
+                 WHERE device_id = ?1 AND path = ?2 AND hash = ?3",
             )?;
-            for (path, track, album) in owners {
-                set.execute(params![id, path, track, album])?;
+            for (path, hash, track, album) in owners {
+                set.execute(params![id, path, hash, track, album])?;
             }
         }
         tx.commit()

@@ -65,14 +65,21 @@ impl Target {
         self.paths.get(path).map(|&i| &self.entries[i])
     }
 
-    /// Whether a file the device holds is of a track or cover whose new
-    /// content isn't ready: its copy stays meanwhile, wherever it is. A
-    /// file the server doesn't know the owner of (one recorded before
-    /// owners were) stays while anything is being prepared.
-    pub fn waits(&self, held: &Held) -> bool {
+    /// Whether a file the device holds, at `path`, is of a track or cover
+    /// whose new content isn't ready: its copy stays meanwhile, wherever it
+    /// is. A cover also stays where a cover is being made, as its album may
+    /// have a new id since. A file the server doesn't know the owner of
+    /// (one recorded before owners were) stays while anything is being
+    /// prepared.
+    pub fn waits(&self, path: &str, held: &Held) -> bool {
         match (held.track, &held.album) {
             (Some(track), _) => self.waiting_tracks.contains(&track),
-            (None, Some(album)) => self.waiting_covers.contains(album),
+            (None, Some(album)) => {
+                self.waiting_covers.contains(album)
+                    || path
+                        .rsplit_once('.')
+                        .is_some_and(|(stem, _)| self.waiting_cover_stems.contains(stem))
+            }
             (None, None) => self.preparing > 0,
         }
     }
