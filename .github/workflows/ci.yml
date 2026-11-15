@@ -36,11 +36,12 @@ jobs:
       - name: Install the UI's dependencies
         working-directory: web
         run: pnpm install --frozen-lockfile
-      - name: Lint and type-check the UI
+      - name: Lint, type-check and test the UI
         working-directory: web
         run: |
           pnpm lint
           pnpm check
+          pnpm test
       # The daemon embeds web/build, so the UI is built before the crates.
       - name: Build the UI
         working-directory: web

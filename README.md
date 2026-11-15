@@ -49,9 +49,13 @@ used on a home server.
 - **Inbox setup**: Copy or Move, autofill for empty tags that are safe to
   assume (album artist from artist, track numbers from file names, …), and
   the uploads folder (see [Uploading albums](#uploading-albums)).
-- **Uploads**: albums sent to the server through the upload API land in the
-  uploads folder and show up in the Inbox. Uploading from the browser and
-  the desktop app is planned; `tools/upload.py` uploads a folder for now.
+- **Uploads**: drop album folders (or files) on the Inbox, or pick them with
+  the top bar's Upload button, and they go to the server's uploads folder and
+  show up in the Inbox, folders such as `CD1/` and `CD2/` kept. A panel shows
+  each upload's progress, with Cancel, and Show once its album is in the
+  Inbox (see [Uploading albums](#uploading-albums)). Uploading from the
+  desktop app, which resumes after the app restarts, is planned;
+  `tools/upload.py` uploads a folder from a terminal.
 - **Smart suggestions** (optional): the import dialog looks the album up on
   MusicBrainz, by Chromaprint fingerprints on AcoustID where it can, and
   otherwise by the barcode (or UPC) and ISRCs its files are tagged with, or
@@ -99,6 +103,7 @@ apps/desktop-linux/     Linux desktop app (Qt 6, Qt WebEngine), a window onto a 
 tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
 tools/player_stall.py   the player's buffering spinner while audio stalls, in headless Firefox
 tools/upload.py         uploads an album folder through the upload API
+tools/browser_upload.py the same through the web UI, in headless Firefox or Chromium, timed
 packaging/arch/         PKGBUILD and systemd user unit for the pacman package
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
@@ -271,6 +276,18 @@ start over, as what was written to them may have been lost; so does a file
 that's missing or shorter than its progress says. An upload no chunk reaches
 for a day is removed, as are uploads in progress when the uploads folder
 changes.
+
+**From the browser**, drop album folders or files on the Inbox, or use the
+top bar's Upload button (**A folder…** or **Files…**). Each folder is one
+upload, named after it, with the folders inside it kept; loose files go
+together into one named `Upload`. Hidden files, and kinds uploads don't take,
+are left out, and the panel says how many. The page sends several chunks at
+once (up to 32 requests and 128 MiB over HTTP/2, four requests over HTTP/1.1,
+which leaves room for the page's own), one upload after another without a
+pause between them. If the connection drops or coversyncd restarts, it asks
+how far each file got and sends the rest, for as long as the page stays open.
+A page can't read the files again after a reload, so leaving the page asks
+first, and cancels the uploads under way on the server as it goes.
 
 A reverse proxy in front must let request bodies of the chunk size through
 and stream them. Caddy sets no body limit and streams by default; nginx's
@@ -599,10 +616,11 @@ warnings show either way. The fallback page has no build step.
 ```sh
 (cd web && pnpm dev)        # Vite on :5173, proxying /api to 127.0.0.1:8770
 cargo test --workspace && cargo clippy --workspace --all-targets
-(cd web && pnpm check)
+(cd web && pnpm check && pnpm test)
 COVERSYNC_PASSWORD=… tools/ui_smoke.py http://127.0.0.1:8770/ shots/   # read-only tour of the UI
 COVERSYNC_PASSWORD=… tools/player_stall.py http://127.0.0.1:8770/       # the player's spinner through stalls
 COVERSYNC_PASSWORD=… tools/upload.py http://127.0.0.1:8770/ ~/Music/Album   # upload a folder
+COVERSYNC_PASSWORD=… tools/browser_upload.py http://127.0.0.1:8770/ ~/Music/Album   # the same through the UI, timed
 ```
 
 A scratch daemon gets a password with
@@ -614,8 +632,8 @@ albums: run them only against a daemon with a scratch `--state-dir` and
 Library folder.
 
 For every pull request and push to `main`, CI (`.github/workflows/ci.yml`) runs
-`pnpm lint`, `pnpm check`, rustfmt, Clippy with warnings as errors and the
-tests, and builds the pacman package.
+`pnpm lint`, `pnpm check`, the UI's tests (`pnpm test`), rustfmt, Clippy with
+warnings as errors and the tests, and builds the pacman package.
 
 Changes to the desktop app or its proxy also run
 `.github/workflows/desktop.yml`, which builds the app against Qt, in an Arch
