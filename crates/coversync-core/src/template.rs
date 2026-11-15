@@ -4,6 +4,13 @@
 //! starts a folder; the file extension is added automatically. `{track_number}`
 //! is zero-padded to two digits. `{album:40}` keeps at most 40 characters of
 //! the value, cut at a word break when one is close.
+//!
+//! Every name a template makes can be written on Windows, SMB shares and
+//! FAT32 or exFAT cards: values have the characters those can't hold
+//! replaced, a template's own text can't have them, names Windows keeps
+//! for devices (CON, NUL, COM1, …) get a `_` in front, and no name ends in
+//! a dot or space, is `..`, or is longer than [`MAX_NAME`] bytes. How long
+//! a whole path may be is up to where it goes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -79,7 +86,7 @@ impl Template {
                     }
                     Some(i) => {
                         if i > 0 {
-                            parts.push(Part::Text(rest[..i].to_string()));
+                            parts.push(text(&rest[..i])?);
                         }
                         let Some(end) = rest[i..].find('}') else {
                             return invalid(format!("Unclosed {{ in '{raw}'."));
@@ -107,7 +114,7 @@ impl Template {
                         rest = &rest[i + end + 1..];
                     }
                     None => {
-                        parts.push(Part::Text(rest.to_string()));
+                        parts.push(text(rest)?);
                         rest = "";
                     }
                 }
@@ -212,6 +219,9 @@ impl Template {
                 }
             }
             let mut name = finish(&text);
+            if reserved(&name) {
+                name = finish(&format!("_{name}"));
+            }
             if name.is_empty() {
                 name = "_".into();
             }
@@ -346,36 +356,26 @@ fn joins_previous(c: char) -> bool {
         | '\u{e0100}'..='\u{e01ef}')
 }
 
-/// Characters FAT32 and exFAT can't hold in a name, besides control ones.
-const FAT_ILLEGAL: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
+/// Characters a name can't hold on Windows, SMB shares, or FAT32 and
+/// exFAT cards, besides `/` and control characters. Values have them
+/// replaced (see [`clean`]); a template's own text can't have them.
+pub(crate) const NOT_IN_NAMES: &[char] = &['"', '*', ':', '<', '>', '?', '\\', '|'];
 
-/// One file or folder name as a FAT32 or exFAT card can hold it, and
-/// Windows can open it there. Characters those can't hold go, as do
-/// leading and trailing spaces and trailing dots. A name Windows keeps for
-/// a device (CON, NUL, COM1 and the like, with any extension) gets a `_` in
-/// front. A name longer than [`MAX_NAME`] bytes is cut (see [`cut`]), and a
-/// file keeps its extension. A name left empty is `_`.
-pub fn fat_name(name: &str, file: bool) -> String {
-    let clean: String = name
+/// Text a template writes as it is, if a name can hold it.
+fn text(t: &str) -> Result<Part> {
+    match t
         .chars()
-        .filter(|c| !c.is_control() && !FAT_ILLEGAL.contains(c))
-        .collect();
-    let (stem, ext) = if file {
-        split_extension(&clean)
-    } else {
-        (clean.as_str(), "")
-    };
-    let tidy = |s: &str| s.trim().trim_end_matches(['.', ' ']).to_string();
-    let max = MAX_NAME - ext.len();
-    let mut stem = tidy(cut(&tidy(stem), max));
-    // Checked once cut, which can leave a reserved name behind.
-    if reserved(&stem) {
-        stem = tidy(cut(&format!("_{stem}"), max));
-    }
-    if stem.is_empty() {
-        format!("_{ext}")
-    } else {
-        format!("{stem}{ext}")
+        .find(|c| c.is_control() || NOT_IN_NAMES.contains(c))
+    {
+        Some(c) => Err(Error::Invalid(format!(
+            "{} can't be in a file or folder name on Windows or a memory card; use - or _ instead.",
+            if c.is_control() {
+                "A control character".to_string()
+            } else {
+                format!("'{c}'")
+            }
+        ))),
+        None => Ok(Part::Text(t.to_string())),
     }
 }
 
@@ -391,8 +391,10 @@ pub fn split_extension(name: &str) -> (&str, &str) {
     }
 }
 
-/// Whether Windows keeps `stem` (up to its first dot) for a device.
-fn reserved(stem: &str) -> bool {
+/// Whether Windows keeps `stem` (up to its first dot) for a device, as
+/// CON, NUL, COM1 and the like, which FAT cards and SMB shares can't hold
+/// either. Such a name gets a `_` in front.
+pub(crate) fn reserved(stem: &str) -> bool {
     let base = stem.split('.').next().unwrap_or_default().trim_end();
     let upper = base.to_ascii_uppercase();
     if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) {
@@ -516,35 +518,31 @@ mod tests {
     }
 
     #[test]
-    fn fat_names() {
-        for (name, file, safe) in [
-            ("CON", false, "_CON"),
-            ("con.flac", true, "_con.flac"),
-            ("NUL .flac", true, "_NUL.flac"),
-            ("LPT¹", false, "_LPT¹"),
-            ("COM10", false, "COM10"),
-            ("Console", false, "Console"),
-            ("AC:DC? *Live* <1979>|\"", false, "ACDC Live 1979"),
-            ("a\\b/c\u{7}", false, "abc"),
-            ("Vol. 1... ", false, "Vol. 1"),
-            (" Track . .flac", true, "Track.flac"),
-            ("???", false, "_"),
-            ("?.flac", true, "_.flac"),
-            ("Mr. Brightside", false, "Mr. Brightside"),
+    fn names_windows_keeps_for_itself_get_a_mark() {
+        let t = Template::parse("{album}/{title}").unwrap();
+        for (album, title, path) in [
+            ("CON", "nul", "_CON/_nul.flac"),
+            ("Aux. Live", "LPT¹", "_Aux. Live/_LPT¹.flac"),
+            ("COM10", "Console", "COM10/Console.flac"),
         ] {
-            assert_eq!(fat_name(name, file), safe, "{name:?}");
+            let v = vals(&[("album", album), ("title", title)]);
+            assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from(path));
         }
-        // Cut to MAX_NAME bytes, keeping the extension, and never inside a
-        // character, between a letter and its accent, or inside an emoji.
-        let long = format!("{}.flac", "曲".repeat(100));
-        assert_eq!(fat_name(&long, true), format!("{}.flac", "曲".repeat(58)));
-        let accent = format!("{}e\u{301}x.flac", "a".repeat(174));
-        assert_eq!(fat_name(&accent, true), format!("{}.flac", "a".repeat(174)));
+        // Also when the length cut leaves one behind.
+        let padded = format!("CON{}X", " ".repeat(178));
+        let v = vals(&[("album", padded.as_str()), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("_CON/T.flac"));
+    }
+
+    #[test]
+    fn cuts_keep_characters_whole() {
+        // Never inside a character, between a letter and its accent, or
+        // inside an emoji.
+        assert_eq!(cut(&"曲".repeat(100), MAX_NAME), "曲".repeat(60));
+        let accent = format!("{}e\u{301}x", "a".repeat(179));
+        assert_eq!(cut(&accent, MAX_NAME), "a".repeat(179));
         let family = format!("{}👨\u{200d}👩", "b".repeat(170));
-        assert_eq!(fat_name(&family, false), "b".repeat(170));
-        // A name the cut leaves reserved is caught too.
-        let padded = format!("CON{}X.flac", " ".repeat(174));
-        assert_eq!(fat_name(&padded, true), "_CON.flac");
+        assert_eq!(cut(&family, MAX_NAME), "b".repeat(170));
     }
 
     #[test]
@@ -570,6 +568,9 @@ mod tests {
             "{album:-3}/{title}",
             "{album:999}/{title}",
             "{album:}/{title}",
+            "{album_artist}: {album}/{title}",
+            "{album}/{track_number} | {title}",
+            "{album}/a\\b {title}",
         ] {
             assert!(Template::parse(bad).is_err(), "{bad}");
         }

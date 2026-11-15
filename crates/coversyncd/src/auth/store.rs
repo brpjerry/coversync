@@ -1131,16 +1131,16 @@ mod tests {
     #[test]
     fn sync_settings_are_removed_with_their_device() {
         let s = store("sync-settings");
-        let fat = DeviceSettings {
-            fat_safe: true,
+        let own = DeviceSettings {
+            structure: Some("{album}/{title}".into()),
             ..Default::default()
         };
         let (a, _) = s.add_device("Player", Scope::Sync, 0).unwrap();
         let (b, _) = s.add_device("Phone", Scope::Manage, 0).unwrap();
-        assert_eq!(s.set_device_sync(a, &fat).unwrap().unwrap().version, 1);
+        assert_eq!(s.set_device_sync(a, &own).unwrap().unwrap().version, 1);
         // Unchanged, they keep their version (and the paths cached for it).
-        assert_eq!(s.set_device_sync(a, &fat).unwrap().unwrap().version, 1);
-        s.set_device_sync(b, &fat).unwrap();
+        assert_eq!(s.set_device_sync(a, &own).unwrap().unwrap().version, 1);
+        s.set_device_sync(b, &own).unwrap();
         s.remove_device(a).unwrap();
         let left: Vec<i64> = s
             .conn()
@@ -1151,7 +1151,7 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(left, [b]);
-        assert_eq!(s.set_device_sync(a, &fat).unwrap(), None);
+        assert_eq!(s.set_device_sync(a, &own).unwrap(), None);
     }
 
     #[test]

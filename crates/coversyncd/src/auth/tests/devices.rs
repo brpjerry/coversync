@@ -1382,7 +1382,7 @@ async fn an_app_reads_only_its_own_sync_settings() {
     let (player, player_token) = app.device(Scope::Sync);
     let (phone, phone_token) = app.device(Scope::Manage);
     let url = |id: i64, what: &str| format!("/api/devices/{id}/sync/{what}");
-    let settings = json!({ "fat_safe": true, "art": { "cover_name": "folder.jpg" } });
+    let settings = json!({ "art": { "cover_name": "folder.jpg", "max_width": 320 } });
     let res = app
         .call("PUT", &url(player, "settings"), &cookie, Some(settings))
         .await;
@@ -1428,7 +1428,7 @@ async fn an_app_reads_only_its_own_sync_settings() {
     let res = app
         .call("GET", &url(player, "settings"), &cookie, None)
         .await;
-    assert_eq!(body(res).await["settings"]["fat_safe"], json!(true));
+    assert_eq!(body(res).await["settings"]["art"]["max_width"], json!(320));
     let listed = app.devices(&cookie).await;
     let all = listed["devices"].as_array().unwrap();
     assert!(all.iter().all(|d| d["sync"].is_object()), "{listed}");

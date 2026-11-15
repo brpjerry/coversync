@@ -41,8 +41,6 @@ pub struct DeviceSettings {
     /// The device's own folder structure (see [`template`]). None: each
     /// file keeps its path in the Library.
     pub structure: Option<String>,
-    /// Names a FAT32 or exFAT card can hold (see [`template::fat_name`]).
-    pub fat_safe: bool,
     pub art: DeviceArt,
 }
 
@@ -79,17 +77,6 @@ impl DeviceSettings {
             Template::parse(structure)?;
         }
         self.art.cover_name = art::cover_file_name(&self.art.cover_name)?;
-        // A name kept while no cover file is written isn't checked.
-        if self.fat_safe
-            && self.art.cover_file
-            && template::fat_name(&self.art.cover_name, false) != self.art.cover_name
-        {
-            return Err(Error::Invalid(
-                "With FAT-safe names, the cover file name can't hold : ? * \" < > | or end in a \
-                 dot or space, nor be a name Windows keeps for itself, such as CON."
-                    .into(),
-            ));
-        }
         if let Some(width) = self.art.max_width
             && !ART_WIDTHS.contains(&width)
         {
@@ -160,7 +147,9 @@ pub struct DevicePaths {
 /// - With its own, the path comes from the track's tags. A variable the
 ///   track has no value for is left empty, and a name left empty is `_`, so
 ///   every track still goes to the device.
-/// - FAT-safe names go through [`template::fat_name`].
+/// - Either way, every name is one a FAT32 or exFAT card can hold, as
+///   import and templates make them (see [`template`]). How long a whole
+///   path may be is up to the device.
 /// - Tracks that would share a path, case aside (FAT, exFAT and Android's
 ///   shared storage ignore it), are kept apart: in order of their Library
 ///   paths, the first keeps it and the next get " (2)", " (3)" and so on.
@@ -182,7 +171,7 @@ pub fn device_paths(
     let mut files = Vec::with_capacity(catalog.tracks.len());
     for track in catalog.tracks {
         let path = match &template {
-            None => device_names(&track.path, settings.fat_safe),
+            None => track.path,
             Some(template) => {
                 let values = tag_values(&track.values, &kinds);
                 let ext = Path::new(&track.path)
@@ -191,7 +180,7 @@ pub fn device_paths(
                     .unwrap_or_default();
                 let (path, missing) = template.render_partial(&values, &ext);
                 incomplete += usize::from(!missing.is_empty());
-                device_names(&path.to_string_lossy(), settings.fat_safe)
+                path.to_string_lossy().into_owned()
             }
         };
         files.push(DeviceFile {
@@ -208,21 +197,6 @@ pub fn device_paths(
         renamed,
         files,
     })
-}
-
-/// A relative path with FAT-safe names, if asked for.
-fn device_names(path: &str, fat_safe: bool) -> String {
-    if !fat_safe {
-        return path.to_string();
-    }
-    let names: Vec<&str> = path.split('/').collect();
-    let last = names.len() - 1;
-    names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| template::fat_name(name, i == last))
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// The values of `kinds` among a track's stored tag values.
@@ -380,40 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn library_paths_go_as_they_are_or_fat_safe() {
-        let tracks = [
-            ("A/B/01 - x.flac", ""),
-            ("AC:DC/CON/x.flac", ""),
-            ("AC:DC/CON/x?.flac", ""),
-            ("a/b/01 - X.flac", ""),
-        ];
+    fn library_paths_go_as_they_are() {
+        let tracks = [("A/B/01 - x.flac", ""), ("a/b/01 - X.flac", "")];
         // Only a name that differs by case alone is numbered.
         let (got, _, renamed) = paths(&tracks, DeviceSettings::default());
-        assert_eq!(
-            got,
-            [
-                "A/B/01 - x.flac",
-                "AC:DC/CON/x.flac",
-                "AC:DC/CON/x?.flac",
-                "a/b/01 - X (2).flac"
-            ]
-        );
+        assert_eq!(got, ["A/B/01 - x.flac", "a/b/01 - X (2).flac"]);
         assert_eq!(renamed, 1);
-        let fat = DeviceSettings {
-            fat_safe: true,
-            ..Default::default()
-        };
-        let (got, _, renamed) = paths(&tracks, fat);
-        assert_eq!(
-            got,
-            [
-                "A/B/01 - x.flac",
-                "ACDC/_CON/x.flac",
-                "ACDC/_CON/x (2).flac",
-                "a/b/01 - X (2).flac"
-            ]
-        );
-        assert_eq!(renamed, 2);
     }
 
     #[test]
@@ -456,28 +402,21 @@ mod tests {
             "track_number":"1/10","title":"Highway to Hell"}"#;
         let gaps = r#"{"album":"Highway to Hell","track_number":"2","title":"Girls Got Rhythm"}"#;
         let tracks = [("x/1.flac", full), ("x/2.FLAC", gaps), ("y/1.flac", full)];
-        let own = |fat_safe| DeviceSettings {
-            structure: Some("{album_artist}/{year} - {album}/{track_number}: {title}".into()),
-            fat_safe,
+        let own = DeviceSettings {
+            structure: Some("{album_artist}/{year} - {album}/{track_number}. {title}".into()),
             ..Default::default()
         };
-        let (got, incomplete, renamed) = paths(&tracks, own(false));
+        let (got, incomplete, renamed) = paths(&tracks, own);
         assert_eq!(
             got,
             [
-                "AC-DC/1979 - Highway to Hell/01: Highway to Hell.flac",
+                "AC-DC/1979 - Highway to Hell/01. Highway to Hell.flac",
                 // No album artist or year: those parts are left empty.
-                "_/- Highway to Hell/02: Girls Got Rhythm.flac",
-                "AC-DC/1979 - Highway to Hell/01: Highway to Hell (2).flac",
+                "_/- Highway to Hell/02. Girls Got Rhythm.flac",
+                "AC-DC/1979 - Highway to Hell/01. Highway to Hell (2).flac",
             ]
         );
         assert_eq!((incomplete, renamed), (1, 1));
-        // FAT-safe names also leave out what the template itself writes.
-        let (got, _, _) = paths(&tracks, own(true));
-        assert_eq!(
-            got[0],
-            "AC-DC/1979 - Highway to Hell/01 Highway to Hell.flac"
-        );
     }
 
     #[test]

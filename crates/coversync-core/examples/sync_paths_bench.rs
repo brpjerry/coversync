@@ -1,7 +1,7 @@
 //! Time working out where every Library file goes on a device: the catalog
 //! read and the paths, for the Library's folder structure and a device's
-//! own, each with and without FAT-safe names, and for one that puts
-//! thousands of files at the same path, to be numbered.
+//! own, and for one that puts thousands of files at the same path, to be
+//! numbered.
 //!
 //! Usage: cargo run --release -p coversync-core --example sync_paths_bench -- STATE [--create]
 //!
@@ -25,16 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("created the Library database in {folder}");
         return Ok(());
     }
-    for (structure, fat_safe) in [
-        (None, false),
-        (None, true),
-        (Some(DEFAULT), false),
-        (Some(DEFAULT), true),
-        (Some("{genre}"), false),
-    ] {
+    for structure in [None, Some(DEFAULT), Some("{genre}")] {
         let settings = DeviceSettings {
             structure: structure.map(str::to_string),
-            fat_safe,
             ..Default::default()
         };
         for _ in 0..5 {
@@ -48,7 +41,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 serde_json::json!({
                     "structure": structure.unwrap_or("Library's"),
-                    "fat_safe": fat_safe,
                     "files": paths.files.len(),
                     "incomplete": paths.incomplete,
                     "renamed": paths.renamed,

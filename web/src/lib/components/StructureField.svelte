@@ -164,9 +164,7 @@
 				<p class="muted">Nothing in the Inbox to preview with yet.</p>
 			{/each}
 			{#if device && preview.examples.length}
-				<p class="requires">
-					Inbox files as examples, before FAT-safe names and numbers for names that clash.
-				</p>
+				<p class="requires">Inbox files as examples, before numbers for names that clash.</p>
 			{/if}
 			{#if preview.requires.length && device}
 				<p class="requires">

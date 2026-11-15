@@ -470,8 +470,6 @@ export interface Device {
 export interface DeviceSettings {
 	/** Its own folder structure; null keeps each file's path in the Library. */
 	structure: string | null;
-	/** Names a FAT32 or exFAT card can hold. */
-	fat_safe: boolean;
 	art: {
 		/** Write each album's cover as a file beside its tracks. */
 		cover_file: boolean;

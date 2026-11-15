@@ -11,7 +11,7 @@ use image::{ImageFormat, ImageReader};
 use lofty::picture::{MimeType, Picture, PictureType};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, template};
 
 /// Stands for album art among required tag kinds in attention flags.
 pub const ART: &str = "album_art";
@@ -76,9 +76,17 @@ pub fn cover_file_name(typed: &str) -> Result<String> {
     if name.is_empty() {
         name = FILE_NAMES[0];
     }
-    if name.contains(['/', '\\', '\0']) || name.starts_with('.') || name.chars().count() > 64 {
+    if name.contains('/')
+        || name.contains(template::NOT_IN_NAMES)
+        || name.chars().any(char::is_control)
+        || name.starts_with('.')
+        || template::reserved(name)
+        || name.chars().count() > 64
+    {
         return Err(Error::Invalid(
-            "The cover file name can't contain slashes or start with a dot.".into(),
+            "The cover file name can't contain / \\ : * ? \" < > |, start with a dot, or be \
+             a name Windows keeps for itself, such as CON."
+                .into(),
         ));
     }
     Ok(name.to_string())
@@ -219,6 +227,8 @@ mod tests {
         assert_eq!(rules("front.art").unwrap().file_name, "front.art");
         assert!(rules("art/cover").is_err());
         assert!(rules(".cover").is_err());
+        assert!(rules("art: front").is_err());
+        assert!(rules("CON").is_err());
     }
 
     #[test]

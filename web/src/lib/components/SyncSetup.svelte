@@ -87,7 +87,6 @@
 	let syncDraft = $state({
 		own: false,
 		structure: '',
-		fatSafe: false,
 		coverFile: true,
 		coverName: 'cover',
 		maxWidth: null as number | null
@@ -104,7 +103,6 @@
 			own: s.structure !== null,
 			// Its own starts from the Library's.
 			structure: s.structure ?? setup.saved.structure,
-			fatSafe: s.fat_safe,
 			coverFile: s.art.cover_file,
 			coverName: s.art.cover_name,
 			maxWidth: s.art.max_width
@@ -118,7 +116,6 @@
 		const settings: DeviceSettings = {
 			// Its own left blank is refused, not taken for the Library's.
 			structure: syncDraft.own ? syncDraft.structure : null,
-			fat_safe: syncDraft.fatSafe,
 			art: {
 				cover_file: syncDraft.coverFile,
 				cover_name: syncDraft.coverName,
@@ -135,7 +132,6 @@
 	function syncSummary(s: DeviceSettings) {
 		return [
 			s.structure ? `Folders as ${s.structure}` : "The Library's folders",
-			s.fat_safe && 'FAT-safe names',
 			s.art.cover_file ? `cover file “${s.art.cover_name}”` : 'no cover file',
 			s.art.max_width && `art at most ${s.art.max_width} px wide`
 		]
@@ -459,11 +455,6 @@
 												</p>
 											{/if}
 										</fieldset>
-										<Toggle
-											bind:checked={syncDraft.fatSafe}
-											label="FAT-safe names"
-											description="For memory cards and players formatted FAT32 or exFAT: names leave out : ? * &quot; < > | and trailing dots and spaces, steer clear of names Windows keeps for itself, such as CON, and stay short."
-										/>
 										<Toggle
 											bind:checked={syncDraft.coverFile}
 											label="Cover file"

@@ -39,7 +39,11 @@ used on a home server.
   `{album_artist}/{year} - {album}/{track_number} - {title}`.
   `{track_number}` is zero-padded and the extension is added. `{album:40}`
   keeps at most 40 characters of a value, cut at a word break when one is
-  close. Tags a template uses count as required on import. The rules and the
+  close. Every name it makes works on Windows, SMB shares and FAT32 or exFAT
+  cards: tag values have `/ \ : * ? " < > |` replaced, the template's own
+  text can't contain them, names Windows keeps for itself (CON, NUL, COM1,
+  …) get a `_` in front, and no name ends in a dot or space. Tags a template
+  uses count as required on import. The rules and the
   Library's index live in the Library folder itself (see
   [Moving the Library](#moving-the-library)).
 - **Import** (right-click an Inbox album): checks the rules and the template's
@@ -72,8 +76,8 @@ used on a home server.
 - **Sync** (planned): devices pair with the server from Sync setup, each with
   a token of its own (see [Pairing devices](#pairing-devices)), and the
   sidebar's Sync section lists them. Each device gets the whole Library, with
-  settings of its own in Sync setup: the Library's folders or its own, FAT-safe
-  names, and its art (a cover file, and the widest art). The server works out
+  settings of its own in Sync setup: the Library's folders or its own, and
+  its art (a cover file, and the widest art). The server works out
   every file's path on each device; copying the files comes later. Sync setup
   can turn the section off.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
