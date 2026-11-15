@@ -24,7 +24,7 @@ impl Source {
     pub async fn ready(&self) -> Result<(), String> {
         match self {
             Source::Keychain => Keychain::new(APP_ID).ready().await,
-            Source::File(_) => Ok(()),
+            Source::File(file) => writable(file),
         }
     }
 
@@ -81,9 +81,64 @@ impl Source {
     }
 }
 
+/// Whether a token could be written to `file`: its folder can be made and
+/// written in, and nothing but a file is in its place. Tried with a file
+/// of another name, so a token already there stays as it is.
+fn writable(file: &std::path::Path) -> Result<(), String> {
+    let cant = |why: String| format!("A token can't be kept in {}: {why}.", file.display());
+    if file.is_dir() {
+        return Err(cant("it's a folder".into()));
+    }
+    let dir = file
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(dir).map_err(|e| cant(e.to_string()))?;
+    let mut name = file.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.try", std::process::id()));
+    let probe = file.with_file_name(name);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+        .map_err(|e| cant(e.to_string()))?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Bugs caught: 0, False positives: 0
+    #[tokio::test]
+    async fn a_token_file_that_couldnt_be_written_is_known_before_pairing() {
+        let dir = std::env::temp_dir().join(format!("coversync-cli-ready-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Somewhere it can go, with the folder still to make: ready, and
+        // nothing left behind but the folder.
+        let fine = Source::File(dir.join("new/token"));
+        assert_eq!(fine.ready().await, Ok(()));
+        assert_eq!(fs::read_dir(dir.join("new")).unwrap().count(), 0);
+        // A token already there is left alone.
+        let token = Token::new("cst_kept").unwrap();
+        fine.save("https://a/", &token).await.unwrap();
+        assert_eq!(fine.ready().await, Ok(()));
+        assert_eq!(fine.load("https://a/").await.unwrap(), Some(token));
+        // A folder where the file would be, a file where its folder would
+        // be, and a folder that can't be written in.
+        assert!(Source::File(dir.join("new")).ready().await.is_err());
+        let under_a_file = Source::File(dir.join("new/token/deeper"));
+        assert!(under_a_file.ready().await.is_err());
+        let locked = dir.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = Source::File(locked.join("token")).ready().await;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err());
+    }
 
     // Bugs caught: 0, False positives: 0
     #[tokio::test]

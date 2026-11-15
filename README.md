@@ -668,7 +668,8 @@ systemctl --user status coversync-agent    # what it's doing, in a line
   device in Sync setup. Without the app, `coversync pair <server> <code>`
   takes a code from Add device and keeps the token in the keychain, or with
   `--token-file` in a file only you can read, for a computer with no
-  keychain.
+  keychain. With the app open, pair in its window: the keychain's token is
+  the app's too, and `coversync pair` waits for it to be closed.
 - **What's kept on the computer** is the server, the folder and, if one is
   used, where the token file is: in
   `~/.config/io.github.brpjerry.coversync/sync.json`, which `coversync setup`
@@ -687,7 +688,8 @@ systemctl --user status coversync-agent    # what it's doing, in a line
   now** is someone asking, and syncs whatever they say. A computer without
   NetworkManager or UPower counts as unmetered and on mains power. Until
   they have answered, a sync that depends on them waits, for ten seconds
-  at most: a service that says nothing by then is taken as not there.
+  at most: a service that says nothing by then is taken as not there, and
+  looked for again every minute.
 - **The server or the network being away** is waited out. A sync that failed
   is tried again after 30 seconds, then at doubling intervals up to 10
   minutes (5 minutes up to an hour for trouble with the folder).

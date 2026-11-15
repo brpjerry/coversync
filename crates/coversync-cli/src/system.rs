@@ -43,6 +43,9 @@ impl Conditions {
 /// How long a service gets to say how things are before the agent goes on
 /// as if it weren't there.
 const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often a service that wasn't there, or went away, is looked for
+/// again.
+const LISTEN_AGAIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Something happened that the server's event stream may have missed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,22 +103,39 @@ impl System {
                 match Connection::system().await {
                     Ok(bus) => {
                         // Each for itself: one that isn't there mustn't
-                        // keep the other's answer waiting.
+                        // keep the other's answer waiting. And each asked
+                        // again now and then: a service that starts after
+                        // the agent has things to say from then on.
                         let network = async {
-                            if let Err(e) = network(&bus, &conditions, &nudges).await {
-                                tracing::info!(
-                                    "not listening to NetworkManager ({e}): every network counts \
-                                     as unmetered"
-                                );
+                            let mut said = false;
+                            loop {
+                                let ended = network(&bus, &conditions, &nudges).await;
+                                if !std::mem::replace(&mut said, true) {
+                                    let why =
+                                        ended.err().map_or(String::new(), |e| format!(" ({e})"));
+                                    tracing::info!(
+                                        "not listening to NetworkManager{why}: every network \
+                                         counts as unmetered until it's there"
+                                    );
+                                }
                                 conditions.send_if_modified(|c| settle(c, true, false));
+                                tokio::time::sleep(LISTEN_AGAIN).await;
                             }
                         };
                         let power = async {
-                            if let Err(e) = power(&bus, &conditions).await {
-                                tracing::info!(
-                                    "not listening to UPower ({e}): the power counts as mains"
-                                );
+                            let mut said = false;
+                            loop {
+                                let ended = power(&bus, &conditions).await;
+                                if !std::mem::replace(&mut said, true) {
+                                    let why =
+                                        ended.err().map_or(String::new(), |e| format!(" ({e})"));
+                                    tracing::info!(
+                                        "not listening to UPower{why}: the power counts as mains \
+                                         until it's there"
+                                    );
+                                }
                                 conditions.send_if_modified(|c| settle(c, false, true));
+                                tokio::time::sleep(LISTEN_AGAIN).await;
                             }
                         };
                         let sleep = async {
