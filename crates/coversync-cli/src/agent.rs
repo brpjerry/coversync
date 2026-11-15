@@ -100,6 +100,8 @@ pub enum Hold {
     Off,
     Metered,
     Battery,
+    /// The desktop hasn't said yet what the network or the power is.
+    Finding,
     /// The folder was synced before and has lost coversync's marker.
     Emptied,
 }
@@ -110,6 +112,7 @@ impl Hold {
             Hold::Off => "Auto sync is off for this device.",
             Hold::Metered => "Waiting for an unmetered network.",
             Hold::Battery => "Waiting for this computer to be plugged in.",
+            Hold::Finding => "Finding out about the network and the power.",
             Hold::Emptied => {
                 "The folder has lost its coversync files: is its disk mounted? Sync now, in \
                  Sync setup, fills it again."
@@ -131,16 +134,104 @@ pub fn may_sync(
         return Ok(());
     }
     let auto = auto.unwrap_or_default();
+    // A condition the device sets holds until the desktop has said how
+    // things are: not knowing isn't leave to go ahead.
+    let held = |wanted: bool, state: Option<bool>, hold: Hold| match (wanted, state) {
+        (false, _) | (true, Some(false)) => None,
+        (true, Some(true)) => Some(hold),
+        (true, None) => Some(Hold::Finding),
+    };
     if !auto.enabled {
         Err(Hold::Off)
     } else if emptied {
         Err(Hold::Emptied)
-    } else if auto.wifi_only && now.metered {
-        Err(Hold::Metered)
-    } else if auto.charging_only && now.on_battery {
-        Err(Hold::Battery)
+    } else if let Some(hold) = held(auto.wifi_only, now.metered, Hold::Metered) {
+        Err(hold)
+    } else if let Some(hold) = held(auto.charging_only, now.on_battery, Hold::Battery) {
+        Err(hold)
     } else {
         Ok(())
+    }
+}
+
+/// The sync that's wanted, and when it may next be tried.
+#[derive(Debug, Default)]
+struct Pending {
+    reason: Option<Reason>,
+    /// Not before this: a failure's interval. None: as soon as it may.
+    not_before: Option<Instant>,
+}
+
+impl Pending {
+    /// A sync is wanted for `reason`, on top of any wanted already.
+    fn want(&mut self, reason: Reason) {
+        self.reason = Some(stronger(self.reason, reason));
+    }
+
+    /// The same sync again, `wait` from `now`.
+    fn retry(&mut self, reason: Reason, wait: Duration, now: Instant) {
+        self.want(reason);
+        self.not_before = Some(now + wait);
+    }
+
+    /// Whatever it was waiting out may be over: as soon as it may.
+    fn hurry(&mut self) {
+        self.not_before = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The sync to try now, if there is one and its time has come. A
+    /// deadline that has passed is done with: a sync that's then held for
+    /// another reason is looked at again at the usual interval, not at a
+    /// moment already gone.
+    fn due(&mut self, now: Instant) -> Option<Reason> {
+        if self.not_before.is_some_and(|at| at <= now) {
+            self.not_before = None;
+        }
+        self.reason.filter(|_| self.not_before.is_none())
+    }
+
+    /// When to look again with nothing else heard: at the deadline, or
+    /// after `interval` (a sync that's held, or settings that may have
+    /// changed without a word).
+    fn look_at(&self, now: Instant, interval: Duration) -> Instant {
+        match (self.reason, self.not_before) {
+            (Some(_), Some(at)) => at,
+            _ => now + interval,
+        }
+    }
+}
+
+/// What a sync's report leaves to do by itself: how long to wait before
+/// the same sync is tried again, if it is to be. `failures` counts the
+/// tries in a row that got nowhere.
+fn follow_up(report: &Report, failures: &mut u32) -> Option<Duration> {
+    let moved_on = report.files + report.moved + report.deleted > 0;
+    match (report.outcome, report.again) {
+        (Some(Outcome::Complete), _) => {
+            *failures = 0;
+            None
+        }
+        // The engine asks for another go (the network or the server was
+        // away, or the Library kept changing). Its interval is for a try
+        // that got somewhere; ones that don't are spaced out.
+        (_, Again::After(wait)) => {
+            *failures = if moved_on { 0 } else { *failures + 1 };
+            let doubled = wait.saturating_mul(1 << failures.saturating_sub(1).min(8));
+            Some(doubled.min(Duration::from_secs(600).max(wait)))
+        }
+        // The folder failed it as a whole (read-only, an error writing):
+        // nothing on the server will say when that's over.
+        (Some(Outcome::Failed), _) => {
+            *failures += 1;
+            Some(backoff(&Error::Storage(String::new()), *failures))
+        }
+        // Out of room, files held back, or the server preparing files:
+        // the next change, or someone, starts the next sync.
+        _ => None,
     }
 }
 
@@ -206,18 +297,32 @@ fn wait_text(wait: Duration) -> String {
 struct Folder {
     root: PathBuf,
     storage: Arc<FsStorage>,
-    /// The folder's device and inode when it was opened.
-    identity: (u64, u64),
+    /// The device and inode, when it was opened, of the folder and of the
+    /// engine's own folders in it, which the storage keeps open too.
+    identity: [(u64, u64); 3],
 }
 
-fn identity(root: &Path) -> std::io::Result<(u64, u64)> {
-    let meta = std::fs::metadata(root)?;
-    Ok((meta.dev(), meta.ino()))
+/// The folder at `root` and the engine's own two in it, by device and
+/// inode.
+fn identity(root: &Path) -> std::io::Result<[(u64, u64); 3]> {
+    let own = root.join(".coversync-replica");
+    let of = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok::<_, std::io::Error>((meta.dev(), meta.ino()))
+    };
+    let folder = std::fs::metadata(root)?;
+    Ok([
+        (folder.dev(), folder.ino()),
+        of(&own)?,
+        of(&own.join("partial"))?,
+    ])
 }
 
 impl Folder {
-    /// Whether the path still leads to the folder that was opened. A disk
-    /// mounted or unmounted there since makes it another one.
+    /// Whether the path still leads to the folder that was opened, with
+    /// the engine's own folders in it. A disk mounted or unmounted there
+    /// since makes it another one; so does emptying it, which takes the
+    /// folders the storage holds open away from under it.
     fn still_there(&self) -> bool {
         identity(&self.root).is_ok_and(|now| now == self.identity)
     }
@@ -249,6 +354,8 @@ struct Memory {
     file: Option<PathBuf>,
     this: Marked,
     marked_before: bool,
+    /// Whether the file says so too.
+    saved: bool,
 }
 
 impl Memory {
@@ -267,12 +374,15 @@ impl Memory {
             file: settings.state_file.clone(),
             this,
             marked_before,
+            saved: marked_before,
         }
     }
 
-    /// The folder has coversync's marker in it.
+    /// The folder has coversync's marker in it. Written down until that
+    /// works: a full disk today mustn't leave the next run without it.
     fn marked(&mut self) {
-        if std::mem::replace(&mut self.marked_before, true) {
+        self.marked_before = true;
+        if self.saved {
             return;
         }
         let Some(file) = &self.file else { return };
@@ -286,8 +396,9 @@ impl Memory {
             .and_then(|()| {
                 std::fs::write(file, serde_json::to_vec(&state).expect("state serializes"))
             });
-        if let Err(e) = written {
-            tracing::warn!("couldn't note the sync in {}: {e}", file.display());
+        match written {
+            Ok(()) => self.saved = true,
+            Err(e) => tracing::warn!("couldn't note the sync in {}: {e}", file.display()),
         }
     }
 }
@@ -425,8 +536,10 @@ async fn open_folder(
     loop {
         let path = root.to_owned();
         let opened = tokio::task::spawn_blocking(move || {
-            let identity = identity(&path)?;
-            Ok::<_, std::io::Error>((FsStorage::open(&path)?, identity))
+            // Opening makes the engine's own folders, which are part of
+            // what's told apart later.
+            let storage = FsStorage::open(&path)?;
+            Ok::<_, std::io::Error>((storage, identity(&path)?))
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e)));
@@ -483,9 +596,10 @@ enum Next {
 
 impl Session<'_> {
     async fn run(&mut self, carried: Option<Reason>) -> Ended {
-        // The sync that's wanted, and when it may be tried (None: now).
-        let mut wanted = carried;
-        let mut not_before: Option<Instant> = None;
+        let mut pending = Pending {
+            reason: carried,
+            not_before: None,
+        };
         let mut failures = 0u32;
         // Why it waits, as last said.
         let mut held: Option<Hold> = None;
@@ -497,7 +611,7 @@ impl Session<'_> {
             // is. (Turned on again, the watch asks the server for what was
             // left meanwhile.)
             let off = self.watch.auto().is_some_and(|auto| !auto.enabled);
-            if wanted.is_none() && off != off_shown {
+            if pending.reason.is_none() && off != off_shown {
                 off_shown = off;
                 self.shows.status(if off {
                     Hold::Off.text()
@@ -505,12 +619,18 @@ impl Session<'_> {
                     "Auto sync is on again."
                 });
             }
-            if let Some(reason) = wanted
-                && not_before.is_none_or(|at| at <= Instant::now())
+            let now = Instant::now();
+            // A sync the agent starts by itself keeps to the device's
+            // settings, so it waits for a new watch (after waking, or with
+            // the folder opened again) to have heard them: a server that
+            // can't say what they are can't be synced with either.
+            let settled = self.watch.auto().is_some();
+            if let Some(reason) = pending.due(now)
+                && (reason == Reason::User || settled)
             {
                 if !self.folder.still_there() {
                     tracing::info!("the folder isn't the one that was opened: opening it again");
-                    return Ended::Reopen(wanted);
+                    return Ended::Reopen(pending.reason);
                 }
                 let marked = self.folder.has_marker().await;
                 if marked {
@@ -521,30 +641,28 @@ impl Session<'_> {
                 match may_sync(reason, self.watch.auto(), conditions, emptied) {
                     Ok(()) => {
                         held = None;
-                        wanted = None;
-                        not_before = None;
+                        pending.clear();
                         let (next, queued) = self.sync(reason, &mut failures).await;
                         match next {
                             Next::Rest => {}
                             Next::Retry(reason, wait) => {
-                                wanted = Some(reason);
-                                not_before = Some(Instant::now() + wait);
+                                pending.retry(reason, wait, Instant::now());
                             }
-                            Next::Wait(reason) => wanted = Some(reason),
+                            Next::Wait(reason) => pending.want(reason),
                             Next::End(ended) => return ended,
                         }
                         // What the watch said meanwhile. Someone asking
                         // doesn't wait out a failure's interval.
                         if let Some(queued) = queued {
-                            wanted = Some(stronger(wanted, queued));
+                            pending.want(queued);
                             if queued == Reason::User {
-                                not_before = None;
+                                pending.hurry();
                             }
                         }
                         continue;
                     }
                     Err(Hold::Off) => {
-                        wanted = None;
+                        pending.clear();
                         held = None;
                         off_shown = true;
                         self.shows.status(Hold::Off.text());
@@ -559,26 +677,15 @@ impl Session<'_> {
                 }
             }
             // Wait for word: from the watch, the desktop, or the clock.
-            // Until the settings are heard, and while they say off, they
-            // are looked at again; so is a sync that waits.
-            let look_again = self.settings.look_again;
-            let unsettled = off_shown || self.watch.auto().is_none();
-            let clock = async {
-                match (wanted, not_before) {
-                    (Some(_), Some(at)) => tokio::time::sleep_until(at).await,
-                    (Some(_), None) => tokio::time::sleep(look_again).await,
-                    (None, _) if unsettled => tokio::time::sleep(look_again).await,
-                    (None, _) => std::future::pending().await,
-                }
-            };
+            let look = pending.look_at(Instant::now(), self.settings.look_again);
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ended::Stopped,
                 trigger = self.watch.next() => match trigger {
                     Ok(trigger) => {
                         tracing::debug!(?trigger, "time to sync");
-                        wanted = Some(stronger(wanted, trigger.reason));
+                        pending.want(trigger.reason);
                         // The server is there, and has something.
-                        not_before = None;
+                        pending.hurry();
                     }
                     Err(Error::Unauthorized) => return Ended::Refused,
                     Err(e) => {
@@ -597,11 +704,11 @@ impl Session<'_> {
                     Some(nudge) => {
                         self.nudged(nudge);
                         // Whatever kept a sync from working may be over.
-                        not_before = None;
+                        pending.hurry();
                     }
                     None => self.nudges_gone = true,
                 },
-                _ = clock => {}
+                _ = tokio::time::sleep_until(look) => {}
             }
         }
     }
@@ -702,7 +809,6 @@ impl Session<'_> {
         } else {
             match result {
                 Ok(report) => {
-                    *failures = 0;
                     tracing::info!(
                         outcome = ?report.outcome,
                         files = report.files,
@@ -721,10 +827,10 @@ impl Session<'_> {
                     if report.outcome == Some(Outcome::Complete) {
                         self.watch.synced(report.target.as_deref());
                     }
-                    match report.again {
-                        Again::After(wait) => Next::Retry(reason, wait),
+                    match follow_up(&report, failures) {
+                        Some(wait) => Next::Retry(reason, wait),
                         // The watch says when: the server's next target.
-                        Again::WhenChanged | Again::No => Next::Rest,
+                        None => Next::Rest,
                     }
                 }
                 // The network changed under the sync, which is likely
@@ -760,22 +866,13 @@ mod tests {
         wifi_only: true,
         charging_only: true,
     };
-    const FINE: Conditions = Conditions {
-        metered: false,
-        on_battery: false,
-    };
+    const FINE: Conditions = Conditions::FINE;
 
     // Bugs caught: 0, False positives: 0
     #[test]
     fn auto_sync_keeps_to_the_devices_conditions() {
-        let metered = Conditions {
-            metered: true,
-            ..FINE
-        };
-        let battery = Conditions {
-            on_battery: true,
-            ..FINE
-        };
+        let metered = Conditions::known(true, false);
+        let battery = Conditions::known(false, true);
         for reason in [Reason::Event, Reason::Timer, Reason::Wake] {
             assert_eq!(may_sync(reason, Some(AUTO), FINE, false), Ok(()));
             assert_eq!(
@@ -813,16 +910,143 @@ mod tests {
 
     // Bugs caught: 0, False positives: 0
     #[test]
-    fn sync_now_goes_ahead_whatever_the_conditions() {
-        let worst = Conditions {
-            metered: true,
-            on_battery: true,
+    fn what_the_desktop_hasnt_said_yet_isnt_taken_as_fine() {
+        let any = AutoSync {
+            wifi_only: false,
+            charging_only: false,
+            ..AUTO
         };
+        let network_only = AutoSync {
+            charging_only: false,
+            ..AUTO
+        };
+        for reason in [Reason::Event, Reason::Timer, Reason::Wake] {
+            assert_eq!(
+                may_sync(reason, Some(AUTO), Conditions::UNKNOWN, false),
+                Err(Hold::Finding)
+            );
+            // Only what the device sets has to be known.
+            assert_eq!(
+                may_sync(reason, Some(any), Conditions::UNKNOWN, false),
+                Ok(())
+            );
+            let power_unknown = Conditions {
+                metered: Some(false),
+                on_battery: None,
+            };
+            assert_eq!(
+                may_sync(reason, Some(network_only), power_unknown, false),
+                Ok(())
+            );
+            assert_eq!(
+                may_sync(reason, Some(AUTO), power_unknown, false),
+                Err(Hold::Finding)
+            );
+            // What is known to be in the way is said as that.
+            let metered = Conditions {
+                metered: Some(true),
+                on_battery: None,
+            };
+            assert_eq!(
+                may_sync(reason, Some(AUTO), metered, false),
+                Err(Hold::Metered)
+            );
+        }
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_retry_whose_time_has_come_and_is_then_held_waits_the_usual_interval() {
+        let (start, interval) = (Instant::now(), Duration::from_secs(30));
+        let mut pending = Pending::default();
+        assert_eq!(pending.due(start), None);
+        // Idle: looked at again now and then all the same (the settings).
+        assert_eq!(pending.look_at(start, interval), start + interval);
+
+        pending.retry(Reason::Event, Duration::from_secs(60), start);
+        assert_eq!(pending.due(start + Duration::from_secs(59)), None);
+        assert_eq!(
+            pending.look_at(start + Duration::from_secs(59), interval),
+            start + Duration::from_secs(60)
+        );
+        // Its time has come. Say the network is metered, so it's held:
+        // asked again, it's due each time, and the next look is an
+        // interval away, never at the moment that has passed.
+        let later = start + Duration::from_secs(61);
+        assert_eq!(pending.due(later), Some(Reason::Event));
+        assert_eq!(pending.look_at(later, interval), later + interval);
+        assert_eq!(pending.due(later + interval), Some(Reason::Event));
+        assert_eq!(
+            pending.look_at(later + interval, interval),
+            later + interval * 2
+        );
+
+        // Someone asking, or the network coming back, cuts a wait short.
+        pending.retry(Reason::Event, Duration::from_secs(600), later);
+        assert_eq!(pending.due(later), None);
+        pending.want(Reason::User);
+        pending.hurry();
+        assert_eq!(pending.due(later), Some(Reason::User));
+        pending.clear();
+        assert_eq!(pending.due(later), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_report_that_got_nowhere_is_followed_up_at_growing_intervals() {
+        let report = |outcome, again, files| Report {
+            outcome: Some(outcome),
+            again,
+            files,
+            ..Default::default()
+        };
+        let away = report(Outcome::Partial, Again::After(Duration::from_secs(30)), 0);
+        let mut failures = 0;
+        let waits: Vec<u64> = (0..7)
+            .map(|_| follow_up(&away, &mut failures).unwrap().as_secs())
+            .collect();
+        assert_eq!(waits, [30, 60, 120, 240, 480, 600, 600]);
+        // One that got somewhere starts over at the engine's interval.
+        let some = report(Outcome::Partial, Again::After(Duration::from_secs(30)), 4);
+        assert_eq!(
+            follow_up(&some, &mut failures),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(failures, 0);
+
+        // The folder failing the sync as a whole is tried again too, more
+        // rarely: nothing else would.
+        let broken = report(Outcome::Failed, Again::No, 0);
+        let waits: Vec<u64> = (0..5)
+            .map(|_| follow_up(&broken, &mut failures).unwrap().as_secs())
+            .collect();
+        assert_eq!(waits, [300, 600, 1200, 2400, 3600]);
+
+        // Done, or waiting for something only a change or a person ends.
+        assert_eq!(
+            follow_up(&report(Outcome::Complete, Again::No, 9), &mut failures),
+            None
+        );
+        assert_eq!(failures, 0);
+        let full = report(Outcome::Partial, Again::No, 0);
+        assert_eq!(follow_up(&full, &mut failures), None);
+        let preparing = report(Outcome::Partial, Again::WhenChanged, 0);
+        assert_eq!(follow_up(&preparing, &mut failures), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn sync_now_goes_ahead_whatever_the_conditions() {
+        let worst = Conditions::known(true, true);
         let off = AutoSync {
             enabled: false,
             ..AUTO
         };
         assert_eq!(may_sync(Reason::User, Some(AUTO), worst, true), Ok(()));
+        assert_eq!(
+            may_sync(Reason::User, Some(AUTO), Conditions::UNKNOWN, true),
+            Ok(())
+        );
         assert_eq!(may_sync(Reason::User, Some(off), worst, true), Ok(()));
         assert_eq!(may_sync(Reason::User, None, worst, true), Ok(()));
     }
@@ -910,5 +1134,22 @@ mod tests {
         // Another folder, or another server's copy, starts anew.
         assert!(!Memory::open(&settings("https://a/", "/other")).marked_before);
         assert!(!Memory::open(&settings("https://b/", "/music")).marked_before);
+
+        // Somewhere it can't be written for now: remembered for this run,
+        // and written down once it can be.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"a file where the folder would go").unwrap();
+        let elsewhere = || Settings {
+            state_file: Some(blocked.join("sync-state.json")),
+            ..settings("https://a/", "/music")
+        };
+        let mut memory = Memory::open(&elsewhere());
+        memory.marked();
+        assert!(memory.marked_before && !memory.saved);
+        assert!(!Memory::open(&elsewhere()).marked_before);
+        std::fs::remove_file(&blocked).unwrap();
+        memory.marked();
+        assert!(memory.saved);
+        assert!(Memory::open(&elsewhere()).marked_before);
     }
 }

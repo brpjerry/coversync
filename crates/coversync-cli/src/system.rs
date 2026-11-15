@@ -5,7 +5,9 @@
 //!
 //! A computer without one of these services is taken to be on an unmetered
 //! network and on mains power: a server or a desktop with systemd-networkd
-//! has nothing to tell, and nothing to save.
+//! has nothing to tell, and nothing to save. Until a service has answered,
+//! or shown that it isn't there, what it would say isn't known, and the
+//! agent takes nothing for granted.
 
 use std::future::pending;
 
@@ -14,12 +16,33 @@ use tokio::sync::{mpsc, watch};
 use zbus::{Connection, OwnedObjectPath, Proxy};
 
 /// What auto sync may depend on (Sync setup's "unmetered networks only"
-/// and "while charging").
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// and "while charging"). None: the desktop hasn't said yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Conditions {
-    pub metered: bool,
-    pub on_battery: bool,
+    pub metered: Option<bool>,
+    pub on_battery: Option<bool>,
 }
+
+impl Conditions {
+    /// Nothing heard yet.
+    pub const UNKNOWN: Self = Self {
+        metered: None,
+        on_battery: None,
+    };
+    /// An unmetered network and mains power: nothing in the way.
+    pub const FINE: Self = Self::known(false, false);
+
+    pub const fn known(metered: bool, on_battery: bool) -> Self {
+        Self {
+            metered: Some(metered),
+            on_battery: Some(on_battery),
+        }
+    }
+}
+
+/// How long a service gets to say how things are before the agent goes on
+/// as if it weren't there.
+const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Something happened that the server's event stream may have missed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,8 +67,9 @@ pub struct Feed {
 
 impl System {
     /// A system told by hand: by tests, and by [`System::desktop`]'s tasks.
-    pub fn manual() -> (System, Feed) {
-        let (conditions_tx, conditions) = watch::channel(Conditions::default());
+    /// It starts out as `conditions`.
+    pub fn manual(conditions: Conditions) -> (System, Feed) {
+        let (conditions_tx, conditions) = watch::channel(conditions);
         let (nudges_tx, nudges) = mpsc::unbounded_channel();
         (
             System { conditions, nudges },
@@ -56,38 +80,82 @@ impl System {
         )
     }
 
-    /// The desktop's services, listened to from here on.
+    /// The desktop's services, listened to from here on. Nothing is known
+    /// until each has answered or turned out not to be there.
     pub fn desktop() -> System {
-        let (system, feed) = System::manual();
+        let (system, feed) = System::manual(Conditions::UNKNOWN);
         tokio::spawn(async move {
             let Feed { conditions, nudges } = feed;
-            match Connection::system().await {
-                Ok(bus) => {
-                    let heard = tokio::join!(
-                        network(&bus, &conditions, &nudges),
-                        power(&bus, &conditions),
-                        sleep(&bus, &nudges),
+            // A service that neither answers nor fails is given up on.
+            let give_up = async {
+                tokio::time::sleep(ANSWER_WAIT).await;
+                if conditions.send_if_modified(|c| settle(c, true, true)) {
+                    tracing::info!(
+                        "the desktop didn't say in time: taking what isn't known as an unmetered \
+                         network and mains power"
                     );
-                    for (what, result) in [
-                        ("NetworkManager", heard.0),
-                        ("UPower", heard.1),
-                        ("logind", heard.2),
-                    ] {
-                        if let Err(e) = result {
-                            tracing::info!("not listening to {what}: {e}");
-                        }
+                }
+            };
+            let listen = async {
+                match Connection::system().await {
+                    Ok(bus) => {
+                        // Each for itself: one that isn't there mustn't
+                        // keep the other's answer waiting.
+                        let network = async {
+                            if let Err(e) = network(&bus, &conditions, &nudges).await {
+                                tracing::info!(
+                                    "not listening to NetworkManager ({e}): every network counts \
+                                     as unmetered"
+                                );
+                                conditions.send_if_modified(|c| settle(c, true, false));
+                            }
+                        };
+                        let power = async {
+                            if let Err(e) = power(&bus, &conditions).await {
+                                tracing::info!(
+                                    "not listening to UPower ({e}): the power counts as mains"
+                                );
+                                conditions.send_if_modified(|c| settle(c, false, true));
+                            }
+                        };
+                        let sleep = async {
+                            if let Err(e) = sleep(&bus, &nudges).await {
+                                tracing::info!("not listening to logind: {e}");
+                            }
+                        };
+                        tokio::join!(network, power, sleep);
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            "no system bus ({e}): taking the network as unmetered and the power \
+                             as mains"
+                        );
+                        conditions.send_if_modified(|c| settle(c, true, true));
                     }
                 }
-                Err(e) => tracing::info!(
-                    "no system bus ({e}): taking the network as unmetered and the power as mains"
-                ),
-            }
+            };
+            tokio::join!(listen, give_up);
             // The agent goes on without them, on what was last heard.
             let _keep = (conditions, nudges);
             pending::<()>().await
         });
         system
     }
+}
+
+/// Takes what isn't known of the network, the power or both as nothing in
+/// the way. Whether that changed anything.
+fn settle(conditions: &mut Conditions, network: bool, power: bool) -> bool {
+    let mut changed = false;
+    if network && conditions.metered.is_none() {
+        conditions.metered = Some(false);
+        changed = true;
+    }
+    if power && conditions.on_battery.is_none() {
+        conditions.on_battery = Some(false);
+        changed = true;
+    }
+    changed
 }
 
 /// NetworkManager's `Metered`: yes, or guessed to be.
@@ -149,16 +217,14 @@ async fn network(
         .await;
     // Asked once as well: the streams only tell of what the service says
     // from here on when it has said nothing yet.
-    let now = nm.get_property::<u32>("Metered").await?;
-    conditions.send_if_modified(|c| {
-        std::mem::replace(&mut c.metered, is_metered(now)) != is_metered(now)
-    });
+    let now = Some(is_metered(nm.get_property::<u32>("Metered").await?));
+    conditions.send_if_modified(|c| std::mem::replace(&mut c.metered, now) != now);
     let mut link = Link::default();
     loop {
         tokio::select! {
             Some(change) = metered.next() => {
                 if let Ok(value) = change.get().await {
-                    let now = is_metered(value);
+                    let now = Some(is_metered(value));
                     conditions.send_if_modified(|c| std::mem::replace(&mut c.metered, now) != now);
                 }
             }
@@ -190,10 +256,11 @@ async fn power(bus: &Connection, conditions: &watch::Sender<Conditions>) -> zbus
     )
     .await?;
     let mut on_battery = upower.receive_property_changed::<bool>("OnBattery").await;
-    let now = upower.get_property::<bool>("OnBattery").await?;
+    let now = Some(upower.get_property::<bool>("OnBattery").await?);
     conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
     while let Some(change) = on_battery.next().await {
         if let Ok(now) = change.get().await {
+            let now = Some(now);
             conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
         }
     }
@@ -221,6 +288,24 @@ async fn sleep(bus: &Connection, nudges: &mpsc::UnboundedSender<Nudge>) -> zbus:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_service_that_isnt_there_settles_only_what_it_would_have_said() {
+        let mut conditions = Conditions::UNKNOWN;
+        // No NetworkManager: the network is settled, the power still open.
+        assert!(settle(&mut conditions, true, false));
+        assert_eq!(conditions.metered, Some(false));
+        assert_eq!(conditions.on_battery, None);
+        // UPower answered meanwhile: giving up later leaves that alone.
+        conditions.on_battery = Some(true);
+        assert!(!settle(&mut conditions, true, true));
+        assert_eq!(conditions, Conditions::known(false, true));
+        // Nothing answered in time: both settled.
+        let mut conditions = Conditions::UNKNOWN;
+        assert!(settle(&mut conditions, true, true));
+        assert_eq!(conditions, Conditions::FINE);
+    }
 
     // Bugs caught: 0, False positives: 0
     #[test]
