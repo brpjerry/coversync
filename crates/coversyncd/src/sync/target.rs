@@ -66,24 +66,20 @@ impl Target {
     }
 
     /// Whether a file the device holds is of a track or cover whose new
-    /// content isn't ready: its copy stays meanwhile, wherever it is. So
-    /// does a file a check found but couldn't tell (see [`UNKNOWN`]).
+    /// content isn't ready: its copy stays meanwhile, wherever it is. A
+    /// file the server doesn't know the owner of (one recorded before
+    /// owners were) stays while anything is being prepared.
     pub fn waits(&self, held: &Held) -> bool {
-        if held.hash == UNKNOWN {
-            return self.preparing > 0;
-        }
-        match held.track {
-            Some(track) => self.waiting_tracks.contains(&track),
-            None => held
-                .album
-                .as_ref()
-                .is_some_and(|a| self.waiting_covers.contains(a)),
+        match (held.track, &held.album) {
+            (Some(track), _) => self.waiting_tracks.contains(&track),
+            (None, Some(album)) => self.waiting_covers.contains(album),
+            (None, None) => self.preparing > 0,
         }
     }
 
     /// Whether a file found on the device might be content still being
     /// hashed or made: one of a waiting track's size, or where a waiting
-    /// cover goes. A reconcile leaves such a file unclaimed.
+    /// cover goes. A check waits for such content while it's on its way.
     pub fn might_be_waiting(&self, path: &str, size: u64) -> bool {
         self.waiting_sizes.contains(&size)
             || path
@@ -99,12 +95,6 @@ impl Target {
             .map(|e| (e.track, e.album.clone()))
     }
 }
-
-/// The content a reconcile records for a file that might be content still
-/// being hashed or made: the device's, but not yet told. It matches no
-/// target content, so once nothing is being prepared it's replaced where
-/// the target wants a file, and deleted elsewhere.
-pub const UNKNOWN: &str = "unknown";
 
 /// A path as storage that ignores case compares it, as device paths are
 /// kept apart (see `coversync_core::sync`).

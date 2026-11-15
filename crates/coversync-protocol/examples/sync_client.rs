@@ -374,6 +374,13 @@ fn main() -> Result<()> {
     };
     let is =
         |p: &Path, size: u64| fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.len() == size);
+    // Later steps can count on an earlier one (a move into a path a delete
+    // cleared): after one is refused, report what was done and stop. The
+    // next sync starts from what the server then knows.
+    let stop = |sent: Result<bool>| -> Result<()> {
+        sent?;
+        Err("files changed on the device; sync again, or ask for Check files".into())
+    };
     let mut puts = VecDeque::new();
     for op in ops {
         match op {
@@ -385,7 +392,7 @@ fn main() -> Result<()> {
                     Ok(_) if is(&p, size) => fs::remove_file(&p)?,
                     Ok(_) => {
                         changed("delete", path);
-                        continue;
+                        return stop(send(true));
                     }
                 }
                 facts.lock().unwrap().push(Fact::Delete { path, hash });
@@ -409,7 +416,7 @@ fn main() -> Result<()> {
                     // Done before only if the source has gone and the
                     // destination is what it should be.
                     changed("move", from);
-                    continue;
+                    return stop(send(true));
                 }
                 facts.lock().unwrap().push(Fact::Move { from, path, hash });
             }

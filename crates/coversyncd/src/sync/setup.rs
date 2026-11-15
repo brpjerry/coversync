@@ -104,8 +104,14 @@ async fn state(
             Some(w) => {
                 let t = &w.header.totals;
                 // A failure counts while its content is still what the
-                // device should hold there.
-                failed.retain(|f| w.target.at(&f.path).is_some_and(|e| e.hash == f.hash));
+                // device should hold there, and doesn't yet.
+                failed.retain(|f| {
+                    w.target.at(&f.path).is_some_and(|e| e.hash == f.hash)
+                        && files
+                            .inventory
+                            .get(&f.path)
+                            .is_none_or(|h| h.hash != f.hash)
+                });
                 (
                     Count {
                         files: t.put + t.moves + t.delete,

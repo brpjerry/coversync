@@ -377,6 +377,12 @@ impl Store {
                 "UPDATE OR REPLACE sync_inventory SET path = ?3
                  WHERE device_id = ?1 AND path = ?2 AND hash = ?4",
             )?;
+            // The same content can be two tracks' or albums' (a cover shared
+            // by two albums): moved, it's the one at its new path's.
+            let mut moved_to = tx.prepare_cached(
+                "UPDATE OR REPLACE sync_inventory SET path = ?3, track = ?5, album = ?6
+                 WHERE device_id = ?1 AND path = ?2 AND hash = ?4",
+            )?;
             let mut unfailed =
                 tx.prepare_cached("DELETE FROM sync_failures WHERE device_id = ?1 AND path = ?2")?;
             for fact in done {
@@ -391,9 +397,17 @@ impl Store {
                         unfailed.execute(params![id, path])?;
                     }
                     Fact::Move { from, path, hash } => {
-                        // Whatever was at the path was replaced.
-                        if moved.execute(params![id, from, path, hash])? > 0 {
+                        let applied = match of(path, hash) {
+                            Some((track, album)) => {
+                                moved_to.execute(params![id, from, path, hash, track, album])?
+                            }
+                            None => moved.execute(params![id, from, path, hash])?,
+                        };
+                        // Whatever was at the path was replaced, and a put
+                        // that failed there is done after all.
+                        if applied > 0 {
                             gone_other.execute(params![id, path])?;
+                            unfailed.execute(params![id, path])?;
                         }
                     }
                     Fact::Delete {

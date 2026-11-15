@@ -279,7 +279,14 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
         required = required.saturating_add(extra);
         spare = (spare + extra - entry.size).saturating_add(replaced(&entry.path).unwrap_or(0));
     }
-    let short_bytes = budget.map_or(0, |b| required.saturating_sub(b));
+    // Short of the reserve too: what's needed beyond the free space and the
+    // deletes, reserve included.
+    let short_bytes = match device.free_bytes {
+        Some(free) if !puts.is_empty() => required
+            .saturating_add(RESERVE_BYTES)
+            .saturating_sub(free.saturating_add(freed)),
+        _ => 0,
+    };
     let mut put_ops = Vec::with_capacity(puts.len());
     for entry in puts {
         let replaces = replaced(&entry.path);

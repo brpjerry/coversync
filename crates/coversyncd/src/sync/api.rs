@@ -165,9 +165,10 @@ pub(super) fn valid_path(path: &str) -> bool {
             .all(|name| !name.is_empty() && name != "." && name != "..")
         && !path.split('/').next().is_some_and(|first| {
             first.eq_ignore_ascii_case(CLIENT_DIR)
-                // A Windows drive ("C:"), which would take the path out of
-                // the folder there.
-                || (first.len() == 2 && first.ends_with(':'))
+                // A Windows drive ("C:", or "C:name", relative to that
+                // drive), which would take the path out of the folder there.
+                || (first.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                    && first.as_bytes().get(1) == Some(&b':'))
         })
 }
 
@@ -222,6 +223,8 @@ struct Reconcile {
     target: Option<Arc<Target>>,
     /// Files found to hold a content, by path.
     matched: HashMap<String, String>,
+    /// Candidates' own samples, read once for every part of the samples.
+    samples: Arc<Mutex<HashMap<String, String>>>,
 }
 
 struct Wanted {
@@ -482,7 +485,6 @@ fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
         .collect();
     let mut out: Vec<(String, Wanted)> = listing
         .iter()
-        .filter(|l| !target.might_be_waiting(&l.path, l.size))
         .filter_map(|l| {
             let (ranges, candidates) = by_size.get(&l.size)?;
             Some((
@@ -531,7 +533,7 @@ async fn samples(
     let device = device(&access)?;
     let sampled: Vec<Sampled> = lines(&body)?;
     // The work to do: each sample with its ranges and candidates.
-    let (target, work) = state.sync.sessions.with(&id, device, |s| {
+    let (target, work, cache) = state.sync.sessions.with(&id, device, |s| {
         let r = s
             .reconcile
             .as_ref()
@@ -548,7 +550,7 @@ async fn samples(
                 Some((x, w.ranges.clone(), w.candidates.clone()))
             })
             .collect();
-        Ok::<_, Problem>((target, work))
+        Ok::<_, Problem>((target, work, r.samples.clone()))
     })??;
     let matched = blocking(move || {
         use rayon::prelude::*;
@@ -562,13 +564,23 @@ async fn samples(
                 }
             }
         }
-        let samples: HashMap<&str, String> = wanted
+        let known = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let read: Vec<(String, String)> = wanted
             .into_par_iter()
+            .filter(|(hash, _)| !known.contains_key(*hash))
             .filter_map(|(hash, ranges)| {
                 let (mut f, size) = source_file(&target, hash)?;
-                Some((hash, coversync_protocol::sample(&mut f, size, ranges).ok()?))
+                Some((
+                    hash.to_string(),
+                    coversync_protocol::sample(&mut f, size, ranges).ok()?,
+                ))
             })
             .collect();
+        let samples = {
+            let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.extend(read);
+            cache.clone()
+        };
         Ok(work
             .iter()
             .filter_map(|(x, _, candidates)| {
@@ -600,7 +612,7 @@ async fn samples(
     let epoch = random_id("e_")?;
     let mut inventory = HashMap::new();
     let mut other = HashMap::new();
-    let (mut adopted, mut moves, mut waiting, mut others) = (0, 0, 0, Count::default());
+    let (mut adopted, mut moves, mut others) = (0, 0, Count::default());
     // What each content is of, for the files found to hold it.
     let mut owners: HashMap<&str, &plan::Entry> = HashMap::new();
     for e in &target.entries {
@@ -628,20 +640,6 @@ async fn samples(
                     },
                 );
             }
-            // Perhaps content still being hashed or made: the device's,
-            // left where it is until that's done (see `target::UNKNOWN`).
-            None if target.might_be_waiting(&l.path, l.size) => {
-                waiting += 1;
-                inventory.insert(
-                    l.path,
-                    HeldFile {
-                        hash: super::target::UNKNOWN.into(),
-                        size: l.size,
-                        track: None,
-                        album: None,
-                    },
-                );
-            }
             None => {
                 others.files += 1;
                 others.bytes += l.size;
@@ -658,7 +656,6 @@ async fn samples(
         device,
         adopted,
         moves,
-        waiting,
         other = others.files,
         "reconciled a device's folder"
     );
@@ -667,7 +664,6 @@ async fn samples(
         adopted,
         moves,
         other: others,
-        waiting,
     })
     .into_response())
 }
@@ -932,9 +928,10 @@ struct Heartbeat {
 }
 
 /// `GET events`: `target` when the device's target changes (and once at
-/// the start), `sync` when someone asks for a sync in Sync setup. It ends
-/// once the token no longer names the device, as checked every
-/// [`STILL_DEVICE`].
+/// the start), `sync` when someone asks for a sync in Sync setup, and
+/// `settings` (an `AutoSync`) when its automatic-sync settings change; it
+/// gets them at first from `GET status`. It ends once the token no longer
+/// names the device, as checked every [`STILL_DEVICE`].
 async fn events(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
@@ -1130,7 +1127,8 @@ async fn content(
             if left == 0 {
                 return None;
             }
-            let mut buf = vec![0; READ_CHUNK.min(left as usize)];
+            // Bounded before the cast, which would wrap on a 32-bit build.
+            let mut buf = vec![0; left.min(READ_CHUNK as u64) as usize];
             match file.read(&mut buf).await {
                 Ok(0) => Some((
                     Err(std::io::Error::new(

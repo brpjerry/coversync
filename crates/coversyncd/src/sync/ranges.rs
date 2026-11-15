@@ -173,21 +173,34 @@ fn chunks(file: &mut (impl Read + Seek), size: u64) -> io::Result<Option<Vec<[u6
     };
     let mut areas = Vec::new();
     let mut pos = 12;
+    // RF64 gives the audio chunk's real length in its `ds64` chunk.
+    let mut long_data = None;
     while pos + 8 <= size {
         let mut c = [0; 8];
         if read_at(file, pos, &mut c)? < 8 {
             break;
         }
         let len = c[4..8].try_into().expect("4 bytes");
-        let len = u64::from(if big_endian {
+        let mut len = u64::from(if big_endian {
             u32::from_be_bytes(len)
         } else {
             u32::from_le_bytes(len)
         });
-        // RF64 keeps the real size elsewhere; read the rest whole then.
+        if &c[..4] == b"ds64" {
+            let mut d = [0; 16];
+            if read_at(file, pos + 8, &mut d)? == 16 {
+                long_data = Some(u64::from_le_bytes(d[8..16].try_into().expect("8 bytes")));
+            }
+        }
         if len == u64::from(u32::MAX) {
-            areas.push([pos, size]);
-            break;
+            match long_data.filter(|_| &c[..4] == audio) {
+                Some(real) => len = real,
+                // A length nobody gave: read the rest whole.
+                None => {
+                    areas.push([pos, size]);
+                    break;
+                }
+            }
         }
         let end = (pos + 8 + len + (len & 1)).min(size);
         if &c[..4] != audio {

@@ -752,6 +752,23 @@ async fn devices_hear_of_changes_and_check_cheaply() {
     // Sync now, from Sync setup.
     let _ = d.state.sync.requests.send(id);
     assert!(next_event(&mut stream).await.starts_with("event: sync"));
+    // When it syncs by itself can change while its files don't.
+    d.settings(
+        id,
+        DeviceSettings {
+            structure: Some("{title}".into()),
+            auto: coversync_protocol::AutoSync {
+                quiet_seconds: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let settings = next_event(&mut stream).await;
+    assert!(
+        settings.starts_with("event: settings") && settings.contains(r#""quiet_seconds":5"#),
+        "{settings}"
+    );
     // A revoked device is turned away at once; the others aren't.
     let (_, other) = d.device(Scope::Sync);
     d.state
@@ -770,31 +787,34 @@ async fn devices_hear_of_changes_and_check_cheaply() {
 }
 
 #[tokio::test]
-async fn a_check_leaves_files_that_may_be_waiting_alone() {
+async fn files_a_check_cant_tell_yet_are_left_alone() {
     let d = Daemon::new("waiting");
     let (_, token) = d.device(Scope::Sync);
     covers_made(&d, &token).await;
     let tablet = Client::new(&d, token, "tablet");
     tablet.sync().await;
     // A same-length title edit keeps the file's size; until it's hashed,
-    // the device's copy could be the new content or not.
-    write_track(
-        &d.library.join("Artist B/Album Two/01 - Three.flac"),
-        &tags("THREE", "B", "Album Two", 1),
-        70_000,
-    );
+    // the device's copy can't be matched. A file of the user's own happens
+    // to have the same size.
+    let three = d.library.join("Artist B/Album Two/01 - Three.flac");
+    let size = std::fs::metadata(&three).unwrap().len() as usize;
+    write_track(&three, &tags("THREE", "B", "Album Two", 1), 70_000);
     d.scan();
+    std::fs::write(tablet.root.join("mine.bin"), vec![9u8; size]).unwrap();
     std::fs::remove_file(tablet.marker_path()).unwrap();
     let ran = tablet.sync().await;
     let r = ran.reconciled.unwrap();
-    assert_eq!((r.adopted, r.waiting, r.other.files), (3, 1, 0), "{r:?}");
+    // Both count as files of the user's own, which nothing deletes unasked.
+    assert_eq!((r.adopted, r.other.files), (3, 2), "{r:?}");
     assert!(ran.ops.is_empty(), "{:?}", ran.ops);
-    // Once it's hashed, the copy is replaced like any file not yet there.
+    // Once it's hashed, the copy is replaced like any file in the way.
     d.rescan();
     let ran = tablet.sync().await;
     assert_eq!(
         ran.ops,
         ["put Artist B/Album Two/01 - Three.flac (replace)"]
     );
-    assert_eq!(tree(&tablet.root), d.files());
+    let mut want = d.files();
+    want.insert("mine.bin".into(), vec![9u8; size]);
+    assert_eq!(tree(&tablet.root), want);
 }

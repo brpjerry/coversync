@@ -397,11 +397,6 @@ pub struct ReconcileDone {
     pub moves: u64,
     /// Files coversync didn't put there, left alone.
     pub other: Count,
-    /// Files left where they are for now: they might be content the server
-    /// is still hashing or making. Once that's done, a file at a path the
-    /// target wants is replaced, and one elsewhere deleted.
-    #[serde(default)]
-    pub waiting: u64,
 }
 
 /// How a sync ended.
@@ -520,7 +515,8 @@ pub fn sample(file: &mut (impl Read + Seek), size: u64, ranges: &[[u64; 2]]) -> 
         file.seek(SeekFrom::Start(start))?;
         let mut left = end - start;
         while left > 0 {
-            let n = buf.len().min(left as usize);
+            // Bounded before the cast, which would wrap on a 32-bit build.
+            let n = left.min(buf.len() as u64) as usize;
             file.read_exact(&mut buf[..n])?;
             hasher.update(&buf[..n]);
             left -= n as u64;
