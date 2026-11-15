@@ -493,19 +493,17 @@ impl Session<'_> {
         let mut off_shown = false;
         loop {
             // Auto sync is switched in Sync setup, and the watch hears of
-            // it without giving a reason to sync. Off is worth saying; on
-            // again is worth a look at what was left meanwhile.
+            // it without giving a reason to sync: the status says which it
+            // is. (Turned on again, the watch asks the server for what was
+            // left meanwhile.)
             let off = self.watch.auto().is_some_and(|auto| !auto.enabled);
             if wanted.is_none() && off != off_shown {
                 off_shown = off;
-                if off {
-                    self.shows.status(Hold::Off.text());
+                self.shows.status(if off {
+                    Hold::Off.text()
                 } else {
-                    tracing::info!("auto sync is on again: checking the server");
-                    self.shows
-                        .status("Auto sync is on again: checking the server.");
-                    self.watch.check_soon();
-                }
+                    "Auto sync is on again."
+                });
             }
             if let Some(reason) = wanted
                 && not_before.is_none_or(|at| at <= Instant::now())
