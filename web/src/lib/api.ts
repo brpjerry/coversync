@@ -458,6 +458,34 @@ export interface Device {
 	last_seen_at: number | null;
 	last_ip: string | null;
 	revoked_at: number | null;
+	/**
+	 * Its sync settings, when this login may read them: a password login
+	 * reads every device's, an app only its own. Changes to the device leave
+	 * them out.
+	 */
+	sync?: DeviceSync | null;
+}
+
+/** How a device lays out its copy of the Library, and its art. */
+export interface DeviceSettings {
+	/** Its own folder structure; null keeps each file's path in the Library. */
+	structure: string | null;
+	/** Names a FAT32 or exFAT card can hold. */
+	fat_safe: boolean;
+	art: {
+		/** Write each album's cover as a file beside its tracks. */
+		cover_file: boolean;
+		/** Without extension ("cover" → cover.jpg). */
+		cover_name: string;
+		/** The widest the cover file and embedded art may be, in pixels; null for no limit. */
+		max_width: number | null;
+	};
+}
+
+/** A device's sync settings, and their version (0 until first saved). */
+export interface DeviceSync {
+	version: number;
+	settings: DeviceSettings;
 }
 
 export interface DevicesResponse {
@@ -658,6 +686,8 @@ export const api = {
 		request<Device>(`/api/devices/${id}`, json('PUT', change)),
 	revokeDevice: (id: number) => request<Device>(`/api/devices/${id}/revoke`, { method: 'POST' }),
 	removeDevice: (id: number) => request<void>(`/api/devices/${id}`, { method: 'DELETE' }),
+	saveDeviceSync: (id: number, settings: DeviceSettings) =>
+		request<DeviceSync>(`/api/devices/${id}/sync/settings`, json('PUT', settings)),
 	/** Add device: a code for a device to pair with, replacing `replace`'s entry if given. */
 	newPairing: (name: string, scope: Scope, replace: number | null) =>
 		request<NewPairing>('/api/pairings', json('POST', { name, scope, replace })),

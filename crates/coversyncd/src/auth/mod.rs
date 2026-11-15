@@ -67,7 +67,8 @@ const OPEN: &[&str] = &[
 ];
 
 /// Routes a `sync` token may use besides SYN-04's: checking how it's signed
-/// in.
+/// in. It may also read its own sync settings (see
+/// [`devices::sync_readable`]).
 const SYNC_OPEN: &[&str] = &["/api/session"];
 
 pub struct Auth {
@@ -495,7 +496,11 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         }
     }
     match checked.access {
-        Ok(access) if access.scope == Scope::Sync && !SYNC_OPEN.contains(&req.uri().path()) => {
+        Ok(access)
+            if access.scope == Scope::Sync
+                && !SYNC_OPEN.contains(&req.uri().path())
+                && !devices::sync_readable(req.method(), req.uri().path()) =>
+        {
             error(
                 StatusCode::FORBIDDEN,
                 "sync_only",

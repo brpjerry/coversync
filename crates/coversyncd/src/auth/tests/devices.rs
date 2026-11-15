@@ -1374,3 +1374,59 @@ async fn what_devices_say_about_themselves_is_checked() {
     let d = app.state.auth.store().device_info(device).unwrap().unwrap();
     assert_eq!((d.platform, d.hostname, d.app_version), (None, None, None));
 }
+
+#[tokio::test]
+async fn an_app_reads_only_its_own_sync_settings() {
+    let app = App::with_password("sync-settings");
+    let cookie = app.cookie().await;
+    let (player, player_token) = app.device(Scope::Sync);
+    let (phone, phone_token) = app.device(Scope::Manage);
+    let url = |id: i64, what: &str| format!("/api/devices/{id}/sync/{what}");
+    let settings = json!({ "fat_safe": true, "art": { "cover_name": "folder.jpg" } });
+    let res = app
+        .call("PUT", &url(player, "settings"), &cookie, Some(settings))
+        .await;
+    let b = body(res).await;
+    assert_eq!(
+        (&b["version"], &b["settings"]["art"]["cover_name"]),
+        (&json!(1), &json!("folder"))
+    );
+    let traded = app
+        .state
+        .auth
+        .store()
+        .create_device_session(&phone_token, now())
+        .unwrap()
+        .unwrap();
+    let traded = format!("{COOKIE}={traded}");
+    for (id, other, auth) in [
+        (player, phone, player_token.as_str()),
+        (phone, player, phone_token.as_str()),
+        (phone, player, traded.as_str()),
+    ] {
+        for what in ["settings", "paths"] {
+            let res = app.call("GET", &url(id, what), auth, None).await;
+            assert_eq!(res.status(), StatusCode::OK, "{id} {what}");
+            let res = app.call("GET", &url(other, what), auth, None).await;
+            assert_eq!(
+                code_of(res).await,
+                (StatusCode::FORBIDDEN, "other_device".into()),
+                "{id} {what}"
+            );
+        }
+        // Nor may an app change its own.
+        let res = app
+            .call("PUT", &url(id, "settings"), auth, Some(json!({})))
+            .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+    let listed = app.devices(&phone_token).await;
+    for d in listed["devices"].as_array().unwrap() {
+        assert_eq!(d["sync"].is_null(), d["id"] != json!(phone), "{d}");
+    }
+    // The password login reads any device's.
+    let res = app
+        .call("GET", &url(player, "settings"), &cookie, None)
+        .await;
+    assert_eq!(body(res).await["settings"]["fat_safe"], json!(true));
+}

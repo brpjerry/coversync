@@ -23,7 +23,7 @@ pub const SUGGESTIONS: &[&str] = &[
 /// `{year}` is the first four digits of the date tag.
 pub const YEAR: &str = "year";
 /// The longest a variable can be limited to; a whole component is capped
-/// at 180 bytes anyway.
+/// at [`MAX_NAME`] bytes anyway.
 pub const MAX_LIMIT: usize = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,22 @@ impl Template {
         values: &HashMap<&'static str, String>,
         extension: &str,
     ) -> std::result::Result<PathBuf, Vec<&'static str>> {
+        let (path, missing) = self.render_partial(values, extension);
+        if missing.is_empty() {
+            Ok(path)
+        } else {
+            Err(missing)
+        }
+    }
+
+    /// The relative path even when variables have no value: those are left
+    /// empty, and a name left empty is `_`. Also gives the variables that
+    /// had no value.
+    pub fn render_partial(
+        &self,
+        values: &HashMap<&'static str, String>,
+        extension: &str,
+    ) -> (PathBuf, Vec<&'static str>) {
         let mut missing = Vec::new();
         let mut path = PathBuf::new();
         let last = self.segments.len() - 1;
@@ -204,11 +220,7 @@ impl Template {
             }
             path.push(name);
         }
-        if missing.is_empty() {
-            Ok(path)
-        } else {
-            Err(missing)
-        }
+        (path, missing)
     }
 }
 
@@ -280,21 +292,116 @@ fn shorten(value: &str, max: usize) -> String {
 
 /// Trim, drop trailing dots (Windows), and cap the length of one component.
 fn finish(component: &str) -> String {
-    let mut s = component
-        .trim()
-        .trim_end_matches('.')
-        .trim_end()
-        .to_string();
-    const MAX: usize = 180;
-    if s.len() > MAX {
-        let mut cut = MAX;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-        s = s.trim_end().to_string();
+    let s = component.trim().trim_end_matches('.').trim_end();
+    cut(s, MAX_NAME).trim_end().to_string()
+}
+
+/// The most bytes of UTF-8 a file or folder name gets: below what Linux
+/// (255 bytes), FAT32 and exFAT (255 UTF-16 units) allow.
+pub const MAX_NAME: usize = 180;
+
+/// At most `max` bytes of `s`, never splitting a character, or a
+/// character from the marks that combine with it (accents, dakuten,
+/// variation selectors, emoji joined by ZWJ).
+pub fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
     }
-    s
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let next = s[end..].chars().next();
+        let last = s[..end].chars().next_back();
+        // A mark after the cut belongs to the character before it; a
+        // joiner before the cut joins that character to the next.
+        if next.is_some_and(joins_previous) || last == Some('\u{200d}') {
+            end -= last.map_or(0, char::len_utf8);
+        } else {
+            return &s[..end];
+        }
+        if end == 0 {
+            return "";
+        }
+    }
+}
+
+/// Characters drawn together with the one before them.
+fn joins_previous(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}' // combining diacritical marks
+        | '\u{1ab0}'..='\u{1aff}'
+        | '\u{1dc0}'..='\u{1dff}'
+        | '\u{200c}'..='\u{200d}' // zero-width (non-)joiner
+        | '\u{20d0}'..='\u{20ff}'
+        | '\u{3099}'..='\u{309a}' // kana voicing marks
+        | '\u{fe00}'..='\u{fe0f}' // variation selectors
+        | '\u{fe20}'..='\u{fe2f}'
+        | '\u{1f3fb}'..='\u{1f3ff}' // skin tones
+        | '\u{e0020}'..='\u{e007f}' // emoji tag sequences
+        | '\u{e0100}'..='\u{e01ef}')
+}
+
+/// Characters FAT32 and exFAT can't hold in a name, besides control ones.
+const FAT_ILLEGAL: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
+
+/// One file or folder name as a FAT32 or exFAT card can hold it, and
+/// Windows can open it there. Characters those can't hold go, as do
+/// leading and trailing spaces and trailing dots. A name Windows keeps for
+/// a device (CON, NUL, COM1 and the like, with any extension) gets a `_` in
+/// front. A name longer than [`MAX_NAME`] bytes is cut (see [`cut`]), and a
+/// file keeps its extension. A name left empty is `_`.
+pub fn fat_name(name: &str, file: bool) -> String {
+    let clean: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !FAT_ILLEGAL.contains(c))
+        .collect();
+    let (stem, ext) = if file {
+        split_extension(&clean)
+    } else {
+        (clean.as_str(), "")
+    };
+    let tidy = |s: &str| s.trim().trim_end_matches(['.', ' ']).to_string();
+    let mut stem = tidy(stem);
+    if reserved(&stem) {
+        stem.insert(0, '_');
+    }
+    let stem = tidy(cut(&stem, MAX_NAME - ext.len()));
+    if stem.is_empty() {
+        format!("_{ext}")
+    } else {
+        format!("{stem}{ext}")
+    }
+}
+
+/// A file name's stem and its extension, dot included ("" for none).
+pub fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot)
+            if name.len() - dot <= 17 && name.len() - dot > 1 && !name[dot..].contains(' ') =>
+        {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    }
+}
+
+/// Whether Windows keeps `stem` (up to its first dot) for a device.
+fn reserved(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or_default().trim_end();
+    let upper = base.to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|port| {
+        upper.strip_prefix(port).is_some_and(|n| {
+            let mut n = n.chars();
+            n.next()
+                .is_some_and(|d| d.is_ascii_digit() || "¹²³".contains(d))
+                && n.next().is_none()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -388,6 +495,35 @@ mod tests {
             t.render(&v, "flac").unwrap(),
             PathBuf::from("Kevin Penkin/2017 - MADE IN ABYSS/03 - Hanezeve.flac")
         );
+    }
+
+    #[test]
+    fn fat_names() {
+        for (name, file, safe) in [
+            ("CON", false, "_CON"),
+            ("con.flac", true, "_con.flac"),
+            ("NUL .flac", true, "_NUL.flac"),
+            ("LPT¹", false, "_LPT¹"),
+            ("COM10", false, "COM10"),
+            ("Console", false, "Console"),
+            ("AC:DC? *Live* <1979>|\"", false, "ACDC Live 1979"),
+            ("a\\b/c\u{7}", false, "abc"),
+            ("Vol. 1... ", false, "Vol. 1"),
+            (" Track . .flac", true, "Track.flac"),
+            ("???", false, "_"),
+            ("?.flac", true, "_.flac"),
+            ("Mr. Brightside", false, "Mr. Brightside"),
+        ] {
+            assert_eq!(fat_name(name, file), safe, "{name:?}");
+        }
+        // Cut to MAX_NAME bytes, keeping the extension, and never inside a
+        // character, between a letter and its accent, or inside an emoji.
+        let long = format!("{}.flac", "曲".repeat(100));
+        assert_eq!(fat_name(&long, true), format!("{}.flac", "曲".repeat(58)));
+        let accent = format!("{}e\u{301}x.flac", "a".repeat(174));
+        assert_eq!(fat_name(&accent, true), format!("{}.flac", "a".repeat(174)));
+        let family = format!("{}👨\u{200d}👩", "b".repeat(170));
+        assert_eq!(fat_name(&family, false), "b".repeat(170));
     }
 
     #[test]

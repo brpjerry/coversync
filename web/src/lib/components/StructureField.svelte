@@ -15,8 +15,17 @@
 		suggestions: string[];
 		variables: { id: string; label: string; group: string }[];
 		label: (id: string) => string;
+		/** A device's folder structure: files with gaps still go, so nothing is required. */
+		device?: boolean;
 	}
-	let { value = $bindable(), folder, suggestions, variables, label }: Props = $props();
+	let {
+		value = $bindable(),
+		folder,
+		suggestions,
+		variables,
+		label,
+		device = false
+	}: Props = $props();
 
 	let input = $state<HTMLInputElement>();
 	let preview = $state<StructurePreview | null>(null);
@@ -151,7 +160,12 @@
 			{:else}
 				<p class="muted">Nothing in the Inbox to preview with yet.</p>
 			{/each}
-			{#if preview.requires.length}
+			{#if preview.requires.length && device}
+				<p class="requires">
+					A file without a value for one of these leaves that part empty, or <b>_</b> for a whole name.
+					It still goes to the device.
+				</p>
+			{:else if preview.requires.length}
 				<p class="requires">
 					Imported files need
 					{#each preview.requires as id, i (id)}<b>{label(id)}</b>{i < preview.requires.length - 1

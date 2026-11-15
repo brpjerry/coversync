@@ -87,6 +87,8 @@ pub struct AppState {
     pub uploads: Uploads,
     /// Change notices for clients listening on `/api/events`.
     pub events: events::Events,
+    /// Each device's Library paths, as last worked out.
+    pub device_paths: coversync_core::sync::PathCache,
 }
 
 impl AppState {
@@ -313,6 +315,7 @@ async fn run() -> anyhow::Result<()> {
         auth,
         uploads: Uploads::default(),
         events: events::Events::default(),
+        device_paths: Default::default(),
     });
     tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
     uploads::follow_folder(&state);
@@ -363,6 +366,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         auth: auth::Auth::open(&state_dir).unwrap(),
         uploads: Uploads::default(),
         events: events::Events::default(),
+        device_paths: Default::default(),
     })
 }
 

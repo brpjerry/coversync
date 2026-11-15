@@ -63,24 +63,29 @@ impl Default for ArtRules {
     }
 }
 
+/// A cover file name as typed, without its extension: "cover.jpg" means
+/// "cover", as the extension follows the image, and nothing means "cover".
+pub fn cover_file_name(typed: &str) -> Result<String> {
+    let mut name = typed.trim();
+    if let Some((stem, ext)) = name.rsplit_once('.')
+        && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    {
+        name = stem.trim_end();
+    }
+    if name.is_empty() {
+        name = FILE_NAMES[0];
+    }
+    if name.contains(['/', '\\', '\0']) || name.starts_with('.') || name.chars().count() > 64 {
+        return Err(Error::Invalid(
+            "The cover file name can't contain slashes or start with a dot.".into(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
 impl ArtRules {
     pub fn normalize(mut self) -> Result<Self> {
-        let mut name = self.file_name.trim();
-        // "cover.jpg" means "cover": the extension follows the image.
-        if let Some((stem, ext)) = name.rsplit_once('.')
-            && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
-        {
-            name = stem.trim_end();
-        }
-        if name.is_empty() {
-            name = FILE_NAMES[0];
-        }
-        if name.contains(['/', '\\', '\0']) || name.starts_with('.') || name.chars().count() > 64 {
-            return Err(Error::Invalid(
-                "The cover file name can't contain slashes or start with a dot.".into(),
-            ));
-        }
-        self.file_name = name.to_string();
+        self.file_name = cover_file_name(&self.file_name)?;
         Ok(self)
     }
 

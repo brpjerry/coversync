@@ -1012,7 +1012,11 @@
 				inboxSetup.refresh();
 				dataGeneration++;
 			} else if (saved === 'appearance') appearance.refresh();
-			else return syncSetup.refresh();
+			else {
+				// Sync setup also shows each device's sync settings.
+				devices.load();
+				return syncSetup.refresh();
+			}
 			loadAlbums();
 		},
 		resync

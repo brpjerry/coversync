@@ -18,14 +18,26 @@
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import Lock from '@lucide/svelte/icons/lock';
-	import { api, ApiError, type CaInfo, type Device, type Scope } from '#lib/api.ts';
+	import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
+	import FolderTree from '@lucide/svelte/icons/folder-tree';
+	import ImageIcon from '@lucide/svelte/icons/image';
+	import {
+		api,
+		ApiError,
+		type CaInfo,
+		type Device,
+		type DeviceSettings,
+		type Scope
+	} from '#lib/api.ts';
 	import { ago, devices, platformName, SCOPES } from '#lib/devices.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
+	import { setup } from '#lib/setup.svelte.ts';
 	import { syncSetup } from '#lib/sync-setup.svelte.ts';
 	import SetupPane, { type Back } from './SetupPane.svelte';
 	import SaveBar from './SaveBar.svelte';
 	import Toggle from './Toggle.svelte';
 	import AddDevice from './AddDevice.svelte';
+	import StructureField from './StructureField.svelte';
 
 	interface Props {
 		back: Back;
@@ -34,6 +46,8 @@
 
 	syncSetup.refresh();
 	devices.load();
+	// The Library's folder structure, and the variables a device's own can use.
+	setup.load();
 
 	let adding = $state(false);
 	/** The device being renamed or re-scoped, and its draft. */
@@ -49,6 +63,7 @@
 	function edit(d: Device) {
 		opened++;
 		confirming = null;
+		syncing = null;
 		editing = d.id;
 		draftName = d.name;
 		draftScope = d.scope;
@@ -65,6 +80,66 @@
 		// opened since, or edited further meanwhile, stays.
 		const same = mine === opened && editing === d.id;
 		if (saved && same && draftName === name && draftScope === scope) editing = null;
+	}
+
+	/** The device whose sync settings are open, and their draft. */
+	let syncing = $state<number | null>(null);
+	let syncDraft = $state({
+		own: false,
+		structure: '',
+		fatSafe: false,
+		coverFile: true,
+		coverName: 'cover',
+		maxWidth: null as number | null
+	});
+
+	function editSync(d: Device) {
+		if (!d.sync) return;
+		opened++;
+		confirming = null;
+		editing = null;
+		syncing = d.id;
+		const s = d.sync.settings;
+		syncDraft = {
+			own: s.structure !== null,
+			// Its own starts from the Library's.
+			structure: s.structure ?? setup.saved.structure,
+			fatSafe: s.fat_safe,
+			coverFile: s.art.cover_file,
+			coverName: s.art.cover_name,
+			maxWidth: s.art.max_width
+		};
+	}
+
+	async function saveSync(d: Device) {
+		const mine = opened;
+		const sent = JSON.stringify(syncDraft);
+		const width = syncDraft.maxWidth;
+		const settings: DeviceSettings = {
+			structure: syncDraft.own ? syncDraft.structure.trim() || null : null,
+			fat_safe: syncDraft.fatSafe,
+			art: {
+				cover_file: syncDraft.coverFile,
+				cover_name: syncDraft.coverName,
+				max_width: width === null || Number.isNaN(width) ? null : Math.round(width)
+			}
+		};
+		const saved = await devices.saveSync(d.id, settings);
+		// As with renaming: only these settings as they were saved close.
+		const same = mine === opened && syncing === d.id && JSON.stringify(syncDraft) === sent;
+		if (saved && same) syncing = null;
+	}
+
+	/** What a device's sync settings come to, in a line. */
+	function syncSummary(s: DeviceSettings) {
+		return [
+			s.structure ? `Folders as ${s.structure}` : "The Library's folders",
+			s.fat_safe && 'FAT-safe names',
+			s.art.cover_file ? `cover file “${s.art.cover_name}”` : 'no cover file',
+			s.art.max_width && `art at most ${s.art.max_width} px wide`
+		]
+			.filter(Boolean)
+			.join(' · ');
 	}
 
 	async function confirm(d: Device) {
@@ -288,6 +363,9 @@
 											{/if}
 										</p>
 										<p class="meta">{details(d).join(' · ')}</p>
+										{#if d.sync}
+											<p class="meta sync-summary">{syncSummary(d.sync.settings)}</p>
+										{/if}
 									</div>
 									{#if devices.canManage}
 										{#if confirming?.id === d.id}
@@ -312,6 +390,15 @@
 										{:else}
 											<div class="actions">
 												{#if !revoked}
+													{#if d.sync}
+														<button
+															class="btn sm"
+															onclick={() => (syncing === d.id ? (syncing = null) : editSync(d))}
+															aria-expanded={syncing === d.id}
+														>
+															<SlidersHorizontal size={14} /> Sync settings
+														</button>
+													{/if}
 													<button class="btn sm" onclick={() => edit(d)}>
 														<Pencil size={14} /> Edit
 													</button>
@@ -332,6 +419,98 @@
 											</div>
 										{/if}
 									{/if}
+								{/if}
+								{#if syncing === d.id && d.sync && devices.canManage}
+									<form
+										class="sync-edit"
+										transition:slide={{ duration: 220, easing: cubicOut }}
+										onsubmit={(e) => {
+											e.preventDefault();
+											saveSync(d);
+										}}
+									>
+										<fieldset>
+											<legend class="field-label"><FolderTree size={15} /> Folders</legend>
+											<div class="segmented" role="radiogroup" aria-label="Folder structure">
+												<label class:on={!syncDraft.own}>
+													<input type="radio" value={false} bind:group={syncDraft.own} />
+													Like the Library
+												</label>
+												<label class:on={syncDraft.own}>
+													<input type="radio" value={true} bind:group={syncDraft.own} />
+													Its own
+												</label>
+											</div>
+											{#if syncDraft.own}
+												<StructureField
+													bind:value={syncDraft.structure}
+													folder=""
+													suggestions={setup.suggestions}
+													variables={setup.variables}
+													label={(id) => setup.label(id)}
+													device
+												/>
+											{:else}
+												<p class="help">
+													Each file goes where it is in the Library{setup.saved.structure
+														? `, ${setup.saved.structure}`
+														: ''}.
+												</p>
+											{/if}
+										</fieldset>
+										<Toggle
+											bind:checked={syncDraft.fatSafe}
+											label="FAT-safe names"
+											description="For memory cards and players formatted FAT32 or exFAT: names leave out : ? * &quot; < > | and trailing dots and spaces, steer clear of names Windows keeps for itself, such as CON, and stay short."
+										/>
+										<Toggle
+											bind:checked={syncDraft.coverFile}
+											label="Cover file"
+											description="Each album's cover as an image beside its tracks, for players that look for one."
+										/>
+										{#if syncDraft.coverFile}
+											<label class="inline-field" transition:slide={{ duration: 180 }}>
+												<span class="field-label">File name</span>
+												<input
+													bind:value={syncDraft.coverName}
+													placeholder="cover"
+													maxlength="64"
+													spellcheck="false"
+													autocomplete="off"
+												/>
+												<span class="muted">.jpg or .png, as the image is</span>
+											</label>
+										{/if}
+										<div class="width">
+											<label class="inline-field">
+												<span class="field-label"><ImageIcon size={15} /> Widest art</span>
+												<input
+													type="number"
+													min="16"
+													max="16384"
+													step="1"
+													inputmode="numeric"
+													placeholder="No limit"
+													bind:value={syncDraft.maxWidth}
+												/>
+												<span class="muted">pixels</span>
+											</label>
+											<p class="help">
+												For the cover file and the art inside the tracks. Wider art is scaled down
+												when it's copied, keeping its shape; narrower art stays as it is.
+											</p>
+										</div>
+										<div class="actions">
+											<button type="button" class="btn sm" onclick={() => (syncing = null)}>
+												Cancel
+											</button>
+											<button class="btn sm primary" disabled={devices.busy[d.id]}>
+												{#if devices.busy[d.id]}<span class="spin"><LoaderCircle size={14} /></span
+													>{/if}
+												Save
+											</button>
+										</div>
+									</form>
 								{/if}
 							</li>
 						{/each}
@@ -604,6 +783,60 @@
 		pointer-events: none;
 	}
 
+	.sync-summary {
+		color: var(--text-2);
+	}
+	.sync-edit {
+		grid-column: 2 / -1;
+		display: grid;
+		gap: 12px;
+		padding: 4px 0 2px;
+	}
+	.sync-edit fieldset {
+		display: grid;
+		gap: 10px;
+		min-width: 0;
+		margin: 0;
+		padding: 0;
+		border: 0;
+	}
+	.sync-edit legend {
+		margin-bottom: 10px;
+		padding: 0;
+	}
+	.sync-edit .segmented {
+		justify-self: start;
+	}
+	.inline-field {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 10px;
+	}
+	.inline-field input {
+		width: 160px;
+		height: 36px;
+		padding: 0 12px;
+		border-radius: 10px;
+		border: 1px solid var(--border-strong);
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		font-size: 14px;
+		outline: 0;
+	}
+	.inline-field input:focus {
+		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
+		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+	}
+	.inline-field .muted {
+		font-size: 13px;
+	}
+	.width {
+		display: grid;
+		gap: 6px;
+	}
+
 	.pairing {
 		display: grid;
 		gap: 16px;
@@ -715,6 +948,9 @@
 		.device > .actions {
 			grid-column: 2;
 			justify-content: flex-start;
+		}
+		.sync-edit {
+			grid-column: 1 / -1;
 		}
 	}
 </style>
