@@ -202,7 +202,12 @@ fn chunks(file: &mut (impl Read + Seek), size: u64) -> io::Result<Option<Vec<[u6
                 }
             }
         }
-        let end = (pos + 8 + len + (len & 1)).min(size);
+        // A damaged length mustn't wrap the walk back over itself.
+        let end = pos
+            .saturating_add(8)
+            .saturating_add(len)
+            .saturating_add(len & 1)
+            .min(size);
         if &c[..4] != audio {
             areas.push([pos, end]);
         }

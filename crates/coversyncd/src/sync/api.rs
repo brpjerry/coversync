@@ -160,16 +160,20 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Answer<T> + Send + 'sta
 pub(super) fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains(['\\', '\0'])
-        && path
-            .split('/')
-            .all(|name| !name.is_empty() && name != "." && name != "..")
-        && !path.split('/').next().is_some_and(|first| {
-            first.eq_ignore_ascii_case(CLIENT_DIR)
+        && path.split('/').all(|name| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
                 // A Windows drive ("C:", or "C:name", relative to that
-                // drive), which would take the path out of the folder there.
-                || (first.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-                    && first.as_bytes().get(1) == Some(&b':'))
+                // drive), anywhere: joined name by name, it would take the
+                // path out of the folder there.
+                && !(name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                    && name.as_bytes().get(1) == Some(&b':'))
         })
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(CLIENT_DIR))
 }
 
 fn ndjson(body: String) -> Response {
@@ -732,8 +736,29 @@ async fn plan_page(
 /// A device's plan from its target and its files as the server knows them.
 pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> Answer<Snapshot> {
     let target = target(state, device)?;
-    let files = state.sync.store.files(device)?;
+    let mut files = state.sync.store.files(device)?;
     let st = state.sync.store.device(device)?;
+    // A file already where it should be takes the owner the target gives
+    // it now: an album retagged keeps its cover's path and bytes, but not
+    // its id, which waiting for a new cover goes by.
+    let owners: Vec<(String, Option<i64>, String)> = files
+        .inventory
+        .iter()
+        .filter_map(|(path, held)| {
+            let e = target.at(path).filter(|e| e.hash == held.hash)?;
+            (held.track != e.track || held.album.as_deref() != Some(e.album.as_str()))
+                .then(|| (path.clone(), e.track, e.album.clone()))
+        })
+        .collect();
+    if !owners.is_empty() {
+        state.sync.store.set_owners(device, &owners)?;
+        for (path, track, album) in owners {
+            if let Some(held) = files.inventory.get_mut(&path) {
+                held.track = track;
+                held.album = Some(album);
+            }
+        }
+    }
     // A Library with nothing in it, nothing on its way and a device holding
     // files is far likelier a mistake (an empty folder chosen, a disk not
     // mounted) than a wish to empty the device: plan nothing.
@@ -1256,6 +1281,7 @@ mod tests {
     fn device_paths_stay_in_the_folder() {
         assert!(valid_path("A/B/01 x.flac"));
         for bad in [
+            "Album/C:x.flac",
             "",
             "/abs",
             "a//b",

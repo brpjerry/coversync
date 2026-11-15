@@ -165,6 +165,16 @@ impl Store {
                 conn.execute_batch(&format!("ALTER TABLE sync_inventory ADD COLUMN {column}"))?;
             }
         }
+        // A build that was never released recorded files a check couldn't
+        // match as the device's, with content "unknown": they're files of
+        // the user's own, like any other.
+        conn.execute_batch(
+            "BEGIN;
+             INSERT OR REPLACE INTO sync_other (device_id, path, size)
+                SELECT device_id, path, size FROM sync_inventory WHERE hash = 'unknown';
+             DELETE FROM sync_inventory WHERE hash = 'unknown';
+             COMMIT;",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -339,6 +349,26 @@ impl Store {
             })
         })?
         .collect()
+    }
+
+    /// Say what files the device holds are of, by path: (path, track,
+    /// album).
+    pub fn set_owners(
+        &self,
+        id: i64,
+        owners: &[(String, Option<i64>, String)],
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut set = tx.prepare_cached(
+                "UPDATE sync_inventory SET track = ?3, album = ?4 WHERE device_id = ?1 AND path = ?2",
+            )?;
+            for (path, track, album) in owners {
+                set.execute(params![id, path, track, album])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Let the failed puts be tried again.
