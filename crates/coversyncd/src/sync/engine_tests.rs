@@ -321,12 +321,15 @@ struct Tight {
     used: Arc<AtomicU64>,
     /// What it says it has free, if not the truth.
     claims: Option<u64>,
+    /// Bytes written to partial files.
+    written: Arc<AtomicU64>,
 }
 
 struct TightFile {
     inner: Box<dyn Partial>,
     room: Arc<AtomicU64>,
     used: Arc<AtomicU64>,
+    written: Arc<AtomicU64>,
 }
 
 impl Write for TightFile {
@@ -336,6 +339,7 @@ impl Write for TightFile {
             self.used.fetch_sub(buf.len() as u64, Ordering::SeqCst);
             return Err(io::ErrorKind::StorageFull.into());
         }
+        self.written.fetch_add(buf.len() as u64, Ordering::SeqCst);
         self.inner.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -392,6 +396,7 @@ impl Storage for Tight {
             inner: self.inner.write_partial(name, resume)?,
             room: self.room.clone(),
             used: self.used.clone(),
+            written: self.written.clone(),
         }))
     }
     fn read_partial(&self, name: &str) -> io::Result<Box<dyn Read + Send>> {
@@ -454,6 +459,7 @@ async fn a_full_device_syncs_what_fits_and_says_how_much_more_it_needs() {
         room: room.clone(),
         used: used.clone(),
         claims: None,
+        written: Default::default(),
     });
     let e = engine(addr, &token, small, options());
     let r = sync(&e).await;
@@ -478,6 +484,7 @@ async fn a_full_device_syncs_what_fits_and_says_how_much_more_it_needs() {
         room: room.clone(),
         used: Arc::new(AtomicU64::new(0)),
         claims: Some(1 << 40),
+        written: Default::default(),
     });
     let (_, token2) = d.device(Scope::Sync);
     let e = engine(addr, &token2, liar, options());
@@ -973,19 +980,25 @@ async fn old_partial_files_give_their_room_back() {
     let half = &data[..data.len() / 2];
     let resumable = format!("{hash}-{}", &blake3::hash(path.as_bytes()).to_hex()[..16]);
     std::fs::write(partials.join(resumable), half).unwrap();
-    let old = 150_000u64;
+    // Big enough that the room it takes must be freed mid-sync.
+    let old = 40u64 << 20;
     let obsolete = format!("{}-0000000000000000", "0".repeat(64));
     std::fs::write(partials.join(obsolete), vec![7; old as usize]).unwrap();
     let used = Arc::new(AtomicU64::new(half.len() as u64 + old));
+    let written = Arc::new(AtomicU64::new(0));
     let small = Arc::new(Tight {
         inner,
         room: Arc::new(AtomicU64::new(reserve + files + 20_000)),
         used,
         claims: None,
+        written: written.clone(),
     });
     let e = engine(addr, &token, small, options());
     let r = sync(&e).await;
     assert_eq!(r.outcome, Some(Outcome::Complete), "{r:?}");
     assert_eq!(tree(&root), d.files());
     assert_eq!(std::fs::read_dir(&partials).unwrap().count(), 0);
+    // The half already there was kept and resumed, not freed and fetched
+    // again.
+    assert_eq!(written.load(Ordering::SeqCst), files - half.len() as u64);
 }

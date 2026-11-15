@@ -694,10 +694,15 @@ async fn plan(ctx: &Arc<Ctx>, report: &mut Report) -> Result<(), Error> {
                 let t = &header.totals;
                 tracing::info!(target = header.target, totals = ?t, "planned");
                 ctx.planning.store(true, Ordering::Relaxed);
-                ctx.stats.puts_total.fetch_add(t.put, Ordering::Relaxed);
-                ctx.stats
-                    .bytes_total
-                    .fetch_add(t.put_bytes, Ordering::Relaxed);
+                // A fresh plan holds only what's left: the totals are what's
+                // done so far and that.
+                let s = &ctx.stats;
+                s.puts_total
+                    .store(s.puts.load(Ordering::Relaxed) + t.put, Ordering::Relaxed);
+                s.bytes_total.store(
+                    s.bytes.load(Ordering::Relaxed) + t.put_bytes,
+                    Ordering::Relaxed,
+                );
                 report.preparing = t.preparing;
                 report.short_bytes = t.short_bytes;
                 report.target = Some(header.target.clone());
@@ -935,6 +940,27 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     };
     // Collect finished downloads, so the set stays small.
     while puts.try_join_next().is_some() {}
+    // Its own partial file, if an earlier sync left one, is no spare: taken
+    // first, so freeing room can't remove it, and what it holds needn't fit
+    // again. Given back if this put doesn't start.
+    let mut claim = Claim {
+        ctx: ctx.clone(),
+        name: None,
+        size: 0,
+    };
+    if valid_path(&put.path) && is_hash(&put.hash) && !protected(&ctx.options, &put.path) {
+        let name = partial_name(&put.hash, &put.path);
+        let size = ctx
+            .spare
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
+        if let Some(size) = size {
+            claim.name = Some(name);
+            claim.size = size;
+        }
+    }
+    let need = put.size.saturating_sub(claim.size);
     // The plan counts on spare partial files going, and on each replacement
     // freeing its old file once it's done: take the spares back, then wait
     // for downloads under way, before calling the storage full.
@@ -942,7 +968,7 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
         if ctx.pausing() {
             return;
         }
-        if room_for(ctx, &put).await {
+        if room_for(ctx, need, put.replace).await {
             break;
         }
         if reclaim(ctx).await {
@@ -968,14 +994,8 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     if ctx.pausing() {
         return;
     }
-    // Its own partial file, if an earlier sync left one, is no spare: taken
-    // now, before a later put could reclaim it.
-    if valid_path(&put.path) && is_hash(&put.hash) && !protected(&ctx.options, &put.path) {
-        ctx.spare
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&partial_name(&put.hash, &put.path));
-    }
+    // Started: the partial file is the download's now.
+    claim.name = None;
     ctx.stats.owed.fetch_add(put.size, Ordering::Relaxed);
     let c = ctx.clone();
     puts.spawn(async move {
@@ -1025,45 +1045,62 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     });
 }
 
-/// Remove the spare partial files no download has taken up; whether there
-/// were any.
-async fn reclaim(ctx: &Ctx) -> bool {
-    let spare: Vec<String> = ctx
-        .spare
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain()
-        .map(|(name, _)| name)
-        .collect();
-    if spare.is_empty() {
-        return false;
-    }
-    tracing::info!(
-        files = spare.len(),
-        "taking back room from old partial files"
-    );
-    let s = ctx.storage.clone();
-    let _ = blocking(move || {
-        for name in spare {
-            let _ = s.remove_partial(&name);
+/// A put's own spare partial file, taken back into the spares unless the
+/// put starts.
+struct Claim {
+    ctx: Arc<Ctx>,
+    name: Option<String>,
+    size: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            self.ctx
+                .spare
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name, self.size);
         }
-    })
-    .await;
+    }
+}
+
+/// Remove the largest spare partial file no download has taken up; whether
+/// there was one. One at a time, so the room check stops it as soon as it
+/// has made enough: a spare a later put would resume is kept if it can be.
+async fn reclaim(ctx: &Ctx) -> bool {
+    let largest = {
+        let mut spare = ctx.spare.lock().unwrap_or_else(|e| e.into_inner());
+        let name = spare
+            .iter()
+            .max_by_key(|(_, size)| **size)
+            .map(|(name, _)| name.clone());
+        name.inspect(|n| {
+            spare.remove(n);
+        })
+    };
+    let Some(name) = largest else {
+        return false;
+    };
+    tracing::info!(name, "taking back room from an old partial file");
+    let s = ctx.storage.clone();
+    let _ = blocking(move || s.remove_partial(&name)).await;
     true
 }
 
-/// Whether the storage has room for `put`, beside the downloads under way.
-/// The plan was fitted to the free space; this catches anything else
-/// filling the storage meanwhile. A replacement frees its old file once
-/// it's done, so it may use the reserve the server keeps.
-async fn room_for(ctx: &Ctx, put: &PutOp) -> bool {
+/// Whether the storage has room for `need` more bytes (a put's, less what
+/// its partial file holds already), beside the downloads under way. The
+/// plan was fitted to the free space; this catches anything else filling
+/// the storage meanwhile. A replacement frees its old file once it's done,
+/// so it may use the reserve the server keeps.
+async fn room_for(ctx: &Ctx, need: u64, replace: bool) -> bool {
     let s = ctx.storage.clone();
     let Ok(Ok(Some(free))) = blocking(move || s.free_bytes()).await else {
         return true;
     };
     let owed = ctx.stats.owed.load(Ordering::Relaxed);
-    let margin = if put.replace { 0 } else { RESERVE_BYTES / 2 };
-    free >= owed.saturating_add(put.size).saturating_add(margin)
+    let margin = if replace { 0 } else { RESERVE_BYTES / 2 };
+    free >= owed.saturating_add(need).saturating_add(margin)
 }
 
 /// Why a download ended without its file in place.

@@ -183,7 +183,9 @@ impl Watch {
                 }
             }
             if self.next_status <= now {
-                let reason = if std::mem::take(&mut self.woke) {
+                // Still waking until a status has been read: a check cut
+                // short (the caller dropped this future) doesn't count.
+                let reason = if self.woke {
                     Reason::Wake
                 } else {
                     Reason::Timer
@@ -291,10 +293,12 @@ impl Watch {
     async fn check(&mut self, reason: Reason) -> Result<Option<Trigger>, Error> {
         match status(&self.api, self.etag.as_deref()).await {
             Ok(StatusCheck::Unchanged) => {
+                self.woke = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 Ok(None)
             }
             Ok(StatusCheck::Changed { status, etag }) => {
+                self.woke = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 // Only a status that asked for nothing may come back as
                 // "unchanged": one with work pending must be looked at
@@ -326,7 +330,6 @@ impl Watch {
             Err(Error::Unauthorized) => Err(Error::Unauthorized),
             Err(e) => {
                 tracing::debug!("status check: {e}");
-                self.woke = self.woke || reason == Reason::Wake;
                 self.next_status = Instant::now() + Duration::from_secs(60);
                 Ok(None)
             }
@@ -462,6 +465,26 @@ mod tests {
         assert!(w.due.is_some());
         target(&mut w, "t_2");
         assert!(w.due.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_check_cut_short_is_still_the_wake() {
+        // A server that takes the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Server {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: Token::new("cst_test").unwrap(),
+            tls: Tls::System,
+        };
+        let mut w = Watch::new(
+            Arc::new(Api::new(&server, 1).unwrap()),
+            WatchOptions::default(),
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(200), w.next()).await;
+        assert!(cut.is_err());
+        // The caller dropped it mid-request: the next check still wakes.
+        assert!(w.woke);
+        drop(listener);
     }
 
     #[test]
