@@ -183,7 +183,9 @@ impl Watch {
                 }
             }
             if self.next_status <= now {
-                let reason = if std::mem::take(&mut self.woke) {
+                // Still waking until a status has been read: a check cut
+                // short (the caller dropped this future) doesn't count.
+                let reason = if self.woke {
                     Reason::Wake
                 } else {
                     Reason::Timer
@@ -198,10 +200,11 @@ impl Watch {
                     Ok(events) => {
                         tracing::debug!("listening for the server's events");
                         self.stream = Some(events);
-                        // Anything missed while away shows in the status.
-                        if self.failures > 0 {
-                            self.next_status = Instant::now();
-                        }
+                        // The stream tells of changes from now on: the
+                        // status, read again, has the settings as they are
+                        // (they may have changed during a first sync) and
+                        // anything missed while away.
+                        self.check_soon();
                         self.failures = 0;
                     }
                     Err(Error::Unauthorized) => return Err(Error::Unauthorized),
@@ -259,6 +262,9 @@ impl Watch {
                     return;
                 };
                 if self.synced.as_deref() == Some(event.target.as_str()) {
+                    // Reached already: an older change's wait goes too.
+                    self.due = None;
+                    self.due_for = None;
                     return;
                 }
                 // Each change starts the quiet period again: a run of edits
@@ -287,10 +293,12 @@ impl Watch {
     async fn check(&mut self, reason: Reason) -> Result<Option<Trigger>, Error> {
         match status(&self.api, self.etag.as_deref()).await {
             Ok(StatusCheck::Unchanged) => {
+                self.woke = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 Ok(None)
             }
             Ok(StatusCheck::Changed { status, etag }) => {
+                self.woke = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 // Only a status that asked for nothing may come back as
                 // "unchanged": one with work pending must be looked at
@@ -315,14 +323,13 @@ impl Watch {
                     }
                 } else if status.pending.files == 0 {
                     // Nothing to do for this target.
-                    self.synced = Some(status.target);
+                    self.synced(Some(&status.target));
                 }
                 Ok(None)
             }
             Err(Error::Unauthorized) => Err(Error::Unauthorized),
             Err(e) => {
                 tracing::debug!("status check: {e}");
-                self.woke = self.woke || reason == Reason::Wake;
                 self.next_status = Instant::now() + Duration::from_secs(60);
                 Ok(None)
             }
@@ -412,5 +419,88 @@ impl Events {
                 None => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Server, Tls, Token};
+
+    fn watch() -> Watch {
+        let server = Server {
+            url: "http://127.0.0.1:9".into(),
+            token: Token::new("cst_test").unwrap(),
+            tls: Tls::System,
+        };
+        Watch::new(
+            Arc::new(Api::new(&server, 1).unwrap()),
+            WatchOptions::default(),
+        )
+    }
+
+    fn target(w: &mut Watch, t: &str) {
+        w.heard(
+            "target",
+            &format!(r#"{{"target":"{t}","changed_at":null}}"#),
+        );
+    }
+
+    #[test]
+    fn a_sync_clears_the_wait_for_what_it_reached_and_no_other() {
+        // Reaching an older target leaves the wait for a newer one.
+        let mut w = watch();
+        target(&mut w, "t_a");
+        target(&mut w, "t_b");
+        w.synced(Some("t_a"));
+        assert!(w.due.is_some());
+        w.synced(Some("t_b"));
+        assert!(w.due.is_none());
+
+        // Events queued during a sync, read after it reached the newest:
+        // the older one's wait goes when the newest is read.
+        let mut w = watch();
+        w.synced(Some("t_2"));
+        target(&mut w, "t_1");
+        assert!(w.due.is_some());
+        target(&mut w, "t_2");
+        assert!(w.due.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_check_cut_short_is_still_the_wake() {
+        // A server that takes the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Server {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: Token::new("cst_test").unwrap(),
+            tls: Tls::System,
+        };
+        let mut w = Watch::new(
+            Arc::new(Api::new(&server, 1).unwrap()),
+            WatchOptions::default(),
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(200), w.next()).await;
+        assert!(cut.is_err());
+        // The caller dropped it mid-request: the next check still wakes.
+        assert!(w.woke);
+        drop(listener);
+    }
+
+    #[test]
+    fn auto_sync_turned_back_on_checks_at_once() {
+        let mut w = watch();
+        let later = Instant::now() + Duration::from_secs(600);
+        w.next_status = later;
+        w.heard(
+            "settings",
+            r#"{"enabled":false,"quiet_seconds":60,"wifi_only":true,"charging_only":false}"#,
+        );
+        assert_eq!(w.next_status, later);
+        w.heard(
+            "settings",
+            r#"{"enabled":true,"quiet_seconds":60,"wifi_only":true,"charging_only":false}"#,
+        );
+        assert!(w.next_status <= Instant::now());
     }
 }

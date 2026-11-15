@@ -405,7 +405,7 @@ async fn session(
     };
 
     let ran = run(&ctx, &started, &mut report).await;
-    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost();
     let stop = ctx.stop.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = &ctx.stats;
     report.files = s.puts.load(Ordering::Relaxed);
@@ -535,7 +535,7 @@ async fn session(
         }
     }
     tracing::info!(?report, "sync session ended");
-    flags.lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    flags.lost = ctx.facts.lost();
     Ok((report, matches!(stop, Some(Stop::Refused))))
 }
 
@@ -694,10 +694,15 @@ async fn plan(ctx: &Arc<Ctx>, report: &mut Report) -> Result<(), Error> {
                 let t = &header.totals;
                 tracing::info!(target = header.target, totals = ?t, "planned");
                 ctx.planning.store(true, Ordering::Relaxed);
-                ctx.stats.puts_total.fetch_add(t.put, Ordering::Relaxed);
-                ctx.stats
-                    .bytes_total
-                    .fetch_add(t.put_bytes, Ordering::Relaxed);
+                // A fresh plan holds only what's left: the totals are what's
+                // done so far and that.
+                let s = &ctx.stats;
+                s.puts_total
+                    .store(s.puts.load(Ordering::Relaxed) + t.put, Ordering::Relaxed);
+                s.bytes_total.store(
+                    s.bytes.load(Ordering::Relaxed) + t.put_bytes,
+                    Ordering::Relaxed,
+                );
                 report.preparing = t.preparing;
                 report.short_bytes = t.short_bytes;
                 report.target = Some(header.target.clone());
@@ -801,11 +806,9 @@ async fn ordered_steps(ctx: &Arc<Ctx>, ops: Vec<Op>) -> Result<(), Error> {
 }
 
 pub(crate) fn protected(options: &Options, path: &str) -> bool {
-    let first = path.split('/').next().unwrap_or(path);
-    options
-        .protected
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(first))
+    // As the server compares names on storage that ignores case.
+    let first = path.split('/').next().unwrap_or(path).to_uppercase();
+    options.protected.iter().any(|p| p.to_uppercase() == first)
 }
 
 /// One step; false if the folder refused it.
@@ -937,6 +940,27 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     };
     // Collect finished downloads, so the set stays small.
     while puts.try_join_next().is_some() {}
+    // Its own partial file, if an earlier sync left one, is no spare: taken
+    // first, so freeing room can't remove it, and what it holds needn't fit
+    // again. Given back if this put doesn't start.
+    let mut claim = Claim {
+        ctx: ctx.clone(),
+        name: None,
+        size: 0,
+    };
+    if valid_path(&put.path) && is_hash(&put.hash) && !protected(&ctx.options, &put.path) {
+        let name = partial_name(&put.hash, &put.path);
+        let size = ctx
+            .spare
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
+        if let Some(size) = size {
+            claim.name = Some(name);
+            claim.size = size;
+        }
+    }
+    let need = put.size.saturating_sub(claim.size);
     // The plan counts on spare partial files going, and on each replacement
     // freeing its old file once it's done: take the spares back, then wait
     // for downloads under way, before calling the storage full.
@@ -944,7 +968,7 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
         if ctx.pausing() {
             return;
         }
-        if room_for(ctx, &put).await {
+        if room_for(ctx, need, put.replace).await {
             break;
         }
         if reclaim(ctx).await {
@@ -970,14 +994,8 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     if ctx.pausing() {
         return;
     }
-    // Its own partial file, if an earlier sync left one, is no spare: taken
-    // now, before a later put could reclaim it.
-    if valid_path(&put.path) && is_hash(&put.hash) && !protected(&ctx.options, &put.path) {
-        ctx.spare
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&partial_name(&put.hash, &put.path));
-    }
+    // Started: the partial file is the download's now.
+    claim.name = None;
     ctx.stats.owed.fetch_add(put.size, Ordering::Relaxed);
     let c = ctx.clone();
     puts.spawn(async move {
@@ -1027,45 +1045,62 @@ async fn start_put(ctx: &Arc<Ctx>, put: PutOp, puts: &mut JoinSet<()>) {
     });
 }
 
-/// Remove the spare partial files no download has taken up; whether there
-/// were any.
-async fn reclaim(ctx: &Ctx) -> bool {
-    let spare: Vec<String> = ctx
-        .spare
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain()
-        .map(|(name, _)| name)
-        .collect();
-    if spare.is_empty() {
-        return false;
-    }
-    tracing::info!(
-        files = spare.len(),
-        "taking back room from old partial files"
-    );
-    let s = ctx.storage.clone();
-    let _ = blocking(move || {
-        for name in spare {
-            let _ = s.remove_partial(&name);
+/// A put's own spare partial file, taken back into the spares unless the
+/// put starts.
+struct Claim {
+    ctx: Arc<Ctx>,
+    name: Option<String>,
+    size: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            self.ctx
+                .spare
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name, self.size);
         }
-    })
-    .await;
+    }
+}
+
+/// Remove the largest spare partial file no download has taken up; whether
+/// there was one. One at a time, so the room check stops it as soon as it
+/// has made enough: a spare a later put would resume is kept if it can be.
+async fn reclaim(ctx: &Ctx) -> bool {
+    let largest = {
+        let mut spare = ctx.spare.lock().unwrap_or_else(|e| e.into_inner());
+        let name = spare
+            .iter()
+            .max_by_key(|(_, size)| **size)
+            .map(|(name, _)| name.clone());
+        name.inspect(|n| {
+            spare.remove(n);
+        })
+    };
+    let Some(name) = largest else {
+        return false;
+    };
+    tracing::info!(name, "taking back room from an old partial file");
+    let s = ctx.storage.clone();
+    let _ = blocking(move || s.remove_partial(&name)).await;
     true
 }
 
-/// Whether the storage has room for `put`, beside the downloads under way.
-/// The plan was fitted to the free space; this catches anything else
-/// filling the storage meanwhile. A replacement frees its old file once
-/// it's done, so it may use the reserve the server keeps.
-async fn room_for(ctx: &Ctx, put: &PutOp) -> bool {
+/// Whether the storage has room for `need` more bytes (a put's, less what
+/// its partial file holds already), beside the downloads under way. The
+/// plan was fitted to the free space; this catches anything else filling
+/// the storage meanwhile. A replacement frees its old file once it's done,
+/// so it may use the reserve the server keeps.
+async fn room_for(ctx: &Ctx, need: u64, replace: bool) -> bool {
     let s = ctx.storage.clone();
     let Ok(Ok(Some(free))) = blocking(move || s.free_bytes()).await else {
         return true;
     };
     let owed = ctx.stats.owed.load(Ordering::Relaxed);
-    let margin = if put.replace { 0 } else { RESERVE_BYTES / 2 };
-    free >= owed.saturating_add(put.size).saturating_add(margin)
+    let margin = if replace { 0 } else { RESERVE_BYTES / 2 };
+    free >= owed.saturating_add(need).saturating_add(margin)
 }
 
 /// Why a download ended without its file in place.
@@ -1241,12 +1276,15 @@ async fn download(
         let (tx, rx) = mpsc::channel::<Bytes>(4);
         let s = ctx.storage.clone();
         let n = name.clone();
-        let writer = tokio::task::spawn_blocking(move || write(&*s, &n, resume, verify, rx));
+        let cancel = ctx.cancel.clone();
+        let writer =
+            tokio::task::spawn_blocking(move || write(&*s, &n, resume, verify, &cancel, rx));
         let streamed = stream(ctx, res.into_body(), tx, put.size - start, counted).await;
         let written = writer
             .await
             .map_err(|e| Halt::Stop(Stop::Storage(e.to_string())))?;
         match (streamed, written) {
+            (_, Err(_)) if ctx.cancel.is_cancelled() => return Err(Halt::Cancelled),
             (_, Err(e)) => {
                 if matches!(
                     e.kind(),
@@ -1385,6 +1423,26 @@ async fn stream(
 
 type Written = (Box<dyn Partial>, Option<blake3::Hasher>, u64);
 
+/// Hash what `r` holds, a MiB at a time, stopping if the sync is cancelled
+/// (a large partial file on a slow card takes a while).
+fn hash_into(
+    h: &mut blake3::Hasher,
+    mut r: impl io::Read,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    let mut buf = vec![0; 1 << 20];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        h.update(&buf[..n]);
+    }
+}
+
 /// The writer: the partial file, appended to or begun again, hashed as it
 /// goes (from its start, when resumed).
 fn write(
@@ -1392,11 +1450,12 @@ fn write(
     name: &str,
     resume: bool,
     verify: bool,
+    cancel: &CancellationToken,
     mut rx: mpsc::Receiver<Bytes>,
 ) -> io::Result<Written> {
     let mut hasher = verify.then(blake3::Hasher::new);
     if resume && let Some(h) = hasher.as_mut() {
-        h.update_reader(storage.read_partial(name)?)?;
+        hash_into(h, storage.read_partial(name)?, cancel)?;
     }
     let mut file = storage.write_partial(name, resume)?;
     let mut n = 0u64;
@@ -1433,9 +1492,17 @@ fn finish(
                 .map_err(|e| storage_halt(&e, "a partial file"))?;
             let hasher = if verify {
                 let mut h = blake3::Hasher::new();
-                s.read_partial(name)
-                    .and_then(|r| h.update_reader(r).map(|_| ()))
-                    .map_err(|e| storage_halt(&e, "a partial file"))?;
+                if let Err(e) = s
+                    .read_partial(name)
+                    .and_then(|r| hash_into(&mut h, r, &ctx.cancel))
+                {
+                    // Cancelled, the partial stays for next time.
+                    return Err(if ctx.cancel.is_cancelled() {
+                        Halt::Cancelled
+                    } else {
+                        storage_halt(&e, "a partial file")
+                    });
+                }
                 Some(h)
             } else {
                 None
