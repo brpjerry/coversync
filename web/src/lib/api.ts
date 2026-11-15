@@ -518,6 +518,39 @@ export interface Access {
 	device: number | null;
 }
 
+/** What uploads take, and where they go (`GET /api/uploads`). */
+export interface UploadsInfo {
+	/** The uploads folder as coversyncd sees it; null without an Inbox folder. */
+	folder: FolderStatus | null;
+	/** The chunk size to send, in bytes. */
+	chunk_size: number;
+	/** The file extensions uploads take, lowercase. */
+	extensions: string[];
+	max_files: number;
+}
+
+/** An upload under way on the server, with each file's progress. */
+export interface ServerUpload {
+	id: string;
+	folder: string;
+	size: number;
+	received: number;
+	files: {
+		index: number;
+		path: string;
+		size: number;
+		/** The bytes the server has, as `[start, end)` pairs. */
+		ranges: [number, number][];
+	}[];
+}
+
+/** A finished upload: the folder it went into, numbered if the name was taken. */
+export interface FinishedUpload {
+	folder: string;
+	/** Where it is on the server. */
+	path: string;
+}
+
 export class ApiError extends Error {
 	constructor(
 		public status: number,
@@ -559,6 +592,47 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		throw new ApiError(res.status, body.error ?? res.statusText, body);
 	}
 	return res.status === 202 || res.status === 204 ? (undefined as T) : res.json();
+}
+
+/**
+ * Send one chunk of an upload: `body` into file `index` from byte `offset`.
+ * By XMLHttpRequest, which, unlike fetch, tells how much of the body has
+ * gone (`progress`). The browser reads a file's slice from disk as it sends
+ * it. Throws an ApiError, with status 0 when the request got no answer (the
+ * connection dropped, or it was aborted through `signal`).
+ */
+export function sendChunk(
+	id: string,
+	index: number,
+	offset: number,
+	body: Blob,
+	progress: (sent: number) => void,
+	signal: AbortSignal
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const lost = () => reject(new ApiError(0, 'The connection to coversyncd was lost.'));
+		if (signal.aborted) return lost();
+		const xhr = new XMLHttpRequest();
+		xhr.open(
+			'PUT',
+			`${BASE}/api/uploads/${encodeURIComponent(id)}/files/${index}?offset=${offset}`
+		);
+		xhr.upload.onprogress = (e) => progress(e.loaded);
+		xhr.onload = () => {
+			if (xhr.status >= 200 && xhr.status < 300) return resolve();
+			let answer: Record<string, unknown> = {};
+			try {
+				answer = JSON.parse(xhr.responseText);
+			} catch {}
+			const code = typeof answer.code === 'string' ? answer.code : 'login_required';
+			if (xhr.status === 401) unauthorized(code);
+			const message = typeof answer.error === 'string' ? answer.error : xhr.statusText;
+			reject(new ApiError(xhr.status, message, answer));
+		};
+		xhr.onerror = xhr.onabort = xhr.ontimeout = lost;
+		signal.addEventListener('abort', () => xhr.abort(), { once: true });
+		xhr.send(body);
+	});
 }
 
 const json = (method: string, body: unknown): RequestInit => ({
@@ -673,6 +747,18 @@ export const api = {
 		request<CaInfo | null>(`/api/pairing/check-ca?path=${encodeURIComponent(path)}`),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
+	uploads: () => request<UploadsInfo>('/api/uploads'),
+	startUpload: (folder: string, files: { path: string; size: number }[]) =>
+		request<ServerUpload>('/api/uploads', json('POST', { folder, files })),
+	upload: (id: string) => request<ServerUpload>(`/api/uploads/${encodeURIComponent(id)}`),
+	finishUpload: (id: string) =>
+		request<FinishedUpload>(`/api/uploads/${encodeURIComponent(id)}/finish`, { method: 'POST' }),
+	/** The Inbox albums with files where an upload went (finishing's `path`), as the last scan found them. */
+	uploadAlbums: (path: string) =>
+		request<{ albums: string[] }>(`/api/uploads/albums?path=${encodeURIComponent(path)}`),
+	/** `keepalive`: sent even as the page goes away. */
+	cancelUpload: (id: string, keepalive = false) =>
+		request<void>(`/api/uploads/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
 	/** Throws TagConflict when `body.version` is no longer the album's. */
 	writeTags: (id: string, body: TagWrite) =>
 		request<TagWriteResult>(`/api/albums/${id}/tags`, {

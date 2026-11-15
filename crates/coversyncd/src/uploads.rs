@@ -11,13 +11,16 @@
 //! - `POST /api/uploads/{id}/finish` moves the files into the uploads folder
 //!   and starts a scan, so the album shows up in the Inbox.
 //!   `DELETE /api/uploads/{id}` cancels.
+//! - `GET /api/uploads/albums?path=PATH` names the Inbox albums with files
+//!   in the folder a finished upload went into, once a scan has found them:
+//!   the albums it became.
 //!
 //! Uploads take no lock that other uploads, scans or imports wait on, and
 //! never the jobs lock: chunks stream from the network to their file at
 //! their offset through large buffers, the disk writes overlapping the
 //! network reads.
 
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -50,6 +53,7 @@ pub fn router() -> Router<Shared> {
             // Room for the paths of many files.
             get(list).post(start).layer(DefaultBodyLimit::max(8 << 20)),
         )
+        .route("/api/uploads/albums", get(albums))
         .route("/api/uploads/{id}", get(status).delete(cancel))
         // The body streams to disk, bounded by the file's size, not
         // collected: no body limit applies.
@@ -104,6 +108,42 @@ async fn status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<UploadStatus>> {
     Ok(Json(state.uploads.get(&id)?.status(true)))
+}
+
+#[derive(Deserialize)]
+struct AlbumsQuery {
+    /// Where an upload went, as finishing answered: it stays that folder
+    /// after the uploads folder changes.
+    path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct AlbumsResponse {
+    albums: Vec<String>,
+}
+
+/// The Inbox albums with files in the folder a finished upload went into, as
+/// the last scan found them.
+async fn albums(
+    State(state): State<Shared>,
+    Query(q): Query<AlbumsQuery>,
+) -> ApiResult<Json<AlbumsResponse>> {
+    blocking(&state, move |s| {
+        let dir = q.path;
+        if !dir.is_absolute() || dir.components().any(|c| c == Component::ParentDir) {
+            return Err(coversync_core::Error::Invalid(format!(
+                "“{}” isn't where an upload went: an absolute path, as finishing answered.",
+                dir.display()
+            )));
+        }
+        // As the scan found it: links followed.
+        let dir = dir.canonicalize().unwrap_or(dir);
+        Ok(AlbumsResponse {
+            albums: s.lib.inbox_albums_under(&dir)?,
+        })
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]

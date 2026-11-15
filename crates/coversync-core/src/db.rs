@@ -1858,6 +1858,24 @@ impl Library {
         Ok(albums)
     }
 
+    /// The Inbox albums with a file in `dir` or under it, as the last scan
+    /// found them: the albums an upload became, its disc folders and all,
+    /// including one in a `CD1` folder, whose album is the folder above.
+    pub fn inbox_albums_under(&self, dir: &Path) -> Result<Vec<String>> {
+        let dir = dir.to_string_lossy();
+        let dir = dir.trim_end_matches('/');
+        // From `dir/` up to `dir0` ('0' follows '/'): the paths under it, as
+        // a range of the path index.
+        let (from, to) = (format!("{dir}/"), format!("{dir}0"));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT album_id FROM main.tracks
+                WHERE path >= ?1 AND path < ?2 AND {VISIBLE} ORDER BY album_id"
+        ))?;
+        let ids = stmt.query_map([&from, &to], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn album(&self, id: &str) -> Result<Option<AlbumDetail>> {
         let (mut tracks, dir, added, version) = {
             let conn = self.conn();

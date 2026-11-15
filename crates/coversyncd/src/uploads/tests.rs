@@ -397,6 +397,68 @@ async fn an_album_uploads_in_chunks_resumes_and_appears_in_the_inbox() {
     );
 }
 
+/// Upload `files` whole into `folder`, and finish.
+async fn upload(app: &App, folder: &str, files: &[(&str, &[u8])]) -> Value {
+    let (status, up) = app.start(folder, files).await;
+    assert_eq!(status, StatusCode::CREATED, "{up}");
+    let id = up["id"].as_str().unwrap();
+    for (i, (_, bytes)) in files.iter().enumerate() {
+        assert_eq!(app.put(id, i, 0, bytes).await.0, StatusCode::OK);
+    }
+    let (status, done) = app
+        .call(Method::POST, &format!("/api/uploads/{id}/finish"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    done
+}
+
+#[tokio::test]
+async fn an_uploads_albums_are_found_where_it_went() {
+    let app = app("albums");
+    let src = app.dir.join("src");
+    let one = wav(&src, "One", "Two Discs", 1);
+    let two = wav(&src, "Two", "Two Discs", 1);
+    let discs = upload(
+        &app,
+        "Two Discs",
+        &[("CD1/01 One.wav", &one), ("CD2/01 Two.wav", &two)],
+    )
+    .await;
+    let both = app.album_appears("Two Discs").await;
+    // A disc folder uploaded on its own: the scan files its album under the
+    // folder above, the uploads folder.
+    let solo = wav(&src, "Solo", "Lone Disc", 1);
+    let disc = upload(&app, "CD1", &[("01 Solo.wav", &solo)]).await;
+    let lone = app.album_appears("Lone Disc").await;
+    let app = &app;
+    let albums = |path: String| async move {
+        let encoded: String = path.bytes().map(|b| format!("%{b:02X}")).collect();
+        let path = format!("/api/uploads/albums?path={encoded}");
+        app.call(Method::GET, &path, None).await
+    };
+    let at = |done: &Value| done["path"].as_str().unwrap().to_owned();
+    assert_eq!(
+        albums(at(&discs)).await,
+        (StatusCode::OK, json!({ "albums": [both["id"]] }))
+    );
+    assert_eq!(
+        albums(at(&disc)).await,
+        (StatusCode::OK, json!({ "albums": [lone["id"]] }))
+    );
+    // Not a prefix of another folder's name; only absolute paths, without `..`.
+    let uploads = app.inbox.join("Uploads").display().to_string();
+    assert_eq!(
+        albums(format!("{uploads}/Two")).await.1,
+        json!({ "albums": [] })
+    );
+    assert_eq!(
+        albums("Uploads/CD1".into()).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let up = format!("{uploads}/CD1/..");
+    assert_eq!(albums(up).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn bad_paths_and_chunks_are_refused() {
     let app = app("refused");

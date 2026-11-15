@@ -30,6 +30,8 @@
 		search?: HTMLInputElement;
 		/** The sort menu, at the bar's right end. */
 		sorts: Snippet;
+		/** Buttons before Rescan, such as Upload in the Inbox. */
+		actions?: Snippet;
 	}
 	let {
 		query = $bindable(),
@@ -44,7 +46,8 @@
 		ontogglesidebar,
 		onrescan,
 		search = $bindable(),
-		sorts
+		sorts,
+		actions
 	}: Props = $props();
 
 	const views = [
@@ -169,6 +172,7 @@
 				{shown !== total ? `${count(shown)} of ${count(total)}` : count(total)} albums
 			</span>
 		{/if}
+		{@render actions?.()}
 		<button
 			class="icon-btn"
 			onclick={onrescan}

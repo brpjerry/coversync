@@ -16,6 +16,7 @@
 	import PanelTopOpen from '@lucide/svelte/icons/panel-top-open';
 	import Play from '@lucide/svelte/icons/play';
 	import FilterX from '@lucide/svelte/icons/funnel-x';
+	import Upload from '@lucide/svelte/icons/upload';
 	import {
 		api,
 		ApiError,
@@ -64,6 +65,10 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
+	import UploadButton from '#lib/components/UploadButton.svelte';
+	import UploadsPanel from '#lib/components/UploadsPanel.svelte';
+	import { uploads, UploadsUnavailable } from '#lib/uploads.svelte.ts';
+	import type { Picked } from '#lib/upload-files.ts';
 	import type { Draft, TagDraft } from '#lib/components/TagEditor.svelte';
 
 	const SORT_KEY = 'coversync.sort';
@@ -524,6 +529,8 @@
 				hold(null, draft === 'draft');
 			[albums, library] = [inbox, managed];
 			lastAlbums = Date.now();
+			// Finished uploads' albums may be among them.
+			void uploads.albumsLoaded(inbox);
 		} catch {
 			toast('Could not reach coversyncd', 'error');
 		}
@@ -559,6 +566,8 @@
 	}
 	/** A scan ended: show what it found. */
 	function scanFinished() {
+		// Uploads finished before it have their albums in the Inbox now, if any.
+		uploads.scanFinished();
 		dataGeneration++;
 		// The Inbox folder may have come or gone; the empty Inbox's message says which.
 		inboxSetup.refresh();
@@ -617,8 +626,11 @@
 		live = up;
 		// Down: poll again straight away. Up: the safety poll takes over after a resync.
 		if (!up) poll();
-		// The server answers: the app can be found now, if it couldn't before.
-		else findApp();
+		else {
+			// The server answers: the app can be found now, if it couldn't before.
+			findApp();
+			uploads.reconnected();
+		}
 	}
 
 	/**
@@ -1128,6 +1140,88 @@
 		if (album) open(album);
 	}
 
+	// Uploads: files and folders dropped on the Inbox, or picked with Upload.
+	/** Uploads go into the Inbox, so they're dropped on it, with nothing open over it. */
+	let canDrop = $derived(view === 'inbox' && !sheetAlbum && !importing);
+	/** Files are being dragged over the window. */
+	let dragging = $state(false);
+	/** dragenter and dragleave come for each element crossed, so they're counted. */
+	let dragDepth = 0;
+	/** Ends `dragging` if dragover stops without a dragleave (which browsers sometimes skip). */
+	let dragTimer: ReturnType<typeof setTimeout> | undefined;
+	const carriesFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
+	function dragEnded() {
+		clearTimeout(dragTimer);
+		dragDepth = 0;
+		dragging = false;
+	}
+	function ondragenter(e: DragEvent) {
+		if (!carriesFiles(e)) return;
+		e.preventDefault();
+		dragDepth++;
+		dragging = true;
+	}
+	function ondragover(e: DragEvent) {
+		if (!carriesFiles(e)) return;
+		dragging = true;
+		clearTimeout(dragTimer);
+		dragTimer = setTimeout(dragEnded, 1000);
+		// An element took it for itself: the import dialog's album art takes an image.
+		if (e.defaultPrevented) return;
+		// Taken everywhere else, so files dropped outside the Inbox don't open
+		// in the page's place.
+		e.preventDefault();
+		e.dataTransfer!.dropEffect = canDrop ? 'copy' : 'none';
+	}
+	function ondragleave(e: DragEvent) {
+		if (!carriesFiles(e)) return;
+		dragDepth = Math.max(0, dragDepth - 1);
+		if (!dragDepth) dragEnded();
+	}
+	function ondrop(e: DragEvent) {
+		dragEnded();
+		if (!carriesFiles(e) || e.defaultPrevented) return;
+		e.preventDefault();
+		if (!canDrop) return;
+		// Only to be had while the drop is handled.
+		const entries = [...e.dataTransfer!.items]
+			.filter((item) => item.kind === 'file')
+			.map((item) => item.webkitGetAsEntry())
+			.filter((entry) => entry !== null);
+		startUploads(() => uploads.drop(entries));
+	}
+
+	/** Start uploads, and say what couldn't be uploaded. */
+	async function startUploads(start: () => Promise<Picked[]>) {
+		let empty: Picked[];
+		try {
+			empty = await start();
+		} catch (e) {
+			const message = e instanceof Error ? e.message : 'The upload couldn’t start.';
+			const fix =
+				e instanceof UploadsUnavailable
+					? { label: 'Inbox setup', run: () => setView('inbox-setup') }
+					: undefined;
+			toast(message, 'error', 8000, fix);
+			return;
+		}
+		for (const p of empty)
+			toast(
+				`${p.folder ? `Nothing to upload in “${p.folder}”` : 'None of those files can be uploaded'}: only music, images, cue sheets and rip logs are.`,
+				'info',
+				7000
+			);
+	}
+
+	/** Open an album an upload became. */
+	async function showUploaded(id: string) {
+		await setView('inbox');
+		await tick();
+		const album = byId.get(id);
+		if (album) open(album);
+		else toast('That album isn’t in the Inbox any more', 'info');
+	}
+
 	async function rescan() {
 		await api.rescan().catch(() => toast('Rescan failed to start', 'error'));
 		// The folder may have been mounted (or unmounted) since the page loaded.
@@ -1187,7 +1281,11 @@
 
 	// Signed back in after the session ended: whatever was asked for meanwhile failed.
 	$effect(() => {
-		if (session.generation > 0) untrack(loadAll);
+		if (session.generation > 0)
+			untrack(() => {
+				loadAll();
+				uploads.reconnected();
+			});
 	});
 
 	let listening: Listening | undefined;
@@ -1224,7 +1322,7 @@
 	});
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window {onkeydown} {ondragenter} {ondragover} {ondragleave} {ondrop} />
 
 <!-- The page under an open album: inert, and blurred (see .behind). -->
 <div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum}>
@@ -1242,6 +1340,11 @@
 		ontogglesidebar={toggleSidebar}
 		onrescan={rescan}
 	>
+		{#snippet actions()}
+			{#if view === 'inbox'}
+				<UploadButton onpick={(files) => startUploads(() => uploads.pick(files))} />
+			{/if}
+		{/snippet}
 		{#snippet sorts()}
 			<SortMenu
 				sorts={appearance.sorts.saved}
@@ -1363,7 +1466,10 @@
 								</div>
 							{:else}
 								<h2>The Inbox is empty</h2>
-								<p>No audio files were found in the Inbox folder.</p>
+								<p>
+									No audio files were found in the Inbox folder. Drop album folders here to upload
+									them.
+								</p>
 								<div class="empty-actions">
 									<button class="btn primary" onclick={() => setView('inbox-setup')}>
 										<FolderCog size={16} /> Inbox setup
@@ -1479,6 +1585,17 @@
 	/>
 {/if}
 
+{#if dragging && canDrop}
+	<div class="drop" transition:fade={{ duration: 140 }} aria-hidden="true">
+		<div class="drop-box">
+			<span class="drop-icon"><Upload size={34} strokeWidth={1.6} /></span>
+			<h2>Drop to upload to the Inbox</h2>
+			<p>Folders go up whole, with their CD1 and CD2 folders.</p>
+		</div>
+	</div>
+{/if}
+
+<UploadsPanel onshow={showUploaded} />
 <Toasts />
 
 <style>
@@ -1554,6 +1671,53 @@
 		z-index: 25;
 		background: rgb(0 0 0 / 0.45);
 		backdrop-filter: blur(2px);
+	}
+	/* Over the Inbox while files are dragged over it. Events pass through to the window. */
+	.drop {
+		position: fixed;
+		inset: var(--topbar-h) 0 var(--dock, 0px) 0;
+		z-index: 40;
+		display: grid;
+		padding: 20px;
+		background: color-mix(in oklab, var(--bg) 80%, transparent);
+		backdrop-filter: blur(10px);
+		pointer-events: none;
+	}
+	.drop-box {
+		display: grid;
+		place-content: center;
+		justify-items: center;
+		gap: 6px;
+		padding: 24px;
+		border-radius: 22px;
+		border: 2px dashed color-mix(in oklab, var(--accent) 70%, transparent);
+		background: color-mix(in oklab, var(--accent) 8%, transparent);
+		text-align: center;
+	}
+	.drop-icon {
+		display: grid;
+		place-items: center;
+		width: 72px;
+		height: 72px;
+		margin-bottom: 10px;
+		border-radius: 999px;
+		color: var(--accent);
+		background: color-mix(in oklab, var(--accent) 16%, transparent);
+	}
+	.drop-box h2 {
+		margin: 0;
+		font-size: 22px;
+		letter-spacing: -0.02em;
+	}
+	.drop-box p {
+		margin: 0;
+		color: var(--text-2);
+	}
+	@media (max-width: 900px) {
+		/* The top bar takes two rows there. */
+		.drop {
+			inset: 0 0 var(--dock, 0px) 0;
+		}
 	}
 	.grid {
 		display: grid;
