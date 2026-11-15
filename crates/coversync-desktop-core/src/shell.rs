@@ -1388,6 +1388,10 @@ mod tests {
         assert!(shell.problem().is_none());
     }
 
+    // Bugs caught: 0, False positives: 1
+    // (Failed once in a full run and passed six times after: the port it
+    // takes for closed is only just freed, and another test running beside
+    // it can have bound it again by then.)
     #[test]
     fn an_address_that_isnt_coversync_never_gets_the_code() {
         let pairing = Pairing::new("pair-elsewhere");

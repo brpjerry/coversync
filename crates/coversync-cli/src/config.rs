@@ -55,30 +55,61 @@ impl Config {
         let mut config = self.clone();
         config.version = VERSION;
         let failed = |e: io::Error| format!("{} can't be written: {e}.", file.display());
-        let dir = file.parent().unwrap_or(Path::new("."));
-        fs::create_dir_all(dir).map_err(failed)?;
         // A path that isn't valid UTF-8 has no place in JSON: [`path`]
         // turns those away before they get here.
         let mut text = serde_json::to_vec_pretty(&config)
             .map_err(|e| format!("{} can't be written: {e}.", file.display()))?;
         text.push(b'\n');
-        // A file of this save's own: two saves at once (the app and the
-        // command, say) mustn't write into each other's.
-        let tmp = file.with_extension(format!("json.{}.new", std::process::id()));
-        let written = fs::File::options()
+        write_whole(file, &text, 0o666).map_err(failed)
+    }
+}
+
+/// A new, empty file in `dir`, for writing something whole before it's
+/// put in place: under a short name of its own, so not another writer's
+/// (two saves at once mustn't write into each other's), and not longer than
+/// a name the folder could hold. `mode` is the most anyone may do with it.
+pub fn temporary(dir: &Path, mode: u32) -> io::Result<(fs::File, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A name left by a run that was cut short is passed over, not reused.
+    for n in 0..64 {
+        let path = dir.join(format!(".coversync-{}-{n}.tmp", std::process::id()));
+        let made = fs::File::options()
             .write(true)
             .create_new(true)
-            .open(&tmp)
-            .and_then(|mut out| {
-                out.write_all(&text)?;
-                out.sync_all()
-            })
-            .and_then(|()| fs::rename(&tmp, file));
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
+            .mode(mode)
+            .open(&path);
+        match made {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-        written.map_err(failed)
     }
+    Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Puts `bytes` at `file`, whole or not at all: written to a file beside
+/// it and flushed, renamed over it, and the folder flushed too, so that a
+/// power cut leaves the old contents or the new.
+pub fn write_whole(file: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let dir = file
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let (mut out, tmp) = temporary(dir, mode)?;
+    let written = out
+        .write_all(bytes)
+        .and_then(|()| out.sync_all())
+        .and_then(|()| fs::rename(&tmp, file));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return written;
+    }
+    // The rename is in the folder: flushed where the file system allows.
+    if let Ok(folder) = fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
+    Ok(())
 }
 
 /// A server's address as it's kept, and as the keychain knows it.
@@ -192,6 +223,32 @@ mod tests {
         assert_eq!(fs::read_dir(file.parent().unwrap()).unwrap().count(), 1);
         fs::write(&file, b"{").unwrap();
         assert!(Config::load(&file).is_err());
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_file_is_put_in_place_whole_whatever_its_name_and_whatever_was_left() {
+        let dir = scratch("whole");
+        // A name as long as a folder can hold: the temporary beside it
+        // must not need a longer one.
+        let long = dir.join("t".repeat(255));
+        write_whole(&long, b"one", 0o600).unwrap();
+        assert_eq!(fs::read(&long).unwrap(), b"one");
+        // A temporary left by a run cut short (this process's number, used
+        // again) is passed over and left alone.
+        let orphan = dir.join(format!(".coversync-{}-0.tmp", std::process::id()));
+        fs::write(&orphan, b"left behind").unwrap();
+        write_whole(&long, b"two", 0o600).unwrap();
+        assert_eq!(fs::read(&long).unwrap(), b"two");
+        assert_eq!(fs::read(&orphan).unwrap(), b"left behind");
+        // Nothing of this save's own stays beside the file.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        // A file that can't be put in place leaves no temporary either.
+        let blocked = dir.join("folder");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("in-it"), b"").unwrap();
+        assert!(write_whole(&blocked, b"x", 0o600).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
     }
 
     // Bugs caught: 0, False positives: 0
