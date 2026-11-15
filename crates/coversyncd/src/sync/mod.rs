@@ -241,7 +241,19 @@ fn make_covers(state: Shared, wanted: Vec<CoverWanted>) {
         }
         state.sync.covers_made.fetch_add(1, Ordering::SeqCst);
         state.sync.changed();
+        tell_browsers(&state);
     });
+}
+
+/// Every device's sync may look different now: Sync setup reads them again.
+fn tell_browsers(state: &Shared) {
+    if let Ok(devices) = state.auth.device_syncs() {
+        for device in devices.into_keys() {
+            state
+                .events
+                .publish(crate::events::Notice::DeviceSync { device });
+        }
+    }
 }
 
 /// One cover file: the album's art at the width asked for, written into
@@ -310,6 +322,7 @@ pub fn spawn_watcher(state: Shared) {
             })
             .await;
             state.sync.changed();
+            tell_browsers(&state);
         }
     });
 }

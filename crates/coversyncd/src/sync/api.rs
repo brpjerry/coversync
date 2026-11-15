@@ -36,6 +36,9 @@ use crate::events::Notice;
 const MAX_LISTED: usize = 4_000_000;
 /// A session no request has touched for this long is let go.
 const SESSION_IDLE: Duration = Duration::from_secs(3600);
+/// A session no request has touched for this long isn't shown as running:
+/// its device has most likely gone without saying so.
+const SESSION_QUIET: Duration = Duration::from_secs(300);
 /// Browsers hear of a running sync's progress at most this often.
 const PROGRESS_NOTICE: Duration = Duration::from_secs(1);
 /// File reads for downloads.
@@ -249,7 +252,7 @@ impl Sessions {
     pub fn running(&self, device: i64) -> Option<Running> {
         self.lock()
             .values()
-            .find(|s| s.device == device)
+            .find(|s| s.device == device && s.touched.elapsed() < SESSION_QUIET)
             .map(|s| Running {
                 started_at: s.started_at,
                 reason: s.reason,

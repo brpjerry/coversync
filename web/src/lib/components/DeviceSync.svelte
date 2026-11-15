@@ -252,15 +252,11 @@
 		</div>
 	{/if}
 
-	{#if sync.remove_other}
+	{#if sync.remove_other && sync.other.files}
 		<div class="row">
 			<p class="line">
-				{#if sync.other.files}
-					Its folder has {sized(sync.other)} that coversync didn't put there: they're removed at its next
-					sync.
-				{:else}
-					Files that coversync didn't put in its folder are removed when it syncs.
-				{/if}
+				Its folder has {sized(sync.other)} that coversync didn't put there: they're removed at its next
+				sync.
 			</p>
 			{#if manage}
 				<button

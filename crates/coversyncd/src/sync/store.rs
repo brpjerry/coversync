@@ -381,6 +381,14 @@ impl Store {
                 }
             }
         }
+        // Removing other files is asked for once: when none are left, files
+        // a later check finds stay unless the user asks again.
+        tx.execute(
+            "UPDATE sync_devices SET remove_other = 0
+             WHERE device_id = ?1 AND remove_other
+                AND NOT EXISTS (SELECT 1 FROM sync_other WHERE device_id = ?1)",
+            [id],
+        )?;
         tx.commit()
     }
 
@@ -469,7 +477,8 @@ pub enum Flag {
     Check,
     /// Someone asked for a sync.
     Sync,
-    /// Remove the files in its folder that coversync didn't put there.
+    /// Remove the files in its folder that coversync didn't put there, once:
+    /// it clears when none are left.
     RemoveOther,
 }
 

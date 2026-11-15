@@ -611,6 +611,8 @@ async fn a_copied_folder_is_adopted_by_samples() {
     let ran = player.sync().await;
     assert_eq!(ran.ops, ["delete notes.txt"]);
     assert_eq!(tree(&player.root), d.files());
+    // Asked once: files the user puts there later stay.
+    assert!(!d.state.sync.store.device(id).unwrap().remove_other);
 }
 
 #[tokio::test]
