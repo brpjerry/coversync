@@ -737,6 +737,7 @@ async fn plan_page(
 pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> Answer<Snapshot> {
     let target = target(state, device)?;
     let mut files = state.sync.store.files(device)?;
+    let holds_files = !files.inventory.is_empty();
     // Paths an earlier build took that the rules now refuse: left alone,
     // as the device couldn't report doing anything with them.
     files.inventory.retain(|path, _| valid_path(path));
@@ -745,13 +746,13 @@ pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> 
     // A file already where it should be takes the owner the target gives
     // it now: an album retagged keeps its cover's path and bytes, but not
     // its id, which waiting for a new cover goes by.
-    let owners: Vec<(String, String, Option<i64>, String)> = files
+    let owners: Vec<(String, HeldFile, Option<i64>, String)> = files
         .inventory
         .iter()
         .filter_map(|(path, held)| {
             let e = target.at(path).filter(|e| e.hash == held.hash)?;
             (held.track != e.track || held.album.as_deref() != Some(e.album.as_str()))
-                .then(|| (path.clone(), held.hash.clone(), e.track, e.album.clone()))
+                .then(|| (path.clone(), held.clone(), e.track, e.album.clone()))
         })
         .collect();
     if !owners.is_empty() {
@@ -766,7 +767,7 @@ pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> 
     // A Library with nothing in it, nothing on its way and a device holding
     // files is far likelier a mistake (an empty folder chosen, a disk not
     // mounted) than a wish to empty the device: plan nothing.
-    let empty = target.entries.is_empty() && target.preparing == 0 && !files.inventory.is_empty();
+    let empty = target.entries.is_empty() && target.preparing == 0 && holds_files;
     if empty {
         tracing::warn!(
             device,

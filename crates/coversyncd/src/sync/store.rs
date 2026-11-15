@@ -353,23 +353,26 @@ impl Store {
         .collect()
     }
 
-    /// Say what files the device holds are of: (path, the content seen
-    /// there, track, album). A file whose content changed meanwhile (a
-    /// report since) is left as that report made it.
+    /// Say what files the device holds are of: (path, the file as seen
+    /// there, track, album). A file that changed meanwhile, in content or
+    /// owner (a report since), is left as that report made it.
     pub fn set_owners(
         &self,
         id: i64,
-        owners: &[(String, String, Option<i64>, String)],
+        owners: &[(String, Held, Option<i64>, String)],
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         {
             let mut set = tx.prepare_cached(
                 "UPDATE sync_inventory SET track = ?4, album = ?5
-                 WHERE device_id = ?1 AND path = ?2 AND hash = ?3",
+                 WHERE device_id = ?1 AND path = ?2 AND hash = ?3
+                    AND track IS ?6 AND album IS ?7",
             )?;
-            for (path, hash, track, album) in owners {
-                set.execute(params![id, path, hash, track, album])?;
+            for (path, seen, track, album) in owners {
+                set.execute(params![
+                    id, path, seen.hash, track, album, seen.track, seen.album
+                ])?;
             }
         }
         tx.commit()
