@@ -736,6 +736,7 @@ async fn hello_needs_no_login() {
     assert_eq!(b["app"], "coversync");
     assert_eq!(b["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(b["api"], serde_json::json!(["1"]));
+    assert_eq!(b["sync"], serde_json::json!(["1"]));
     assert!(b["name"].is_string());
 }
 

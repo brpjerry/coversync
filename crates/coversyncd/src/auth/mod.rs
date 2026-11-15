@@ -682,6 +682,8 @@ struct Hello {
     name: String,
     version: &'static str,
     api: &'static [&'static str],
+    /// The sync API's versions (`/api/sync/v1/`).
+    sync: &'static [&'static str],
 }
 
 /// Open to all: tells a client that this URL is a coversync server, and
@@ -692,6 +694,7 @@ async fn hello() -> Json<Hello> {
         name: host_name(),
         version: env!("CARGO_PKG_VERSION"),
         api: API_VERSIONS,
+        sync: &["1"],
     })
 }
 
