@@ -108,7 +108,13 @@ impl Api {
             Tls::System => builder
                 .with_provider_and_platform_verifier(rustls::crypto::ring::default_provider())
                 .map_err(|e| Error::Network(format!("couldn't set up TLS: {e}")))?,
-            Tls::Config(config) => builder.with_tls_config((**config).clone()),
+            Tls::Config(config) => {
+                // The connector picks the protocol (HTTP/1.1) itself, and
+                // refuses settings that already name one.
+                let mut config = (**config).clone();
+                config.alpn_protocols.clear();
+                builder.with_tls_config(config)
+            }
         }
         .https_or_http()
         .enable_http1()
@@ -298,4 +304,27 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = s.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tls_config_naming_a_protocol_is_taken() {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let server = Server {
+            url: "https://example.invalid".into(),
+            token: Token::new("cst_test").unwrap(),
+            tls: Tls::Config(Arc::new(config)),
+        };
+        assert!(Api::new(&server, 1).is_ok());
+    }
 }
