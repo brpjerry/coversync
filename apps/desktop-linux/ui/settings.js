@@ -17,9 +17,14 @@ const busy = $('busy');
 
 /** How often the agent's status is read while the page is up. */
 const REFRESH_MS = 2000;
+/**
+ * How long the controls stay still after the page comes up. A server's page can open it at any
+ * moment (that's its one command): a click meant for that page mustn't land on a switch here.
+ */
+const SETTLE_MS = 600;
 
-// A command is under way: the controls wait for it.
-let working = false;
+// A command is under way, or the page has only just come up: the controls wait.
+let working = true;
 
 /** A server's address without its scheme, as people say it. */
 const plain = (url) => url.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -62,6 +67,7 @@ function show(overview) {
 	if (on && overview.running) status.textContent = overview.status || 'Starting.';
 	else if (on) status.textContent = overview.unpaired ? '' : 'Sync is on, and not running right now.';
 	else if (elsewhere) status.textContent = overview.status;
+	else if (!overview.server) status.textContent = 'Open a server to turn sync on.';
 	else if (!overview.folder) status.textContent = 'Choose a folder to turn sync on.';
 	else status.textContent = 'Sync is off.';
 }
@@ -81,6 +87,11 @@ async function refresh() {
 		fail(problem);
 	}
 }
+
+// What there is to see shows at once; only the controls wait.
+invoke('settings')
+	.then(show)
+	.catch(fail);
 
 /** Runs a command that answers with the overview, keeping the controls still meanwhile. */
 async function run(cmd, args, doing) {
@@ -115,5 +126,9 @@ document.addEventListener('keydown', (event) => {
 	if (event.key === 'Escape') invoke('close_settings').catch(() => {});
 });
 
-refresh();
+toggle.disabled = chooseButton.disabled = true;
+setTimeout(() => {
+	working = false;
+	refresh();
+}, SETTLE_MS);
 setInterval(refresh, REFRESH_MS);
