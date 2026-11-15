@@ -79,7 +79,11 @@ impl DeviceSettings {
             Template::parse(structure)?;
         }
         self.art.cover_name = art::cover_file_name(&self.art.cover_name)?;
-        if self.fat_safe && template::fat_name(&self.art.cover_name, false) != self.art.cover_name {
+        // A name kept while no cover file is written isn't checked.
+        if self.fat_safe
+            && self.art.cover_file
+            && template::fat_name(&self.art.cover_name, false) != self.art.cover_name
+        {
             return Err(Error::Invalid(
                 "With FAT-safe names, the cover file name can't hold : ? * \" < > | or end in a \
                  dot or space, nor be a name Windows keeps for itself, such as CON."
@@ -267,19 +271,11 @@ fn keep_apart(files: &mut [DeviceFile]) -> usize {
     clashes.len()
 }
 
-/// A path as FAT, exFAT and Android's shared storage compare names: each
-/// letter as its capital, so case aside, and σ and ς alike.
+/// A path as FAT, exFAT and Android's shared storage compare names, or a
+/// little more strictly: in capitals, so case aside, σ and ς alike, and ᾀ
+/// and ᾈ too. (ß and SS also match, which those don't: a needless number.)
 fn case_key(path: &str) -> String {
-    path.chars()
-        .map(|c| {
-            let mut upper = c.to_uppercase();
-            match (upper.next(), upper.next()) {
-                (Some(u), None) => u,
-                // ß has no one-letter capital, and stays itself.
-                _ => c,
-            }
-        })
-        .collect()
+    path.to_uppercase()
 }
 
 /// `path` with " (n)" after its file name's stem.
@@ -430,6 +426,8 @@ mod tests {
             ("x.flac", ""),
             ("Σ.flac", ""),
             ("ς.flac", ""),
+            ("ᾀ.flac", ""),
+            ("ᾈ.flac", ""),
         ];
         let (got, _, renamed) = paths(&tracks, DeviceSettings::default());
         assert_eq!(
@@ -443,11 +441,13 @@ mod tests {
                 // Its first free number.
                 "x (3).flac",
                 "Σ.flac",
-                // ς's capital is Σ.
+                // ς's capital is Σ, and ᾀ's and ᾈ's are alike.
                 "ς (2).flac",
+                "ᾀ.flac",
+                "ᾈ (2).flac",
             ]
         );
-        assert_eq!(renamed, 3);
+        assert_eq!(renamed, 4);
     }
 
     #[test]

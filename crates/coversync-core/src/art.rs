@@ -65,9 +65,10 @@ impl Default for ArtRules {
 
 /// A cover file name as typed, without its extension: "cover.jpg" means
 /// "cover", as the extension follows the image, and nothing means "cover".
+/// Every image extension at the end goes, so a name taken once stays.
 pub fn cover_file_name(typed: &str) -> Result<String> {
     let mut name = typed.trim();
-    if let Some((stem, ext)) = name.rsplit_once('.')
+    while let Some((stem, ext)) = name.rsplit_once('.')
         && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
     {
         name = stem.trim_end();

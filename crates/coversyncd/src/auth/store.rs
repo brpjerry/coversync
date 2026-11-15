@@ -731,13 +731,13 @@ fn device_sync(conn: &Connection, id: i64) -> rusqlite::Result<Option<DeviceSync
 
 /// Sync settings as stored: the defaults, at version 0, until first saved.
 /// Settings this build can't read or use (a newer one's, say) read as the
-/// defaults.
+/// defaults; usable ones read as saved.
 fn sync_row(version: Option<i64>, settings: Option<String>) -> DeviceSync {
     DeviceSync {
         version: version.unwrap_or(0),
         settings: settings
             .and_then(|s| serde_json::from_str::<DeviceSettings>(&s).ok())
-            .and_then(|s| s.normalize().ok())
+            .filter(|s| s.clone().normalize().is_ok())
             .unwrap_or_default(),
     }
 }

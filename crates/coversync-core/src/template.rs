@@ -291,18 +291,21 @@ fn shorten(value: &str, max: usize) -> String {
 }
 
 /// Trim, drop trailing dots (Windows), and cap the length of one component.
+/// Dots and spaces go together, so no name is left as `.` or `..`.
 fn finish(component: &str) -> String {
-    let s = component.trim().trim_end_matches('.').trim_end();
-    cut(s, MAX_NAME).trim_end().to_string()
+    let trailing = |c: char| c == '.' || c.is_whitespace();
+    let s = component.trim().trim_end_matches(trailing);
+    cut(s, MAX_NAME).trim_end_matches(trailing).to_string()
 }
 
 /// The most bytes of UTF-8 a file or folder name gets: below what Linux
 /// (255 bytes), FAT32 and exFAT (255 UTF-16 units) allow.
 pub const MAX_NAME: usize = 180;
 
-/// At most `max` bytes of `s`, never splitting a character, or a
-/// character from the marks that combine with it (accents, dakuten,
-/// variation selectors, emoji joined by ZWJ).
+/// At most `max` bytes of `s`, never splitting a character. Nor does it
+/// part a character from the common marks that combine with it (accents,
+/// dakuten, variation selectors, emoji joined by ZWJ; see
+/// [`joins_previous`]), though it doesn't know every script's.
 pub fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -455,6 +458,20 @@ mod tests {
             t.render(&v, "flac").unwrap(),
             PathBuf::from("AC-DC/What_ Why_ _Now_.flac")
         );
+    }
+
+    #[test]
+    fn a_name_is_never_dots_alone() {
+        // With the value missing, or there, the folder isn't `..`.
+        let t = Template::parse(".. .{composer}/{title}").unwrap();
+        let (path, missing) = t.render_partial(&vals(&[("title", "T")]), "flac");
+        assert_eq!(
+            (path, missing),
+            (PathBuf::from("_/T.flac"), vec!["composer"])
+        );
+        let t = Template::parse("{album}/{title}").unwrap();
+        let v = vals(&[("album", ".. ."), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("_/T.flac"));
     }
 
     #[test]
