@@ -78,7 +78,8 @@ used on a home server.
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
-- **Sync** (the server's side; device apps come next): devices pair with the
+- **Sync** (the server and the engine every device runs; the device apps
+  come next): devices pair with the
   server from Sync setup, each with a token of its own (see
   [Pairing devices](#pairing-devices)), and the sidebar's Sync section lists
   them. Each device gets the whole Library, with settings of its own in Sync
@@ -90,7 +91,11 @@ used on a home server.
   what each device holds, so a normal sync reads nothing back from the
   device. Sync setup shows each device's last sync, what's left, failed files
   and files in its folder coversync didn't put there, with **Sync now** and
-  **Check files**. Sync setup can turn the section off.
+  **Check files**. Sync setup can turn the section off. The sync engine
+  (`crates/coversync-replica`) is the device's side, shared by every client:
+  it runs the server's plans into a folder, several downloads at once, each
+  checked against its hash as it arrives, resumed where it stopped, and put
+  in place only once it's whole.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
@@ -111,6 +116,8 @@ used on a home server.
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
 crates/coversync-protocol  the sync API's requests and replies, shared by the server and clients;
                         `cargo run -p coversync-protocol --example sync_client` syncs a folder
+crates/coversync-replica  the sync engine every client runs; `cargo run -p coversync-replica
+                        --example replica` syncs a folder with it
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 crates/coversync-desktop-core  the desktop app's settings, servers and launches, apart from its window
@@ -217,8 +224,9 @@ until the command is run on the server.
 - **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
   (see [Pairing devices](#pairing-devices)), one per device, each with a
   scope: `manage` (everything a browser can do, except managing devices) or
-  `sync` (syncing only; refused with 403 for now, but for `GET /api/session`
-  and its own `GET /api/devices/{id}/sync/settings` and `/sync/paths`).
+  `sync` (syncing only: the sync API under `/api/sync/v1/`, `GET
+  /api/session`, and its own `GET /api/devices/{id}/sync/settings`,
+  `/sync/paths` and `/sync/state`; everything else is refused with 403).
   `POST /api/login/token` trades a token for a session cookie, for an app's
   web view; that session has the device's scope and isn't a password login.
 - **Everything under `/api` needs one or the other**, except `GET /api/hello`
@@ -411,8 +419,9 @@ The database also gives the Library a random id and a change counter, which
 coversyncd commits: an import, a tag edit, or a scan that finds files added,
 changed or removed (a large scan or import commits in several batches). The
 tracks each batch wrote, and the files it removed, carry the new value. There
-is no endpoint yet to ask for the changes since a given value; that comes
-with sync. If a Library's counter is ever lower than the highest one this
+is no endpoint to ask for the changes since a given value: devices learn of
+changes from the sync API's `target`, which the counter is part of. If a
+Library's counter is ever lower than the highest one this
 installation has seen it reach, as when its folder is restored from an older
 backup, coversyncd gives it a new id, so clients that knew the later state
 start over rather than trust it. A Library moved to another installation

@@ -112,6 +112,8 @@ jobs:
 
       - name: Build coversync-core without default features
         run: cargo ${{ matrix.cargo }} -p coversync-core --no-default-features --locked --target ${{ matrix.target }}
+      - name: Build the sync engine
+        run: cargo ${{ matrix.cargo }} -p coversync-replica --locked --target ${{ matrix.target }}
 
   package:
     name: Arch package

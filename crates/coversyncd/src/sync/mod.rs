@@ -9,6 +9,8 @@
 //! outgoing requests only; nothing here reaches out to them.
 
 mod api;
+#[cfg(test)]
+mod engine_tests;
 mod plan;
 mod ranges;
 mod setup;
