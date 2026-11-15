@@ -76,10 +76,7 @@ impl DeviceSettings {
         if let Some(structure) = &self.structure {
             Template::parse(structure)?;
         }
-        // A name kept while no cover file is written isn't checked.
-        if self.art.cover_file {
-            self.art.cover_name = art::cover_file_name(&self.art.cover_name)?;
-        }
+        self.art.cover_name = art::cover_file_name(&self.art.cover_name, self.art.cover_file)?;
         if let Some(width) = self.art.max_width
             && !ART_WIDTHS.contains(&width)
         {

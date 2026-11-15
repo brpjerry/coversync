@@ -66,7 +66,9 @@ impl Default for ArtRules {
 /// A cover file name as typed, without its extension: "cover.jpg" means
 /// "cover", as the extension follows the image, and nothing means "cover".
 /// Every image extension at the end goes, so a name taken once stays.
-pub fn cover_file_name(typed: &str) -> Result<String> {
+/// With `used` (a cover file is written), a name no file can have is
+/// refused; one kept while it's off is only tidied.
+pub fn cover_file_name(typed: &str, used: bool) -> Result<String> {
     let mut name = typed.trim();
     while let Some((stem, ext)) = name.rsplit_once('.')
         && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
@@ -76,12 +78,13 @@ pub fn cover_file_name(typed: &str) -> Result<String> {
     if name.is_empty() {
         name = FILE_NAMES[0];
     }
-    if name.contains('/')
-        || name.contains(template::NOT_IN_NAMES)
-        || name.chars().any(char::is_control)
-        || name.starts_with('.')
-        || template::reserved(name)
-        || name.chars().count() > 64
+    if used
+        && (name.contains('/')
+            || name.contains(template::NOT_IN_NAMES)
+            || name.chars().any(char::is_control)
+            || name.starts_with('.')
+            || template::reserved(name)
+            || name.chars().count() > 64)
     {
         return Err(Error::Invalid(
             "The cover file name can't contain / \\ : * ? \" < > |, start with a dot, or be \
@@ -94,10 +97,7 @@ pub fn cover_file_name(typed: &str) -> Result<String> {
 
 impl ArtRules {
     pub fn normalize(mut self) -> Result<Self> {
-        // A name kept while no cover file is written isn't checked.
-        if self.placement.file() {
-            self.file_name = cover_file_name(&self.file_name)?;
-        }
+        self.file_name = cover_file_name(&self.file_name, self.placement.file())?;
         Ok(self)
     }
 
@@ -232,12 +232,17 @@ mod tests {
         assert!(rules(".cover").is_err());
         assert!(rules("art: front").is_err());
         assert!(rules("CON").is_err());
-        let embedded = ArtRules {
-            placement: Placement::Embedded,
-            file_name: "art: front".into(),
-            ..Default::default()
+        // A name kept while no cover file is written is only tidied.
+        let embedded = |name: &str| {
+            ArtRules {
+                placement: Placement::Embedded,
+                file_name: name.into(),
+                ..Default::default()
+            }
+            .normalize()
         };
-        assert!(embedded.normalize().is_ok());
+        assert_eq!(embedded("art: front.jpg").unwrap().file_name, "art: front");
+        assert_eq!(embedded(" ").unwrap().file_name, "cover");
     }
 
     #[test]
