@@ -12,7 +12,8 @@ use coversync_cli::config::{self, Config};
 use coversync_cli::notify::Notifier;
 use coversync_cli::system::System;
 use coversync_cli::tokens::Source;
-use coversync_desktop_core::ConfigLock;
+use coversync_desktop_core::config::Device;
+use coversync_desktop_core::{ConfigLock, Store};
 use coversync_proxy::{AboutApp, Upstream};
 use coversync_replica::{CancellationToken, Options, WatchOptions};
 use tokio::signal::unix::{SignalKind, signal};
@@ -248,6 +249,30 @@ fn apps_lock(tokens: &Source, settings: Option<&Path>) -> Result<Option<ConfigLo
     Ok(Some(lock))
 }
 
+/// Tells the app, in its settings, of a pairing that put a token in the
+/// keychain for `url`. A token that manages is one the app signs in with:
+/// the server is listed as paired, as if the app had paired itself. A
+/// sync-only token isn't (the app would be refused everything it asks):
+/// the server is taken off the list, and the app signs in by password.
+fn note_for_app(
+    settings: &Path,
+    url: &str,
+    paired: &coversync_proxy::Paired,
+) -> std::io::Result<()> {
+    let store = Store::open(settings.to_owned());
+    store.update(|app| {
+        if paired.manages {
+            let device = Device {
+                id: paired.device_id,
+                name: paired.name.clone(),
+            };
+            app.paired.insert(url.to_owned(), device);
+        } else {
+            app.paired.remove(url);
+        }
+    })
+}
+
 /// What the agent runs with, once the command's options and the settings
 /// file are put together.
 #[derive(Debug, PartialEq)]
@@ -264,7 +289,21 @@ fn resolve(
     root: Option<PathBuf>,
     token_file: Option<PathBuf>,
 ) -> Result<Resolved, String> {
-    let server = server.or(config.server).ok_or(
+    let given = server.as_deref().map(config::server_url).transpose()?;
+    // The settings' token file is the token of the settings' server: sent
+    // to another one, it would hand that server this computer's sign-in
+    // to the first. Another server needs its own named.
+    if let (Some(given), Some(kept), Some(file), None) =
+        (&given, &config.server, &config.token_file, &token_file)
+        && given != kept
+    {
+        return Err(format!(
+            "The token file in the settings ({}) is this computer's token for {kept}, not for \
+             {given}. Name {given}'s with --token-file, or pair with it: coversync pair.",
+            file.display()
+        ));
+    }
+    let server = given.or(config.server).ok_or(
         "No server is set. Turn sync on in the coversync app's settings, or run `coversync \
          setup --server <url> --root <folder>`.",
     )?;
@@ -295,8 +334,17 @@ fn setup(
 ) -> Done {
     let mut config = Config::load(file).map_err(setup_error)?;
     let changing = server.is_some() || root.is_some() || token_file.is_some() || keychain;
+    // A token file is one server's token. Moved to another server without
+    // a token file named for it, the old file is let go of (it would be
+    // sent to the new server otherwise) and the keychain is looked in.
+    let mut let_go = None;
     if let Some(server) = server {
-        config.server = Some(config::server_url(&server).map_err(setup_error)?);
+        let server = config::server_url(&server).map_err(setup_error)?;
+        let moved = config.server.as_ref().is_some_and(|kept| *kept != server);
+        if moved && token_file.is_none() {
+            let_go = config.token_file.take();
+        }
+        config.server = Some(server);
     }
     if let Some(root) = root {
         config.root = Some(config::folder(&root).map_err(setup_error)?);
@@ -323,6 +371,13 @@ fn setup(
             |p| format!("in {}", p.display())
         )
     );
+    if let Some(old) = let_go {
+        println!(
+            "The token file {} was the other server's and is no longer used. Pair with this \
+             one (coversync pair), or name its token file with --token-file.",
+            old.display()
+        );
+    }
     if changing {
         println!("Saved to {}.", file.display());
         println!(
@@ -369,6 +424,18 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
             paired.name
         ))
     })?;
+    // The keychain's token is the app's too, and the app goes by its own
+    // list of the servers it's paired with: kept in step, under the lock
+    // still held.
+    if let (Source::Keychain, Some(settings)) = (&tokens, config::file().parent())
+        && let Err(e) = note_for_app(settings, &url, &paired)
+    {
+        eprintln!(
+            "coversync: paired, but the app's settings in {} couldn't be updated ({e}). The \
+             app may ask to pair again.",
+            settings.display()
+        );
+    }
     config.server = Some(url.clone());
     config.token_file = token_file;
     config.save(file).map_err(setup_error)?;
@@ -417,6 +484,14 @@ mod tests {
         let one = resolve(saved(), None, Some("/given".into()), None).unwrap();
         assert_eq!(one.server, "https://saved.example/");
         assert_eq!(one.root, Path::new("/given"));
+
+        // Another server than the settings' one, with only the settings'
+        // token file to go by: refused, not sent that token.
+        let other = resolve(saved(), Some("https://other.example".into()), None, None);
+        let why = other.unwrap_err();
+        assert!(why.contains("not for https://other.example/"), "{why}");
+        // The same server spelled another way is the same server.
+        assert!(resolve(saved(), Some("saved.example".into()), None, None).is_ok());
 
         // No token file anywhere: the keychain.
         let keychain = Config {
@@ -476,6 +551,28 @@ mod tests {
         let saved = Config::load(&file).unwrap();
         assert_eq!(saved.token_file, None);
         assert_eq!(saved.root.as_deref(), Some(dir.as_path()));
+        // A token file is one server's: moving to another server lets go
+        // of it, unless that server's is named in the same breath.
+        let a = Some("https://a.example".to_owned());
+        let b = Some("https://b.example".to_owned());
+        setup(&file, a.clone(), None, Some(token.clone()), false).unwrap();
+        setup(&file, a.clone(), None, None, false).unwrap();
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(
+            saved.token_file.as_deref(),
+            Some(token.as_path()),
+            "the same server"
+        );
+        setup(&file, b.clone(), None, None, false).unwrap();
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.server.as_deref(), Some("https://b.example/"));
+        assert_eq!(saved.token_file, None, "a's token would have gone to b");
+        let other = dir.join("b-token");
+        setup(&file, a.clone(), None, Some(other.clone()), false).unwrap();
+        let saved = Config::load(&file).unwrap();
+        assert_eq!(saved.token_file.as_deref(), Some(other.as_path()));
+        setup(&file, None, None, None, true).unwrap();
+
         // Only looking changes nothing.
         let before = std::fs::read(&file).unwrap();
         setup(&file, None, None, None, false).unwrap();
@@ -483,5 +580,35 @@ mod tests {
         // A folder that isn't there is refused, and the settings stay.
         assert!(setup(&file, None, Some(dir.join("missing")), None, false).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_pairing_into_the_keychain_is_told_to_the_app() {
+        let dir = std::env::temp_dir().join(format!("coversync-cli-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = "https://music.example/";
+        let paired = |manages| coversync_proxy::Paired {
+            device_id: 12,
+            name: "Laptop".into(),
+            manages,
+            token: coversync_proxy::Token::new("cst_example").unwrap(),
+        };
+        // A token that manages: the app finds the server paired.
+        note_for_app(&dir, url, &paired(true)).unwrap();
+        let app = Store::open(dir.clone()).get();
+        assert_eq!(
+            app.paired.get(url).map(|d| (d.id, d.name.as_str())),
+            Some((12, "Laptop"))
+        );
+        // Paired again as sync-only: the app mustn't sign in with that
+        // one, and nothing else of its settings goes.
+        Store::open(dir.clone())
+            .update(|app| app.server = Some(url.to_owned()))
+            .unwrap();
+        note_for_app(&dir, url, &paired(false)).unwrap();
+        let app = Store::open(dir.clone()).get();
+        assert!(app.paired.is_empty());
+        assert_eq!(app.server.as_deref(), Some(url));
     }
 }
