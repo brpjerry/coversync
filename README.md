@@ -4,7 +4,8 @@ A music library manager and tag editor that runs as a small daemon and serves
 its UI to the browser. It indexes an **Inbox** of unmanaged music and imports
 albums into a **Library** it manages: copied (or moved) into a folder structure
 you define, held to rules about tags and album art, with tags filled in or
-corrected on the way. Syncing the Library to devices is planned.
+corrected on the way. The server's side of syncing the Library to devices is
+in place; the device apps come next.
 
 Early days: a single user with a password (see [Signing in](#signing-in)),
 used on a home server.
@@ -77,13 +78,19 @@ used on a home server.
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
-- **Sync** (planned): devices pair with the server from Sync setup, each with
-  a token of its own (see [Pairing devices](#pairing-devices)), and the
-  sidebar's Sync section lists them. Each device gets the whole Library, with
-  settings of its own in Sync setup: the Library's folders or its own, and
-  its art (a cover file, and the widest art). The server works out
-  every file's path on each device; copying the files comes later. Sync setup
-  can turn the section off.
+- **Sync** (the server's side; device apps come next): devices pair with the
+  server from Sync setup, each with a token of its own (see
+  [Pairing devices](#pairing-devices)), and the sidebar's Sync section lists
+  them. Each device gets the whole Library, with settings of its own in Sync
+  setup: the Library's folders or its own, its art (a cover file, and the
+  widest art), and when it syncs by itself. The sync API (`/api/sync/v1/`,
+  its types in `crates/coversync-protocol`) plans every sync on the server:
+  a device downloads what's new by content hash, several files at once, and
+  renames what only moved, keeping no database of its own. The server keeps
+  what each device holds, so a normal sync reads nothing back from the
+  device. Sync setup shows each device's last sync, what's left, failed files
+  and files in its folder coversync didn't put there, with **Sync now** and
+  **Check files**. Sync setup can turn the section off.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
@@ -102,6 +109,8 @@ used on a home server.
 
 ```text
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
+crates/coversync-protocol  the sync API's requests and replies, shared by the server and clients;
+                        `cargo run -p coversync-protocol --example sync_client` syncs a folder
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 crates/coversync-desktop-core  the desktop app's settings, servers and launches, apart from its window

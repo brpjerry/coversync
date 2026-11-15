@@ -1,11 +1,28 @@
 // The devices paired with this server: listed in the sidebar's Sync section
 // and in Sync setup, where they're added, renamed, re-scoped and revoked, and
 // their sync settings changed. Changes are made at once, not through the
-// save bar.
+// save bar. While Sync setup is open, each device's sync is read too, and
+// read again as it moves on.
 
 import { createSubscriber } from 'svelte/reactivity';
-import { api, ApiError, type Device, type DeviceSettings, type Scope } from './api';
+import {
+	api,
+	ApiError,
+	type Device,
+	type DeviceSettings,
+	type DeviceSyncState,
+	type Scope,
+	type SyncAction
+} from './api';
 import { toast } from './toast.svelte';
+
+const ACTION_FAILED: Record<SyncAction, string> = {
+	sync: 'Asking the device to sync failed',
+	check: 'Asking for a check of its files failed',
+	retry: 'Retrying the failed files failed',
+	remove_other: 'Asking to remove the files failed',
+	keep_other: 'Asking to keep the files failed'
+};
 
 class DevicesStore {
 	loaded = $state(false);
@@ -35,8 +52,108 @@ class DevicesStore {
 			this.canManage = r.can_manage;
 			this.loaded = true;
 			this.failed = false;
+			// Devices may have come or gone, and saved settings changed what's left to sync.
+			this.readSyncAll();
 		} catch {
 			if (version === this.#version) this.failed = !this.loaded;
+		}
+	}
+
+	/**
+	 * Each device's sync, while Sync setup shows it (see `watchSync`): the
+	 * devices whose sync settings this login may read, which are the ones
+	 * whose sync it may read.
+	 */
+	syncStates = $state<Record<number, DeviceSyncState>>({});
+	/** Devices whose sync action is being sent, and which. */
+	syncBusy = $state<Record<number, SyncAction>>({});
+	/** Screens showing sync states. */
+	#watching = 0;
+	/** Per device: the read under way, and the one waiting for it to end. */
+	#reading = new Map<number, Promise<void>>();
+	#waiting = new Map<number, Promise<void>>();
+
+	/** Re-reads syncs shown as running, while a screen shows them. */
+	#ticker: ReturnType<typeof setInterval> | undefined;
+
+	/** Read every device's sync while a screen shows it; returns the stop. */
+	watchSync() {
+		this.#watching++;
+		this.readSyncAll();
+		// A device that goes quiet mid-sync stops counting as syncing on the
+		// server after a few minutes, which no event says: read those again
+		// now and then.
+		this.#ticker ??= setInterval(() => {
+			for (const [id, state] of Object.entries(this.syncStates))
+				if (state.running) void this.readSync(Number(id));
+		}, 60_000);
+		return () => {
+			// Not kept for next time, when it would show out of date at first.
+			if (!--this.#watching) {
+				this.syncStates = {};
+				clearInterval(this.#ticker);
+				this.#ticker = undefined;
+			}
+		};
+	}
+
+	/** Read the sync of each device this login may read again, while it's shown. */
+	readSyncAll() {
+		if (!this.#watching) return;
+		const ids = this.list.filter((d) => d.sync && d.revoked_at === null).map((d) => d.id);
+		for (const id of Object.keys(this.syncStates).map(Number))
+			if (!ids.includes(id)) delete this.syncStates[id];
+		for (const id of ids) void this.readSync(id);
+	}
+
+	/**
+	 * Read a device's sync again, while it's shown. A device's reads go one
+	 * at a time, so each lands over an older one, and a busy device (whose
+	 * sync moves on every second) isn't asked more often than it answers:
+	 * asked during a read, the next starts when it ends, and asks meanwhile
+	 * share that one. Resolves once a read started after the ask has landed.
+	 */
+	readSync(id: number): Promise<void> {
+		if (!this.#watching) return Promise.resolve();
+		const waiting = this.#waiting.get(id);
+		if (waiting) return waiting;
+		const next = (this.#reading.get(id) ?? Promise.resolve()).then(() => {
+			this.#waiting.delete(id);
+			const read = this.#readState(id);
+			this.#reading.set(id, read);
+			return read.finally(() => {
+				if (this.#reading.get(id) === read) this.#reading.delete(id);
+			});
+		});
+		this.#waiting.set(id, next);
+		return next;
+	}
+
+	/** Never fails: a read that does leaves what's shown. */
+	async #readState(id: number) {
+		try {
+			const state = await api.deviceSyncState(id);
+			if (this.#watching) this.syncStates[id] = state;
+		} catch (e) {
+			// Gone, or no longer this login's to read.
+			if (e instanceof ApiError && (e.status === 403 || e.status === 404))
+				delete this.syncStates[id];
+		}
+	}
+
+	/** Ask something of a device's sync (a password login only); returns whether it was taken. */
+	async syncAction(id: number, action: SyncAction) {
+		this.syncBusy[id] = action;
+		try {
+			await api.deviceSyncAction(id, action);
+			// Shown as it is now before the button comes back.
+			await this.readSync(id);
+			return true;
+		} catch (e) {
+			toast(e instanceof ApiError ? e.message : ACTION_FAILED[action], 'error', 6000);
+			return false;
+		} finally {
+			delete this.syncBusy[id];
 		}
 	}
 

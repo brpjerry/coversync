@@ -571,6 +571,8 @@
 		dataGeneration++;
 		// The Inbox folder may have come or gone; the empty Inbox's message says which.
 		inboxSetup.refresh();
+		// The Library may have changed, and with it what devices have left to sync.
+		devices.readSyncAll();
 		return loadAlbums();
 	}
 
@@ -945,8 +947,10 @@
 
 	/** An album was edited, here or elsewhere: show it as it is now. */
 	function albumChanged({ id, previous_id, collection, version }: Notices['album_changed']) {
-		// The Inbox's tag coverage, which Library setup shows, may have changed.
+		// The Inbox's tag coverage, which Library setup shows, may have changed;
+		// a Library album's files are what devices sync.
 		if (collection === 'inbox') dataGeneration++;
+		else devices.readSyncAll();
 		loadAlbums();
 		enqueue({ kind: 'notice', id, previous: previous_id, version });
 	}
@@ -1001,6 +1005,8 @@
 			// Copies hide the Inbox files, which Inbox setup counts.
 			inboxSetup.refresh();
 			inboxChanged();
+			// Devices have the album to sync now.
+			devices.readSyncAll();
 			// The Inbox album open moves to the Library (an import made here
 			// closes its sheet itself); a Library album open may have more tracks.
 			enqueue({
@@ -1010,6 +1016,9 @@
 			});
 		},
 		album_changed: albumChanged,
+		device_sync({ device }) {
+			devices.readSync(device);
+		},
 		lookup_finished({ album_id, state }) {
 			notify(
 				state === 'done' ? 'Suggestions are ready' : 'Looking for suggestions failed',

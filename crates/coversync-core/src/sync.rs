@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::LibraryVersion;
 use crate::template::{self, Template};
 use crate::{Error, Library, Result, art};
+pub use coversync_protocol::AutoSync;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -42,6 +43,8 @@ pub struct DeviceSettings {
     /// file keeps its path in the Library.
     pub structure: Option<String>,
     pub art: DeviceArt,
+    /// When the device syncs by itself.
+    pub auto: AutoSync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +80,13 @@ impl DeviceSettings {
             Template::parse(structure)?;
         }
         self.art.cover_name = art::cover_file_name(&self.art.cover_name, self.art.cover_file)?;
+        if !AutoSync::QUIET_RANGE.contains(&self.auto.quiet_seconds) {
+            return Err(Error::Invalid(format!(
+                "The wait after a change can be {} to {} seconds.",
+                AutoSync::QUIET_RANGE.start(),
+                AutoSync::QUIET_RANGE.end()
+            )));
+        }
         if let Some(width) = self.art.max_width
             && !ART_WIDTHS.contains(&width)
         {
@@ -102,6 +112,8 @@ pub struct DeviceSync {
 /// go (see [`Library::sync_catalog`]).
 pub struct Catalog {
     pub library: LibraryVersion,
+    /// The Library folder.
+    pub root: PathBuf,
     /// In order of their paths.
     pub tracks: Vec<CatalogTrack>,
 }
@@ -114,6 +126,19 @@ pub struct CatalogTrack {
     pub path: String,
     /// Its tag values as stored (a JSON object), when they were asked for.
     pub values: String,
+    pub content: Content,
+}
+
+/// A Library file's bytes, as indexed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Content {
+    pub size: u64,
+    pub mtime_ns: i64,
+    /// When the file joined the Library (Unix seconds).
+    pub added_at: i64,
+    /// BLAKE3 of the file as 64 hex characters, while it's for this size
+    /// and time. None until the hash pass reaches the file.
+    pub hash: Option<String>,
 }
 
 /// Where a Library track goes on a device.
@@ -123,6 +148,11 @@ pub struct DeviceFile {
     pub album_id: String,
     /// Relative to wherever the device keeps the Library, `/` between names.
     pub path: String,
+    /// Its path in the Library folder, relative to it.
+    #[serde(skip)]
+    pub source: String,
+    #[serde(skip)]
+    pub content: Content,
 }
 
 /// Every Library track's path on a device, as of a Library version and the
@@ -130,6 +160,9 @@ pub struct DeviceFile {
 #[derive(Debug, Serialize)]
 pub struct DevicePaths {
     pub library: LibraryVersion,
+    /// The Library folder the tracks are in.
+    #[serde(skip)]
+    pub root: PathBuf,
     pub settings_version: i64,
     /// Tracks with no value for a variable of the device's own folder
     /// structure, which was left empty.
@@ -171,7 +204,7 @@ pub fn device_paths(
     let mut files = Vec::with_capacity(catalog.tracks.len());
     for track in catalog.tracks {
         let path = match &template {
-            None => track.path,
+            None => track.path.clone(),
             Some(template) => {
                 let values = tag_values(&track.values, &kinds);
                 let ext = Path::new(&track.path)
@@ -187,11 +220,14 @@ pub fn device_paths(
             track_id: track.id,
             album_id: track.album_id,
             path,
+            source: track.path,
+            content: track.content,
         });
     }
     let renamed = keep_apart(&mut files);
     Ok(DevicePaths {
         library: catalog.library,
+        root: catalog.root,
         settings_version,
         incomplete,
         renamed,
@@ -293,12 +329,14 @@ impl PathCache {
         // Requests for one device wait for paths being worked out for it,
         // rather than each working them out too.
         let mut cached = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(library) = lib.index_versions()?.library else {
+        // The folder too: a Library moved elsewhere keeps its id and counter.
+        let Some((library, root)) = lib.sync_location()? else {
             return Ok(None);
         };
         if let Some(paths) = cached.as_ref()
             && paths.settings_version == sync.version
             && paths.library == library
+            && paths.root == root
         {
             return Ok(Some(paths.clone()));
         }
@@ -336,6 +374,7 @@ mod tests {
                 id: "library".into(),
                 generation: 1,
             },
+            root: PathBuf::from("/library"),
             tracks: tracks
                 .iter()
                 .enumerate()
@@ -344,6 +383,7 @@ mod tests {
                     album_id: "album".into(),
                     path: path.to_string(),
                     values: values.to_string(),
+                    content: Content::default(),
                 })
                 .collect(),
         };

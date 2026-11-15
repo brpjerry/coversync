@@ -25,15 +25,53 @@ use crate::model::{
     KindCoverage, LibraryChanges, LibraryVersion, RemovedTrack, TagCoverage, Track,
 };
 use crate::rules::{self, LibrarySetup};
-use crate::sync::{Catalog, CatalogTrack, SyncSetup};
+use crate::sync::{Catalog, CatalogTrack, Content, SyncSetup};
 use crate::tags::TrackTags;
 use crate::{Error, Result};
 
-const SCHEMA: &str = r#"
+/// The local database's tables, the Inbox's tracks among them.
+fn local_schema() -> String {
+    format!(
+        r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
-CREATE TABLE IF NOT EXISTS tracks (
-    id           INTEGER PRIMARY KEY,
+{}
+CREATE INDEX IF NOT EXISTS tracks_album ON tracks (album_id);
+-- Inbox files already copied into the Library; kept by path so rescans keep them hidden.
+CREATE TABLE IF NOT EXISTS hidden (
+    path      TEXT PRIMARY KEY,
+    hidden_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS covers (
+    album_id  TEXT PRIMARY KEY,
+    source    TEXT,
+    color     TEXT,
+    signature TEXT NOT NULL,
+    version   TEXT
+);
+-- The highest change counter this installation has seen for each Library
+-- database it attached, so that one restored from an older copy is noticed.
+CREATE TABLE IF NOT EXISTS seen_libraries (
+    id         TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL
+);
+"#,
+        inbox_tracks_table("tracks")
+    )
+}
+
+/// The Inbox's tracks table, made as `name`: `tracks`, or the copy
+/// [`migrate`] rebuilds an older one in. A removed track's id is never
+/// given to another file (AUTOINCREMENT): clients keep track ids, and one
+/// given out again would point them at the wrong file.
+fn inbox_tracks_table(name: &str) -> String {
+    format!(
+        r#"CREATE TABLE IF NOT EXISTS {name} (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     path         TEXT NOT NULL UNIQUE,
     root         TEXT NOT NULL,
     mtime        INTEGER NOT NULL,
@@ -58,34 +96,14 @@ CREATE TABLE IF NOT EXISTS tracks (
     format       TEXT NOT NULL,
     tag_keys     TEXT NOT NULL DEFAULT '',
     collection   TEXT NOT NULL DEFAULT 'inbox',
-    tag_values   TEXT NOT NULL DEFAULT '{}',
+    tag_values   TEXT NOT NULL DEFAULT '{{}}',
     -- The Inbox's change counter when the row was last written (see GENERATION).
-    generation   INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS tracks_album ON tracks (album_id);
--- Inbox files already copied into the Library; kept by path so rescans keep them hidden.
-CREATE TABLE IF NOT EXISTS hidden (
-    path      TEXT PRIMARY KEY,
-    hidden_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS covers (
-    album_id  TEXT PRIMARY KEY,
-    source    TEXT,
-    color     TEXT,
-    signature TEXT NOT NULL,
-    version   TEXT
-);
--- The highest change counter this installation has seen for each Library
--- database it attached, so that one restored from an older copy is noticed.
-CREATE TABLE IF NOT EXISTS seen_libraries (
-    id         TEXT PRIMARY KEY,
-    generation INTEGER NOT NULL
-);
-"#;
+    generation   INTEGER NOT NULL DEFAULT 0,
+    -- Modification time in nanoseconds; -1 when unknown.
+    mtime_ns     INTEGER NOT NULL DEFAULT -1
+);"#
+    )
+}
 
 /// The local database's file name, in the state directory.
 pub const LOCAL_DB: &str = "inbox.sqlite3";
@@ -179,9 +197,9 @@ fn stamp_triggers(schema: &str, key: &str) -> String {
 /// every track removed (its row id and its path relative to the folder, as
 /// the tracks have them), and triggers that keep both up to date whatever
 /// writes or deletes a track. A file back at a removed path is a new track,
-/// usually under a new id (SQLite can reuse the highest one); its removal
-/// stays recorded, so a client applying the changes in order (see
-/// [`LibraryChanges`]) sees the old track go before the new one arrives.
+/// under a new id (no id is given out twice: see [`library_tracks_table`]);
+/// its removal stays recorded, so a client applying the changes in order
+/// (see [`LibraryChanges`]) sees the old track go before the new one arrives.
 fn counter_schema(schema: &str) -> String {
     let next = next_generation_sql(GENERATION);
     let stamps = stamp_triggers(schema, GENERATION);
@@ -291,8 +309,26 @@ fn library_schema(schema: &str) -> String {
     format!(
         r#"
 PRAGMA {schema}.journal_mode = DELETE;
-CREATE TABLE IF NOT EXISTS {schema}.tracks (
-    id           INTEGER PRIMARY KEY,
+{}
+CREATE INDEX IF NOT EXISTS {schema}.tracks_album ON tracks (album_id);
+CREATE TABLE IF NOT EXISTS {schema}.settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#,
+        library_tracks_table(schema, "tracks")
+    )
+}
+
+/// The Library's tracks table, made as `name` in the database attached as
+/// `schema`: `tracks`, or the copy [`migrate_library`] rebuilds an older one
+/// in. A removed track's id is never given to another file (AUTOINCREMENT):
+/// clients keep track ids, and one given out again would point them at the
+/// wrong file.
+fn library_tracks_table(schema: &str, name: &str) -> String {
+    format!(
+        r#"CREATE TABLE IF NOT EXISTS {schema}.{name} (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     path         TEXT NOT NULL UNIQUE,
     mtime        INTEGER NOT NULL,
     size         INTEGER NOT NULL,
@@ -320,14 +356,17 @@ CREATE TABLE IF NOT EXISTS {schema}.tracks (
     -- wrote it, or for a file found there by a scan, its modification time.
     added_at     INTEGER NOT NULL DEFAULT 0,
     -- The change counter when the row was last written (see GENERATION).
-    generation   INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS {schema}.tracks_album ON tracks (album_id);
-CREATE TABLE IF NOT EXISTS {schema}.settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"#
+    generation   INTEGER NOT NULL DEFAULT 0,
+    -- Modification time in nanoseconds; -1 when unknown.
+    mtime_ns     INTEGER NOT NULL DEFAULT -1,
+    -- The file's digest, and the size and modification time it was taken at.
+    hash         TEXT,
+    hash_size    INTEGER,
+    hash_mtime_ns INTEGER,
+    -- The generation of the row's last content write, once publishing its
+    -- digest has raised `generation` past it; NULL until then.
+    content_generation INTEGER
+);"#
     )
 }
 
@@ -496,7 +535,9 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
         if carry.is_some() {
             // The index carries on, as clients may have seen it: the same
-            // rows, generations and removals, under the same id and counter.
+            // rows, generations and removals, under the same id and counter,
+            // and no id it gave out, even to a track since removed, is given
+            // out again.
             let cols = [
                 "id",
                 "path",
@@ -513,9 +554,14 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
             .collect::<Vec<_>>()
             .join(", ");
             let removed = "track_id, path, album_id, generation, removed_at";
+            let given = track_ids_past(
+                "lib_new",
+                "(SELECT COALESCE(MAX(seq), 0) FROM lib.sqlite_sequence WHERE name = 'tracks')",
+            );
             conn.execute_batch(&format!(
                 "INSERT OR IGNORE INTO lib_new.tracks ({cols}) SELECT {cols} FROM lib.tracks;
                  INSERT INTO lib_new.removed ({removed}) SELECT {removed} FROM lib.removed;
+                 {given}
                  INSERT OR REPLACE INTO lib_new.settings
                     SELECT * FROM lib.settings WHERE key IN ('{LIBRARY_ID}', '{GENERATION}');"
             ))?;
@@ -595,6 +641,18 @@ fn remember_library(conn: &Connection) {
     }
 }
 
+/// The Library's trigger that drops a track's digest when its file changes.
+/// An older daemon also invalidates hashes whenever it rewrites a row,
+/// including tag edits that preserve size and the old second timestamp.
+fn hash_trigger(schema: &str) -> String {
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS {schema}.tracks_hash_invalidated
+            AFTER UPDATE OF mtime, size, mtime_ns, tag_values ON tracks
+            BEGIN UPDATE tracks SET hash = NULL, hash_size = NULL, hash_mtime_ns = NULL,
+                content_generation = NULL WHERE id = NEW.id; END;"
+    )
+}
+
 /// Add columns transactionally; checking each column also supports a database
 /// whose schema version was reset by an older installation.
 fn hash_schema(
@@ -626,14 +684,7 @@ fn hash_schema(
         }
     }
     if library {
-        // An older daemon also invalidates hashes whenever it rewrites a row,
-        // including tag edits that preserve size and the old second timestamp.
-        sql.push_str(&format!(
-            "CREATE TRIGGER IF NOT EXISTS {schema}.tracks_hash_invalidated
-            AFTER UPDATE OF mtime, size, mtime_ns, tag_values ON tracks
-            BEGIN UPDATE tracks SET hash = NULL, hash_size = NULL, hash_mtime_ns = NULL,
-                content_generation = NULL WHERE id = NEW.id; END;"
-        ));
+        sql.push_str(&hash_trigger(schema));
     }
     sql.push_str(&format!(
         "PRAGMA {schema}.user_version = {version}; COMMIT;"
@@ -641,6 +692,79 @@ fn hash_schema(
     conn.execute_batch(&sql).inspect_err(|_| {
         let _ = conn.execute_batch("ROLLBACK");
     })
+}
+
+/// Rebuild `schema`'s tracks table if it was made without AUTOINCREMENT, as
+/// before Library v5 and local v8: SQLite then gives the highest id to the
+/// next new file once its track is removed. `table` makes the new table
+/// under the name it is given, with every column the old one has; the rows
+/// are copied over, ids and all. Dropping the old table drops its indexes
+/// and triggers, so `after` makes them again. In one write transaction,
+/// which also sets the version, so the rebuild is done once and in full. An
+/// older coversyncd opening the database later finds the table as it is,
+/// and its new rows get new ids too.
+fn autoincrement_tracks(
+    conn: &Connection,
+    schema: &str,
+    table: impl Fn(&str) -> String,
+    after: &str,
+    version: i64,
+) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN")?;
+    let done = (|| {
+        // Setting the version first takes this database's write lock (and
+        // only its own: BEGIN IMMEDIATE would lock every one attached), so
+        // the table is looked at as no other connection can change it.
+        conn.execute_batch(&format!("PRAGMA {schema}.user_version = {version}"))?;
+        let sql: String = conn.query_row(
+            &format!(
+                "SELECT sql FROM {schema}.sqlite_schema WHERE type = 'table' AND name = 'tracks'"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        // A new database's table has it already, as has one another
+        // connection rebuilt meanwhile.
+        if !sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
+            let columns: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('tracks', '{schema}')"
+                ))?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let columns = columns.join(", ");
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {schema}.tracks_rebuilt;
+                 {}
+                 INSERT INTO {schema}.tracks_rebuilt ({columns})
+                    SELECT {columns} FROM {schema}.tracks;
+                 DROP TABLE {schema}.tracks;
+                 ALTER TABLE {schema}.tracks_rebuilt RENAME TO tracks;
+                 {after}",
+                table("tracks_rebuilt")
+            ))?;
+        }
+        conn.execute_batch("COMMIT")
+    })();
+    done.inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK");
+    })
+}
+
+/// SQL that sets the Library database `schema`'s track id sequence past
+/// `floor` (an SQL expression) and every id its tracks and removals hold.
+/// AUTOINCREMENT gives out ids above it, so a removed track's id, even the
+/// highest, doesn't come back.
+fn track_ids_past(schema: &str, floor: &str) -> String {
+    format!(
+        "INSERT INTO {schema}.sqlite_sequence (name, seq)
+            SELECT 'tracks', 0 WHERE NOT EXISTS
+                (SELECT 1 FROM {schema}.sqlite_sequence WHERE name = 'tracks');
+         UPDATE {schema}.sqlite_sequence SET seq = MAX(seq, {floor},
+                (SELECT COALESCE(MAX(id), 0) FROM {schema}.tracks),
+                (SELECT COALESCE(MAX(track_id), 0) FROM {schema}.removed))
+            WHERE name = 'tracks';"
+    )
 }
 
 /// Bring a Library database up to the current schema (its own `user_version`).
@@ -707,6 +831,27 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     }
     if version < 4 {
         hash_schema(conn, schema, true, 4)?;
+    }
+    if version < 5 {
+        // v5 gives no track's id out twice (see library_tracks_table). Its
+        // sequence starts past every id the tracks and removals hold: a
+        // client may know a removed track's id too.
+        let after = format!(
+            "CREATE INDEX IF NOT EXISTS {schema}.tracks_album ON tracks (album_id);
+             {}
+             {}
+             {}",
+            counter_schema(schema),
+            hash_trigger(schema),
+            track_ids_past(schema, "0")
+        );
+        autoincrement_tracks(
+            conn,
+            schema,
+            |name| library_tracks_table(schema, name),
+            &after,
+            5,
+        )?;
     }
     Ok(())
 }
@@ -1180,6 +1325,19 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 7 {
         hash_schema(conn, "main", false, 7)?;
     }
+    if version < 8 {
+        // v8 gives no track's id out twice (see inbox_tracks_table). Copying
+        // the rows starts its sequence past the highest id there; the Inbox
+        // keeps no record of the tracks removed before.
+        let after = format!(
+            "CREATE INDEX IF NOT EXISTS main.tracks_album ON tracks (album_id);
+             {}
+             {}",
+            stamp_triggers("main", INBOX_GENERATION),
+            inbox_pending_triggers()
+        );
+        autoincrement_tracks(conn, "main", inbox_tracks_table, &after, 8)?;
+    }
     Ok(())
 }
 
@@ -1286,7 +1444,7 @@ impl Library {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(&local_schema())?;
         migrate(&conn)?;
         settle_inbox_generation(&conn)?;
         conn.execute_batch(&temp_schema())?;
@@ -1452,9 +1610,20 @@ impl Library {
         }))
     }
 
-    /// Every Library track's id, album and path, and with `values` its tag
-    /// values, read at once with the Library version they belong to (see
-    /// [`crate::sync::device_paths`]). None without a Library folder.
+    /// The attached Library's version and folder, read together, while the
+    /// folder is there. None without one, or with one that's gone (a disk
+    /// not mounted).
+    pub fn sync_location(&self) -> Result<Option<(LibraryVersion, PathBuf)>> {
+        let conn = self.conn();
+        Ok(library_version(&conn)?
+            .zip(library_root(&conn)?)
+            .filter(|(_, root)| root.is_dir()))
+    }
+
+    /// Every Library track's id, album, path and content, and with `values`
+    /// its tag values, read at once with the Library version they belong to
+    /// (see [`crate::sync::device_paths`]). None without a Library folder.
+    /// A hash counts only while it's for the file's size and time as indexed.
     pub fn sync_catalog(&self, values: bool) -> Result<Option<Catalog>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1463,7 +1632,9 @@ impl Library {
         };
         let tracks = tx
             .prepare(
-                "SELECT id, path, album_id, CASE WHEN ?1 THEN tag_values ELSE '' END
+                "SELECT id, path, album_id, CASE WHEN ?1 THEN tag_values ELSE '' END,
+                    size, mtime_ns, added_at,
+                    CASE WHEN hash_size = size AND hash_mtime_ns = mtime_ns THEN hash END
                 FROM lib.tracks ORDER BY path",
             )?
             .query_map([values], |r| {
@@ -1472,11 +1643,23 @@ impl Library {
                     path: r.get(1)?,
                     album_id: r.get(2)?,
                     values: r.get(3)?,
+                    content: Content {
+                        size: r.get::<_, i64>(4)? as u64,
+                        mtime_ns: r.get(5)?,
+                        added_at: r.get(6)?,
+                        hash: r
+                            .get::<_, Option<String>>(7)?
+                            .and_then(|h| h.strip_prefix("blake3:").map(str::to_string)),
+                    },
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
         tx.commit()?;
-        Ok(Some(Catalog { library, tracks }))
+        Ok(Some(Catalog {
+            library,
+            root: a.root,
+            tracks,
+        }))
     }
 
     /// Path -> (mtime, size, collection) for every indexed file.
@@ -1952,10 +2135,10 @@ impl Library {
 
     /// The album most of `tracks` (ids, with their `rel_path`s) are in now
     /// (the earliest listed on a tie), counting those still indexed and
-    /// shown under the same id and at the same path: SQLite can give a
-    /// removed track's id to a new file. None when none of them is. An
-    /// album's tracks can be found this way after an edit elsewhere has
-    /// given it a new id, as a new title does.
+    /// shown under the same id and at the same path: a database restored
+    /// from an older copy can give a removed track's id to a new file. None
+    /// when none of them is. An album's tracks can be found this way after
+    /// an edit elsewhere has given it a new id, as a new title does.
     pub fn album_of_tracks(&self, tracks: &[(i64, String)]) -> Result<Option<String>> {
         let conn = self.conn();
         let mut inbox = conn.prepare_cached(&format!(
@@ -2386,6 +2569,31 @@ impl Library {
             .optional()?;
         Ok(s.flatten().as_deref().and_then(CoverSource::decode))
     }
+
+    /// Every album's art as the cover pass last found it: where it is, and
+    /// its version (a digest of the art). Albums without art are left out.
+    pub fn cover_versions(&self) -> Result<HashMap<String, (CoverSource, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT album_id, source, version FROM covers
+             WHERE source IS NOT NULL AND version IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut covers = HashMap::new();
+        for row in rows {
+            let (album, source, version) = row?;
+            if let Some(source) = CoverSource::decode(&source) {
+                covers.insert(album, (source, version));
+            }
+        }
+        Ok(covers)
+    }
 }
 
 #[cfg(test)]
@@ -2434,14 +2642,20 @@ mod tests {
     fn migrating_v0_marks_rows_for_rescan() {
         let path = temp_db("migrate");
         let conn = Connection::open(&path).unwrap();
-        // The v0 table had neither tag_keys nor collection, and there was no
-        // record of Libraries seen.
-        let v0 = SCHEMA[..SCHEMA.find("-- The highest change counter").unwrap()]
+        // The v0 table had neither tag_keys nor collection, and gave out
+        // ids without AUTOINCREMENT; there was no record of Libraries seen.
+        let schema = local_schema();
+        let v0 = schema[..schema.find("-- The highest change counter").unwrap()]
+            .replace(" AUTOINCREMENT", "")
             .replace(",\n    tag_keys     TEXT NOT NULL DEFAULT ''", "")
             .replace(",\n    collection   TEXT NOT NULL DEFAULT 'inbox'", "")
             .replace(",\n    tag_values   TEXT NOT NULL DEFAULT '{}'", "")
             .replace(
                 ",\n    -- The Inbox's change counter when the row was last written (see GENERATION).\n    generation   INTEGER NOT NULL DEFAULT 0",
+                "",
+            )
+            .replace(
+                ",\n    -- Modification time in nanoseconds; -1 when unknown.\n    mtime_ns     INTEGER NOT NULL DEFAULT -1",
                 "",
             );
         assert!(
@@ -2449,6 +2663,8 @@ mod tests {
                 && !v0.contains("collection")
                 && !v0.contains("tag_values")
                 && !v0.contains("generation")
+                && !v0.contains("mtime_ns")
+                && !v0.contains("AUTOINCREMENT")
         );
         conn.execute_batch(&v0).unwrap();
         conn.execute(
@@ -2466,7 +2682,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         // The Inbox's counter starts with the rows already there.
         assert_eq!(lib.index_versions().unwrap().inbox.generation, 0);
         let generation: i64 = lib
@@ -2482,7 +2698,7 @@ mod tests {
     fn migrating_v4_versions_covers_on_the_next_cover_pass() {
         let path = temp_db("migratecovers");
         let conn = Connection::open(&path).unwrap();
-        let v4 = SCHEMA.replace(",\n    version   TEXT", "");
+        let v4 = local_schema().replace(",\n    version   TEXT", "");
         assert!(!v4.contains("version   TEXT"));
         conn.execute_batch(&v4).unwrap();
         conn.execute_batch(
@@ -2974,7 +3190,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     /// Turn a Library database this build made into what v2 left: no
@@ -3026,6 +3242,87 @@ mod tests {
             .into_iter()
             .map(|t| (t.path, t.generation))
             .collect()
+    }
+
+    /// The public id of the track indexed at `path`, Inbox or Library.
+    fn track_id(lib: &Library, path: impl AsRef<Path>) -> Option<i64> {
+        lib.conn()
+            .query_row(
+                "SELECT id FROM temp.indexed_tracks WHERE path = ?1",
+                [path.as_ref().to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The indexes and triggers on `schema`'s tracks table.
+    fn tracks_objects(conn: &Connection, schema: &str) -> Vec<String> {
+        conn.prepare(&format!(
+            "SELECT type || ' ' || name FROM {schema}.sqlite_schema
+             WHERE tbl_name = 'tracks' AND type IN ('index', 'trigger') ORDER BY 1"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Turn a database this build made into what an older build left at
+    /// `version`: its tracks table without AUTOINCREMENT, so that SQLite
+    /// gives the highest id out again once its track is removed. The
+    /// keyword changes nothing else on disk, so the table's definition is
+    /// edited in place.
+    fn without_autoincrement(conn: &Connection, version: i64) {
+        conn.execute_batch(&format!(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = replace(sql, ' AUTOINCREMENT', '')
+                WHERE type = 'table' AND name = 'tracks';
+             PRAGMA writable_schema = OFF;
+             DELETE FROM sqlite_sequence WHERE name = 'tracks';
+             PRAGMA user_version = {version};"
+        ))
+        .unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'tracks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("AUTOINCREMENT"), "{sql}");
+    }
+
+    #[test]
+    fn ids_of_removed_tracks_are_never_given_out_again() {
+        let (_dir, root, lib) = new_library("libreuse");
+        let inbox = PathBuf::from("/m/a");
+        lib.upsert(&[
+            library_file(&root, "A/1.flac", "A", 1),
+            library_file(&root, "A/2.flac", "A", 1),
+            file("/m/a/1.flac", "a", &[]),
+            file("/m/a/2.flac", "a", &[]),
+        ])
+        .unwrap();
+        // The tracks written last have the highest ids, which SQLite would
+        // give the next files without AUTOINCREMENT.
+        let gone = [root.join("A/2.flac"), inbox.join("2.flac")];
+        let gone_ids = gone.each_ref().map(|p| track_id(&lib, p).unwrap());
+        lib.remove_paths(&gone).unwrap();
+        lib.upsert(&[
+            library_file(&root, "A/3.flac", "A", 1),
+            file("/m/a/3.flac", "a", &[]),
+        ])
+        .unwrap();
+        for (path, gone) in [root.join("A/3.flac"), inbox.join("3.flac")]
+            .iter()
+            .zip(gone_ids)
+        {
+            // Further on, not just another: Library ids are negative.
+            let id = track_id(&lib, path).unwrap();
+            assert!(id.abs() > gone.abs(), "{id} after {gone}");
+        }
     }
 
     #[test]
@@ -3124,7 +3421,7 @@ mod tests {
         let journal: String = conn
             .query_row("PRAGMA lib.journal_mode", [], |r| r.get(0))
             .unwrap();
-        assert_eq!((version, journal.as_str()), (4, "delete"));
+        assert_eq!((version, journal.as_str()), (5, "delete"));
         drop(conn);
         // The rows there start at generation 0, with the counter: nothing
         // has changed since.
@@ -3141,6 +3438,68 @@ mod tests {
         let lib = Library::open_in(&dir.join("state")).unwrap();
         assert_eq!(library_version(&lib).id, version.id);
         assert_eq!(library_version(&lib).generation, 1);
+    }
+
+    #[test]
+    fn a_library_from_before_autoincrement_stops_giving_out_removed_ids() {
+        let (dir, root, lib) = new_library("libv4");
+        let mut hashed = library_file(&root, "A/1.flac", "A", 1);
+        hashed.0.hash = Some(FileHash {
+            hash: "blake3:1".into(),
+            size: 1,
+            mtime_ns: -1,
+        });
+        lib.upsert(&[
+            hashed,
+            library_file(&root, "A/2.flac", "A", 1),
+            library_file(&root, "A/3.flac", "A", 1),
+        ])
+        .unwrap();
+        let ids =
+            ["A/1.flac", "A/2.flac", "A/3.flac"].map(|p| track_id(&lib, root.join(p)).unwrap());
+        let objects = tracks_objects(&lib.conn(), "lib");
+        drop(lib);
+        // As v4 left it; an older coversyncd then removes the track with
+        // the highest id.
+        let own = Connection::open(root.join(LIBRARY_DB)).unwrap();
+        without_autoincrement(&own, 4);
+        own.execute("DELETE FROM tracks WHERE path = 'A/3.flac'", [])
+            .unwrap();
+        drop(own);
+
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        let version: i64 = lib
+            .conn()
+            .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        // The rows came along, ids, digests and generations and all, with
+        // every index and trigger, and the removal is still recorded.
+        assert_eq!(tracks_objects(&lib.conn(), "lib"), objects);
+        assert_eq!(track_id(&lib, root.join("A/1.flac")), Some(ids[0]));
+        assert_eq!(track_id(&lib, root.join("A/2.flac")), Some(ids[1]));
+        assert_eq!(lib.library_hashes().unwrap().len(), 1);
+        assert_eq!(library_version(&lib).generation, 2);
+        assert_eq!(
+            changed(&lib, 0),
+            [("A/1.flac".into(), 1), ("A/2.flac".into(), 1)]
+        );
+        assert_eq!(removed(&lib, 0), [("A/3.flac".into(), 2)]);
+
+        // A new file's id is past the removed track's.
+        lib.upsert(&[library_file(&root, "B/1.flac", "B", 1)])
+            .unwrap();
+        let new = track_id(&lib, root.join("B/1.flac")).unwrap();
+        assert!(new.abs() > ids[2].abs(), "{new} after {}", ids[2]);
+        // Rewriting a file drops its digest; removing one is recorded.
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 2)])
+            .unwrap();
+        assert!(lib.library_hashes().unwrap().is_empty());
+        lib.remove_paths(&[root.join("A/2.flac")]).unwrap();
+        assert_eq!(
+            removed(&lib, 0),
+            [("A/3.flac".into(), 2), ("A/2.flac".into(), 5)]
+        );
     }
 
     #[test]
@@ -3584,6 +3943,38 @@ mod tests {
     }
 
     #[test]
+    fn an_inbox_from_before_autoincrement_stops_giving_out_removed_ids() {
+        let path = temp_db("inboxv7");
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[]), file("/m/a/2.flac", "a", &[])])
+            .unwrap();
+        let ids = ["/m/a/1.flac", "/m/a/2.flac"].map(|p| track_id(&lib, p).unwrap());
+        let objects = tracks_objects(&lib.conn(), "main");
+        drop(lib);
+        let old = Connection::open(&path).unwrap();
+        without_autoincrement(&old, 7);
+        drop(old);
+
+        let lib = Library::open(&path).unwrap();
+        let inbox = |lib: &Library| lib.index_versions().unwrap().inbox.generation;
+        let version: i64 = lib
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        assert_eq!(tracks_objects(&lib.conn(), "main"), objects);
+        assert_eq!(track_id(&lib, "/m/a/1.flac"), Some(ids[0]));
+        assert_eq!(track_id(&lib, "/m/a/2.flac"), Some(ids[1]));
+        assert_eq!(inbox(&lib), 1);
+
+        // The track with the highest id goes; a new file's id is past it.
+        lib.remove_paths(&["/m/a/2.flac".into()]).unwrap();
+        lib.upsert(&[file("/m/a/3.flac", "a", &[])]).unwrap();
+        assert!(track_id(&lib, "/m/a/3.flac").unwrap() > ids[1]);
+        assert_eq!(inbox(&lib), 3);
+    }
+
+    #[test]
     fn missing_added_times_are_filled_from_the_files() {
         let dir = temp_dir("libzero", &["state", "Lib"]);
         let root = dir.join("Lib");
@@ -3777,6 +4168,12 @@ mod tests {
         assert!(!root.join(".coversync").exists());
         lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
             .unwrap();
+        lib.remove_paths(&[root.join("A/1.flac")]).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
+            .unwrap();
+        lib.upsert(&[library_file(&root, "A/2.flac", "A", 1)])
+            .unwrap();
+        lib.remove_paths(&[root.join("A/2.flac")]).unwrap();
         let before = lib
             .album_track_ids(
                 &lib.albums(Collection::Library, &[], &[], "", &[], None)
@@ -3785,12 +4182,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before.len(), 1);
-        lib.remove_paths(&[root.join("A/1.flac")]).unwrap();
-        lib.upsert(&[library_file(&root, "A/1.flac", "A", 1)])
-            .unwrap();
-        lib.upsert(&[library_file(&root, "A/2.flac", "A", 1)])
-            .unwrap();
-        lib.remove_paths(&[root.join("A/2.flac")]).unwrap();
         let version = library_version(&lib);
         assert_eq!(version.generation, 5);
 
@@ -3811,6 +4202,13 @@ mod tests {
             removed(&lib, 0),
             [("A/1.flac".into(), 2), ("A/2.flac".into(), 5)]
         );
+        // Nor does it give out an id it gave before: A/2.flac's was the
+        // highest.
+        let gone = changes(&lib, 0).removed[1].id;
+        lib.upsert(&[library_file(&root, "A/3.flac", "A", 1)])
+            .unwrap();
+        let id = track_id(&lib, root.join("A/3.flac")).unwrap();
+        assert!(id.abs() > gone.abs(), "{id} after {gone}");
     }
 
     #[test]

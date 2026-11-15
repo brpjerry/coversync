@@ -448,6 +448,7 @@ name = "coversync-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "coversync-protocol",
  "flate2",
  "getrandom 0.4.3",
  "image",
@@ -479,6 +480,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coversync-protocol"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "coversync-proxy"
 version = "0.1.0"
 dependencies = [
@@ -507,12 +518,15 @@ dependencies = [
  "argon2",
  "axum",
  "base64",
+ "blake3",
  "clap",
  "coversync-core",
+ "coversync-protocol",
  "futures-util",
  "getrandom 0.4.3",
  "libc",
  "mime_guess",
+ "rayon",
  "rpassword",
  "rusqlite",
  "rust-embed",

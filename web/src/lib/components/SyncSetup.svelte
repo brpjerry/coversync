@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { fade, fly, slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
@@ -37,6 +38,7 @@
 	import SaveBar from './SaveBar.svelte';
 	import Toggle from './Toggle.svelte';
 	import AddDevice from './AddDevice.svelte';
+	import DeviceSync from './DeviceSync.svelte';
 	import StructureField from './StructureField.svelte';
 
 	interface Props {
@@ -48,6 +50,8 @@
 	devices.load();
 	// The Library's folder structure, and the variables a device's own can use.
 	setup.load();
+	// Each device's sync, read again as it moves on while this is open.
+	onMount(() => devices.watchSync());
 
 	let adding = $state(false);
 	/** The device being renamed or re-scoped, and its draft. */
@@ -89,7 +93,11 @@
 		structure: '',
 		coverFile: true,
 		coverName: 'cover',
-		maxWidth: null as number | null
+		maxWidth: null as number | null,
+		auto: true,
+		quiet: 60 as number | null,
+		wifiOnly: true,
+		chargingOnly: false
 	});
 
 	function editSync(d: Device) {
@@ -105,7 +113,11 @@
 			structure: s.structure ?? setup.saved.structure,
 			coverFile: s.art.cover_file,
 			coverName: s.art.cover_name,
-			maxWidth: s.art.max_width
+			maxWidth: s.art.max_width,
+			auto: s.auto.enabled,
+			quiet: s.auto.quiet_seconds,
+			wifiOnly: s.auto.wifi_only,
+			chargingOnly: s.auto.charging_only
 		};
 	}
 
@@ -113,6 +125,7 @@
 		const mine = opened;
 		const sent = JSON.stringify(syncDraft);
 		const width = syncDraft.maxWidth;
+		const quiet = syncDraft.quiet;
 		const settings: DeviceSettings = {
 			// Its own left blank is refused, not taken for the Library's.
 			structure: syncDraft.own ? syncDraft.structure : null,
@@ -120,6 +133,14 @@
 				cover_file: syncDraft.coverFile,
 				cover_name: syncDraft.coverName,
 				max_width: width === null || Number.isNaN(width) ? null : Math.round(width)
+			},
+			auto: {
+				enabled: syncDraft.auto,
+				// Left empty: no wait.
+				// An emptied number field binds as undefined: no wait.
+				quiet_seconds: typeof quiet !== 'number' || Number.isNaN(quiet) ? 0 : Math.round(quiet),
+				wifi_only: syncDraft.wifiOnly,
+				charging_only: syncDraft.chargingOnly
 			}
 		};
 		const saved = await devices.saveSync(d.id, settings);
@@ -133,7 +154,8 @@
 		return [
 			s.structure ? `Folders as ${s.structure}` : "The Library's folders",
 			s.art.cover_file ? `cover file “${s.art.cover_name}”` : 'no cover file',
-			s.art.max_width && `art at most ${s.art.max_width} px wide`
+			s.art.max_width && `cover at most ${s.art.max_width} px wide`,
+			!s.auto.enabled && 'syncs only when asked'
 		]
 			.filter(Boolean)
 			.join(' · ');
@@ -246,7 +268,8 @@
 					<h2 id="sync-title">Sync</h2>
 					<p>
 						Sync will keep devices such as phones and music players up to date with the Library,
-						each with its own settings. Devices can pair now; copying files to them comes later.
+						each with its own settings. Devices can pair now; the apps that copy files to them come
+						next.
 					</p>
 				</div>
 			</header>
@@ -417,6 +440,13 @@
 										{/if}
 									{/if}
 								{/if}
+								{#if devices.syncStates[d.id] && !revoked}
+									<DeviceSync
+										id={d.id}
+										sync={devices.syncStates[d.id]}
+										manage={devices.canManage}
+									/>
+								{/if}
 								{#if syncing === d.id && d.sync && devices.canManage}
 									<form
 										class="sync-edit"
@@ -487,11 +517,47 @@
 												/>
 												<span class="muted">pixels</span>
 											</label>
+											<!-- Art inside the tracks: SYN-12. -->
 											<p class="help">
-												For the cover file and the art inside the tracks. Wider art is scaled down
-												when it's copied, keeping its shape; narrower art stays as it is.
+												Wider cover art is scaled down when it's copied, keeping its shape; narrower
+												art stays as it is. For now this is the cover file only: shrinking the art
+												inside the tracks comes later.
 											</p>
 										</div>
+										<Toggle
+											bind:checked={syncDraft.auto}
+											label="Sync by itself"
+											description="When the Library changes, and from time to time. Off, it syncs only when asked."
+										/>
+										{#if syncDraft.auto}
+											<div class="auto" transition:slide={{ duration: 180 }}>
+												<label class="inline-field">
+													<span class="field-label">Wait after a change</span>
+													<input
+														type="number"
+														min="0"
+														max="3600"
+														step="1"
+														inputmode="numeric"
+														placeholder="0"
+														bind:value={syncDraft.quiet}
+													/>
+													<span class="muted">seconds, so a run of edits becomes one sync</span>
+												</label>
+												<Toggle
+													bind:checked={syncDraft.wifiOnly}
+													label="Only on Wi-Fi"
+													description="Not over mobile data."
+													nested
+												/>
+												<Toggle
+													bind:checked={syncDraft.chargingOnly}
+													label="Only while charging"
+													description="For devices with a battery."
+													nested
+												/>
+											</div>
+										{/if}
 										<div class="actions">
 											<button type="button" class="btn sm" onclick={() => (syncing = null)}>
 												Cancel
@@ -827,6 +893,10 @@
 	.width {
 		display: grid;
 		gap: 6px;
+	}
+	/* Under the switch's label, like its nested options. */
+	.auto .inline-field {
+		padding: 4px 14px 4px 38px;
 	}
 
 	.pairing {

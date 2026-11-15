@@ -149,7 +149,7 @@ pub struct ChangedTrack {
 }
 
 /// A track that left the Library. A file may since have come back at the
-/// same path: that is a new track, usually under a new id, listed among the
+/// same path: that is a new track, under a new id, listed among the
 /// changed tracks (see [`LibraryChanges`] for the order to apply them in).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedTrack {

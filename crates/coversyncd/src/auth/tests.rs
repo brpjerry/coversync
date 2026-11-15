@@ -161,6 +161,8 @@ fn registered_paths() -> Vec<String> {
         include_str!("mod.rs"),
         include_str!("devices.rs"),
         include_str!("../uploads.rs"),
+        include_str!("../sync/api.rs"),
+        include_str!("../sync/setup.rs"),
     ] {
         for (at, _) in source.match_indices(".route(") {
             let Some(rest) = source[at + ".route(".len()..]
@@ -734,6 +736,7 @@ async fn hello_needs_no_login() {
     assert_eq!(b["app"], "coversync");
     assert_eq!(b["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(b["api"], serde_json::json!(["1"]));
+    assert_eq!(b["sync"], serde_json::json!(["1"]));
     assert!(b["name"].is_string());
 }
 

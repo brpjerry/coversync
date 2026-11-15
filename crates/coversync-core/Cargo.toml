@@ -21,6 +21,7 @@ name = "change_counter"
 required-features = ["server"]
 
 [dependencies]
+coversync-protocol = { version = "0.1.0", path = "../coversync-protocol" }
 image = { version = "0.25.10", optional = true, default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 flate2 = { version = "1.1.10", optional = true }
 getrandom = { version = "0.4.3", optional = true }

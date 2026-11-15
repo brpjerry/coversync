@@ -19,7 +19,7 @@ mod limit;
 mod pairing;
 pub mod store;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io::{BufRead, IsTerminal};
 use std::net::{IpAddr, SocketAddr};
@@ -34,6 +34,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use coversync_core::sync::DeviceSync;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -119,6 +120,16 @@ impl Auth {
             #[cfg(test)]
             probe: Probe::default(),
         })
+    }
+
+    /// A device's sync settings, if there is such a device.
+    pub fn device_sync(&self, id: i64) -> rusqlite::Result<Option<DeviceSync>> {
+        self.store.device_sync(id)
+    }
+
+    /// Every device's sync settings, by device.
+    pub fn device_syncs(&self) -> rusqlite::Result<HashMap<i64, DeviceSync>> {
+        self.store.device_syncs()
     }
 
     /// The time the rate limits count by.
@@ -499,6 +510,7 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
         Ok(access)
             if access.scope == Scope::Sync
                 && !SYNC_OPEN.contains(&req.uri().path())
+                && !req.uri().path().starts_with(crate::sync::DEVICE_ROUTES)
                 && !devices::sync_readable(req.method(), req.uri().path()) =>
         {
             error(
@@ -527,6 +539,19 @@ pub async fn still_valid(state: &Shared, headers: &HeaderMap) -> bool {
     let now = now();
     match tokio::task::spawn_blocking(move || check(&s.auth.store, found, now)).await {
         Ok(Ok(checked)) => checked.access.is_ok_and(|a| a.scope != Scope::Sync),
+        _ => true,
+    }
+}
+
+/// Whether a device's sync event stream may go on: its credentials still
+/// name `device`, any scope. Revoking the device, or pairing it again with
+/// a new token, ends it.
+pub async fn still_device(state: &Shared, headers: &HeaderMap, device: i64) -> bool {
+    let found = credentials(headers);
+    let s = state.clone();
+    let now = now();
+    match tokio::task::spawn_blocking(move || check(&s.auth.store, found, now)).await {
+        Ok(Ok(checked)) => checked.access.is_ok_and(|a| a.device == Some(device)),
         _ => true,
     }
 }
@@ -670,6 +695,8 @@ struct Hello {
     name: String,
     version: &'static str,
     api: &'static [&'static str],
+    /// The sync API's versions (`/api/sync/v1/`).
+    sync: &'static [&'static str],
 }
 
 /// Open to all: tells a client that this URL is a coversync server, and
@@ -680,6 +707,7 @@ async fn hello() -> Json<Hello> {
         name: host_name(),
         version: env!("CARGO_PKG_VERSION"),
         api: API_VERSIONS,
+        sync: &["1"],
     })
 }
 
