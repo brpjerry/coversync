@@ -51,8 +51,67 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy without the server feature
+        run: cargo clippy -p coversync-core --no-default-features --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+
+  # Clients (the sync engine, the Android app) build coversync-core without
+  # its default `server` feature, for their own platforms.
+  clients:
+    name: Client build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            cargo: build
+          - target: aarch64-unknown-linux-musl
+            cargo: zigbuild
+          - target: armv7-unknown-linux-musleabihf
+            cargo: zigbuild
+          # There's no Windows client since #28, but the check is cheap.
+          - target: x86_64-pc-windows-gnu
+            cargo: zigbuild
+    # A warning only one platform sees fails like any other: rustc's, such as
+    # code a `cfg` leaves unused, and Cargo's, such as an unused dependency.
+    env:
+      RUSTFLAGS: -D warnings
+      CARGO_BUILD_WARNINGS: deny
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The bundled SQLite and BLAKE3's SIMD code are C, so each target needs
+      # a C cross-compiler: the runner's Android NDK for Android, which Zig
+      # doesn't cover, and Zig through cargo-zigbuild for the rest.
+      # API level 21, the oldest the NDK builds for, so nothing leans on newer
+      # calls in Android's C library.
+      - name: Use the Android NDK's compiler
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          bin=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          test -x "$bin/aarch64-linux-android21-clang"
+          echo "CC_aarch64_linux_android=$bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$bin/llvm-ar" >> "$GITHUB_ENV"
+      - uses: mlugg/setup-zig@v2
+        if: matrix.cargo == 'zigbuild'
+        with:
+          version: 0.17.1
+          cache-key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        if: matrix.cargo == 'zigbuild'
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build coversync-core without default features
+        run: cargo ${{ matrix.cargo }} -p coversync-core --no-default-features --locked --target ${{ matrix.target }}
 
   package:
     name: Arch package

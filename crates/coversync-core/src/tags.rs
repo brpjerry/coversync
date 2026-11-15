@@ -602,6 +602,7 @@ mod tests {
     }
 
     /// A tiny silent WAV whose only tag is RIFF INFO (as ffmpeg writes them).
+    #[cfg(feature = "server")]
     fn wav_with_info(path: &Path) {
         let samples = [0u8; 16];
         let mut b = Vec::new();
@@ -630,6 +631,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn a_new_primary_tag_keeps_values_from_the_old_one() {
         let dir = std::env::temp_dir().join(format!("coversync-tags-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -658,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn replaced_art_takes_the_front_covers_place() {
         let dir = std::env::temp_dir().join(format!("coversync-art-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

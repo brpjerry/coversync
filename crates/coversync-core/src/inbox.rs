@@ -49,8 +49,8 @@ pub struct Suggestions {
     /// or Korean put the family name first ("Nishikino Maki").
     #[serde(default)]
     pub family_name_first: bool,
-    /// Keep AcoustID's and MusicBrainz's answers in the
-    /// [`LookupCache`](crate::LookupCache), so an album is looked up once.
+    /// Keep AcoustID's and MusicBrainz's answers in the server's
+    /// `LookupCache`, so an album is looked up once.
     /// Off, every lookup asks both services and nothing is read or saved.
     #[serde(default = "yes")]
     pub save_lookups: bool,
@@ -98,6 +98,7 @@ impl InboxSetup {
 
     /// Where uploads go: the uploads folder, or `Uploads` in the Inbox
     /// folder. None without either.
+    #[cfg(feature = "server")]
     pub fn uploads_folder(&self) -> Option<PathBuf> {
         self.uploads.as_deref().map(PathBuf::from).or_else(|| {
             self.folder
@@ -145,6 +146,7 @@ pub fn check_folders(inbox: Option<&str>, library: Option<&str>) -> crate::Resul
 /// Inbox folder) is part of the Inbox: inside the Inbox folder, or apart
 /// from it and from the Library folder. One holding the Inbox folder would
 /// scan it twice. Links are followed, as the scan follows them.
+#[cfg(feature = "server")]
 pub fn check_uploads(
     uploads: Option<&str>,
     inbox: Option<&str>,
@@ -226,6 +228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn uploads_go_in_the_inbox_unless_set_elsewhere() {
         let mut s = InboxSetup {
             folder: Some("/data2/Music".into()),
@@ -257,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn an_uploads_folder_is_inside_the_inbox_or_apart() {
         let (inbox, lib) = (Some("/m/in"), Some("/m/lib"));
         assert!(check_uploads(None, inbox, lib).is_ok());
@@ -271,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn folders_are_compared_as_the_scan_sees_them() {
         let dir = std::env::temp_dir().join(format!("coversync-aliases-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

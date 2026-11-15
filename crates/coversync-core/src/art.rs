@@ -4,10 +4,14 @@
 //! file beside the tracks (named by the rule, whatever the source was
 //! called), embedded in every audio file, or both.
 
+#[cfg(feature = "server")]
 use std::io::Cursor;
 
+#[cfg(feature = "server")]
 use image::codecs::jpeg::JpegEncoder;
+#[cfg(feature = "server")]
 use image::{ImageFormat, ImageReader};
+#[cfg(feature = "server")]
 use lofty::picture::{MimeType, Picture, PictureType};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +89,7 @@ impl ArtRules {
     }
 
     /// The cover file name for `art`, e.g. "cover.jpg".
+    #[cfg(feature = "server")]
     pub fn file_for(&self, art: &Art) -> String {
         format!("{}.{}", self.file_name, art.file_extension())
     }
@@ -98,6 +103,7 @@ impl ArtRules {
 }
 
 /// A cover image, as found beside or inside the files, or uploaded.
+#[cfg(feature = "server")]
 #[derive(Debug, Clone)]
 pub struct Art {
     data: Vec<u8>,
@@ -107,15 +113,19 @@ pub struct Art {
 }
 
 /// Formats kept as they are in a cover file; anything else becomes JPEG.
+#[cfg(feature = "server")]
 const FILE_FORMATS: &[ImageFormat] = &[ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::WebP];
 /// Formats kept as they are when embedded; every tag format and player knows these.
+#[cfg(feature = "server")]
 const EMBED_FORMATS: &[ImageFormat] = &[ImageFormat::Jpeg, ImageFormat::Png];
 
 /// The media type of image data, for serving it.
+#[cfg(feature = "server")]
 pub fn media_type(data: &[u8]) -> &'static str {
     image::guess_format(data).map_or("application/octet-stream", |f| f.to_mime_type())
 }
 
+#[cfg(feature = "server")]
 fn extension(format: ImageFormat) -> &'static str {
     match format {
         ImageFormat::Png => "png",
@@ -124,6 +134,7 @@ fn extension(format: ImageFormat) -> &'static str {
     }
 }
 
+#[cfg(feature = "server")]
 impl Art {
     /// Check that `data` is an image coversync can read.
     pub fn new(data: Vec<u8>) -> Result<Self> {
@@ -189,8 +200,10 @@ impl Art {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "server")]
     use image::{DynamicImage, Rgb, RgbImage};
 
+    #[cfg(feature = "server")]
     fn image(format: ImageFormat) -> Vec<u8> {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([200, 40, 40])));
         let mut out = Cursor::new(Vec::new());
@@ -226,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn images_keep_or_change_format() {
         let png = Art::new(image(ImageFormat::Png)).unwrap();
         assert_eq!((png.width, png.height), (8, 6));

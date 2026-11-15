@@ -3,25 +3,33 @@
 pub mod appearance;
 pub mod art;
 pub mod autofill;
+#[cfg(feature = "server")]
 pub mod cover;
 pub mod db;
 pub mod hashes;
+#[cfg(feature = "server")]
 pub mod identify;
+#[cfg(feature = "server")]
 pub mod import;
 pub mod inbox;
+#[cfg(feature = "server")]
 pub mod lookups;
 pub mod model;
+#[cfg(feature = "server")]
 pub mod musicbrainz;
+#[cfg(feature = "server")]
 pub mod romanize;
 pub mod rules;
 pub mod scan;
 pub mod sync;
 pub mod tags;
 pub mod template;
+#[cfg(feature = "server")]
 pub mod upload;
 
 pub use db::Library;
 pub use inbox::{HiddenStats, InboxSetup, IngestMode};
+#[cfg(feature = "server")]
 pub use lookups::LookupCache;
 pub use model::{
     Album, AlbumDetail, Collection, IndexVersions, LibraryChanges, LibraryVersion, ScanProgress,
@@ -37,6 +45,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("tags: {0}")]
     Tags(String),
+    #[cfg(feature = "server")]
     #[error("image: {0}")]
     Image(#[from] image::ImageError),
     #[error("not found")]
