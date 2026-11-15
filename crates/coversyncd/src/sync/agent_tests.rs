@@ -132,6 +132,22 @@ impl Agent {
         self.lines.said("Up to date")
     }
 
+    /// Waits until the agent has said nothing new for a while: whatever it
+    /// was still doing is done. (After its first sync a second, empty one
+    /// can follow: the watch's status check, made while the first ran, saw
+    /// work pending.)
+    async fn at_rest(&self) {
+        let said = || self.lines.0.lock().unwrap().len();
+        let mut last = said();
+        let mut still = 0;
+        while still < 12 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let now = said();
+            still = if now == last { still + 1 } else { 0 };
+            last = now;
+        }
+    }
+
     /// Waits for the folder to hold the Library and the sync that got it
     /// there to be over, `before` being [`Agent::syncs`] from before it. A
     /// sync still running takes a new change along, whatever the
@@ -365,9 +381,10 @@ async fn the_agent_ends_when_its_token_is_refused_unless_theres_a_newer_one() {
     assert_eq!(a.task.await.unwrap(), Err(Stop::Refused));
 }
 
-// Bugs caught: 0, False positives: 1
-// (It swapped the folder while the first sync was still ending, which then
-// took the test's change along into the old folder and left nothing to do.)
+// Bugs caught: 0, False positives: 2
+// (Twice it swapped the folder while a sync was still under way, which then
+// took the test's change along into the old folder and left nothing to do:
+// first the first sync's end, then the empty sync that can follow it.)
 #[tokio::test]
 async fn a_folder_that_isnt_there_is_waited_for_and_never_made() {
     let d = Daemon::new("agent-missing");
@@ -384,6 +401,9 @@ async fn a_folder_that_isnt_there_is_waited_for_and_never_made() {
     // The disk is mounted.
     std::fs::create_dir_all(&a.root).unwrap();
     a.caught_up(&d, 0, "the first sync").await;
+    // With no sync under way: one that's running goes on in the folder it
+    // has open, wherever that has moved to.
+    a.at_rest().await;
 
     // The disk goes, leaving its empty mount point: the folder there now
     // is another one, without coversync's marker. Nothing is put in it.
@@ -506,6 +526,7 @@ async fn a_sync_that_waits_for_power_still_waits_after_waking() {
     std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
     let a = start(&d, addr, &token, "laptop");
     a.caught_up(&d, 0, "the first sync").await;
+    a.at_rest().await;
 
     // On battery, a change waits.
     a.feed
@@ -517,6 +538,7 @@ async fn a_sync_that_waits_for_power_still_waits_after_waking() {
         a.lines.said("plugged in") > 0
     })
     .await;
+    let before = a.syncs();
     // The laptop sleeps and wakes, still on battery: the watch is new and
     // has the device's settings to hear again. What waited still waits.
     for _ in 0..3 {
@@ -524,10 +546,10 @@ async fn a_sync_that_waits_for_power_still_waits_after_waking() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!a.in_step(&d), "synced on battery after waking");
     }
-    assert_eq!(a.syncs(), 1);
+    assert_eq!(a.syncs(), before, "a sync ran on battery after waking");
     // Plugged in: it goes.
     a.feed.conditions.send(Conditions::FINE).unwrap();
-    a.caught_up(&d, 1, "being plugged in").await;
+    a.caught_up(&d, before, "being plugged in").await;
     assert_eq!(a.stop().await, Ok(()));
 }
 
@@ -613,6 +635,9 @@ async fn a_folder_emptied_under_a_running_agent_is_filled_again_by_sync_now() {
     std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
     let a = start(&d, addr, &token, "laptop");
     a.caught_up(&d, 0, "the first sync").await;
+    // With no sync under way: one that loses its folders half-way fails
+    // files, which the server then holds back until someone says Retry.
+    a.at_rest().await;
 
     // Everything in the folder goes, the engine's own files with it; the
     // folder itself stays where it was.
@@ -633,7 +658,8 @@ async fn a_folder_emptied_under_a_running_agent_is_filled_again_by_sync_now() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(tree(&a.root).is_empty());
     // Sync now does, in the folder as it is now.
+    let before = a.syncs();
     d.state.sync.requests.send(id).unwrap();
-    a.caught_up(&d, 1, "Sync now filling it").await;
+    a.caught_up(&d, before, "Sync now filling it").await;
     assert_eq!(a.stop().await, Ok(()));
 }

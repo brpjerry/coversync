@@ -127,8 +127,9 @@ pub trait Storage: Send + Sync + 'static {
     fn read_journal(&self) -> io::Result<Vec<u8>>;
 
     /// Add to the journal's end. Called once per finished operation, so it
-    /// should be cheap: no flush to the disk is needed (a fact lost to a
-    /// power cut only repeats its operation).
+    /// should be cheap: no flush is needed, as `end_changes` flushes the
+    /// journal with the folder, and a sync that never gets there has the
+    /// next one check the folder.
     fn append_journal(&self, bytes: &[u8]) -> io::Result<()>;
 
     /// Replace the journal's contents.

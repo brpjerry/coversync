@@ -1,8 +1,10 @@
 //! Facts: what the device did, kept in `.coversync-replica/facts` until the
-//! server confirms them, and sent in batches. A fact the server never heard
-//! of only repeats its operation in the next plan (a put downloads again),
-//! so the journal is never flushed to the disk: it's there so that a sync
-//! cut off (the network, the app closed) loses nothing it did.
+//! server confirms them, and sent in batches. Appends aren't flushed one by
+//! one: `Storage::end_changes` makes the journal and the folder durable
+//! together at the end of a sync. A sync that never gets there leaves its
+//! dirty note, and so does one whose journal couldn't be written: the next
+//! sync checks the folder rather than trust facts that may be lost or stale
+//! (repeating a move isn't always safe).
 
 use std::sync::{Arc, Mutex};
 
@@ -89,7 +91,9 @@ impl Facts {
         let mut i = self.lock();
         i.unconfirmed.clear();
         if let Err(e) = self.storage.replace_journal(b"") {
+            // Stale facts left there would be replayed next time.
             tracing::warn!("couldn't empty the facts journal: {e}");
+            self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -111,8 +115,8 @@ impl Facts {
         self.damaged
     }
 
-    /// A fact couldn't be journaled: it lives only in memory until the
-    /// server confirms it.
+    /// The journal couldn't be written as it should (a fact appended, a
+    /// trim, a clear): what it holds can't be trusted next time.
     pub(crate) fn lost(&self) -> bool {
         self.lost.load(std::sync::atomic::Ordering::Relaxed)
     }
