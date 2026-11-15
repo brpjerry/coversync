@@ -267,7 +267,8 @@
 					<h2 id="sync-title">Sync</h2>
 					<p>
 						Sync will keep devices such as phones and music players up to date with the Library,
-						each with its own settings. Devices can pair now; copying files to them comes later.
+						each with its own settings. Devices can pair now; the apps that copy files to them come
+						next.
 					</p>
 				</div>
 			</header>
