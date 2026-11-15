@@ -375,10 +375,11 @@ fn main() -> Result<()> {
     let finished = AtomicBool::new(false);
     let t = Instant::now();
     std::thread::scope(|scope| -> Result<()> {
+        let mut workers = Vec::new();
         for _ in 0..a.jobs {
             let (queue, api, facts, failed, bytes, root) =
                 (&queue, &api, &facts, &failed, &bytes, &root);
-            scope.spawn(move || {
+            workers.push(scope.spawn(move || {
                 loop {
                     let Some((path, hash, size)) = queue.lock().unwrap().pop_front() else {
                         return;
@@ -401,7 +402,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-            });
+            }));
         }
         let finished = &finished;
         let reporter = scope.spawn(|| -> Result<()> {
@@ -419,12 +420,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         });
-        while !queue.lock().unwrap().is_empty() {
-            std::thread::sleep(Duration::from_millis(50));
+        for w in workers {
+            w.join().expect("download threads don't panic");
         }
-        Ok(drop(reporter))
+        finished.store(true, Ordering::Relaxed);
+        reporter.join().expect("the reporter doesn't panic")
     })?;
-    finished.store(true, Ordering::Relaxed);
     let changed = send(true)?;
     let secs = t.elapsed().as_secs_f64();
     let moved = bytes.load(Ordering::Relaxed);
