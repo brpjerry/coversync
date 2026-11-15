@@ -144,6 +144,8 @@ impl Watch {
     /// is nothing new.
     pub fn synced(&mut self, target: Option<&str>) {
         if let Some(t) = target {
+            // A sync reached it, its session having checked the folder.
+            self.woke = false;
             // A change heard while that sync ran, which it reached: nothing
             // left to wait for (the stream's first event, say).
             if self.due_for.as_deref() == Some(t) {
@@ -309,7 +311,11 @@ impl Watch {
                 Ok(None)
             }
             Ok(StatusCheck::Changed { status, etag }) => {
-                self.woke = false;
+                // With auto sync off, the wake's sync is still owed: only a
+                // session checks the folder's marker, so it comes when auto
+                // sync is turned on (or a sync is reported reached).
+                let owed = reason == Reason::Wake && !status.auto.enabled;
+                self.woke = owed;
                 self.refresh = false;
                 self.next_status = Instant::now() + self.options.status_every;
                 // Only a status that asked for nothing may come back as
@@ -334,7 +340,7 @@ impl Watch {
                     if self.due.is_none() {
                         return Ok(Some(Trigger { reason }));
                     }
-                } else if status.pending.files == 0 {
+                } else if status.pending.files == 0 && !owed {
                     // Nothing to do for this target.
                     self.synced(Some(&status.target));
                 }

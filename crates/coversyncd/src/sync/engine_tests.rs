@@ -869,6 +869,28 @@ async fn the_watch_says_when_to_sync() {
     let r = sync(&e2).await;
     assert!(r.reconciled.is_some());
     assert_eq!(tree(&root2), d.files());
+
+    // Another new folder, with auto sync off at waking: no sync then, but
+    // the wake's sync is still owed when auto sync is turned on, though the
+    // server thinks the device has everything.
+    d.settings(id, auto(false));
+    let (root3, storage3) = folder(&d, "laptop-3");
+    let e3 = engine(addr, &token, storage3, options());
+    let mut w3 = e3.watch(WatchOptions {
+        heartbeat: 15,
+        ..Default::default()
+    });
+    let off = tokio::time::timeout(Duration::from_secs(2), w3.next()).await;
+    assert!(off.is_err(), "{off:?}");
+    d.settings(id, auto(true));
+    assert_eq!(
+        next(&mut w3).await,
+        Trigger {
+            reason: Reason::Wake
+        }
+    );
+    sync(&e3).await;
+    assert_eq!(tree(&root3), d.files());
 }
 
 #[tokio::test]
