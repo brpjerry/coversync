@@ -40,10 +40,16 @@ pub struct Target {
     pub entries: Vec<Entry>,
     /// Files still being hashed or made.
     pub preparing: u64,
-    /// Files whose path is too long for the device.
+    /// Files whose path the device can't hold: too long, or unusable (a
+    /// name a hand-placed Library file has, such as one with a backslash).
     pub too_long: u64,
     sources: HashMap<String, Source>,
     paths: HashMap<String, usize>,
+    /// Tracks still being hashed, by path on the device.
+    waiting: HashSet<String>,
+    /// Cover files still being made, by path without the extension, which
+    /// follows the image.
+    waiting_covers: HashSet<String>,
 }
 
 impl Target {
@@ -57,12 +63,20 @@ impl Target {
         self.paths.get(path).map(|&i| &self.entries[i])
     }
 
-    /// A content's size, if it's in this target.
-    pub fn size_of(&self, hash: &str) -> Option<u64> {
-        self.sources.get(hash).map(|s| match s {
-            Source::Library { size, .. } | Source::Cover { size, .. } => *size,
-        })
+    /// Whether the file at `path` on the device is waiting for its new
+    /// content, so its copy there stays meanwhile.
+    pub fn waits(&self, path: &str) -> bool {
+        self.waiting.contains(path)
+            || path
+                .rsplit_once('.')
+                .is_some_and(|(stem, _)| self.waiting_covers.contains(stem))
     }
+}
+
+/// A path as storage that ignores case compares it, as device paths are
+/// kept apart (see `coversync_core::sync`).
+fn case_key(path: &str) -> String {
+    path.to_uppercase()
 }
 
 /// A cover file a target needs, not made yet.
@@ -90,8 +104,10 @@ pub struct Inputs<'a> {
 pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
     let caps = i.capabilities;
     let fits = |path: &str| {
-        caps.max_path_bytes
-            .is_none_or(|max| path.len() <= max as usize)
+        super::api::valid_path(path)
+            && caps
+                .max_path_bytes
+                .is_none_or(|max| path.len() <= max as usize)
             && caps
                 .max_name_bytes
                 .is_none_or(|max| path.split('/').all(|name| name.len() <= max as usize))
@@ -117,6 +133,7 @@ pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
         }
         let Some(hash) = &f.content.hash else {
             target.preparing += 1;
+            target.waiting.insert(f.path.clone());
             continue;
         };
         target
@@ -143,25 +160,42 @@ pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
     let mut wanted = Vec::new();
     if i.settings.art.cover_file {
         // A folder gets a cover only when it holds one album's tracks: a
-        // shared cover would be wrong for the others.
-        let mut folders: HashMap<&str, HashSet<&str>> = HashMap::new();
+        // shared cover would be wrong for the others. Folders are told apart
+        // as storage that ignores case does, and a cover never takes a name
+        // a track or folder has.
+        let mut folders: HashMap<String, (&str, HashSet<&str>)> = HashMap::new();
+        let mut taken: HashSet<String> = HashSet::new();
         for f in &i.paths.files {
             let dir = f.path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            folders.entry(dir).or_default().insert(&f.album_id);
+            folders
+                .entry(case_key(dir))
+                .or_insert((dir, HashSet::new()))
+                .1
+                .insert(&f.album_id);
+            taken.insert(case_key(&f.path));
+            for (n, _) in f.path.match_indices('/') {
+                taken.insert(case_key(&f.path[..n]));
+            }
         }
         let width = i.settings.art.max_width.unwrap_or(0);
         let mut asked: HashSet<&str> = HashSet::new();
-        let mut folders: Vec<_> = folders.into_iter().collect();
+        let mut folders: Vec<_> = folders.into_values().collect();
         folders.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (dir, in_it) in folders {
             let [album] = in_it.into_iter().collect::<Vec<_>>()[..] else {
                 continue;
+            };
+            let stem = if dir.is_empty() {
+                i.settings.art.cover_name.clone()
+            } else {
+                format!("{dir}/{}", i.settings.art.cover_name)
             };
             let Some((source, version)) = i.art.get(album) else {
                 continue;
             };
             let Some(made) = i.covers.get(&(version.clone(), width)) else {
                 target.preparing += 1;
+                target.waiting_covers.insert(stem);
                 if asked.insert(version) {
                     wanted.push(CoverWanted {
                         version: version.clone(),
@@ -171,12 +205,10 @@ pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
                 }
                 continue;
             };
-            let name = format!("{}.{}", i.settings.art.cover_name, made.ext);
-            let path = if dir.is_empty() {
-                name
-            } else {
-                format!("{dir}/{name}")
-            };
+            let path = format!("{stem}.{}", made.ext);
+            if taken.contains(&case_key(&path)) {
+                continue;
+            }
             if !fits(&path) {
                 target.too_long += 1;
                 continue;

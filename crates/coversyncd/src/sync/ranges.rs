@@ -31,13 +31,18 @@ pub fn ranges(file: &mut (impl Read + Seek), size: u64) -> io::Result<Vec<[u64; 
         areas.extend(mp4(file, at, size)?);
     }
     areas.extend(ape(file, size)?);
+    for a in &mut areas {
+        a[1] = a[1].min(a[0].saturating_add(MAX_AREA));
+    }
     Ok(merge(areas, size))
 }
 
-/// Sort, clip and join overlapping or touching ranges.
-fn merge(mut areas: Vec<[u64; 2]>, size: u64) -> Vec<[u64; 2]> {
+/// Sort, clip to the file and join overlapping or touching ranges: those of
+/// one file, or of several files of one size, whose union then samples any
+/// of them.
+pub fn merge(mut areas: Vec<[u64; 2]>, size: u64) -> Vec<[u64; 2]> {
     for a in &mut areas {
-        a[1] = a[1].min(size).min(a[0].saturating_add(MAX_AREA));
+        a[1] = a[1].min(size);
     }
     areas.retain(|a| a[0] < a[1]);
     areas.sort_unstable();

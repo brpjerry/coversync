@@ -178,10 +178,31 @@ fn reconcile(api: &Api, base: &str, root: &Path, full_hashes: bool) -> Result<Re
     Ok(serde_json::from_slice(&done)?)
 }
 
-/// Download one content into its partial file, hashing as it arrives, then
-/// flush it and rename it into place.
+/// `rel` under `root`, refusing a path through a symbolic link: the plan's
+/// paths are the server's, but the links are the device's own, and could
+/// lead anywhere. (A real client opens each folder without following links;
+/// this checks first, which is enough for trying the API.)
+fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
+    let mut at = root.to_path_buf();
+    for name in rel.split('/') {
+        at.push(name);
+        if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{rel}: goes through a symbolic link").into());
+        }
+    }
+    Ok(at)
+}
+
+/// Download one content into its own partial file, hashing as it arrives,
+/// then flush it and rename it into place. Each destination has its own
+/// partial file: the same content can go to two paths at once (a cover in
+/// each disc's folder).
 fn put(api: &Api, root: &Path, path: &str, hash: &str, size: u64, bytes: &AtomicU64) -> Result<()> {
-    let partial = root.join(CLIENT_DIR).join("partial").join(hash);
+    let dest = inside(root, path)?;
+    let partial = root.join(CLIENT_DIR).join("partial").join(format!(
+        "{hash}-{}",
+        &blake3::hash(path.as_bytes()).to_hex()[..16]
+    ));
     let have = fs::metadata(&partial)
         .map(|m| m.len())
         .unwrap_or(0)
@@ -190,7 +211,7 @@ fn put(api: &Api, root: &Path, path: &str, hash: &str, size: u64, bytes: &Atomic
         .agent
         .get(format!("{}/api/sync/v1/content/{hash}", api.base))
         .header("Authorization", &api.auth);
-    if have > 0 {
+    if have > 0 && have < size {
         req = req
             .header("Range", format!("bytes={have}-"))
             .header("If-Range", format!("\"{hash}\""));
@@ -228,11 +249,7 @@ fn put(api: &Api, root: &Path, path: &str, hash: &str, size: u64, bytes: &Atomic
         let _ = fs::remove_file(&partial);
         return Err(format!("{path}: the bytes don't match their hash").into());
     }
-    let dest = root.join(path);
-    if fs::rename(&partial, &dest).is_err() {
-        let _ = fs::remove_file(&dest);
-        fs::rename(&partial, &dest)?;
-    }
+    fs::rename(&partial, &dest)?;
     Ok(())
 }
 
@@ -335,30 +352,55 @@ fn main() -> Result<()> {
         Ok(reply.changed)
     };
 
-    // Everything but puts, in order.
-    let at = |p: &str| root.join(p);
+    // Everything but puts, in order. A file that isn't the size the server
+    // expects isn't the one it means: it's left alone and reported.
+    let changed = |op: &str, path: String| {
+        failed.lock().unwrap().push(Failure {
+            op: op.into(),
+            path,
+            hash: None,
+            error: errors::CHANGED.into(),
+            detail: Some("not the file the server meant".into()),
+        });
+    };
+    let is =
+        |p: &Path, size: u64| fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.len() == size);
     let mut puts = VecDeque::new();
     for op in ops {
         match op {
             Op::Delete { path, size } => {
-                if fs::metadata(at(&path)).is_ok_and(|m| m.len() == size) {
-                    fs::remove_file(at(&path))?;
+                let p = inside(&root, &path)?;
+                match fs::symlink_metadata(&p) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                    Ok(_) if is(&p, size) => fs::remove_file(&p)?,
+                    Ok(_) => {
+                        changed("delete", path);
+                        continue;
+                    }
                 }
                 facts.lock().unwrap().push(Fact::Delete { path });
             }
-            Op::Mkdir { path } => fs::create_dir_all(at(&path))?,
+            Op::Mkdir { path } => fs::create_dir_all(inside(&root, &path)?)?,
             Op::Move {
-                from, path, size, ..
+                from,
+                path,
+                size,
+                hash,
             } => {
-                if fs::metadata(at(&from)).is_ok() {
-                    fs::rename(at(&from), at(&path))?;
-                } else if !fs::metadata(at(&path)).is_ok_and(|m| m.len() == size) {
+                let (src, dst) = (inside(&root, &from)?, inside(&root, &path)?);
+                if is(&src, size) {
+                    fs::rename(&src, &dst)?;
+                } else if fs::symlink_metadata(&src).is_ok() || !is(&dst, size) {
+                    // Done before only if the source has gone and the
+                    // destination is what it should be.
+                    changed("move", from);
                     continue;
                 }
-                facts.lock().unwrap().push(Fact::Move { from, path });
+                facts.lock().unwrap().push(Fact::Move { from, path, hash });
             }
             Op::Rmdir { path } => {
-                let _ = fs::remove_dir(at(&path));
+                let _ = fs::remove_dir(inside(&root, &path)?);
             }
             Op::Put {
                 path, hash, size, ..
@@ -373,20 +415,22 @@ fn main() -> Result<()> {
     let queue = Arc::new(Mutex::new(puts));
     let bytes = Arc::new(AtomicU64::new(0));
     let finished = AtomicBool::new(false);
+    let failures = AtomicU64::new(0);
     let t = Instant::now();
     std::thread::scope(|scope| -> Result<()> {
         let mut workers = Vec::new();
         for _ in 0..a.jobs {
-            let (queue, api, facts, failed, bytes, root) =
-                (&queue, &api, &facts, &failed, &bytes, &root);
+            let (queue, api, facts, failed, bytes, root, failures) =
+                (&queue, &api, &facts, &failed, &bytes, &root, &failures);
             workers.push(scope.spawn(move || {
                 loop {
                     let Some((path, hash, size)) = queue.lock().unwrap().pop_front() else {
                         return;
                     };
                     match put(api, root, &path, &hash, size, bytes) {
-                        Ok(()) => facts.lock().unwrap().push(Fact::Put { path, hash }),
+                        Ok(()) => facts.lock().unwrap().push(Fact::Put { path, hash, size }),
                         Err(e) => {
+                            failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!("put {path}: {e}");
                             failed.lock().unwrap().push(Failure {
                                 op: "put".into(),
@@ -444,10 +488,15 @@ fn main() -> Result<()> {
             ""
         }
     );
+    let failed_puts = failures.load(Ordering::Relaxed);
     let report = EndReport {
-        result: Outcome::Complete,
-        message: None,
-        files: count as u64,
+        result: if failed_puts == 0 {
+            Outcome::Complete
+        } else {
+            Outcome::Partial
+        },
+        message: (failed_puts > 0).then(|| format!("{failed_puts} files failed")),
+        files: count as u64 - failed_puts,
         bytes: moved,
         seconds: began.elapsed().as_secs(),
         free_bytes: None,

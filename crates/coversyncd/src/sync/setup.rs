@@ -136,7 +136,7 @@ async fn state(
     .map_err(|e| Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "failed", e.to_string()))?
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     /// Tell the device to sync now (through its event stream, or at its
@@ -178,18 +178,30 @@ async fn action(
         ));
     }
     let s = state.clone();
-    tokio::task::spawn_blocking(move || match asked.action {
-        Action::Sync => s.sync.store.set_flag(id, Flag::Sync, true),
-        Action::Check => s.sync.store.set_flag(id, Flag::Check, true),
-        Action::Retry => s.sync.store.clear_failures(id),
-        Action::RemoveOther => s.sync.store.set_flag(id, Flag::RemoveOther, true),
-        Action::KeepOther => s.sync.store.set_flag(id, Flag::RemoveOther, false),
+    let action = asked.action;
+    tokio::task::spawn_blocking(move || {
+        match action {
+            Action::Sync | Action::KeepOther => {}
+            Action::Check => s.sync.store.set_flag(id, Flag::Check, true)?,
+            Action::Retry => s.sync.store.clear_failures(id)?,
+            Action::RemoveOther => s.sync.store.set_flag(id, Flag::RemoveOther, true)?,
+        }
+        if let Action::KeepOther = action {
+            s.sync.store.set_flag(id, Flag::RemoveOther, false)
+        } else {
+            // Each of these is done at the device's next sync: ask for one,
+            // so a device checking its status, rather than listening, starts
+            // it too.
+            s.sync.store.set_flag(id, Flag::Sync, true)
+        }
     })
     .await
     .map_err(|e| Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "failed", e.to_string()))??;
     // A device listening hears of it at once; the others at their next
     // status check.
-    let _ = state.sync.requests.send(id);
+    if !matches!(action, Action::KeepOther) {
+        let _ = state.sync.requests.send(id);
+    }
     state.sync.changed();
     state.events.publish(Notice::DeviceSync { device: id });
     Ok(StatusCode::NO_CONTENT)

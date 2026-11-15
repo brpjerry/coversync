@@ -1610,6 +1610,16 @@ impl Library {
         }))
     }
 
+    /// The attached Library's version and folder, read together, while the
+    /// folder is there. None without one, or with one that's gone (a disk
+    /// not mounted).
+    pub fn sync_location(&self) -> Result<Option<(LibraryVersion, PathBuf)>> {
+        let conn = self.conn();
+        Ok(library_version(&conn)?
+            .zip(library_root(&conn)?)
+            .filter(|(_, root)| root.is_dir()))
+    }
+
     /// Every Library track's id, album, path and content, and with `values`
     /// its tag values, read at once with the Library version they belong to
     /// (see [`crate::sync::device_paths`]). None without a Library folder.

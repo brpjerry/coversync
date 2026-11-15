@@ -8,8 +8,12 @@
 //! finally puts, which download.
 //! Moves are matched by content hash, so a file that only changed place is
 //! renamed, never downloaded again.
+//!
+//! On storage that ignores case in names, paths that differ only by case
+//! are one file: every check of what's where compares them that way, while
+//! the operations keep the target's spelling.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use coversync_protocol::{Op, RESERVE_BYTES, Totals};
 
@@ -43,6 +47,11 @@ pub struct Device<'a> {
     pub remove_other: bool,
     /// Free space, when the device said. The plan then fits it.
     pub free_bytes: Option<u64>,
+    /// Paths whose copy on the device stays as it is: their new content is
+    /// still being hashed or made, so it isn't in the target yet.
+    pub keep: &'a dyn Fn(&str) -> bool,
+    /// The device's storage ignores case in names.
+    pub fold_case: bool,
 }
 
 #[derive(Debug, Default)]
@@ -56,10 +65,6 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(move |(i, _)| &path[..i])
 }
 
-fn folders<'a>(paths: impl Iterator<Item = &'a str>) -> HashSet<&'a str> {
-    paths.flat_map(ancestors).collect()
-}
-
 /// A move worked out from matching hashes.
 struct Move {
     from: String,
@@ -68,10 +73,42 @@ struct Move {
     hash: String,
 }
 
+/// How a device's storage tells paths apart.
+#[derive(Clone, Copy)]
+struct Names {
+    fold_case: bool,
+}
+
+impl Names {
+    /// A path as the storage compares it: in capitals when it ignores case,
+    /// as device paths are kept apart (see `coversync_core::sync`).
+    fn key(self, path: &str) -> String {
+        if self.fold_case {
+            path.to_uppercase()
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// The folders `paths` are in, by key, each with a spelling.
+    fn folders<'a>(self, paths: impl Iterator<Item = &'a str>) -> HashMap<String, &'a str> {
+        let mut out = HashMap::new();
+        for dir in paths.flat_map(ancestors) {
+            out.entry(self.key(dir)).or_insert(dir);
+        }
+        out
+    }
+}
+
 pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     let inventory = device.inventory;
+    let names = Names {
+        fold_case: device.fold_case,
+    };
     let by_path: HashMap<&str, &Entry> = target.iter().map(|e| (e.path.as_str(), e)).collect();
     let in_place = |path: &str, held: &Held| by_path.get(path).is_some_and(|e| e.hash == held.hash);
+    // A file with no place in the target that stays all the same.
+    let kept = |path: &str| !by_path.contains_key(path) && (device.keep)(path);
 
     let mut held: Vec<(&String, &Held)> = inventory.iter().collect();
     held.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -79,7 +116,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     // move to one path that needs it.
     let mut sources: HashMap<&str, VecDeque<&str>> = HashMap::new();
     for (path, h) in &held {
-        if !in_place(path, h) {
+        if !in_place(path, h) && !kept(path) {
             sources
                 .entry(h.hash.as_str())
                 .or_default()
@@ -124,78 +161,75 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
         }
     }
 
+    // What's where before the plan, by key: the files the server knows of,
+    // with their sizes.
+    let mut at: HashMap<String, (&str, u64)> = HashMap::new();
+    for (path, size) in device.other {
+        at.insert(names.key(path), (path.as_str(), *size));
+    }
+    for (path, h) in inventory {
+        at.insert(names.key(path), (path.as_str(), h.size));
+    }
+    let had = names.folders(at.values().map(|(p, _)| *p));
+
     // Deletes: files with no place in the target, and other files the user
-    // asked to remove. Files at a target path stay until they're replaced.
-    let mut deletes: Vec<(String, u64)> = held
-        .iter()
-        .filter(|(path, _)| !moved.contains(path.as_str()) && !by_path.contains_key(path.as_str()))
-        .map(|(path, h)| ((*path).clone(), h.size))
-        .collect();
-    let mut others: Vec<(&String, &u64)> = device.other.iter().collect();
-    others.sort_unstable();
+    // asked to remove. Files at a target path stay until they're replaced,
+    // and so do files whose new content isn't ready.
+    let mut deletes: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    for (path, h) in &held {
+        if !moved.contains(path.as_str()) && !by_path.contains_key(path.as_str()) && !kept(path) {
+            deletes.insert(names.key(path), ((*path).clone(), h.size));
+        }
+    }
     if device.remove_other {
-        deletes.extend(
-            others
-                .iter()
-                .filter(|(path, _)| !by_path.contains_key(path.as_str()))
-                .map(|(path, size)| ((*path).clone(), **size)),
-        );
+        for (path, size) in device.other {
+            if !by_path.contains_key(path.as_str()) && !kept(path) {
+                deletes.insert(names.key(path), (path.clone(), *size));
+            }
+        }
     }
     // A move goes into a free path: whatever else is there goes first,
     // unless it's moving away itself.
     for m in &moves {
-        let occupant = match inventory.get(&m.to) {
-            Some(h) if !moved.contains(m.to.as_str()) => Some(h.size),
-            _ => device.other.get(&m.to).copied(),
-        };
-        if let Some(size) = occupant {
-            deletes.push((m.to.clone(), size));
+        if let Some((path, size)) = at.get(&names.key(&m.to))
+            && !moved.contains(path)
+        {
+            deletes.insert(names.key(path), (path.to_string(), *size));
         }
     }
-    deletes.sort_unstable();
-    deletes.dedup_by(|a, b| a.0 == b.0);
-
-    // Where things are before and after: for temporary names, and for the
-    // folders to create and remove.
-    let before: HashSet<&str> = inventory
-        .keys()
-        .chain(device.other.keys())
-        .map(String::as_str)
-        .collect();
-    let mut after: HashSet<String> = before.iter().map(|p| p.to_string()).collect();
-    for (path, _) in &deletes {
-        after.remove(path);
-    }
-    let mut taken: HashSet<String> = before
+    let mut after: HashMap<String, (String, u64)> = at
         .iter()
-        .map(|p| p.to_string())
-        .chain(target.iter().map(|e| e.path.clone()))
+        .filter(|(k, _)| !deletes.contains_key(*k))
+        .map(|(k, (p, s))| (k.clone(), (p.to_string(), *s)))
         .collect();
-    let ordered = order_moves(moves, &mut taken);
+
+    // Every name in use, which temporary names avoid.
+    let mut taken: HashSet<String> = at
+        .keys()
+        .cloned()
+        .chain(target.iter().map(|e| names.key(&e.path)))
+        .collect();
+    let ordered = order_moves(moves, &mut taken, names);
     for m in &ordered {
-        after.remove(&m.from);
-        after.insert(m.to.clone());
+        let size = after.remove(&names.key(&m.from)).map_or(m.size, |(_, s)| s);
+        after.insert(names.key(&m.to), (m.to.clone(), size));
     }
 
-    // Puts, as far as the space goes.
-    let replaced = |path: &str| -> Option<u64> {
-        if !after.contains(path) {
-            return None;
-        }
-        inventory
-            .get(path)
-            .map(|h| h.size)
-            .or_else(|| device.other.get(path).copied())
-    };
-    let freed: u64 = deletes.iter().map(|(_, size)| size).sum();
+    // Puts, as far as the space goes. A replacement downloads beside the
+    // file it replaces, which goes only once it's done.
+    let replaced = |path: &str| after.get(&names.key(path)).map(|(_, size)| *size);
+    let freed: u64 = deletes.values().map(|(_, size)| size).sum();
     let mut budget = device
         .free_bytes
-        .map(|free| (free + freed).saturating_sub(RESERVE_BYTES));
-    let wanted: u64 = puts
-        .iter()
-        .map(|e| e.size.saturating_sub(replaced(&e.path).unwrap_or(0)))
-        .sum();
-    let short_bytes = budget.map_or(0, |b| wanted.saturating_sub(b));
+        .map(|free| free.saturating_add(freed).saturating_sub(RESERVE_BYTES));
+    // The least room every put needs, in order, to go.
+    let (mut required, mut spare) = (0u64, 0u64);
+    for entry in &puts {
+        let extra = entry.size.saturating_sub(spare);
+        required = required.saturating_add(extra);
+        spare = (spare + extra - entry.size).saturating_add(replaced(&entry.path).unwrap_or(0));
+    }
+    let short_bytes = budget.map_or(0, |b| required.saturating_sub(b));
     let mut put_ops = Vec::with_capacity(puts.len());
     for entry in puts {
         let replaces = replaced(&entry.path);
@@ -215,21 +249,29 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
         });
     }
     for op in &put_ops {
-        after.insert(op.path().to_string());
+        after.insert(names.key(op.path()), (op.path().to_string(), 0));
     }
 
     // Folders: create those the moves and puts need, parents first; remove
     // those left with nothing in them, deepest first.
-    let had = folders(before.iter().copied());
-    let has = folders(after.iter().map(String::as_str));
-    let needed = folders(
+    let has = names.folders(after.values().map(|(p, _)| p.as_str()));
+    let needed = names.folders(
         ordered
             .iter()
             .map(|m| m.to.as_str())
             .chain(put_ops.iter().map(Op::path)),
     );
-    let mkdirs: BTreeSet<&str> = needed.into_iter().filter(|d| !had.contains(d)).collect();
-    let mut rmdirs: Vec<&str> = had.into_iter().filter(|d| !has.contains(d)).collect();
+    let mut mkdirs: Vec<&str> = needed
+        .iter()
+        .filter(|(k, _)| !had.contains_key(*k))
+        .map(|(_, p)| *p)
+        .collect();
+    mkdirs.sort_unstable();
+    let mut rmdirs: Vec<&str> = had
+        .iter()
+        .filter(|(k, _)| !has.contains_key(*k))
+        .map(|(_, p)| *p)
+        .collect();
     rmdirs.sort_unstable_by(|a, b| {
         b.matches('/')
             .count()
@@ -258,7 +300,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     );
     ops.extend(
         deletes
-            .into_iter()
+            .into_values()
             .map(|(path, size)| Op::Delete { path, size }),
     );
     ops.extend(mkdirs.into_iter().map(|p| Op::Mkdir { path: p.into() }));
@@ -275,24 +317,24 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
 
 /// Moves in an order where each goes into a free path: one whose file is
 /// still to move away waits for it. Moves that wait on each other in a
-/// circle (two files trading places) are untied by moving one to a
-/// temporary name first. `taken` holds every path in use, which temporary
-/// names avoid.
-fn order_moves(mut moves: Vec<Move>, taken: &mut HashSet<String>) -> Vec<Move> {
+/// circle (two files trading places, or a file whose name changes only by
+/// case on storage that ignores it) are untied by moving one to a temporary
+/// name first. `taken` holds every name in use, which temporary names avoid.
+fn order_moves(mut moves: Vec<Move>, taken: &mut HashSet<String>, names: Names) -> Vec<Move> {
     // The pending move whose file is at a path, and the one into a path.
     let mut leaving: HashMap<String, usize> = moves
         .iter()
         .enumerate()
-        .map(|(i, m)| (m.from.clone(), i))
+        .map(|(i, m)| (names.key(&m.from), i))
         .collect();
     let into: HashMap<String, usize> = moves
         .iter()
         .enumerate()
-        .map(|(i, m)| (m.to.clone(), i))
+        .map(|(i, m)| (names.key(&m.to), i))
         .collect();
     let mut done = vec![false; moves.len()];
     let mut ready: VecDeque<usize> = (0..moves.len())
-        .filter(|&i| !leaving.contains_key(&moves[i].to))
+        .filter(|&i| !leaving.contains_key(&names.key(&moves[i].to)))
         .collect();
     let mut ordered = Vec::with_capacity(moves.len());
     let mut next_stuck = 0;
@@ -302,9 +344,10 @@ fn order_moves(mut moves: Vec<Move>, taken: &mut HashSet<String>) -> Vec<Move> {
                 continue;
             }
             done[i] = true;
-            leaving.remove(&moves[i].from);
+            let from = names.key(&moves[i].from);
+            leaving.remove(&from);
             // Whatever waited for this path can go now.
-            if let Some(&j) = into.get(&moves[i].from)
+            if let Some(&j) = into.get(&from)
                 && !done[j]
             {
                 ready.push_back(j);
@@ -324,9 +367,9 @@ fn order_moves(mut moves: Vec<Move>, taken: &mut HashSet<String>) -> Vec<Move> {
             break;
         };
         let from = moves[k].from.clone();
-        let temporary = free_name(&from, taken);
-        leaving.remove(&from);
-        leaving.insert(temporary.clone(), k);
+        let temporary = free_name(&from, taken, names);
+        leaving.remove(&names.key(&from));
+        leaving.insert(names.key(&temporary), k);
         ordered.push(Move {
             from: from.clone(),
             to: temporary.clone(),
@@ -334,26 +377,25 @@ fn order_moves(mut moves: Vec<Move>, taken: &mut HashSet<String>) -> Vec<Move> {
             hash: moves[k].hash.clone(),
         });
         moves[k].from = temporary;
-        if let Some(&j) = into.get(&from) {
+        if let Some(&j) = into.get(&names.key(&from)) {
             ready.push_back(j);
         }
     }
     ordered
 }
 
-/// A name beside `path` that nothing uses, which it then takes.
-fn free_name(path: &str, taken: &mut HashSet<String>) -> String {
-    let mut n = 0;
-    loop {
-        let name = match n {
-            0 => format!("{path}.coversync-move"),
-            n => format!("{path}.coversync-move-{n}"),
-        };
-        if taken.insert(name.clone()) {
-            return name;
-        }
-        n += 1;
-    }
+/// A temporary name beside `path` that nothing uses, which it then takes.
+/// It's short (".cs1", ".cs2", …), so it fits wherever `path` does: no
+/// shorter audio file name is worth the case.
+fn free_name(path: &str, taken: &mut HashSet<String>, names: Names) -> String {
+    let dir = path.rsplit_once('/').map(|(dir, _)| dir);
+    (1..)
+        .map(|n| match dir {
+            Some(dir) => format!("{dir}/.cs{n}"),
+            None => format!(".cs{n}"),
+        })
+        .find(|name| taken.insert(names.key(name)))
+        .expect("a free name")
 }
 
 #[cfg(test)]
@@ -402,6 +444,8 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: false,
                 free_bytes: None,
+                keep: &|_| false,
+                fold_case: false,
             },
         );
         plan.ops.iter().map(short).collect()
@@ -479,12 +523,7 @@ mod tests {
         ];
         assert_eq!(
             ops(&target, &inventory, &[]),
-            [
-                "move c>d",
-                "move b>b.coversync-move",
-                "move a>b",
-                "move b.coversync-move>a"
-            ]
+            ["move c>d", "move b>.cs1", "move a>b", "move .cs1>a"]
         );
         // A chain needs no temporary name: x waits until y has moved on.
         let inventory = [("x", "h1", 1), ("y", "h2", 2)];
@@ -514,6 +553,8 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: true,
                 free_bytes: None,
+                keep: &|_| false,
+                fold_case: false,
             },
         );
         assert_eq!(
@@ -541,6 +582,8 @@ mod tests {
                 remove_other: false,
                 // With the delete, 30 MB free after the 64 MB reserve.
                 free_bytes: Some(84 * mb),
+                keep: &|_| false,
+                fold_case: false,
             },
         );
         // Order is kept: c would fit, but not before b.
@@ -565,8 +608,95 @@ mod tests {
                 held_back: &held_back,
                 remove_other: false,
                 free_bytes: None,
+                keep: &|_| false,
+                fold_case: false,
             },
         );
         assert_eq!(plan.ops.iter().map(short).collect::<Vec<_>>(), ["put b"]);
+    }
+
+    /// The plan's operations for a device whose storage ignores case.
+    fn folded(target: &[Entry], inventory: &[(&str, &str, u64)]) -> Vec<String> {
+        let inventory = held(inventory);
+        let plan = plan(
+            target,
+            0,
+            &Device {
+                inventory: &inventory,
+                other: &HashMap::new(),
+                held_back: &HashSet::new(),
+                remove_other: false,
+                free_bytes: None,
+                keep: &|_| false,
+                fold_case: true,
+            },
+        );
+        plan.ops.iter().map(short).collect()
+    }
+
+    #[test]
+    fn names_that_differ_by_case_alone_are_one_file_where_case_is_ignored() {
+        // A new spelling goes through a temporary name, where it would be
+        // the same file.
+        let inventory = [("x.flac", "h1", 1)];
+        let target = [entry("X.flac", "h1", 1)];
+        assert_eq!(
+            folded(&target, &inventory),
+            ["move x.flac>.cs1", "move .cs1>X.flac"]
+        );
+        assert_eq!(ops(&target, &inventory, &[]), ["move x.flac>X.flac"]);
+        // Two files trading names that differ only by case are a circle.
+        let inventory = [("a.flac", "h1", 1), ("b.flac", "h2", 2)];
+        let target = [entry("B.flac", "h1", 1), entry("A.flac", "h2", 2)];
+        assert_eq!(
+            folded(&target, &inventory),
+            ["move a.flac>.cs1", "move b.flac>A.flac", "move .cs1>B.flac"]
+        );
+    }
+
+    #[test]
+    fn copies_wait_for_their_new_content() {
+        // A.flac's tags were edited: its new hash isn't known yet, so the
+        // device keeps the copy it has rather than losing it meanwhile.
+        let inventory = held(&[("A/a.flac", "old", 5), ("Gone/g.flac", "h", 5)]);
+        let plan = plan(
+            &[],
+            1,
+            &Device {
+                inventory: &inventory,
+                other: &HashMap::new(),
+                held_back: &HashSet::new(),
+                remove_other: false,
+                free_bytes: None,
+                keep: &|p| p == "A/a.flac",
+                fold_case: false,
+            },
+        );
+        assert_eq!(
+            plan.ops.iter().map(short).collect::<Vec<_>>(),
+            ["delete Gone/g.flac", "rmdir Gone"]
+        );
+    }
+
+    #[test]
+    fn a_replacement_needs_room_beside_the_file_it_replaces() {
+        let mb = 1 << 20;
+        let inventory = held(&[("a", "old", 100 * mb)]);
+        let plan = plan(
+            &[entry("a", "new", 100 * mb)],
+            0,
+            &Device {
+                inventory: &inventory,
+                other: &HashMap::new(),
+                held_back: &HashSet::new(),
+                remove_other: false,
+                // Only the reserve is free.
+                free_bytes: Some(64 * mb),
+                keep: &|_| false,
+                fold_case: false,
+            },
+        );
+        assert!(plan.ops.is_empty());
+        assert_eq!(plan.totals.short_bytes, 100 * mb);
     }
 }

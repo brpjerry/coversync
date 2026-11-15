@@ -21,7 +21,7 @@ use coversync_protocol::{
     LastSync, Listed, Op, PAGE_BYTES, PAGE_OPS, PlanEnd, PlanHeader, PlanLine, Progress, Reason,
     ReconcileDone, SampleRequest, Sampled, SessionStart, SessionStarted, Status, TargetEvent,
 };
-use futures_util::stream;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use super::plan::{self, Held as HeldFile};
@@ -43,6 +43,8 @@ const SESSION_QUIET: Duration = Duration::from_secs(300);
 const PROGRESS_NOTICE: Duration = Duration::from_secs(1);
 /// File reads for downloads.
 const READ_CHUNK: usize = 512 * 1024;
+/// How often a device's event stream checks its token is still good.
+const STILL_DEVICE: Duration = Duration::from_secs(20);
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -154,14 +156,17 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Answer<T> + Send + 'sta
 }
 
 /// A path a device may use: relative, `/` between names, none of them empty,
-/// `.` or `..`, and not in the client's own folder.
+/// `.` or `..`, and not in the client's own folder (whatever its case).
 pub(super) fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains(['\\', '\0'])
         && path
             .split('/')
             .all(|name| !name.is_empty() && name != "." && name != "..")
-        && path.split('/').next() != Some(CLIENT_DIR)
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(CLIENT_DIR))
 }
 
 fn ndjson(body: String) -> Response {
@@ -347,7 +352,9 @@ struct Part {
 }
 
 /// `POST sessions/{s}/reconcile`: the folder's listing, in one request or
-/// several, the last with `?last=1`. Its reply names the files to sample.
+/// several, the last with `?last=1`. Its reply names the files to sample,
+/// or is `503 preparing` while the server still hashes or makes files: the
+/// device starts a session again later.
 async fn reconcile(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
@@ -393,6 +400,15 @@ async fn reconcile(
     let s = state.clone();
     let (target, wanted) = blocking(move || {
         let target = target(&s, device)?;
+        // Files still being hashed or made can't be matched yet: the
+        // device's copies of them would be taken for files of its own.
+        if target.preparing > 0 {
+            return Err(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "preparing",
+                "The server is still getting files ready; try again in a minute.",
+            ));
+        }
         Ok((target.clone(), to_sample(&target, &listing)))
     })
     .await?;
@@ -417,32 +433,46 @@ async fn reconcile(
 }
 
 /// The listed files worth sampling: those of a size some target content
-/// has, with the ranges to read, picked from the content the same path
-/// should hold or else from the first of that size.
+/// has. The ranges for a size are the union of every such content's tag
+/// areas and ends, so the sample tells the file apart from any of them.
 fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
     use rayon::prelude::*;
-    let mut by_size: HashMap<u64, Vec<&plan::Entry>> = HashMap::new();
+    let mut by_size: HashMap<u64, Vec<&str>> = HashMap::new();
     for e in &target.entries {
-        by_size.entry(e.size).or_default().push(e);
+        by_size.entry(e.size).or_default().push(&e.hash);
     }
+    for hashes in by_size.values_mut() {
+        hashes.sort_unstable();
+        hashes.dedup();
+    }
+    let sizes: std::collections::HashSet<u64> = listing
+        .iter()
+        .map(|l| l.size)
+        .filter(|s| by_size.contains_key(s))
+        .collect();
+    let ranges_by_size: HashMap<u64, Vec<[u64; 2]>> = sizes
+        .into_par_iter()
+        .filter_map(|size| {
+            let mut all = Vec::new();
+            for hash in &by_size[&size] {
+                if let Some(found) =
+                    source_file(target, hash).and_then(|(mut f, s)| ranges::ranges(&mut f, s).ok())
+                {
+                    all.extend(found);
+                }
+            }
+            (!all.is_empty()).then(|| (size, ranges::merge(all, size)))
+        })
+        .collect();
     let mut out: Vec<(String, Wanted)> = listing
-        .par_iter()
+        .iter()
         .filter_map(|l| {
-            let candidates = by_size.get(&l.size)?;
-            let model = candidates
-                .iter()
-                .find(|e| e.path == l.path)
-                .unwrap_or(&candidates[0]);
-            let ranges = source_file(target, &model.hash)
-                .and_then(|(mut f, size)| ranges::ranges(&mut f, size).ok())?;
-            let mut hashes: Vec<String> = candidates.iter().map(|e| e.hash.clone()).collect();
-            hashes.sort_unstable();
-            hashes.dedup();
+            let ranges = ranges_by_size.get(&l.size)?;
             Some((
                 l.path.clone(),
                 Wanted {
-                    ranges,
-                    candidates: hashes,
+                    ranges: ranges.clone(),
+                    candidates: by_size[&l.size].iter().map(|h| h.to_string()).collect(),
                 },
             ))
         })
@@ -677,6 +707,8 @@ pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> 
                 held_back: &files.held_back,
                 remove_other: st.remove_other,
                 free_bytes,
+                keep: &|path| target.waits(path),
+                fold_case: st.capabilities.case_insensitive,
             },
         )
     };
@@ -703,7 +735,7 @@ async fn facts(
         coversync_protocol::Fact::Put { path, .. } | coversync_protocol::Fact::Delete { path } => {
             valid_path(path)
         }
-        coversync_protocol::Fact::Move { from, path } => valid_path(from) && valid_path(path),
+        coversync_protocol::Fact::Move { from, path, .. } => valid_path(from) && valid_path(path),
     });
     if !paths_ok {
         return Err(Problem::bad("A fact names a path outside the sync folder."));
@@ -726,18 +758,11 @@ async fn facts(
         })
         .ok();
     let s = state.clone();
-    let snapshot = planned.as_ref().and_then(|(p, _)| p.clone());
     let target = blocking(move || {
-        let target = target(&s, device)?;
-        let size = |hash: &str| {
-            target
-                .size_of(hash)
-                .or_else(|| snapshot.as_ref().and_then(|p| p.target.size_of(hash)))
-        };
         s.sync
             .store
-            .apply_facts(device, &batch.done, &batch.failed, size, now())?;
-        Ok(target)
+            .apply_facts(device, &batch.done, &batch.failed, now())?;
+        Ok(target(&s, device)?)
     })
     .await?;
     let planned_target = planned
@@ -845,11 +870,14 @@ struct Heartbeat {
 }
 
 /// `GET events`: `target` when the device's target changes (and once at
-/// the start), `sync` when someone asks for a sync in Sync setup.
+/// the start), `sync` when someone asks for a sync in Sync setup. It ends
+/// once the token no longer names the device, as checked every
+/// [`STILL_DEVICE`].
 async fn events(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
     Query(q): Query<Heartbeat>,
+    headers: HeaderMap,
 ) -> Answer {
     let device = device(&access)?;
     let heartbeat = q
@@ -864,6 +892,17 @@ async fn events(
         sent: Option<String>,
         first: bool,
     }
+    let ended = {
+        let state = state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(STILL_DEVICE).await;
+                if !crate::auth::still_device(&state, &headers, device).await {
+                    return;
+                }
+            }
+        }
+    };
     let listening = Listening {
         changes: state.sync.changes.subscribe(),
         requests: state.sync.requests.subscribe(),
@@ -929,7 +968,7 @@ async fn events(
     });
     Ok((
         [(header::HeaderName::from_static("x-accel-buffering"), "no")],
-        Sse::new(events).keep_alive(
+        Sse::new(events.take_until(ended)).keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(heartbeat.into()))
                 .text("heartbeat"),
@@ -955,9 +994,14 @@ async fn content(
             return Ok(None);
         }
         let opened = source_file(&target, &h);
-        if opened.is_none() && matches!(target.source(&h), Some(Source::Library { .. })) {
-            // The file changed since it was hashed: hash it again.
-            crate::spawn_hashes(s.clone());
+        match target.source(&h) {
+            // The file changed since it was indexed: a scan reads it again,
+            // and the hash pass after it hashes it.
+            Some(Source::Library { .. }) if opened.is_none() => crate::spawn_scan(s.clone()),
+            // The cover file has gone from the cache: it's made again once
+            // the target is worked out afresh.
+            Some(Source::Cover { .. }) if opened.is_none() => s.sync.forget(device),
+            _ => {}
         }
         Ok(opened)
     })

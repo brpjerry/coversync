@@ -256,14 +256,26 @@ impl PlanLine {
 }
 
 /// Something a device did, as it reports it. Facts are idempotent: the
-/// same one twice changes nothing.
+/// same batch sent twice (its reply lost, say) changes nothing the second
+/// time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Fact {
-    /// `path` now holds content `hash`.
-    Put { path: String, hash: String },
-    /// What was at `from` is now at `path`.
-    Move { from: String, path: String },
+    /// `path` now holds content `hash`, `size` bytes of it.
+    Put {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    /// Content `hash`, which was at `from`, is now at `path`. Applied only
+    /// while the server believes `from` holds that content, so a move sent
+    /// again after it was applied, or after its source took other content
+    /// (a swap), changes nothing.
+    Move {
+        from: String,
+        path: String,
+        hash: String,
+    },
     /// Nothing is at `path` now.
     Delete { path: String },
 }

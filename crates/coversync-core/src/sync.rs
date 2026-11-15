@@ -329,12 +329,14 @@ impl PathCache {
         // Requests for one device wait for paths being worked out for it,
         // rather than each working them out too.
         let mut cached = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(library) = lib.index_versions()?.library else {
+        // The folder too: a Library moved elsewhere keeps its id and counter.
+        let Some((library, root)) = lib.sync_location()? else {
             return Ok(None);
         };
         if let Some(paths) = cached.as_ref()
             && paths.settings_version == sync.version
             && paths.library == library
+            && paths.root == root
         {
             return Ok(Some(paths.clone()));
         }

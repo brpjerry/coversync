@@ -61,6 +61,9 @@ pub struct SyncState {
     /// Goes up as cover files are made, so targets waiting on them are
     /// worked out again.
     covers_made: AtomicU64,
+    /// Goes up when the watcher sees albums' art change (a cover image
+    /// replaced beside the tracks changes no track).
+    art_seen: AtomicU64,
     /// Cover files being made, and those whose art couldn't be read.
     making: Mutex<HashSet<(String, u32)>>,
     failed_covers: Mutex<HashSet<(String, u32)>>,
@@ -76,9 +79,11 @@ pub struct SyncState {
 /// A target, with what it was worked out from.
 struct Cached {
     library: LibraryVersion,
+    root: PathBuf,
     settings_version: i64,
     capabilities: Capabilities,
     covers_made: u64,
+    art_seen: u64,
     target: Arc<Target>,
 }
 
@@ -108,6 +113,7 @@ impl SyncState {
             cover_dir,
             targets: Mutex::new(HashMap::new()),
             covers_made: AtomicU64::new(0),
+            art_seen: AtomicU64::new(0),
             making: Mutex::new(HashSet::new()),
             failed_covers: Mutex::new(HashSet::new()),
             sessions: Sessions::default(),
@@ -131,12 +137,13 @@ impl SyncState {
 }
 
 /// A device's target as things are now, worked out again only when the
-/// Library, the device's settings or capabilities, or the cover files made
-/// have changed. Blocking.
+/// Library (or where it is), the device's settings or capabilities, albums'
+/// art or the cover files made have changed. Blocking.
 pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
     let sync = state.auth.device_sync(device)?.ok_or(NoTarget::NoDevice)?;
     let capabilities = state.sync.store.device(device)?.capabilities;
     let covers_made = state.sync.covers_made.load(Ordering::SeqCst);
+    let art_seen = state.sync.art_seen.load(Ordering::SeqCst);
     let paths = state
         .device_paths
         .paths(&state.lib, device, &sync)?
@@ -145,6 +152,8 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         let cached = state.sync.targets.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cached.get(&device)
             && c.library == paths.library
+            && c.root == paths.root
+            && c.art_seen == art_seen
             && c.settings_version == sync.version
             && c.capabilities == capabilities
             && c.covers_made == covers_made
@@ -153,7 +162,13 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         }
     }
     let art = state.lib.cover_versions()?;
-    let covers = state.sync.store.covers()?;
+    // The cache folder can be cleared, or moved: a cover file that isn't
+    // there any more is made again.
+    let mut covers = state.sync.store.covers()?;
+    covers.retain(|_, c| {
+        std::fs::metadata(state.sync.cover_dir.join(format!("{}.{}", c.hash, c.ext)))
+            .is_ok_and(|m| m.is_file() && m.len() == c.size)
+    });
     let (target, wanted) = target::build(target::Inputs {
         paths: &paths,
         settings: &sync.settings,
@@ -176,6 +191,8 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
             device,
             Cached {
                 library: paths.library.clone(),
+                root: paths.root.clone(),
+                art_seen,
                 settings_version: sync.version,
                 capabilities,
                 covers_made,
@@ -264,9 +281,18 @@ fn make_cover(dir: &Path, w: &CoverWanted) -> anyhow::Result<CoverFile> {
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let path = dir.join(format!("{hash}.{ext}"));
     if !path.exists() {
-        let tmp = dir.join(format!("{hash}.{ext}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        // Each writer its own temporary file: two widths of art narrower than
+        // both come out the same.
+        static WRITE: AtomicU64 = AtomicU64::new(0);
+        let tmp = dir.join(format!(
+            "{hash}.{ext}.{}.tmp",
+            WRITE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written?;
     }
     Ok(CoverFile {
         hash,
@@ -276,7 +302,8 @@ fn make_cover(dir: &Path, w: &CoverWanted) -> anyhow::Result<CoverFile> {
 }
 
 /// Watch for changes that move devices' targets: the Library's version
-/// (which also goes up as files are hashed) and devices' settings. Each
+/// (which also goes up as files are hashed) and folder, devices' settings,
+/// and albums' art. Each
 /// device's target is worked out again then, so its `changed_at` is when
 /// the change happened rather than when the device next asked, and event
 /// streams hear of it.
@@ -291,28 +318,48 @@ pub fn spawn_watcher(state: Shared) {
             }
             let s = state.clone();
             let now = tokio::task::spawn_blocking(move || {
-                let library = s.lib.index_versions().ok()?.library;
-                let settings: Vec<(i64, i64)> = s
+                let library = s.lib.sync_location().ok()?;
+                let mut settings: Vec<(i64, i64)> = s
                     .auth
                     .device_syncs()
                     .ok()?
                     .into_iter()
                     .map(|(id, sync)| (id, sync.version))
                     .collect();
-                Some((library, settings))
+                settings.sort_unstable();
+                // Albums' art, as a digest of every album's art version.
+                let mut art: Vec<(String, String)> = s
+                    .lib
+                    .cover_versions()
+                    .ok()?
+                    .into_iter()
+                    .map(|(album, (_, version))| (album, version))
+                    .collect();
+                art.sort_unstable();
+                let mut digest = blake3::Hasher::new();
+                for (album, version) in &art {
+                    digest.update(album.as_bytes());
+                    digest.update(b"\0");
+                    digest.update(version.as_bytes());
+                    digest.update(b"\n");
+                }
+                Some((library, settings, digest.finalize()))
             })
             .await
             .ok()
             .flatten();
-            let Some(mut now) = now else { continue };
-            now.1.sort_unstable();
+            let Some(now) = now else { continue };
             if seen.as_ref() == Some(&now) {
                 continue;
             }
             let first = seen.is_none();
+            let art_changed = seen.as_ref().is_some_and(|s| s.2 != now.2);
             seen = Some(now.clone());
             if first {
                 continue;
+            }
+            if art_changed {
+                state.sync.art_seen.fetch_add(1, Ordering::SeqCst);
             }
             let s = state.clone();
             let _ = tokio::task::spawn_blocking(move || {

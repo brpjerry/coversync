@@ -122,10 +122,15 @@ impl Daemon {
 
     /// Index and hash the Library as it is now.
     fn rescan(&self) {
+        self.scan();
+        coversync_core::hashes::run(&self.state.lib, &self.state.hashes).unwrap();
+    }
+
+    /// Index the Library as it is now, leaving changed files unhashed.
+    fn scan(&self) {
         let s = &self.state;
         s.lib.refresh_library().unwrap();
         coversync_core::scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress).unwrap();
-        coversync_core::hashes::run(&s.lib, &s.hashes).unwrap();
     }
 
     fn device(&self, scope: Scope) -> (i64, String) {
@@ -431,11 +436,14 @@ impl Client<'_> {
                 std::fs::create_dir_all(at(path)).unwrap();
                 None
             }
-            Op::Move { from, path, .. } => {
+            Op::Move {
+                from, path, hash, ..
+            } => {
                 std::fs::rename(at(from), at(path)).unwrap();
                 Some(Fact::Move {
                     from: from.clone(),
                     path: path.clone(),
+                    hash: hash.clone(),
                 })
             }
             Op::Rmdir { path } => {
@@ -458,6 +466,7 @@ impl Client<'_> {
                 Some(Fact::Put {
                     path: path.clone(),
                     hash: hash.clone(),
+                    size: *size,
                 })
             }
         }
@@ -534,7 +543,8 @@ async fn a_device_follows_the_library() {
     );
     assert_eq!(folders(&phone.root), ["Album One", "Album Two"]);
 
-    // A tag edit: one file again, in place.
+    // A tag edit: one file again, in place. Until it's hashed, the device
+    // keeps the copy it has.
     let mut edited = tags("Two", "A", "Album One", 2);
     edited.push("GENRE=Rock".into());
     write_track(
@@ -542,6 +552,9 @@ async fn a_device_follows_the_library() {
         &edited,
         60_000,
     );
+    d.scan();
+    let ran = phone.sync().await;
+    assert!(ran.ops.is_empty(), "{:?}", ran.ops);
     d.rescan();
     let ran = phone.sync().await;
     assert_eq!(ran.ops, ["put Album One/Two.flac (replace)"]);

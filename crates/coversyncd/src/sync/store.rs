@@ -143,6 +143,11 @@ impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
+        // As the index's own connection: with a write-ahead log, a commit
+        // needn't wait for the disk, which a hash pass or a sync can keep
+        // busy for seconds at a time. A power cut can lose the last few
+        // reports, which devices send again; it can't corrupt anything.
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -212,10 +217,11 @@ impl Store {
     /// when it last changed.
     pub fn saw_target(&self, id: i64, target: &str, now: i64) -> rusqlite::Result<i64> {
         let conn = self.conn();
-        Self::ensure(&conn, id)?;
         conn.execute(
-            "UPDATE sync_devices SET target = ?2, changed_at = ?3
-             WHERE device_id = ?1 AND target IS NOT ?2",
+            "INSERT INTO sync_devices (device_id, target, changed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (device_id) DO UPDATE SET target = excluded.target,
+                 changed_at = excluded.changed_at
+             WHERE target IS NOT excluded.target",
             params![id, target, now],
         )?;
         conn.query_row(
@@ -314,15 +320,14 @@ impl Store {
         Ok(())
     }
 
-    /// Apply a device's report in one transaction. `size` gives a put
-    /// content's size, if the server knows the content; a put of content it
-    /// doesn't know is left out, as nothing could be planned from it.
+    /// Apply a device's report in one transaction. Applying the same report
+    /// again changes nothing: puts and deletes say what's there now, and a
+    /// move applies only while its source holds the content it names.
     pub fn apply_facts(
         &self,
         id: i64,
         done: &[Fact],
         failed: &[Failure],
-        size: impl Fn(&str) -> Option<u64>,
         now: i64,
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn();
@@ -339,27 +344,24 @@ impl Store {
                 tx.prepare_cached("DELETE FROM sync_other WHERE device_id = ?1 AND path = ?2")?;
             let mut moved = tx.prepare_cached(
                 "UPDATE OR REPLACE sync_inventory SET path = ?3
-                 WHERE device_id = ?1 AND path = ?2",
+                 WHERE device_id = ?1 AND path = ?2 AND hash = ?4",
             )?;
             let mut unfailed =
                 tx.prepare_cached("DELETE FROM sync_failures WHERE device_id = ?1 AND path = ?2")?;
             for fact in done {
                 match fact {
-                    Fact::Put { path, hash } => {
-                        let Some(size) = size(hash) else {
-                            tracing::debug!(device = id, path, "put of unknown content ignored");
+                    Fact::Put { path, hash, size } => {
+                        let Ok(size) = i64::try_from(*size) else {
                             continue;
                         };
-                        put.execute(params![id, path, hash, size as i64])?;
+                        put.execute(params![id, path, hash, size])?;
                         gone_other.execute(params![id, path])?;
                         unfailed.execute(params![id, path])?;
                     }
-                    Fact::Move { from, path } => {
+                    Fact::Move { from, path, hash } => {
                         // Whatever was at the path was replaced.
-                        gone_other.execute(params![id, path])?;
-                        if moved.execute(params![id, from, path])? == 0 {
-                            // A file the server didn't know of moved over it.
-                            gone.execute(params![id, path])?;
+                        if moved.execute(params![id, from, path, hash])? > 0 {
+                            gone_other.execute(params![id, path])?;
                         }
                     }
                     Fact::Delete { path } => {
@@ -420,8 +422,11 @@ impl Store {
                 put.execute(params![id, path, *size as i64])?;
             }
         }
+        // Removing other files was asked for the files listed before; a new
+        // listing needs asking again.
         tx.execute(
-            "UPDATE sync_devices SET epoch = ?2, check_requested = 0 WHERE device_id = ?1",
+            "UPDATE sync_devices SET epoch = ?2, check_requested = 0, remove_other = 0
+             WHERE device_id = ?1",
             params![id, epoch],
         )?;
         tx.commit()
@@ -488,4 +493,74 @@ pub struct DeviceFiles {
     pub inventory: HashMap<String, Held>,
     pub other: HashMap<String, u64>,
     pub held_back: HashSet<(String, String)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "coversyncd-sync-store-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("inbox.sqlite3");
+        // The sync tables' trigger is on the login tables' devices.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE devices (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        Store::open(&path).unwrap()
+    }
+
+    fn put(path: &str, hash: &str) -> Fact {
+        Fact::Put {
+            path: path.into(),
+            hash: hash.into(),
+            size: 1,
+        }
+    }
+
+    fn mv(from: &str, path: &str, hash: &str) -> Fact {
+        Fact::Move {
+            from: from.into(),
+            path: path.into(),
+            hash: hash.into(),
+        }
+    }
+
+    fn held(s: &Store) -> Vec<(String, String)> {
+        let mut out: Vec<_> = s
+            .files(1)
+            .unwrap()
+            .inventory
+            .into_iter()
+            .map(|(p, h)| (p, h.hash))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_report_sent_twice_changes_nothing_the_second_time() {
+        let s = store("replay");
+        s.apply_facts(1, &[put("a", "h1"), put("b", "h2")], &[], 0)
+            .unwrap();
+        // a and b trade places through a temporary name; the reply is lost
+        // and the device sends the same report again.
+        let swap = [mv("a", "t", "h1"), mv("b", "a", "h2"), mv("t", "b", "h1")];
+        for _ in 0..2 {
+            s.apply_facts(1, &swap, &[], 0).unwrap();
+            assert_eq!(
+                held(&s),
+                [("a".into(), "h2".into()), ("b".into(), "h1".into())]
+            );
+        }
+        // A move whose source the server doesn't know of leaves its path as
+        // it was.
+        s.apply_facts(1, &[mv("gone", "a", "h9")], &[], 0).unwrap();
+        assert_eq!(held(&s)[0], ("a".into(), "h2".into()));
+    }
 }

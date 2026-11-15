@@ -543,6 +543,19 @@ pub async fn still_valid(state: &Shared, headers: &HeaderMap) -> bool {
     }
 }
 
+/// Whether a device's sync event stream may go on: its credentials still
+/// name `device`, any scope. Revoking the device, or pairing it again with
+/// a new token, ends it.
+pub async fn still_device(state: &Shared, headers: &HeaderMap, device: i64) -> bool {
+    let found = credentials(headers);
+    let s = state.clone();
+    let now = now();
+    match tokio::task::spawn_blocking(move || check(&s.auth.store, found, now)).await {
+        Ok(Ok(checked)) => checked.access.is_ok_and(|a| a.device == Some(device)),
+        _ => true,
+    }
+}
+
 /// What a login was served may be kept by the browser only, never by a
 /// shared cache, which would hand it to requests without one. A response
 /// with no policy of its own is checked every time.
