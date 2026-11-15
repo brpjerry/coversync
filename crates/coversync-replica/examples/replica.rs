@@ -130,7 +130,14 @@ async fn main() -> Result<()> {
         };
         let trigger = tokio::select! {
             t = w.next() => t?,
-            _ = retry => Trigger { reason: Reason::Timer },
+            _ = retry => {
+                // Auto sync turned off meanwhile: the retry waits for it.
+                if w.auto().is_some_and(|a| !a.enabled) {
+                    retry_at = None;
+                    continue;
+                }
+                Trigger { reason: Reason::Timer }
+            }
             _ = cancel.cancelled() => return Ok(()),
         };
         retry_at = None;

@@ -457,14 +457,6 @@ async fn session(
             Some("the Library kept changing during the sync".into()),
             Again::After(Duration::from_secs(15)),
         ),
-        (Ok(()), None) if report.short_bytes > 0 => (
-            Outcome::Partial,
-            Some(format!(
-                "the device needs {} MB more room",
-                report.short_bytes.div_ceil(1_000_000)
-            )),
-            Again::No,
-        ),
         // Files that changed on the server mid-sync come in a later plan,
         // once the server has hashed them again.
         (Ok(()), None) if s.gone_last.load(Ordering::Relaxed) > 0 => (
@@ -474,6 +466,14 @@ async fn session(
                 s.gone_last.load(Ordering::Relaxed)
             )),
             Again::After(Duration::from_secs(15)),
+        ),
+        (Ok(()), None) if report.short_bytes > 0 => (
+            Outcome::Partial,
+            Some(format!(
+                "the device needs {} MB more room",
+                report.short_bytes.div_ceil(1_000_000)
+            )),
+            Again::No,
         ),
         (Ok(()), None) if report.failed > 0 => (
             Outcome::Partial,

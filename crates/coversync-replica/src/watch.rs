@@ -340,6 +340,11 @@ impl Watch {
                     if self.due.is_none() {
                         return Ok(Some(Trigger { reason }));
                     }
+                    // The wake's sync is still owed until a trigger can be
+                    // returned (the quiet period's comes first).
+                    if reason == Reason::Wake {
+                        self.woke = true;
+                    }
                 } else if status.pending.files == 0 && !owed {
                     // Nothing to do for this target.
                     self.synced(Some(&status.target));
