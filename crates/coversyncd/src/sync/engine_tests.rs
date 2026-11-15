@@ -783,6 +783,48 @@ async fn the_watch_says_when_to_sync() {
     );
     assert_eq!(w.auto().map(|a| a.quiet_seconds), Some(1));
 
+    // A change heard while a sync runs, which that sync reaches: no second
+    // sync for it once the quiet period is over.
+    let two = d.library.join("Artist A/Album One/02 - Two.flac");
+    let mut jazz = tags("Two", "A", "Album One", 2);
+    jazz.push("GENRE=Jazz".into());
+    write_track(&two, &jazz, 60_000);
+    d.rescan();
+    let heard = tokio::time::timeout(Duration::from_millis(300), w.next()).await;
+    assert!(heard.is_err(), "{heard:?}");
+    let r = sync(&e).await;
+    assert_eq!(r.files, 1);
+    w.synced(r.target.as_deref());
+    let again = tokio::time::timeout(Duration::from_secs(3), w.next()).await;
+    assert!(again.is_err(), "{again:?}");
+
+    // Auto sync off: a change waits. Turned back on, it's synced without
+    // waiting for the hourly status check.
+    let auto = |enabled| DeviceSettings {
+        auto: AutoSync {
+            enabled,
+            quiet_seconds: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    d.settings(id, auto(false));
+    let mut blues = tags("Two", "A", "Album One", 2);
+    blues.push("GENRE=Blues".into());
+    write_track(&two, &blues, 60_000);
+    d.rescan();
+    let off = tokio::time::timeout(Duration::from_secs(3), w.next()).await;
+    assert!(off.is_err(), "{off:?}");
+    d.settings(id, auto(true));
+    assert_eq!(
+        next(&mut w).await,
+        Trigger {
+            reason: Reason::Timer
+        }
+    );
+    let r = sync(&e).await;
+    assert_eq!(r.files, 1);
+
     // The same device in a new, empty folder, while the server thinks it
     // has everything: waking still syncs, which finds the folder new.
     let (root2, storage2) = folder(&d, "laptop-2");

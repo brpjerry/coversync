@@ -93,6 +93,8 @@ pub struct Watch {
     synced: Option<String>,
     /// When the quiet period after the last change ends.
     due: Option<Instant>,
+    /// The target that last change was to.
+    due_for: Option<String>,
     /// Someone chose Sync now.
     requested: bool,
     stream: Option<Events>,
@@ -116,6 +118,7 @@ impl Watch {
             auto: None,
             synced: None,
             due: None,
+            due_for: None,
             requested: false,
             stream: None,
             reconnect_at: now,
@@ -135,6 +138,12 @@ impl Watch {
     /// is nothing new.
     pub fn synced(&mut self, target: Option<&str>) {
         if let Some(t) = target {
+            // A change heard while that sync ran, which it reached: nothing
+            // left to wait for (the stream's first event, say).
+            if self.due_for.as_deref() == Some(t) {
+                self.due = None;
+                self.due_for = None;
+            }
             self.synced = Some(t.to_string());
         }
     }
@@ -255,13 +264,19 @@ impl Watch {
                 // Each change starts the quiet period again: a run of edits
                 // becomes one sync.
                 self.due = Some(Instant::now() + self.quiet());
+                self.due_for = Some(event.target);
             }
             "sync" => self.requested = true,
             "settings" => {
                 if let Ok(auto) = serde_json::from_str::<AutoSync>(data) {
+                    let was_off = self.auto.is_some_and(|a| !a.enabled);
                     self.auto = Some(auto);
                     if !auto.enabled {
                         self.due = None;
+                    } else if was_off {
+                        // Turned back on: whatever waited meanwhile is
+                        // looked at now, not at the next periodic check.
+                        self.check_soon();
                     }
                 }
             }
