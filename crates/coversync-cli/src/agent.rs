@@ -42,6 +42,9 @@ use crate::tokens::Source;
 /// folder) is looked at again: the server's settings can change without a
 /// word that reaches here.
 pub const LOOK_AGAIN: Duration = Duration::from_secs(30);
+/// How often a folder that has no marker yet is looked at for one while a
+/// sync runs in it.
+const MARKER_LOOK: Duration = Duration::from_millis(250);
 /// How long the keychain gets to answer (it may be asking the user).
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -413,22 +416,12 @@ impl Memory {
         };
         // Whole and on the disk before it counts: the next run may be
         // after a power cut, with the folder's disk not there.
-        let tmp = file.with_extension(format!("json.{}.new", std::process::id()));
-        let written = file
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| serde_json::to_vec(&state).map_err(std::io::Error::other))
-            .and_then(|state| {
-                use std::io::Write;
-                let mut out = std::fs::File::create(&tmp)?;
-                out.write_all(&state)?;
-                out.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&tmp, file));
+        let written = serde_json::to_vec(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|state| crate::config::write_whole(file, &state, 0o666));
         match written {
             Ok(()) => self.saved = true,
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
                 if !std::mem::replace(&mut self.warned, true) {
                     tracing::warn!("couldn't note the sync in {}: {e}", file.display());
                 }
@@ -843,10 +836,16 @@ impl Session<'_> {
                         cancel.cancel();
                     }
                 }
-                // The plan is in, so the engine's marker is in the folder:
-                // remembered now, before the downloads, which a power cut
-                // or a kill could end without another word.
-                _ = planned.notified() => {
+                // The engine puts its marker in a new folder before it asks
+                // for the plan. Remembered as soon as it's seen there, and
+                // at the latest when the plan is in, before the downloads:
+                // a power cut or a kill ends a sync without another word.
+                _ = planned.notified(), if !self.memory.marked_before => {
+                    if self.folder.has_marker().await {
+                        self.memory.marked();
+                    }
+                }
+                _ = tokio::time::sleep(MARKER_LOOK), if !self.memory.marked_before => {
                     if self.folder.has_marker().await {
                         self.memory.marked();
                     }
@@ -874,6 +873,23 @@ impl Session<'_> {
             Ok(report) => report.outcome == Some(Outcome::Cancelled),
             Err(e) => matches!(e, Error::Cancelled),
         };
+        // A change heard while this sync ran may be one it took along (a
+        // sync longer than the quiet period hears of its own target that
+        // way): after a sync that ended whole, the server says whether
+        // anything is left, which costs less than a sync that finds
+        // nothing. Someone asking, and a wake's look at the folder, stand.
+        // Being told to stop doesn't wait for the answer.
+        let whole = matches!(&result, Ok(report) if report.outcome == Some(Outcome::Complete));
+        if whole && !stopping && matches!(queued, Some(Reason::Event | Reason::Timer)) {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => stopping = true,
+                nothing = self.nothing_left() => {
+                    if nothing {
+                        queued = None;
+                    }
+                }
+            }
+        }
         let next = if stopping {
             Next::End(Ended::Stopped)
         } else if refused || matches!(result, Err(Error::Unauthorized)) {
@@ -901,17 +917,6 @@ impl Session<'_> {
                     // server tells of it again.
                     if report.outcome == Some(Outcome::Complete) {
                         self.watch.synced(report.target.as_deref());
-                        // A change heard while this sync ran may be one it
-                        // took along (a sync longer than the quiet period
-                        // hears of its own target that way): the server
-                        // says whether anything is left, which costs less
-                        // than a sync that finds nothing. Someone asking,
-                        // and a wake's look at the folder, stand.
-                        if matches!(queued, Some(Reason::Event | Reason::Timer))
-                            && self.nothing_left().await
-                        {
-                            queued = None;
-                        }
                     }
                     match follow_up(&report, failures) {
                         Some(wait) => Next::Retry(reason, wait),

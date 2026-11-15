@@ -3,5 +3,5 @@
 //! too.
 
 pub use coversync_desktop_core::sync::{
-    Config, VERSION, file, folder, path, server_url, state_file,
+    Config, VERSION, file, folder, path, server_url, state_file, temporary, write_whole,
 };

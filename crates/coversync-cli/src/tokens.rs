@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use coversync_desktop_core::tokens::{Keychain, Tokens};
@@ -57,25 +57,11 @@ impl Source {
         match self {
             Source::Keychain => Keychain::new(APP_ID).save(server, token).await,
             Source::File(file) => {
-                let failed = |e: io::Error| format!("{} can't be written: {e}.", file.display());
-                if let Some(dir) = file.parent() {
-                    fs::create_dir_all(dir).map_err(failed)?;
-                }
-                // Made for the user alone, then put in place whole.
-                let mut name = file.file_name().unwrap_or_default().to_owned();
-                name.push(".new");
-                let tmp = file.with_file_name(name);
-                let _ = fs::remove_file(&tmp);
-                let mut out = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&tmp)
-                    .map_err(failed)?;
-                out.write_all(token.expose().as_bytes()).map_err(failed)?;
-                out.write_all(b"\n").map_err(failed)?;
-                out.sync_all().map_err(failed)?;
-                fs::rename(&tmp, file).map_err(failed)
+                // For the user alone, and put in place whole.
+                let mut text = token.expose().as_bytes().to_vec();
+                text.push(b'\n');
+                crate::config::write_whole(file, &text, 0o600)
+                    .map_err(|e| format!("{} can't be written: {e}.", file.display()))
             }
         }
     }
@@ -94,17 +80,15 @@ fn writable(file: &std::path::Path) -> Result<(), String> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
     fs::create_dir_all(dir).map_err(|e| cant(e.to_string()))?;
-    let mut name = file.file_name().unwrap_or_default().to_owned();
-    name.push(format!(".{}.try", std::process::id()));
-    let probe = file.with_file_name(name);
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)
-        .map_err(|e| cant(e.to_string()))?;
-    let _ = fs::remove_file(&probe);
-    Ok(())
+    // As a token is saved: a file made beside it, with as much written and
+    // flushed as a token comes to. A full disk or quota shows here.
+    let (mut probe, path) =
+        crate::config::temporary(dir, 0o600).map_err(|e| cant(e.to_string()))?;
+    let written = probe
+        .write_all(&[b'-'; 128])
+        .and_then(|()| probe.sync_all());
+    let _ = fs::remove_file(&path);
+    written.map_err(|e| cant(e.to_string()))
 }
 
 #[cfg(test)]

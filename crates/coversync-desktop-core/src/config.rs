@@ -209,6 +209,12 @@ impl Store {
 pub struct ConfigLock(#[allow(dead_code)] Option<File>);
 
 impl ConfigLock {
+    /// Whether the lock is really held: false where locking itself didn't
+    /// work, and [`ConfigLock::take`] went on without.
+    pub fn held(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Refuses only when another process holds the lock. Where locking
     /// itself fails (a file system without locks, a directory that can't be
     /// written), it warns and goes on without, as before the lock existed.

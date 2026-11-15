@@ -225,15 +225,27 @@ async fn run(
 /// remove the new one. So the app's own lock on its settings folder is
 /// held for the pairing, and an app that's open means no pairing here. A
 /// token file is nobody else's: no lock.
+///
+/// Where locks don't work at all (the app goes on without one there too),
+/// whether the app is open can't be told: the pairing goes ahead, and says
+/// what to do if it was.
 fn apps_lock(tokens: &Source, settings: Option<&Path>) -> Result<Option<ConfigLock>, String> {
-    match (tokens, settings) {
-        (Source::Keychain, Some(settings)) => ConfigLock::take(settings).map(Some).map_err(|_| {
-            "The coversync app is open. Pair in its window instead, or close it first: it would \
-             undo a pairing made behind its back."
-                .to_owned()
-        }),
-        _ => Ok(None),
+    let (Source::Keychain, Some(settings)) = (tokens, settings) else {
+        return Ok(None);
+    };
+    let lock = ConfigLock::take(settings).map_err(|_| {
+        "The coversync app is open. Pair in its window instead, or close it first: it would \
+         undo a pairing made behind its back."
+            .to_owned()
+    })?;
+    if !lock.held() {
+        eprintln!(
+            "coversync: couldn't check whether the coversync app is open ({} can't be locked). \
+             If it is, close it and pair again, or pair in its window.",
+            settings.display()
+        );
     }
+    Ok(Some(lock))
 }
 
 /// What the agent runs with, once the command's options and the settings
