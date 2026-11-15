@@ -486,6 +486,7 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
