@@ -714,7 +714,8 @@ page instead: choose the folder there and turn **Sync this computer** on.
   while charging only (as UPower does: not on the battery). A sync under way
   stops when they stop holding, and goes on when they hold again. **Sync
   now** is someone asking, and syncs whatever they say. A computer without
-  NetworkManager or UPower counts as unmetered and on mains power.
+  NetworkManager or UPower counts as unmetered and on mains power; until
+  they have answered, a sync that depends on them waits.
 - **The server or the network being away** is waited out. A sync that failed
   is tried again after 30 seconds, then at doubling intervals up to 10
   minutes (5 minutes up to an hour for trouble with the folder).

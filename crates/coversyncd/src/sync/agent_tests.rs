@@ -76,6 +76,17 @@ struct Agent {
 /// Starts an agent for the folder `name`, which it doesn't make. Agents of
 /// one name share what they remember, as one computer's runs do.
 fn start(d: &Daemon, addr: SocketAddr, token: &str, name: &str) -> Agent {
+    start_with(d, addr, token, name, Conditions::FINE)
+}
+
+/// As [`start`], with the desktop saying `conditions` to begin with.
+fn start_with(
+    d: &Daemon,
+    addr: SocketAddr,
+    token: &str,
+    name: &str,
+    conditions: Conditions,
+) -> Agent {
     let root = d.dir.join(name);
     let token_file = d.dir.join(format!("{name}.token"));
     std::fs::write(&token_file, token).unwrap();
@@ -91,7 +102,7 @@ fn start(d: &Daemon, addr: SocketAddr, token: &str, name: &str) -> Agent {
         options: Options::default(),
         look_again: Duration::from_millis(100),
     };
-    let (system, feed) = System::manual();
+    let (system, feed) = System::manual(conditions);
     let lines = Arc::new(Lines::default());
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(agent::run(
@@ -210,10 +221,7 @@ async fn the_agent_keeps_the_folder_in_step_within_the_devices_conditions() {
     // On a metered network, a device set to unmetered networks waits.
     a.feed
         .conditions
-        .send(Conditions {
-            metered: true,
-            on_battery: false,
-        })
+        .send(Conditions::known(true, false))
         .unwrap();
     edit(&d, 2);
     until(&a.lines, "waiting for the network", || {
@@ -237,17 +245,14 @@ async fn the_agent_keeps_the_folder_in_step_within_the_devices_conditions() {
     .await;
     assert!(!a.in_step(&d));
     let before = a.syncs();
-    a.feed.conditions.send(Conditions::default()).unwrap();
+    a.feed.conditions.send(Conditions::FINE).unwrap();
     a.caught_up(&d, before, "the network being unmetered again")
         .await;
 
     // The battery counts only for a device set to sync while charging.
     a.feed
         .conditions
-        .send(Conditions {
-            metered: false,
-            on_battery: true,
-        })
+        .send(Conditions::known(false, true))
         .unwrap();
     let before = a.syncs();
     edit(&d, 4);
@@ -270,7 +275,7 @@ async fn the_agent_keeps_the_folder_in_step_within_the_devices_conditions() {
     .await;
     assert!(!a.in_step(&d));
     let before = a.syncs();
-    a.feed.conditions.send(Conditions::default()).unwrap();
+    a.feed.conditions.send(Conditions::FINE).unwrap();
     a.caught_up(&d, before, "being plugged in").await;
 
     // Waking from sleep: the server is asked at once, with nothing new
@@ -298,12 +303,7 @@ async fn a_sync_under_way_stops_when_its_conditions_stop_holding() {
     // The network turns metered just as the first sync starts.
     let conditions = a.feed.conditions.clone();
     a.lines.as_a_sync_starts(move || {
-        conditions
-            .send(Conditions {
-                metered: true,
-                on_battery: false,
-            })
-            .unwrap();
+        conditions.send(Conditions::known(true, false)).unwrap();
     });
     std::fs::create_dir_all(&a.root).unwrap();
     until(&a.lines, "stopping for the metered network", || {
@@ -315,7 +315,7 @@ async fn a_sync_under_way_stops_when_its_conditions_stop_holding() {
     assert_eq!(a.syncs(), 0);
 
     // Unmetered again: the sync that was stopped is the one that runs.
-    a.feed.conditions.send(Conditions::default()).unwrap();
+    a.feed.conditions.send(Conditions::FINE).unwrap();
     a.caught_up(&d, 0, "going on when unmetered").await;
 
     // Someone asking isn't stopped by the same change.
@@ -323,12 +323,7 @@ async fn a_sync_under_way_stops_when_its_conditions_stop_holding() {
     a.caught_up(&d, 1, "the change arriving").await;
     let conditions = a.feed.conditions.clone();
     a.lines.as_a_sync_starts(move || {
-        conditions
-            .send(Conditions {
-                metered: true,
-                on_battery: false,
-            })
-            .unwrap();
+        conditions.send(Conditions::known(true, false)).unwrap();
     });
     let said = a.lines.said("unmetered network");
     edit(&d, 2);
@@ -370,7 +365,9 @@ async fn the_agent_ends_when_its_token_is_refused_unless_theres_a_newer_one() {
     assert_eq!(a.task.await.unwrap(), Err(Stop::Refused));
 }
 
-// Bugs caught: 0, False positives: 0
+// Bugs caught: 0, False positives: 1
+// (It swapped the folder while the first sync was still ending, which then
+// took the test's change along into the old folder and left nothing to do.)
 #[tokio::test]
 async fn a_folder_that_isnt_there_is_waited_for_and_never_made() {
     let d = Daemon::new("agent-missing");
@@ -386,7 +383,7 @@ async fn a_folder_that_isnt_there_is_waited_for_and_never_made() {
 
     // The disk is mounted.
     std::fs::create_dir_all(&a.root).unwrap();
-    until(&a.lines, "the first sync", || a.in_step(&d)).await;
+    a.caught_up(&d, 0, "the first sync").await;
 
     // The disk goes, leaving its empty mount point: the folder there now
     // is another one, without coversync's marker. Nothing is put in it.
@@ -404,7 +401,7 @@ async fn a_folder_that_isnt_there_is_waited_for_and_never_made() {
     // The disk is back: the change that waited arrives on it.
     std::fs::remove_dir_all(&a.root).unwrap();
     std::fs::rename(&away, &a.root).unwrap();
-    until(&a.lines, "the disk being back", || a.in_step(&d)).await;
+    a.caught_up(&d, 1, "the disk being back").await;
     assert_eq!(a.stop().await, Ok(()));
 }
 
@@ -484,5 +481,159 @@ async fn a_device_with_auto_sync_off_syncs_only_when_asked() {
     // waiting for the hourly check.
     d.settings(id, auto(true));
     a.caught_up(&d, 1, "auto sync turned on").await;
+    assert_eq!(a.stop().await, Ok(()));
+}
+
+// Bugs caught: 0, False positives: 0
+#[tokio::test]
+async fn a_sync_that_waits_for_power_still_waits_after_waking() {
+    let d = Daemon::new("agent-wake-held");
+    let (id, token) = d.device(Scope::Sync);
+    d.settings(
+        id,
+        DeviceSettings {
+            auto: AutoSync {
+                quiet_seconds: 1,
+                wifi_only: false,
+                charging_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
+    let a = start(&d, addr, &token, "laptop");
+    a.caught_up(&d, 0, "the first sync").await;
+
+    // On battery, a change waits.
+    a.feed
+        .conditions
+        .send(Conditions::known(false, true))
+        .unwrap();
+    edit(&d, 1);
+    until(&a.lines, "waiting for power", || {
+        a.lines.said("plugged in") > 0
+    })
+    .await;
+    // The laptop sleeps and wakes, still on battery: the watch is new and
+    // has the device's settings to hear again. What waited still waits.
+    for _ in 0..3 {
+        a.feed.nudges.send(Nudge::Woke).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!a.in_step(&d), "synced on battery after waking");
+    }
+    assert_eq!(a.syncs(), 1);
+    // Plugged in: it goes.
+    a.feed.conditions.send(Conditions::FINE).unwrap();
+    a.caught_up(&d, 1, "being plugged in").await;
+    assert_eq!(a.stop().await, Ok(()));
+}
+
+// Bugs caught: 0, False positives: 0
+#[tokio::test]
+async fn nothing_starts_by_itself_until_the_desktop_has_said_how_things_are() {
+    let d = Daemon::new("agent-unknown");
+    let (_, token) = quick(&d, Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
+    // The device syncs on unmetered networks only (the default), and the
+    // desktop hasn't answered yet.
+    let a = start_with(&d, addr, &token, "laptop", Conditions::UNKNOWN);
+    until(&a.lines, "saying it's finding out", || {
+        a.lines.said("Finding out") > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        tree(&a.root).is_empty(),
+        "synced before the network was known"
+    );
+    // Metered, it turns out: still nothing.
+    a.feed
+        .conditions
+        .send(Conditions {
+            metered: Some(true),
+            on_battery: None,
+        })
+        .unwrap();
+    until(&a.lines, "waiting for the network", || {
+        a.lines.said("unmetered network") > 0
+    })
+    .await;
+    assert!(tree(&a.root).is_empty());
+    a.feed
+        .conditions
+        .send(Conditions {
+            metered: Some(false),
+            on_battery: None,
+        })
+        .unwrap();
+    a.caught_up(&d, 0, "the network being unmetered").await;
+    assert_eq!(a.stop().await, Ok(()));
+}
+
+// Bugs caught: 0, False positives: 0
+#[tokio::test]
+async fn auto_sync_turned_off_while_idle_shows_in_the_status() {
+    let d = Daemon::new("agent-off-idle");
+    let (id, token) = quick(&d, Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
+    let a = start(&d, addr, &token, "laptop");
+    a.caught_up(&d, 0, "the first sync").await;
+    assert_eq!(a.lines.said("Auto sync is off"), 0);
+    d.settings(
+        id,
+        DeviceSettings {
+            auto: AutoSync {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    until(&a.lines, "saying auto sync is off", || {
+        a.lines.said("Auto sync is off") > 0
+    })
+    .await;
+    assert_eq!(a.stop().await, Ok(()));
+}
+
+// Bugs caught: 0, False positives: 0
+#[tokio::test]
+async fn a_folder_emptied_under_a_running_agent_is_filled_again_by_sync_now() {
+    let d = Daemon::new("agent-emptied-running");
+    let (id, token) = quick(&d, Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    std::fs::create_dir_all(d.dir.join("laptop")).unwrap();
+    let a = start(&d, addr, &token, "laptop");
+    a.caught_up(&d, 0, "the first sync").await;
+
+    // Everything in the folder goes, the engine's own files with it; the
+    // folder itself stays where it was.
+    for entry in std::fs::read_dir(&a.root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    // A change doesn't fill it by itself.
+    edit(&d, 1);
+    until(&a.lines, "noticing the empty folder", || {
+        a.lines.said("lost its coversync files") > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(tree(&a.root).is_empty());
+    // Sync now does, in the folder as it is now.
+    d.state.sync.requests.send(id).unwrap();
+    a.caught_up(&d, 1, "Sync now filling it").await;
     assert_eq!(a.stop().await, Ok(()));
 }
