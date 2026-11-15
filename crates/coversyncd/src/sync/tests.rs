@@ -53,7 +53,7 @@ fn flac(path: &Path, comments: &[&str], audio: usize) {
     std::fs::write(path, b).unwrap();
 }
 
-fn tags(title: &str, artist: &str, album: &str, n: u32) -> Vec<String> {
+pub(super) fn tags(title: &str, artist: &str, album: &str, n: u32) -> Vec<String> {
     vec![
         format!("TITLE={title}"),
         format!("ARTIST={artist}"),
@@ -63,16 +63,16 @@ fn tags(title: &str, artist: &str, album: &str, n: u32) -> Vec<String> {
     ]
 }
 
-fn write_track(path: &Path, tags: &[String], audio: usize) {
+pub(super) fn write_track(path: &Path, tags: &[String], audio: usize) {
     let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
     flac(path, &tags, audio);
 }
 
-struct Daemon {
-    dir: PathBuf,
-    library: PathBuf,
-    state: Shared,
-    router: Router,
+pub(super) struct Daemon {
+    pub(super) dir: PathBuf,
+    pub(super) library: PathBuf,
+    pub(super) state: Shared,
+    pub(super) router: Router,
 }
 
 impl Drop for Daemon {
@@ -83,7 +83,7 @@ impl Drop for Daemon {
 
 impl Daemon {
     /// A daemon over a Library of two albums, the first with a cover image.
-    fn new(name: &str) -> Daemon {
+    pub(super) fn new(name: &str) -> Daemon {
         let dir =
             std::env::temp_dir().join(format!("coversyncd-sync-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -121,19 +121,19 @@ impl Daemon {
     }
 
     /// Index and hash the Library as it is now.
-    fn rescan(&self) {
+    pub(super) fn rescan(&self) {
         self.scan();
         coversync_core::hashes::run(&self.state.lib, &self.state.hashes).unwrap();
     }
 
     /// Index the Library as it is now, leaving changed files unhashed.
-    fn scan(&self) {
+    pub(super) fn scan(&self) {
         let s = &self.state;
         s.lib.refresh_library().unwrap();
         coversync_core::scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress).unwrap();
     }
 
-    fn device(&self, scope: Scope) -> (i64, String) {
+    pub(super) fn device(&self, scope: Scope) -> (i64, String) {
         self.state
             .auth
             .store()
@@ -141,7 +141,7 @@ impl Daemon {
             .unwrap()
     }
 
-    fn settings(&self, device: i64, settings: DeviceSettings) {
+    pub(super) fn settings(&self, device: i64, settings: DeviceSettings) {
         self.state
             .auth
             .store()
@@ -152,14 +152,14 @@ impl Daemon {
 
     /// The Library's files, by path, as a device following its structure
     /// holds them.
-    fn files(&self) -> BTreeMap<String, Vec<u8>> {
+    pub(super) fn files(&self) -> BTreeMap<String, Vec<u8>> {
         tree(&self.library)
             .into_iter()
             .filter(|(p, _)| !p.starts_with(".coversync"))
             .collect()
     }
 
-    async fn call(
+    pub(super) async fn call(
         &self,
         method: &str,
         path: &str,
@@ -191,7 +191,7 @@ async fn bytes(res: Response) -> Vec<u8> {
         .to_vec()
 }
 
-async fn json<T: serde::de::DeserializeOwned>(res: Response) -> T {
+pub(super) async fn json<T: serde::de::DeserializeOwned>(res: Response) -> T {
     let status = res.status();
     let body = bytes(res).await;
     assert!(
@@ -203,7 +203,7 @@ async fn json<T: serde::de::DeserializeOwned>(res: Response) -> T {
 }
 
 /// Every file under `root`, by relative path, but the client's own.
-fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+pub(super) fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -230,7 +230,7 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-fn folders(root: &Path) -> Vec<String> {
+pub(super) fn folders(root: &Path) -> Vec<String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
             let path = e.path();
@@ -490,7 +490,7 @@ fn short(op: &Op) -> String {
 
 /// Wait for the cover files a device needs: they're made in the
 /// background, and count as preparing until then.
-async fn covers_made(d: &Daemon, token: &str) {
+pub(super) async fn covers_made(d: &Daemon, token: &str) {
     for _ in 0..100 {
         let res = d.call("GET", "/api/sync/v1/status", token, None, &[]).await;
         let status: coversync_protocol::Status = json(res).await;

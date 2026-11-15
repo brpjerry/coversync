@@ -8,6 +8,7 @@ mod sync;
 mod uploads;
 mod web;
 
+use axum::serve::ListenerExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -330,7 +331,16 @@ async fn run() -> anyhow::Result<()> {
     tokio::spawn(uploads::housekeeping(state.clone()));
 
     let app = app(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    // Without TCP_NODELAY, a reply written in parts (a streamed body after
+    // its head) waits for the client's delayed ACK: 40 ms a request, which
+    // capped syncs of small files at about 25 a second per download.
+    let listener = tokio::net::TcpListener::bind(args.listen)
+        .await?
+        .tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::debug!("couldn't set TCP_NODELAY: {e}");
+            }
+        });
     tracing::info!("listening on http://{}", args.listen);
     let closing = state.clone();
     axum::serve(listener, app)

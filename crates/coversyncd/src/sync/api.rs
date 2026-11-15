@@ -17,8 +17,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use coversync_protocol::{
-    CLIENT_DIR, Count, EndReport, FactsBatch, FactsReply, HEARTBEAT_RANGE, HEARTBEAT_SECONDS, Held,
-    LastSync, Listed, Op, PAGE_BYTES, PAGE_OPS, PlanEnd, PlanHeader, PlanLine, Progress, Reason,
+    Count, EndReport, FactsBatch, FactsReply, HEARTBEAT_RANGE, HEARTBEAT_SECONDS, Held, LastSync,
+    Listed, Op, PAGE_BYTES, PAGE_OPS, PlanEnd, PlanHeader, PlanLine, Progress, Reason,
     ReconcileDone, SampleRequest, Sampled, SessionStart, SessionStarted, Status, TargetEvent,
 };
 use futures_util::stream::{self, StreamExt};
@@ -155,26 +155,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Answer<T> + Send + 'sta
         .map_err(Problem::failed)?
 }
 
-/// A path a device may use: relative, `/` between names, none of them empty,
-/// `.` or `..`, and not in the client's own folder (whatever its case).
-pub(super) fn valid_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains(['\\', '\0'])
-        && path.split('/').all(|name| {
-            !name.is_empty()
-                && name != "."
-                && name != ".."
-                // A Windows drive ("C:", or "C:name", relative to that
-                // drive), anywhere: joined name by name, it would take the
-                // path out of the folder there.
-                && !(name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
-                    && name.as_bytes().get(1) == Some(&b':'))
-        })
-        && !path
-            .split('/')
-            .next()
-            .is_some_and(|first| first.eq_ignore_ascii_case(CLIENT_DIR))
-}
+pub(super) use coversync_protocol::valid_path;
 
 fn ndjson(body: String) -> Response {
     let mut res = ([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response();
@@ -221,9 +202,9 @@ pub struct Snapshot {
 struct Reconcile {
     listing: Vec<Listed>,
     listed: bool,
-    /// Files to sample: their size, the ranges asked for, and the contents
-    /// of that size they could be.
-    wanted: HashMap<String, Wanted>,
+    /// Files to sample: the ranges asked for, and the contents of their
+    /// size they could be, shared by every file of that size.
+    wanted: HashMap<String, Arc<Wanted>>,
     target: Option<Arc<Target>>,
     /// Files found to hold a content, by path.
     matched: HashMap<String, String>,
@@ -231,6 +212,8 @@ struct Reconcile {
     samples: Arc<Mutex<HashMap<String, String>>>,
 }
 
+/// Contents of one size: the ranges whose sample tells them apart, and
+/// which contents they are.
 struct Wanted {
     ranges: Vec<[u64; 2]>,
     candidates: Vec<String>,
@@ -354,6 +337,7 @@ async fn start(
     );
     Ok(Json(SessionStarted {
         session: id,
+        device,
         reconcile,
         target: target.version.clone(),
     }))
@@ -455,7 +439,7 @@ async fn reconcile(
 /// The listed files worth sampling: those of a size some target content
 /// has. The ranges for a size are the union of every such content's tag
 /// areas and ends, so the sample tells the file apart from any of them.
-fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
+fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Arc<Wanted>)> {
     use rayon::prelude::*;
     let mut by_size: HashMap<u64, Vec<&str>> = HashMap::new();
     for e in &target.entries {
@@ -472,7 +456,7 @@ fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
         .collect();
     // For each size, the union of its contents' ranges, and the contents
     // those cover: one whose file couldn't be read isn't a candidate.
-    let by_size: HashMap<u64, (Vec<[u64; 2]>, Vec<String>)> = sizes
+    let by_size: HashMap<u64, Arc<Wanted>> = sizes
         .into_par_iter()
         .filter_map(|size| {
             let (mut all, mut candidates) = (Vec::new(), Vec::new());
@@ -484,21 +468,17 @@ fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
                     candidates.push(hash.to_string());
                 }
             }
-            (!all.is_empty()).then(|| (size, (ranges::merge(all, size), candidates)))
+            (!all.is_empty()).then(|| {
+                let ranges = ranges::merge(all, size);
+                (size, Arc::new(Wanted { ranges, candidates }))
+            })
         })
         .collect();
-    let mut out: Vec<(String, Wanted)> = listing
+    // Every file of a size shares its size's contents: a folder of many
+    // files the same size mustn't cost their number squared.
+    let mut out: Vec<(String, Arc<Wanted>)> = listing
         .iter()
-        .filter_map(|l| {
-            let (ranges, candidates) = by_size.get(&l.size)?;
-            Some((
-                l.path.clone(),
-                Wanted {
-                    ranges: ranges.clone(),
-                    candidates: candidates.clone(),
-                },
-            ))
-        })
+        .filter_map(|l| Some((l.path.clone(), by_size.get(&l.size)?.clone())))
         .collect();
     out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     out
@@ -547,25 +527,28 @@ async fn samples(
             .target
             .clone()
             .ok_or_else(|| Problem::bad("No listing yet."))?;
-        let work: Vec<(Sampled, Vec<[u64; 2]>, Vec<String>)> = sampled
+        let work: Vec<(Sampled, Arc<Wanted>)> = sampled
             .into_iter()
             .filter_map(|x| {
-                let w = r.wanted.get(&x.path)?;
-                Some((x, w.ranges.clone(), w.candidates.clone()))
+                let w = r.wanted.get(&x.path)?.clone();
+                Some((x, w))
             })
             .collect();
         Ok::<_, Problem>((target, work, r.samples.clone()))
     })??;
     let matched = blocking(move || {
         use rayon::prelude::*;
+        // Each size's contents once, however many listed files share it.
+        let mut groups: HashMap<*const Wanted, &Wanted> = HashMap::new();
+        for (_, w) in &work {
+            groups.entry(Arc::as_ptr(w)).or_insert(w);
+        }
         // Each candidate's own sample, read once however many listed files
         // it might be (a content's size, and so its ranges, are one).
         let mut wanted: HashMap<&str, &Vec<[u64; 2]>> = HashMap::new();
-        for (x, ranges, candidates) in &work {
-            if x.hash.is_none() {
-                for c in candidates {
-                    wanted.entry(c.as_str()).or_insert(ranges);
-                }
+        for w in groups.values() {
+            for c in &w.candidates {
+                wanted.entry(c.as_str()).or_insert(&w.ranges);
             }
         }
         let known = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -585,17 +568,33 @@ async fn samples(
             cache.extend(read);
             cache.clone()
         };
+        // Each size's contents by sample, and by hash, looked up rather
+        // than searched for every file. The first of two contents with one
+        // sample wins, as the candidates are in order.
+        let index: HashMap<*const Wanted, (HashMap<&str, &str>, std::collections::HashSet<&str>)> =
+            groups
+                .iter()
+                .map(|(key, w)| {
+                    let mut by_sample = HashMap::new();
+                    for c in &w.candidates {
+                        if let Some(sample) = samples.get(c.as_str()) {
+                            by_sample.entry(sample.as_str()).or_insert(c.as_str());
+                        }
+                    }
+                    let hashes = w.candidates.iter().map(String::as_str).collect();
+                    (*key, (by_sample, hashes))
+                })
+                .collect();
         Ok(work
             .iter()
-            .filter_map(|(x, _, candidates)| {
+            .filter_map(|(x, w)| {
+                let (by_sample, hashes) = &index[&Arc::as_ptr(w)];
                 let hash = match (&x.hash, &x.sample) {
-                    (Some(hash), _) => candidates.iter().find(|c| *c == hash)?,
-                    (None, Some(sample)) => candidates
-                        .iter()
-                        .find(|c| samples.get(c.as_str()) == Some(sample))?,
+                    (Some(hash), _) => *hashes.get(hash.as_str())?,
+                    (None, Some(sample)) => *by_sample.get(sample.as_str())?,
                     (None, None) => return None,
                 };
-                Some((x.path.clone(), hash.clone()))
+                Some((x.path.clone(), hash.to_string()))
             })
             .collect::<Vec<_>>())
     })
@@ -1280,22 +1279,5 @@ mod tests {
         assert_eq!(byte_range("bytes=50-500", 100), Some((50, 100)));
         assert_eq!(byte_range("bytes=100-", 100), None);
         assert_eq!(byte_range("bytes=0-1,5-6", 100), None);
-    }
-
-    #[test]
-    fn device_paths_stay_in_the_folder() {
-        assert!(valid_path("A/B/01 x.flac"));
-        for bad in [
-            "Album/C:x.flac",
-            "",
-            "/abs",
-            "a//b",
-            "a/../b",
-            ".",
-            "a\\b",
-            ".coversync-replica/device.json",
-        ] {
-            assert!(!valid_path(bad), "{bad}");
-        }
     }
 }

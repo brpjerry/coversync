@@ -56,6 +56,28 @@ pub struct Client {
     pub version: String,
 }
 
+/// A path a device may use: relative, `/` between names, none of them empty,
+/// `.` or `..`, and not in the client's own folder (whatever its case). The
+/// server plans no other, and a client refuses any other.
+pub fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', '\0'])
+        && path.split('/').all(|name| {
+            !name.is_empty()
+                && name != "."
+                && name != ".."
+                // A Windows drive ("C:", or "C:name", relative to that
+                // drive), anywhere: joined name by name, it would take the
+                // path out of the folder there.
+                && !(name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                    && name.as_bytes().get(1) == Some(&b':'))
+        })
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(CLIENT_DIR))
+}
+
 /// What a device's storage can hold, which shapes the paths it gets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -131,6 +153,8 @@ pub struct SessionStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStarted {
     pub session: String,
+    /// The device the token is, for the marker.
+    pub device: i64,
     /// Send the folder's listing (`POST sessions/{s}/reconcile`) before
     /// asking for the plan.
     pub reconcile: bool,
@@ -573,6 +597,24 @@ mod tests {
             put.to_line(),
             r#"{"op":"put","path":"p","hash":"h","size":1}"#
         );
+    }
+
+    #[test]
+    fn device_paths_stay_in_the_folder() {
+        assert!(valid_path("A/B/01 x.flac"));
+        for bad in [
+            "Album/C:x.flac",
+            "",
+            "/abs",
+            "a//b",
+            "a/../b",
+            ".",
+            "a\\b",
+            ".coversync-replica/device.json",
+            ".Coversync-Replica/x",
+        ] {
+            assert!(!valid_path(bad), "{bad}");
+        }
     }
 
     #[test]

@@ -78,7 +78,8 @@ used on a home server.
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
-- **Sync** (the server's side; device apps come next): devices pair with the
+- **Sync** (the server and the engine every device runs; the device apps
+  come next): devices pair with the
   server from Sync setup, each with a token of its own (see
   [Pairing devices](#pairing-devices)), and the sidebar's Sync section lists
   them. Each device gets the whole Library, with settings of its own in Sync
@@ -90,7 +91,11 @@ used on a home server.
   what each device holds, so a normal sync reads nothing back from the
   device. Sync setup shows each device's last sync, what's left, failed files
   and files in its folder coversync didn't put there, with **Sync now** and
-  **Check files**. Sync setup can turn the section off.
+  **Check files**. Sync setup can turn the section off. The sync engine
+  (`crates/coversync-replica`) is the device's side, shared by every client:
+  it runs the server's plans into a folder, several downloads at once, each
+  checked against its hash as it arrives, resumed where it stopped, and put
+  in place only once it's whole.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
@@ -111,6 +116,8 @@ used on a home server.
 crates/coversync-core   scanning (lofty), SQLite index, covers, tags, import, MusicBrainz
 crates/coversync-protocol  the sync API's requests and replies, shared by the server and clients;
                         `cargo run -p coversync-protocol --example sync_client` syncs a folder
+crates/coversync-replica  the sync engine every client runs; `cargo run -p coversync-replica
+                        --example replica` syncs a folder with it
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 crates/coversync-desktop-core  the desktop app's settings, servers and launches, apart from its window

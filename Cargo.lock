@@ -511,6 +511,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "coversync-replica"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "coversync-protocol",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "coversyncd"
 version = "0.1.0"
 dependencies = [
@@ -522,6 +544,7 @@ dependencies = [
  "clap",
  "coversync-core",
  "coversync-protocol",
+ "coversync-replica",
  "futures-util",
  "getrandom 0.4.3",
  "libc",
