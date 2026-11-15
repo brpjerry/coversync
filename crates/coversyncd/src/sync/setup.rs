@@ -91,24 +91,36 @@ async fn state(
         let st = s.sync.store.device(id)?;
         let free = free.or(st.last.as_ref().and_then(|l| l.report.free_bytes));
         let files = s.sync.store.files(id)?;
-        let (count, list) = s.sync.store.failures(id, FAILURES_SHOWN)?;
-        let worked = work_out(&s, id, free);
-        let no_library = matches!(&worked, Err(Problem(StatusCode::SERVICE_UNAVAILABLE, ..)));
+        let mut failed = s.sync.store.failures(id)?;
+        let worked = match work_out(&s, id, free) {
+            Ok(worked) => Some(worked),
+            // Without a Library there's nothing to sync to, which Sync setup
+            // says; anything else is an error, not an empty state.
+            Err(Problem(StatusCode::SERVICE_UNAVAILABLE, ..)) => None,
+            Err(e) => return Err(e),
+        };
+        let no_library = worked.is_none();
         let (pending, preparing, too_long, short_bytes) = match &worked {
-            Ok(w) => {
+            Some(w) => {
                 let t = &w.header.totals;
+                // A failure counts while its content is still what the
+                // device should hold there.
+                failed.retain(|f| w.target.at(&f.path).is_some_and(|e| e.hash == f.hash));
                 (
                     Count {
                         files: t.put + t.moves + t.delete,
                         bytes: t.put_bytes,
                     },
                     t.preparing,
-                    super::target(&s, id).map(|t| t.too_long).unwrap_or(0),
+                    w.target.too_long,
                     t.short_bytes,
                 )
             }
-            Err(_) => (Count::default(), 0, 0, 0),
+            None => (Count::default(), 0, 0, 0),
         };
+        let count = failed.len() as u64;
+        failed.truncate(FAILURES_SHOWN);
+        let list = failed;
         Ok(Json(DeviceSyncState {
             running,
             last: st.last,

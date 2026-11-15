@@ -168,8 +168,15 @@ pub struct PlanHeader {
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Op {
     /// Remove the file at `path`, if its size is `size`. A file of another
-    /// size is left alone and reported as `changed`.
-    Delete { path: String, size: u64 },
+    /// size is left alone and reported as `changed`. `hash` is the content
+    /// the server believes is there, which the fact echoes; none for a file
+    /// coversync didn't put there.
+    Delete {
+        path: String,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+    },
     /// Rename `from` to `path`, which is free by then. Done if `from` has
     /// gone and `path` has `size` bytes.
     Move {
@@ -276,8 +283,15 @@ pub enum Fact {
         path: String,
         hash: String,
     },
-    /// Nothing is at `path` now.
-    Delete { path: String },
+    /// Nothing is at `path` now. `hash` is the delete operation's, echoed:
+    /// applied only while the server believes `path` holds that content,
+    /// so a delete sent again after something else took the path changes
+    /// nothing. Without one, it was a file coversync didn't put there.
+    Delete {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+    },
 }
 
 /// Why an operation failed, as [`Failure::error`] gives it.
@@ -383,6 +397,11 @@ pub struct ReconcileDone {
     pub moves: u64,
     /// Files coversync didn't put there, left alone.
     pub other: Count,
+    /// Files left where they are for now: they might be content the server
+    /// is still hashing or making. Once that's done, a file at a path the
+    /// target wants is replaced, and one elsewhere deleted.
+    #[serde(default)]
+    pub waiting: u64,
 }
 
 /// How a sync ended.

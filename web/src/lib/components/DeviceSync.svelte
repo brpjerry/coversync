@@ -201,8 +201,10 @@
 				<TriangleAlert size={14} />
 				<span>
 					{files(sync.too_long)}
-					{sync.too_long === 1 ? 'has a path' : 'have paths'} too long for this device. A shorter folder
-					structure would fit {sync.too_long === 1 ? 'it' : 'them'}.
+					{sync.too_long === 1 ? 'has a path' : 'have paths'} this device can't use: too long, or with
+					a name it can't hold. A different folder structure may fit {sync.too_long === 1
+						? 'it'
+						: 'them'}.
 				</span>
 			</p>
 		{/if}

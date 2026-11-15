@@ -137,7 +137,8 @@
 			auto: {
 				enabled: syncDraft.auto,
 				// Left empty: no wait.
-				quiet_seconds: quiet === null || Number.isNaN(quiet) ? 0 : Math.round(quiet),
+				// An emptied number field binds as undefined: no wait.
+				quiet_seconds: typeof quiet !== 'number' || Number.isNaN(quiet) ? 0 : Math.round(quiet),
 				wifi_only: syncDraft.wifiOnly,
 				charging_only: syncDraft.chargingOnly
 			}

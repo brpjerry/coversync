@@ -163,10 +163,12 @@ pub(super) fn valid_path(path: &str) -> bool {
         && path
             .split('/')
             .all(|name| !name.is_empty() && name != "." && name != "..")
-        && !path
-            .split('/')
-            .next()
-            .is_some_and(|first| first.eq_ignore_ascii_case(CLIENT_DIR))
+        && !path.split('/').next().is_some_and(|first| {
+            first.eq_ignore_ascii_case(CLIENT_DIR)
+                // A Windows drive ("C:"), which would take the path out of
+                // the folder there.
+                || (first.len() == 2 && first.ends_with(':'))
+        })
 }
 
 fn ndjson(body: String) -> Response {
@@ -205,7 +207,7 @@ pub struct Session {
 
 /// A plan as worked out at the start, served page by page.
 pub struct Snapshot {
-    target: Arc<Target>,
+    pub target: Arc<Target>,
     pub header: PlanHeader,
     ops: Vec<Op>,
 }
@@ -300,6 +302,11 @@ async fn start(
             .store
             .session_started(device, &req.client, &req.capabilities)?;
         let target = target(&s, device)?;
+        // A sync asked for in Sync setup is under way now, with a target to
+        // sync to: one refused for want of a Library stays asked for.
+        s.sync
+            .store
+            .set_flag(device, super::store::Flag::Sync, false)?;
         let st = s.sync.store.device(device)?;
         let marked = req
             .marker
@@ -353,8 +360,8 @@ struct Part {
 
 /// `POST sessions/{s}/reconcile`: the folder's listing, in one request or
 /// several, the last with `?last=1`. Its reply names the files to sample,
-/// or is `503 preparing` while the server still hashes or makes files: the
-/// device starts a session again later.
+/// or is `503 preparing` while the server is hashing or making files the
+/// listed ones might be: the device starts a session again later.
 async fn reconcile(
     State(state): State<Shared>,
     Extension(access): Extension<Access>,
@@ -400,13 +407,19 @@ async fn reconcile(
     let s = state.clone();
     let (target, wanted) = blocking(move || {
         let target = target(&s, device)?;
-        // Files still being hashed or made can't be matched yet: the
-        // device's copies of them would be taken for files of its own.
-        if target.preparing > 0 {
+        // A file that might be content being hashed or made right now is
+        // worth waiting for: the device tries again shortly, and the file
+        // is adopted then rather than downloaded again. Content that isn't
+        // on its way (a file that can't be read) doesn't hold a check up.
+        if super::preparing_now(&s)
+            && listing
+                .iter()
+                .any(|l| target.might_be_waiting(&l.path, l.size))
+        {
             return Err(Problem::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "preparing",
-                "The server is still getting files ready; try again in a minute.",
+                "The server is getting files ready; try again in a minute.",
             ));
         }
         Ok((target.clone(), to_sample(&target, &listing)))
@@ -450,29 +463,33 @@ fn to_sample(target: &Target, listing: &[Listed]) -> Vec<(String, Wanted)> {
         .map(|l| l.size)
         .filter(|s| by_size.contains_key(s))
         .collect();
-    let ranges_by_size: HashMap<u64, Vec<[u64; 2]>> = sizes
+    // For each size, the union of its contents' ranges, and the contents
+    // those cover: one whose file couldn't be read isn't a candidate.
+    let by_size: HashMap<u64, (Vec<[u64; 2]>, Vec<String>)> = sizes
         .into_par_iter()
         .filter_map(|size| {
-            let mut all = Vec::new();
+            let (mut all, mut candidates) = (Vec::new(), Vec::new());
             for hash in &by_size[&size] {
                 if let Some(found) =
                     source_file(target, hash).and_then(|(mut f, s)| ranges::ranges(&mut f, s).ok())
                 {
                     all.extend(found);
+                    candidates.push(hash.to_string());
                 }
             }
-            (!all.is_empty()).then(|| (size, ranges::merge(all, size)))
+            (!all.is_empty()).then(|| (size, (ranges::merge(all, size), candidates)))
         })
         .collect();
     let mut out: Vec<(String, Wanted)> = listing
         .iter()
+        .filter(|l| !target.might_be_waiting(&l.path, l.size))
         .filter_map(|l| {
-            let ranges = ranges_by_size.get(&l.size)?;
+            let (ranges, candidates) = by_size.get(&l.size)?;
             Some((
                 l.path.clone(),
                 Wanted {
                     ranges: ranges.clone(),
-                    candidates: by_size[&l.size].iter().map(|h| h.to_string()).collect(),
+                    candidates: candidates.clone(),
                 },
             ))
         })
@@ -535,25 +552,34 @@ async fn samples(
     })??;
     let matched = blocking(move || {
         use rayon::prelude::*;
+        // Each candidate's own sample, read once however many listed files
+        // it might be (a content's size, and so its ranges, are one).
+        let mut wanted: HashMap<&str, &Vec<[u64; 2]>> = HashMap::new();
+        for (x, ranges, candidates) in &work {
+            if x.hash.is_none() {
+                for c in candidates {
+                    wanted.entry(c.as_str()).or_insert(ranges);
+                }
+            }
+        }
+        let samples: HashMap<&str, String> = wanted
+            .into_par_iter()
+            .filter_map(|(hash, ranges)| {
+                let (mut f, size) = source_file(&target, hash)?;
+                Some((hash, coversync_protocol::sample(&mut f, size, ranges).ok()?))
+            })
+            .collect();
         Ok(work
-            .par_iter()
-            .filter_map(|(x, ranges, candidates)| {
+            .iter()
+            .filter_map(|(x, _, candidates)| {
                 let hash = match (&x.hash, &x.sample) {
-                    (Some(hash), _) => candidates.iter().find(|c| *c == hash)?.clone(),
+                    (Some(hash), _) => candidates.iter().find(|c| *c == hash)?,
                     (None, Some(sample)) => candidates
                         .iter()
-                        .find(|c| {
-                            source_file(&target, c).is_some_and(|(mut f, size)| {
-                                coversync_protocol::sample(&mut f, size, ranges)
-                                    .ok()
-                                    .as_ref()
-                                    == Some(sample)
-                            })
-                        })?
-                        .clone(),
+                        .find(|c| samples.get(c.as_str()) == Some(sample))?,
                     (None, None) => return None,
                 };
-                Some((x.path.clone(), hash))
+                Some((x.path.clone(), hash.clone()))
             })
             .collect::<Vec<_>>())
     })
@@ -574,10 +600,19 @@ async fn samples(
     let epoch = random_id("e_")?;
     let mut inventory = HashMap::new();
     let mut other = HashMap::new();
-    let (mut adopted, mut moves, mut others) = (0, 0, Count::default());
+    let (mut adopted, mut moves, mut waiting, mut others) = (0, 0, 0, Count::default());
+    // What each content is of, for the files found to hold it.
+    let mut owners: HashMap<&str, &plan::Entry> = HashMap::new();
+    for e in &target.entries {
+        owners.entry(e.hash.as_str()).or_insert(e);
+    }
     for l in r.listing {
         match r.matched.get(&l.path) {
             Some(hash) => {
+                let owner = target
+                    .at(&l.path)
+                    .filter(|e| &e.hash == hash)
+                    .or_else(|| owners.get(hash.as_str()).copied());
                 if target.at(&l.path).is_some_and(|e| &e.hash == hash) {
                     adopted += 1;
                 } else {
@@ -588,6 +623,22 @@ async fn samples(
                     HeldFile {
                         hash: hash.clone(),
                         size: l.size,
+                        track: owner.and_then(|e| e.track),
+                        album: owner.map(|e| e.album.clone()),
+                    },
+                );
+            }
+            // Perhaps content still being hashed or made: the device's,
+            // left where it is until that's done (see `target::UNKNOWN`).
+            None if target.might_be_waiting(&l.path, l.size) => {
+                waiting += 1;
+                inventory.insert(
+                    l.path,
+                    HeldFile {
+                        hash: super::target::UNKNOWN.into(),
+                        size: l.size,
+                        track: None,
+                        album: None,
                     },
                 );
             }
@@ -607,6 +658,7 @@ async fn samples(
         device,
         adopted,
         moves,
+        waiting,
         other = others.files,
         "reconciled a device's folder"
     );
@@ -615,6 +667,7 @@ async fn samples(
         adopted,
         moves,
         other: others,
+        waiting,
     })
     .into_response())
 }
@@ -707,7 +760,7 @@ pub(super) fn work_out(state: &Shared, device: i64, free_bytes: Option<u64>) -> 
                 held_back: &files.held_back,
                 remove_other: st.remove_other,
                 free_bytes,
-                keep: &|path| target.waits(path),
+                keep: &|held| target.waits(held),
                 fold_case: st.capabilities.case_insensitive,
             },
         )
@@ -732,9 +785,8 @@ async fn facts(
 ) -> Answer<Json<FactsReply>> {
     let device = device(&access)?;
     let paths_ok = batch.done.iter().all(|f| match f {
-        coversync_protocol::Fact::Put { path, .. } | coversync_protocol::Fact::Delete { path } => {
-            valid_path(path)
-        }
+        coversync_protocol::Fact::Put { path, .. }
+        | coversync_protocol::Fact::Delete { path, .. } => valid_path(path),
         coversync_protocol::Fact::Move { from, path, .. } => valid_path(from) && valid_path(path),
     });
     if !paths_ok {
@@ -758,10 +810,20 @@ async fn facts(
         })
         .ok();
     let s = state.clone();
+    let snapshot = planned.as_ref().and_then(|(p, _)| p.clone());
     let target = blocking(move || {
+        // What each put's content is of: from the target now, or the one
+        // the plan was made from.
+        let now_target = target(&s, device).ok();
+        let of = |path: &str, hash: &str| {
+            now_target
+                .as_ref()
+                .and_then(|t| t.of(path, hash))
+                .or_else(|| snapshot.as_ref().and_then(|p| p.target.of(path, hash)))
+        };
         s.sync
             .store
-            .apply_facts(device, &batch.done, &batch.failed, now())?;
+            .apply_facts(device, &batch.done, &batch.failed, of, now())?;
         Ok(target(&s, device)?)
     })
     .await?;
@@ -890,6 +952,8 @@ async fn events(
         requests: tokio::sync::broadcast::Receiver<i64>,
         closed: tokio::sync::watch::Receiver<bool>,
         sent: Option<String>,
+        auto: Option<coversync_protocol::AutoSync>,
+        queued: Option<Event>,
         first: bool,
     }
     let ended = {
@@ -909,10 +973,15 @@ async fn events(
         closed: state.events.closed(),
         state: state.clone(),
         sent: None,
+        auto: None,
+        queued: None,
         first: true,
     };
     let events = stream::unfold(listening, move |mut l| async move {
         loop {
+            if let Some(event) = l.queued.take() {
+                return Some((Ok::<_, Infallible>(event), l));
+            }
             enum Woke {
                 Changed,
                 Asked,
@@ -947,15 +1016,30 @@ async fn events(
             let found = tokio::task::spawn_blocking(move || {
                 let target = target(&s, device).ok()?;
                 let changed_at = s.sync.store.device(device).ok()?.changed_at;
-                Some(TargetEvent {
-                    target: target.version.clone(),
-                    changed_at,
-                })
+                let auto = s.auth.device_sync(device).ok()??.settings.auto;
+                Some((
+                    TargetEvent {
+                        target: target.version.clone(),
+                        changed_at,
+                    },
+                    auto,
+                ))
             })
             .await
             .ok()
             .flatten();
-            let Some(found) = found else { continue };
+            let Some((found, auto)) = found else { continue };
+            // When the device syncs by itself can change while its files
+            // don't: it hears of that too (not at the start, as `status`
+            // has it).
+            if l.auto.is_some_and(|a| a != auto) {
+                l.queued = Some(
+                    Event::default()
+                        .event("settings")
+                        .data(serde_json::to_string(&auto).expect("events serialize")),
+                );
+            }
+            l.auto = Some(auto);
             if l.sent.as_ref() == Some(&found.target) {
                 continue;
             }

@@ -237,9 +237,9 @@ fn own_device_only(access: &Access, id: i64) -> Result<(), Refusal> {
     ))
 }
 
-/// Routes a `sync` token may use besides [`super::SYNC_OPEN`]: reading a
-/// device's sync settings and paths, which their handlers allow for its own
-/// device only.
+/// Routes a `sync` token may use besides [`super::SYNC_OPEN`] and the sync
+/// API: reading a device's sync settings, paths and state, which their
+/// handlers allow for its own device only.
 pub(super) fn sync_readable(method: &Method, path: &str) -> bool {
     let Some((id, what)) = path
         .strip_prefix("/api/devices/")
@@ -249,7 +249,7 @@ pub(super) fn sync_readable(method: &Method, path: &str) -> bool {
     };
     method == Method::GET
         && id.parse::<i64>().is_ok()
-        && matches!(what, "sync/settings" | "sync/paths")
+        && matches!(what, "sync/settings" | "sync/paths" | "sync/state")
 }
 
 /// A device's sync settings and their version.

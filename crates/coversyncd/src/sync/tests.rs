@@ -426,11 +426,14 @@ impl Client<'_> {
     async fn carry_out(&self, op: &Op) -> Option<Fact> {
         let at = |p: &str| self.root.join(p);
         match op {
-            Op::Delete { path, size } => {
+            Op::Delete { path, size, hash } => {
                 let meta = std::fs::metadata(at(path)).ok()?;
                 assert_eq!(meta.len(), *size, "{path}");
                 std::fs::remove_file(at(path)).unwrap();
-                Some(Fact::Delete { path: path.clone() })
+                Some(Fact::Delete {
+                    path: path.clone(),
+                    hash: hash.clone(),
+                })
             }
             Op::Mkdir { path } => {
                 std::fs::create_dir_all(at(path)).unwrap();
@@ -561,6 +564,25 @@ async fn a_device_follows_the_library() {
     assert_eq!(
         tree(&phone.root)["Album One/Two.flac"],
         std::fs::read(d.library.join("Artist A/Album One/02 - Two.flac")).unwrap()
+    );
+
+    // A new title moves the track under this structure. Until the file is
+    // hashed again, the copy stays where it was; then it's replaced.
+    let mut retitled = tags("Second", "A", "Album One", 2);
+    retitled.push("GENRE=Rock".into());
+    write_track(
+        &d.library.join("Artist A/Album One/02 - Two.flac"),
+        &retitled,
+        60_000,
+    );
+    d.scan();
+    let ran = phone.sync().await;
+    assert!(ran.ops.is_empty(), "{:?}", ran.ops);
+    d.rescan();
+    let ran = phone.sync().await;
+    assert_eq!(
+        ran.ops,
+        ["delete Album One/Two.flac", "put Album One/Second.flac"]
     );
 
     // An album removed from the Library goes from the device, folder and all.
@@ -745,4 +767,34 @@ async fn devices_hear_of_changes_and_check_cheaply() {
         .call("GET", "/api/sync/v1/status", &other, None, &[])
         .await;
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_check_leaves_files_that_may_be_waiting_alone() {
+    let d = Daemon::new("waiting");
+    let (_, token) = d.device(Scope::Sync);
+    covers_made(&d, &token).await;
+    let tablet = Client::new(&d, token, "tablet");
+    tablet.sync().await;
+    // A same-length title edit keeps the file's size; until it's hashed,
+    // the device's copy could be the new content or not.
+    write_track(
+        &d.library.join("Artist B/Album Two/01 - Three.flac"),
+        &tags("THREE", "B", "Album Two", 1),
+        70_000,
+    );
+    d.scan();
+    std::fs::remove_file(tablet.marker_path()).unwrap();
+    let ran = tablet.sync().await;
+    let r = ran.reconciled.unwrap();
+    assert_eq!((r.adopted, r.waiting, r.other.files), (3, 1, 0), "{r:?}");
+    assert!(ran.ops.is_empty(), "{:?}", ran.ops);
+    // Once it's hashed, the copy is replaced like any file not yet there.
+    d.rescan();
+    let ran = tablet.sync().await;
+    assert_eq!(
+        ran.ops,
+        ["put Artist B/Album Two/01 - Three.flac (replace)"]
+    );
+    assert_eq!(tree(&tablet.root), d.files());
 }

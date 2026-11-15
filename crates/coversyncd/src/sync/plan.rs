@@ -28,11 +28,14 @@ pub struct Entry {
     pub album: String,
 }
 
-/// A file the server believes the device holds.
+/// A file the server believes the device holds, and what it's of: a track,
+/// or an album's cover (no track), when the server knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub hash: String,
     pub size: u64,
+    pub track: Option<i64>,
+    pub album: Option<String>,
 }
 
 /// What the server knows about a device's folder.
@@ -47,9 +50,10 @@ pub struct Device<'a> {
     pub remove_other: bool,
     /// Free space, when the device said. The plan then fits it.
     pub free_bytes: Option<u64>,
-    /// Paths whose copy on the device stays as it is: their new content is
-    /// still being hashed or made, so it isn't in the target yet.
-    pub keep: &'a dyn Fn(&str) -> bool,
+    /// Files whose copy on the device stays where it is: the new content
+    /// of their track or cover is still being hashed or made, so it isn't
+    /// in the target yet.
+    pub keep: &'a dyn Fn(&Held) -> bool,
     /// The device's storage ignores case in names.
     pub fold_case: bool,
 }
@@ -108,7 +112,9 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     let by_path: HashMap<&str, &Entry> = target.iter().map(|e| (e.path.as_str(), e)).collect();
     let in_place = |path: &str, held: &Held| by_path.get(path).is_some_and(|e| e.hash == held.hash);
     // A file with no place in the target that stays all the same.
-    let kept = |path: &str| !by_path.contains_key(path) && (device.keep)(path);
+    let kept = |path: &str| {
+        !by_path.contains_key(path) && inventory.get(path).is_some_and(|h| (device.keep)(h))
+    };
 
     let mut held: Vec<(&String, &Held)> = inventory.iter().collect();
     held.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -125,18 +131,11 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     }
 
     let mut moves = Vec::new();
-    let mut puts = Vec::new();
-    let mut moved: HashSet<&str> = HashSet::new();
+    let mut puts: Vec<&Entry> = Vec::new();
     for entry in target {
         if inventory
             .get(&entry.path)
             .is_some_and(|h| h.hash == entry.hash)
-        {
-            continue;
-        }
-        if device
-            .held_back
-            .contains(&(entry.path.clone(), entry.hash.clone()))
         {
             continue;
         }
@@ -149,65 +148,116 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
                 .unwrap_or(0);
             list.remove(i)
         }) {
-            moved.insert(from);
             moves.push(Move {
                 from: from.to_string(),
                 to: entry.path.clone(),
                 size: entry.size,
                 hash: entry.hash.clone(),
             });
-        } else {
+        } else if !device
+            .held_back
+            .contains(&(entry.path.clone(), entry.hash.clone()))
+        {
+            // Only a download is held back after failing: a move of
+            // content the device has still goes.
             puts.push(entry);
         }
     }
 
     // What's where before the plan, by key: the files the server knows of,
-    // with their sizes.
-    let mut at: HashMap<String, (&str, u64)> = HashMap::new();
+    // with their sizes and the content it believes they hold.
+    let mut at: HashMap<String, (&str, u64, Option<&str>)> = HashMap::new();
     for (path, size) in device.other {
-        at.insert(names.key(path), (path.as_str(), *size));
+        at.insert(names.key(path), (path.as_str(), *size, None));
     }
     for (path, h) in inventory {
-        at.insert(names.key(path), (path.as_str(), h.size));
+        at.insert(
+            names.key(path),
+            (path.as_str(), h.size, Some(h.hash.as_str())),
+        );
     }
-    let had = names.folders(at.values().map(|(p, _)| *p));
+    let had = names.folders(at.values().map(|(p, _, _)| *p));
+    // The folders the moves and puts need, before any is left out for space.
+    let wanted: HashSet<String> = names
+        .folders(
+            moves
+                .iter()
+                .map(|m| m.to.as_str())
+                .chain(puts.iter().map(|e| e.path.as_str())),
+        )
+        .into_keys()
+        .collect();
 
-    // Deletes: files with no place in the target, and other files the user
-    // asked to remove. Files at a target path stay until they're replaced,
-    // and so do files whose new content isn't ready.
-    let mut deletes: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    // A file where a folder must go, or a folder where a file must go (a
+    // structure that puts files in a folder named like one of them):
+    // renaming can't get past the other, so such a file is downloaded
+    // again instead, and its old copy deleted.
+    let (moves, redone): (Vec<Move>, Vec<Move>) = moves.into_iter().partition(|m| {
+        !wanted.contains(&names.key(&m.from)) && !had.contains_key(&names.key(&m.to))
+    });
+    puts.extend(
+        redone
+            .iter()
+            .filter_map(|m| by_path.get(m.to.as_str()).copied()),
+    );
+    let target_order: HashMap<&str, usize> = target
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path.as_str(), i))
+        .collect();
+    puts.sort_by_key(|e| target_order[e.path.as_str()]);
+    let moved: HashSet<&str> = moves.iter().map(|m| m.from.as_str()).collect();
+
+    // Deletes: files with no place in the target, other files the user
+    // asked to remove, and files where a folder must go. Files at a target
+    // path stay until they're replaced, and so do files whose new content
+    // isn't ready.
+    let mut deletes: BTreeMap<String, (String, u64, Option<String>)> = BTreeMap::new();
+    let in_the_way = |path: &str| wanted.contains(&names.key(path));
     for (path, h) in &held {
-        if !moved.contains(path.as_str()) && !by_path.contains_key(path.as_str()) && !kept(path) {
-            deletes.insert(names.key(path), ((*path).clone(), h.size));
+        let path = path.as_str();
+        if !moved.contains(path) && !by_path.contains_key(path) && (!kept(path) || in_the_way(path))
+        {
+            deletes.insert(
+                names.key(path),
+                (path.to_string(), h.size, Some(h.hash.clone())),
+            );
         }
     }
-    if device.remove_other {
-        for (path, size) in device.other {
-            if !by_path.contains_key(path.as_str()) && !kept(path) {
-                deletes.insert(names.key(path), (path.clone(), *size));
-            }
+    for (path, size) in device.other {
+        if !by_path.contains_key(path.as_str()) && (device.remove_other || in_the_way(path)) {
+            deletes.insert(names.key(path), (path.clone(), *size, None));
         }
     }
     // A move goes into a free path: whatever else is there goes first,
     // unless it's moving away itself.
     for m in &moves {
-        if let Some((path, size)) = at.get(&names.key(&m.to))
+        if let Some((path, size, hash)) = at.get(&names.key(&m.to))
             && !moved.contains(path)
         {
-            deletes.insert(names.key(path), (path.to_string(), *size));
+            deletes.insert(
+                names.key(path),
+                (path.to_string(), *size, hash.map(str::to_string)),
+            );
         }
     }
     let mut after: HashMap<String, (String, u64)> = at
         .iter()
         .filter(|(k, _)| !deletes.contains_key(*k))
-        .map(|(k, (p, s))| (k.clone(), (p.to_string(), *s)))
+        .map(|(k, (p, s, _))| (k.clone(), (p.to_string(), *s)))
         .collect();
 
-    // Every name in use, which temporary names avoid.
+    // Every name in use, files and folders, which temporary names avoid.
     let mut taken: HashSet<String> = at
         .keys()
         .cloned()
         .chain(target.iter().map(|e| names.key(&e.path)))
+        .chain(had.keys().cloned())
+        .chain(
+            names
+                .folders(target.iter().map(|e| e.path.as_str()))
+                .into_keys(),
+        )
         .collect();
     let ordered = order_moves(moves, &mut taken, names);
     for m in &ordered {
@@ -218,7 +268,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     // Puts, as far as the space goes. A replacement downloads beside the
     // file it replaces, which goes only once it's done.
     let replaced = |path: &str| after.get(&names.key(path)).map(|(_, size)| *size);
-    let freed: u64 = deletes.values().map(|(_, size)| size).sum();
+    let freed: u64 = deletes.values().map(|(_, size, _)| size).sum();
     let mut budget = device
         .free_bytes
         .map(|free| free.saturating_add(freed).saturating_sub(RESERVE_BYTES));
@@ -301,7 +351,7 @@ pub fn plan(target: &[Entry], preparing: u64, device: &Device) -> Plan {
     ops.extend(
         deletes
             .into_values()
-            .map(|(path, size)| Op::Delete { path, size }),
+            .map(|(path, size, hash)| Op::Delete { path, size, hash }),
     );
     ops.extend(mkdirs.into_iter().map(|p| Op::Mkdir { path: p.into() }));
     ops.extend(ordered.into_iter().map(|m| Op::Move {
@@ -421,6 +471,8 @@ mod tests {
                     Held {
                         hash: h.to_string(),
                         size: *s,
+                        track: None,
+                        album: None,
                     },
                 )
             })
@@ -597,13 +649,23 @@ mod tests {
 
     #[test]
     fn failed_puts_are_held_back() {
-        let held_back = HashSet::from([("a".to_string(), "h1".to_string())]);
-        let target = [entry("a", "h1", 1), entry("b", "h2", 1)];
+        // c failed before, but the device has its content elsewhere now:
+        // moving it needs no download.
+        let inventory = held(&[("old/c", "h3", 1)]);
+        let target = [
+            entry("a", "h1", 1),
+            entry("b", "h2", 1),
+            entry("c", "h3", 1),
+        ];
+        let held_back = HashSet::from([
+            ("a".to_string(), "h1".to_string()),
+            ("c".to_string(), "h3".to_string()),
+        ]);
         let plan = plan(
             &target,
             0,
             &Device {
-                inventory: &HashMap::new(),
+                inventory: &inventory,
                 other: &HashMap::new(),
                 held_back: &held_back,
                 remove_other: false,
@@ -612,7 +674,26 @@ mod tests {
                 fold_case: false,
             },
         );
-        assert_eq!(plan.ops.iter().map(short).collect::<Vec<_>>(), ["put b"]);
+        assert_eq!(
+            plan.ops.iter().map(short).collect::<Vec<_>>(),
+            ["move old/c>c", "rmdir old", "put b"]
+        );
+    }
+
+    #[test]
+    fn a_file_where_a_folder_must_go_is_downloaded_again() {
+        // A structure that files tracks in a folder named like the track:
+        // renaming can't put x.flac/x.flac where x.flac is, nor back.
+        let target = [entry("x.flac/x.flac", "h1", 1)];
+        assert_eq!(
+            ops(&target, &[("x.flac", "h1", 1)], &[]),
+            ["delete x.flac", "mkdir x.flac", "put x.flac/x.flac"]
+        );
+        let target = [entry("x.flac", "h1", 1)];
+        assert_eq!(
+            ops(&target, &[("x.flac/x.flac", "h1", 1)], &[]),
+            ["delete x.flac/x.flac", "rmdir x.flac", "put x.flac"]
+        );
     }
 
     /// The plan's operations for a device whose storage ignores case.
@@ -656,9 +737,11 @@ mod tests {
 
     #[test]
     fn copies_wait_for_their_new_content() {
-        // A.flac's tags were edited: its new hash isn't known yet, so the
-        // device keeps the copy it has rather than losing it meanwhile.
-        let inventory = held(&[("A/a.flac", "old", 5), ("Gone/g.flac", "h", 5)]);
+        // Track 7's title was edited, which moves it under the device's
+        // structure: its new hash isn't known yet, so the device keeps the
+        // copy it has, at its old path, rather than losing it meanwhile.
+        let mut inventory = held(&[("A/a.flac", "old", 5), ("Gone/g.flac", "h", 5)]);
+        inventory.get_mut("A/a.flac").unwrap().track = Some(7);
         let plan = plan(
             &[],
             1,
@@ -668,7 +751,7 @@ mod tests {
                 held_back: &HashSet::new(),
                 remove_other: false,
                 free_bytes: None,
-                keep: &|p| p == "A/a.flac",
+                keep: &|h| h.track == Some(7),
                 fold_case: false,
             },
         );

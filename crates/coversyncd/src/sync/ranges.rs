@@ -27,6 +27,8 @@ pub fn ranges(file: &mut (impl Read + Seek), size: u64) -> io::Result<Vec<[u64; 
         areas.push([at, end]);
     } else if let Some(end) = ogg(file, at, size)? {
         areas.push([at, end]);
+    } else if let Some(chunks) = chunks(file, size)? {
+        areas.extend(chunks);
     } else {
         areas.extend(mp4(file, at, size)?);
     }
@@ -156,6 +158,46 @@ fn mp4(file: &mut (impl Read + Seek), at: u64, size: u64) -> io::Result<Option<[
     Ok(None)
 }
 
+/// Every chunk of a WAV (RIFF) or AIFF file but its audio: tags (an `id3 `
+/// chunk, `LIST`, …) can be anywhere among them.
+fn chunks(file: &mut (impl Read + Seek), size: u64) -> io::Result<Option<Vec<[u64; 2]>>> {
+    let mut h = [0; 12];
+    if read_at(file, 0, &mut h)? < 12 {
+        return Ok(None);
+    }
+    let (big_endian, audio): (bool, &[u8; 4]) = match (&h[..4], &h[8..12]) {
+        (b"RIFF" | b"RF64", b"WAVE") => (false, b"data"),
+        (b"RIFX", b"WAVE") => (true, b"data"),
+        (b"FORM", b"AIFF" | b"AIFC") => (true, b"SSND"),
+        _ => return Ok(None),
+    };
+    let mut areas = Vec::new();
+    let mut pos = 12;
+    while pos + 8 <= size {
+        let mut c = [0; 8];
+        if read_at(file, pos, &mut c)? < 8 {
+            break;
+        }
+        let len = c[4..8].try_into().expect("4 bytes");
+        let len = u64::from(if big_endian {
+            u32::from_be_bytes(len)
+        } else {
+            u32::from_le_bytes(len)
+        });
+        // RF64 keeps the real size elsewhere; read the rest whole then.
+        if len == u64::from(u32::MAX) {
+            areas.push([pos, size]);
+            break;
+        }
+        let end = (pos + 8 + len + (len & 1)).min(size);
+        if &c[..4] != audio {
+            areas.push([pos, end]);
+        }
+        pos = end;
+    }
+    Ok(Some(areas))
+}
+
 /// An APEv2 tag at the end, before an ID3v1 tag if there is one.
 fn ape(file: &mut (impl Read + Seek), size: u64) -> io::Result<Option<[u64; 2]>> {
     let mut v1 = [0; 3];
@@ -207,6 +249,28 @@ mod tests {
                 [0, tags_end as u64],
                 [data.len() as u64 - EDGE, data.len() as u64]
             ]
+        );
+    }
+
+    #[test]
+    fn wav_tag_chunks_are_sampled_wherever_they_are() {
+        let chunk = |id: &[u8], len: usize| {
+            let mut c = id.to_vec();
+            c.extend((len as u32).to_le_bytes());
+            c.extend(std::iter::repeat_n(1, len));
+            c
+        };
+        let mut wav = b"RIFF\0\0\0\0WAVE".to_vec();
+        wav.extend(chunk(b"fmt ", 16));
+        wav.extend(chunk(b"data", 1_000_000));
+        let tags_at = wav.len() as u64;
+        wav.extend(chunk(b"id3 ", 200_000));
+        let size = wav.len() as u64;
+        // The tags are within the last 64 KiB's reach only in part: the
+        // whole chunk is read, the audio isn't.
+        assert_eq!(
+            ranges(&mut Cursor::new(&wav), size).unwrap(),
+            [[0, EDGE], [tags_at, size]]
         );
     }
 

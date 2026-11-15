@@ -136,6 +136,28 @@ impl SyncState {
     }
 }
 
+/// Whether files are being got ready right now: a scan, a hash pass (or
+/// one queued) or cover files being made. Blocking.
+pub fn preparing_now(state: &Shared) -> bool {
+    state
+        .progress
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .running
+        || state
+            .hashes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+        || state.hash_pending.load(Ordering::SeqCst)
+        || !state
+            .sync
+            .making
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+}
+
 /// A device's target as things are now, worked out again only when the
 /// Library (or where it is), the device's settings or capabilities, albums'
 /// art or the cover files made have changed. Blocking.
@@ -169,6 +191,12 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         std::fs::metadata(state.sync.cover_dir.join(format!("{}.{}", c.hash, c.ext)))
             .is_ok_and(|m| m.is_file() && m.len() == c.size)
     });
+    let failed = state
+        .sync
+        .failed_covers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let (target, wanted) = target::build(target::Inputs {
         paths: &paths,
         settings: &sync.settings,
@@ -176,6 +204,7 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         art: &art,
         covers: &covers,
         cover_dir: &state.sync.cover_dir,
+        failed: &failed,
     });
     let target = Arc::new(target);
     state
@@ -280,7 +309,10 @@ fn make_cover(dir: &Path, w: &CoverWanted) -> anyhow::Result<CoverFile> {
     let (bytes, ext) = art.device_file((w.width > 0).then_some(w.width))?;
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let path = dir.join(format!("{hash}.{ext}"));
-    if !path.exists() {
+    // The cache folder may have been cleared meanwhile, or the file cut
+    // short: then it's written again.
+    if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(bytes.len() as u64) {
+        std::fs::create_dir_all(dir)?;
         // Each writer its own temporary file: two widths of art narrower than
         // both come out the same.
         static WRITE: AtomicU64 = AtomicU64::new(0);

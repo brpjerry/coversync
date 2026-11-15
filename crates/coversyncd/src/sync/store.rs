@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS sync_inventory (
     path      TEXT NOT NULL,
     hash      TEXT NOT NULL,
     size      INTEGER NOT NULL,
+    -- What the file is of, when the server knows: a track, or an album's
+    -- cover (no track).
+    track     INTEGER,
+    album     TEXT,
     PRIMARY KEY (device_id, path)
 ) WITHOUT ROWID;
 -- Files a reconcile found that coversync didn't put there.
@@ -143,12 +147,24 @@ impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
-        // As the index's own connection: with a write-ahead log, a commit
-        // needn't wait for the disk, which a hash pass or a sync can keep
-        // busy for seconds at a time. A power cut can lose the last few
-        // reports, which devices send again; it can't corrupt anything.
+        // Bookkeeping (the target last seen, Sync setup's flags) commits
+        // without waiting for the disk, which a hash pass or a sync can keep
+        // busy for seconds while the commit holds the write lock: losing the
+        // last of it to a power cut costs nothing. What devices did doesn't:
+        // they forget a report once it's acknowledged, so `durably` commits
+        // those in full.
         conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Tables made before files recorded what they're of.
+        for column in ["track INTEGER", "album TEXT"] {
+            let name = column.split(' ').next().expect("a name");
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('sync_inventory') WHERE name = ?1")?
+                .exists([name])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE sync_inventory ADD COLUMN {column}"))?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -156,6 +172,23 @@ impl Store {
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `f` in a transaction that's on disk when it commits.
+    fn durably<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let mut conn = self.conn();
+        conn.execute_batch("PRAGMA synchronous = FULL")?;
+        let done = (|| {
+            let tx = conn.transaction()?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })();
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        done
     }
 
     pub fn device(&self, id: i64) -> rusqlite::Result<DeviceState> {
@@ -195,8 +228,7 @@ impl Store {
         Ok(())
     }
 
-    /// What a starting session says about the device. A sync asked for in
-    /// Sync setup is under way now.
+    /// What a starting session says about the device.
     pub fn session_started(
         &self,
         id: i64,
@@ -206,8 +238,7 @@ impl Store {
         let conn = self.conn();
         Self::ensure(&conn, id)?;
         conn.execute(
-            "UPDATE sync_devices SET client = ?2, capabilities = ?3, sync_requested = 0
-             WHERE device_id = ?1",
+            "UPDATE sync_devices SET client = ?2, capabilities = ?3 WHERE device_id = ?1",
             params![id, json(client), json(capabilities)],
         )?;
         Ok(())
@@ -260,13 +291,17 @@ impl Store {
     pub fn files(&self, id: i64) -> rusqlite::Result<DeviceFiles> {
         let conn = self.conn();
         let inventory = conn
-            .prepare_cached("SELECT path, hash, size FROM sync_inventory WHERE device_id = ?1")?
+            .prepare_cached(
+                "SELECT path, hash, size, track, album FROM sync_inventory WHERE device_id = ?1",
+            )?
             .query_map([id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     Held {
                         hash: r.get(1)?,
                         size: r.get::<_, i64>(2)? as u64,
+                        track: r.get(3)?,
+                        album: r.get(4)?,
                     },
                 ))
             })?
@@ -287,30 +322,23 @@ impl Store {
     }
 
     /// Puts that failed on the device, newest first.
-    pub fn failures(&self, id: i64, limit: usize) -> rusqlite::Result<(u64, Vec<FailedPut>)> {
+    pub fn failures(&self, id: i64) -> rusqlite::Result<Vec<FailedPut>> {
         let conn = self.conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sync_failures WHERE device_id = ?1",
-            [id],
-            |r| r.get(0),
-        )?;
-        let list = conn
-            .prepare_cached(
-                "SELECT path, hash, op, error, detail, at FROM sync_failures
-                 WHERE device_id = ?1 ORDER BY at DESC, path LIMIT ?2",
-            )?
-            .query_map(params![id, limit as i64], |r| {
-                Ok(FailedPut {
-                    path: r.get(0)?,
-                    hash: r.get(1)?,
-                    op: r.get(2)?,
-                    error: r.get(3)?,
-                    detail: r.get(4)?,
-                    at: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok((count as u64, list))
+        conn.prepare_cached(
+            "SELECT path, hash, op, error, detail, at FROM sync_failures
+             WHERE device_id = ?1 ORDER BY at DESC, path",
+        )?
+        .query_map([id], |r| {
+            Ok(FailedPut {
+                path: r.get(0)?,
+                hash: r.get(1)?,
+                op: r.get(2)?,
+                error: r.get(3)?,
+                detail: r.get(4)?,
+                at: r.get(5)?,
+            })
+        })?
+        .collect()
     }
 
     /// Let the failed puts be tried again.
@@ -320,26 +348,29 @@ impl Store {
         Ok(())
     }
 
-    /// Apply a device's report in one transaction. Applying the same report
-    /// again changes nothing: puts and deletes say what's there now, and a
-    /// move applies only while its source holds the content it names.
+    /// Apply a device's report in one transaction, on disk once it commits.
+    /// Applying the same report again changes nothing: puts say what's there
+    /// now, and a move or delete applies only while its path holds the
+    /// content it names. `of` says what a put's content is of (a track, or
+    /// an album's cover) when the server knows.
     pub fn apply_facts(
         &self,
         id: i64,
         done: &[Fact],
         failed: &[Failure],
+        of: impl Fn(&str, &str) -> Option<(Option<i64>, String)>,
         now: i64,
     ) -> rusqlite::Result<()> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        {
+        self.durably(|tx| {
             let mut put = tx.prepare_cached(
-                "INSERT INTO sync_inventory (device_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO sync_inventory (device_id, path, hash, size, track, album)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (device_id, path) DO UPDATE SET hash = excluded.hash,
-                     size = excluded.size",
+                     size = excluded.size, track = excluded.track, album = excluded.album",
             )?;
-            let mut gone =
-                tx.prepare_cached("DELETE FROM sync_inventory WHERE device_id = ?1 AND path = ?2")?;
+            let mut gone = tx.prepare_cached(
+                "DELETE FROM sync_inventory WHERE device_id = ?1 AND path = ?2 AND hash = ?3",
+            )?;
             let mut gone_other =
                 tx.prepare_cached("DELETE FROM sync_other WHERE device_id = ?1 AND path = ?2")?;
             let mut moved = tx.prepare_cached(
@@ -354,7 +385,8 @@ impl Store {
                         let Ok(size) = i64::try_from(*size) else {
                             continue;
                         };
-                        put.execute(params![id, path, hash, size])?;
+                        let (track, album) = of(path, hash).unzip();
+                        put.execute(params![id, path, hash, size, track.flatten(), album])?;
                         gone_other.execute(params![id, path])?;
                         unfailed.execute(params![id, path])?;
                     }
@@ -364,8 +396,13 @@ impl Store {
                             gone_other.execute(params![id, path])?;
                         }
                     }
-                    Fact::Delete { path } => {
-                        gone.execute(params![id, path])?;
+                    Fact::Delete {
+                        path,
+                        hash: Some(hash),
+                    } => {
+                        gone.execute(params![id, path, hash])?;
+                    }
+                    Fact::Delete { path, hash: None } => {
                         gone_other.execute(params![id, path])?;
                     }
                 }
@@ -382,16 +419,16 @@ impl Store {
                     fail.execute(params![id, f.path, hash, f.op, f.error, f.detail, now])?;
                 }
             }
-        }
-        // Removing other files is asked for once: when none are left, files
-        // a later check finds stay unless the user asks again.
-        tx.execute(
-            "UPDATE sync_devices SET remove_other = 0
-             WHERE device_id = ?1 AND remove_other
-                AND NOT EXISTS (SELECT 1 FROM sync_other WHERE device_id = ?1)",
-            [id],
-        )?;
-        tx.commit()
+            // Removing other files is asked for once: when none are left,
+            // files a later check finds stay unless the user asks again.
+            tx.execute(
+                "UPDATE sync_devices SET remove_other = 0
+                 WHERE device_id = ?1 AND remove_other
+                    AND NOT EXISTS (SELECT 1 FROM sync_other WHERE device_id = ?1)",
+                [id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Replace what the server believes the device holds, after a reconcile,
@@ -403,33 +440,34 @@ impl Store {
         other: &HashMap<String, u64>,
         epoch: &str,
     ) -> rusqlite::Result<()> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        Self::ensure(&tx, id)?;
-        tx.execute("DELETE FROM sync_inventory WHERE device_id = ?1", [id])?;
-        tx.execute("DELETE FROM sync_other WHERE device_id = ?1", [id])?;
-        {
-            let mut put = tx.prepare_cached(
-                "INSERT INTO sync_inventory (device_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (path, h) in inventory {
-                put.execute(params![id, path, h.hash, h.size as i64])?;
+        self.durably(|tx| {
+            Self::ensure(tx, id)?;
+            tx.execute("DELETE FROM sync_inventory WHERE device_id = ?1", [id])?;
+            tx.execute("DELETE FROM sync_other WHERE device_id = ?1", [id])?;
+            {
+                let mut put = tx.prepare_cached(
+                    "INSERT INTO sync_inventory (device_id, path, hash, size, track, album)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for (path, h) in inventory {
+                    put.execute(params![id, path, h.hash, h.size as i64, h.track, h.album])?;
+                }
+                let mut put = tx.prepare_cached(
+                    "INSERT INTO sync_other (device_id, path, size) VALUES (?1, ?2, ?3)",
+                )?;
+                for (path, size) in other {
+                    put.execute(params![id, path, *size as i64])?;
+                }
             }
-            let mut put = tx.prepare_cached(
-                "INSERT INTO sync_other (device_id, path, size) VALUES (?1, ?2, ?3)",
-            )?;
-            for (path, size) in other {
-                put.execute(params![id, path, *size as i64])?;
-            }
-        }
-        // Removing other files was asked for the files listed before; a new
-        // listing needs asking again.
-        tx.execute(
-            "UPDATE sync_devices SET epoch = ?2, check_requested = 0, remove_other = 0
+            // Removing other files was asked for the files listed before; a new
+            // listing needs asking again.
+            tx.execute(
+                "UPDATE sync_devices SET epoch = ?2, check_requested = 0, remove_other = 0
              WHERE device_id = ?1",
-            params![id, epoch],
-        )?;
-        tx.commit()
+                params![id, epoch],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn cover(&self, version: &str, width: u32) -> rusqlite::Result<Option<CoverFile>> {
@@ -546,13 +584,13 @@ mod tests {
     #[test]
     fn a_report_sent_twice_changes_nothing_the_second_time() {
         let s = store("replay");
-        s.apply_facts(1, &[put("a", "h1"), put("b", "h2")], &[], 0)
+        s.apply_facts(1, &[put("a", "h1"), put("b", "h2")], &[], |_, _| None, 0)
             .unwrap();
         // a and b trade places through a temporary name; the reply is lost
         // and the device sends the same report again.
         let swap = [mv("a", "t", "h1"), mv("b", "a", "h2"), mv("t", "b", "h1")];
         for _ in 0..2 {
-            s.apply_facts(1, &swap, &[], 0).unwrap();
+            s.apply_facts(1, &swap, &[], |_, _| None, 0).unwrap();
             assert_eq!(
                 held(&s),
                 [("a".into(), "h2".into()), ("b".into(), "h1".into())]
@@ -560,7 +598,21 @@ mod tests {
         }
         // A move whose source the server doesn't know of leaves its path as
         // it was.
-        s.apply_facts(1, &[mv("gone", "a", "h9")], &[], 0).unwrap();
+        s.apply_facts(1, &[mv("gone", "a", "h9")], &[], |_, _| None, 0)
+            .unwrap();
         assert_eq!(held(&s)[0], ("a".into(), "h2".into()));
+        // What was at b goes, and a moves there; sent twice, the delete
+        // names b's old content, so the moved file stays.
+        let replaced = [
+            Fact::Delete {
+                path: "b".into(),
+                hash: Some("h1".into()),
+            },
+            mv("a", "b", "h2"),
+        ];
+        for _ in 0..2 {
+            s.apply_facts(1, &replaced, &[], |_, _| None, 0).unwrap();
+            assert_eq!(held(&s), [("b".into(), "h2".into())]);
+        }
     }
 }

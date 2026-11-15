@@ -14,7 +14,7 @@ use coversync_core::db::CoverSource;
 use coversync_core::sync::{DevicePaths, DeviceSettings};
 use coversync_protocol::Capabilities;
 
-use super::plan::Entry;
+use super::plan::{Entry, Held};
 use super::store::CoverFile;
 
 /// Where a content's bytes are.
@@ -45,11 +45,13 @@ pub struct Target {
     pub too_long: u64,
     sources: HashMap<String, Source>,
     paths: HashMap<String, usize>,
-    /// Tracks still being hashed, by path on the device.
-    waiting: HashSet<String>,
-    /// Cover files still being made, by path without the extension, which
-    /// follows the image.
+    /// Tracks still being hashed, by id, and their sizes.
+    waiting_tracks: HashSet<i64>,
+    waiting_sizes: HashSet<u64>,
+    /// Albums whose cover file is still being made, and where it goes
+    /// (without the extension, which follows the image).
     waiting_covers: HashSet<String>,
+    waiting_cover_stems: HashSet<String>,
 }
 
 impl Target {
@@ -63,15 +65,46 @@ impl Target {
         self.paths.get(path).map(|&i| &self.entries[i])
     }
 
-    /// Whether the file at `path` on the device is waiting for its new
-    /// content, so its copy there stays meanwhile.
-    pub fn waits(&self, path: &str) -> bool {
-        self.waiting.contains(path)
+    /// Whether a file the device holds is of a track or cover whose new
+    /// content isn't ready: its copy stays meanwhile, wherever it is. So
+    /// does a file a check found but couldn't tell (see [`UNKNOWN`]).
+    pub fn waits(&self, held: &Held) -> bool {
+        if held.hash == UNKNOWN {
+            return self.preparing > 0;
+        }
+        match held.track {
+            Some(track) => self.waiting_tracks.contains(&track),
+            None => held
+                .album
+                .as_ref()
+                .is_some_and(|a| self.waiting_covers.contains(a)),
+        }
+    }
+
+    /// Whether a file found on the device might be content still being
+    /// hashed or made: one of a waiting track's size, or where a waiting
+    /// cover goes. A reconcile leaves such a file unclaimed.
+    pub fn might_be_waiting(&self, path: &str, size: u64) -> bool {
+        self.waiting_sizes.contains(&size)
             || path
                 .rsplit_once('.')
-                .is_some_and(|(stem, _)| self.waiting_covers.contains(stem))
+                .is_some_and(|(stem, _)| self.waiting_cover_stems.contains(stem))
+    }
+
+    /// What the content at a path in this target is of: its track, if any,
+    /// and its album.
+    pub fn of(&self, path: &str, hash: &str) -> Option<(Option<i64>, String)> {
+        self.at(path)
+            .filter(|e| e.hash == hash)
+            .map(|e| (e.track, e.album.clone()))
     }
 }
+
+/// The content a reconcile records for a file that might be content still
+/// being hashed or made: the device's, but not yet told. It matches no
+/// target content, so once nothing is being prepared it's replaced where
+/// the target wants a file, and deleted elsewhere.
+pub const UNKNOWN: &str = "unknown";
 
 /// A path as storage that ignores case compares it, as device paths are
 /// kept apart (see `coversync_core::sync`).
@@ -98,6 +131,8 @@ pub struct Inputs<'a> {
     pub covers: &'a HashMap<(String, u32), CoverFile>,
     /// Where those are.
     pub cover_dir: &'a Path,
+    /// Cover files that couldn't be made, by (art version, width).
+    pub failed: &'a HashSet<(String, u32)>,
 }
 
 /// The device's target, and the cover files it still needs made.
@@ -133,7 +168,8 @@ pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
         }
         let Some(hash) = &f.content.hash else {
             target.preparing += 1;
-            target.waiting.insert(f.path.clone());
+            target.waiting_tracks.insert(f.track_id);
+            target.waiting_sizes.insert(f.content.size);
             continue;
         };
         target
@@ -193,9 +229,16 @@ pub fn build(i: Inputs) -> (Target, Vec<CoverWanted>) {
             let Some((source, version)) = i.art.get(album) else {
                 continue;
             };
-            let Some(made) = i.covers.get(&(version.clone(), width)) else {
+            let key = (version.clone(), width);
+            // Art that couldn't be read gets no cover, rather than one
+            // being prepared for ever.
+            if i.failed.contains(&key) {
+                continue;
+            }
+            let Some(made) = i.covers.get(&key) else {
                 target.preparing += 1;
-                target.waiting_covers.insert(stem);
+                target.waiting_covers.insert(album.to_string());
+                target.waiting_cover_stems.insert(stem);
                 if asked.insert(version) {
                     wanted.push(CoverWanted {
                         version: version.clone(),
@@ -335,6 +378,7 @@ mod tests {
             art: &art,
             covers: &covers,
             cover_dir: Path::new("/cache"),
+            failed: &HashSet::new(),
         });
         let got: Vec<&str> = target.entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
@@ -379,6 +423,7 @@ mod tests {
             art: &art,
             covers: &covers,
             cover_dir: Path::new("/cache"),
+            failed: &HashSet::new(),
         });
         assert_eq!(limited.too_long, 3);
         assert_ne!(limited.version, target.version);

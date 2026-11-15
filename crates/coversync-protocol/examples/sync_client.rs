@@ -119,7 +119,13 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Listed>) -> Result<()> {
     for e in fs::read_dir(dir)? {
         let e = e?;
         let path = e.path();
-        let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
+        // The protocol's separator, whatever the platform's.
+        let rel = path
+            .strip_prefix(root)?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         if rel == CLIENT_DIR {
             continue;
         }
@@ -199,10 +205,13 @@ fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
 /// each disc's folder).
 fn put(api: &Api, root: &Path, path: &str, hash: &str, size: u64, bytes: &AtomicU64) -> Result<()> {
     let dest = inside(root, path)?;
-    let partial = root.join(CLIENT_DIR).join("partial").join(format!(
-        "{hash}-{}",
-        &blake3::hash(path.as_bytes()).to_hex()[..16]
-    ));
+    let partial = inside(
+        root,
+        &format!(
+            "{CLIENT_DIR}/partial/{hash}-{}",
+            &blake3::hash(path.as_bytes()).to_hex()[..16]
+        ),
+    )?;
     let have = fs::metadata(&partial)
         .map(|m| m.len())
         .unwrap_or(0)
@@ -266,8 +275,8 @@ fn main() -> Result<()> {
         auth: format!("Bearer {}", a.token),
     });
     let root = a.root.clone();
-    fs::create_dir_all(root.join(CLIENT_DIR).join("partial"))?;
-    let marker_path = root.join(CLIENT_DIR).join("device.json");
+    fs::create_dir_all(inside(&root, &format!("{CLIENT_DIR}/partial"))?)?;
+    let marker_path = inside(&root, &format!("{CLIENT_DIR}/device.json"))?;
     let marker: Option<Marker> = fs::read(&marker_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
@@ -368,7 +377,7 @@ fn main() -> Result<()> {
     let mut puts = VecDeque::new();
     for op in ops {
         match op {
-            Op::Delete { path, size } => {
+            Op::Delete { path, size, hash } => {
                 let p = inside(&root, &path)?;
                 match fs::symlink_metadata(&p) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -379,7 +388,7 @@ fn main() -> Result<()> {
                         continue;
                     }
                 }
-                facts.lock().unwrap().push(Fact::Delete { path });
+                facts.lock().unwrap().push(Fact::Delete { path, hash });
             }
             Op::Mkdir { path } => fs::create_dir_all(inside(&root, &path)?)?,
             Op::Move {
@@ -389,9 +398,14 @@ fn main() -> Result<()> {
                 hash,
             } => {
                 let (src, dst) = (inside(&root, &from)?, inside(&root, &path)?);
+                let gone = match fs::symlink_metadata(&src) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => false,
+                };
                 if is(&src, size) {
                     fs::rename(&src, &dst)?;
-                } else if fs::symlink_metadata(&src).is_ok() || !is(&dst, size) {
+                } else if !gone || !is(&dst, size) {
                     // Done before only if the source has gone and the
                     // destination is what it should be.
                     changed("move", from);

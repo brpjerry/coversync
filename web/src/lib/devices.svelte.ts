@@ -73,13 +73,27 @@ class DevicesStore {
 	#reading = new Map<number, Promise<void>>();
 	#waiting = new Map<number, Promise<void>>();
 
+	/** Re-reads syncs shown as running, while a screen shows them. */
+	#ticker: ReturnType<typeof setInterval> | undefined;
+
 	/** Read every device's sync while a screen shows it; returns the stop. */
 	watchSync() {
 		this.#watching++;
 		this.readSyncAll();
+		// A device that goes quiet mid-sync stops counting as syncing on the
+		// server after a few minutes, which no event says: read those again
+		// now and then.
+		this.#ticker ??= setInterval(() => {
+			for (const [id, state] of Object.entries(this.syncStates))
+				if (state.running) void this.readSync(Number(id));
+		}, 60_000);
 		return () => {
 			// Not kept for next time, when it would show out of date at first.
-			if (!--this.#watching) this.syncStates = {};
+			if (!--this.#watching) {
+				this.syncStates = {};
+				clearInterval(this.#ticker);
+				this.#ticker = undefined;
+			}
 		};
 	}
 
