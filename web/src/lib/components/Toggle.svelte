@@ -17,6 +17,7 @@
 </script>
 
 <button
+	type="button"
 	class="toggle"
 	class:nested
 	role="switch"

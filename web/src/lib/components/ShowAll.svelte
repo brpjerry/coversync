@@ -22,7 +22,13 @@
 </script>
 
 <div class="show-all">
-	<button class="toggle" aria-expanded={shown} onclick={() => (open = !shown)} disabled={forceOpen}>
+	<button
+		type="button"
+		class="toggle"
+		aria-expanded={shown}
+		onclick={() => (open = !shown)}
+		disabled={forceOpen}
+	>
 		<span class="chev" class:open={shown}><ChevronRight size={15} /></span>
 		{shown ? label.replace(/^Show all/, 'Hide') : label}
 		{#if count !== undefined && !shown}<span class="count tabular">{count}</span>{/if}

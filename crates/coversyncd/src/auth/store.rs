@@ -3,6 +3,7 @@
 //! connection of its own, so checking a request never waits for a scan's or
 //! an import's work on the index.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -10,6 +11,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use base64::Engine;
+use coversync_core::sync::{DeviceSettings, DeviceSync};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +39,20 @@ CREATE TABLE IF NOT EXISTS pairing_setup (
     ca_path    TEXT,
     allow_http INTEGER NOT NULL DEFAULT 0
 );
+"#;
+
+/// Each device's sync settings (`DeviceSettings` as JSON) and their
+/// version, which goes up with each change. The trigger removes them with
+/// their device, whichever build removes it. Made after [`migrate`], since
+/// rebuilding the devices table drops its triggers.
+const SYNC_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS device_sync (
+    device_id INTEGER PRIMARY KEY,
+    version   INTEGER NOT NULL,
+    settings  TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS device_sync_removed AFTER DELETE ON devices
+BEGIN DELETE FROM device_sync WHERE device_id = OLD.id; END;
 "#;
 
 /// The devices table, made as `name`: `devices`, or the copy [`migrate`]
@@ -286,6 +302,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(&devices_table("devices"))?;
         migrate(&mut conn)?;
+        conn.execute_batch(SYNC_SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -589,6 +606,52 @@ impl Store {
         Ok(found == 1)
     }
 
+    /// A device's sync settings, if there is such a device.
+    pub fn device_sync(&self, id: i64) -> rusqlite::Result<Option<DeviceSync>> {
+        device_sync(&self.conn(), id)
+    }
+
+    /// Every device's sync settings, by device.
+    pub fn device_syncs(&self) -> rusqlite::Result<HashMap<i64, DeviceSync>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, s.version, s.settings
+             FROM devices d LEFT JOIN device_sync s ON s.device_id = d.id",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, sync_row(r.get(1)?, r.get(2)?))))?
+            .collect()
+    }
+
+    /// Save a device's sync settings, raising their version if they
+    /// changed. None if there's no such device.
+    pub fn set_device_sync(
+        &self,
+        id: i64,
+        settings: &DeviceSettings,
+    ) -> rusqlite::Result<Option<DeviceSync>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(current) = device_sync(&tx, id)? else {
+            return Ok(None);
+        };
+        if current.settings == *settings {
+            return Ok(Some(current));
+        }
+        let saved = DeviceSync {
+            version: current.version + 1,
+            settings: settings.clone(),
+        };
+        let json = serde_json::to_string(settings).expect("settings serialize");
+        tx.execute(
+            "INSERT INTO device_sync (device_id, version, settings) VALUES (?1, ?2, ?3)
+             ON CONFLICT (device_id) DO UPDATE SET version = excluded.version,
+                 settings = excluded.settings",
+            params![id, saved.version, json],
+        )?;
+        tx.commit()?;
+        Ok(Some(saved))
+    }
+
     pub fn pairing_setup(&self) -> rusqlite::Result<PairingSetup> {
         Ok(self
             .conn()
@@ -652,6 +715,30 @@ impl Store {
         self.conn()
             .execute("UPDATE devices SET last_seen_at = NULL WHERE id = ?1", [id])?;
         Ok(())
+    }
+}
+
+/// A device's sync settings, if there is such a device.
+fn device_sync(conn: &Connection, id: i64) -> rusqlite::Result<Option<DeviceSync>> {
+    conn.query_row(
+        "SELECT s.version, s.settings
+         FROM devices d LEFT JOIN device_sync s ON s.device_id = d.id WHERE d.id = ?1",
+        [id],
+        |r| Ok(sync_row(r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// Sync settings as stored: the defaults, at version 0, until first saved.
+/// Settings this build can't read or use (a newer one's, say) read as the
+/// defaults; usable ones read as saved.
+fn sync_row(version: Option<i64>, settings: Option<String>) -> DeviceSync {
+    DeviceSync {
+        version: version.unwrap_or(0),
+        settings: settings
+            .and_then(|s| serde_json::from_str::<DeviceSettings>(&s).ok())
+            .filter(|s| s.clone().normalize().is_ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -1039,6 +1126,32 @@ mod tests {
         assert_eq!(s.pairing_setup().unwrap(), setup);
         s.set_pairing_setup(&PairingSetup::default()).unwrap();
         assert_eq!(s.pairing_setup().unwrap(), PairingSetup::default());
+    }
+
+    #[test]
+    fn sync_settings_are_removed_with_their_device() {
+        let s = store("sync-settings");
+        let own = DeviceSettings {
+            structure: Some("{album}/{title}".into()),
+            ..Default::default()
+        };
+        let (a, _) = s.add_device("Player", Scope::Sync, 0).unwrap();
+        let (b, _) = s.add_device("Phone", Scope::Manage, 0).unwrap();
+        assert_eq!(s.set_device_sync(a, &own).unwrap().unwrap().version, 1);
+        // Unchanged, they keep their version (and the paths cached for it).
+        assert_eq!(s.set_device_sync(a, &own).unwrap().unwrap().version, 1);
+        s.set_device_sync(b, &own).unwrap();
+        s.remove_device(a).unwrap();
+        let left: Vec<i64> = s
+            .conn()
+            .prepare("SELECT device_id FROM device_sync")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, [b]);
+        assert_eq!(s.set_device_sync(a, &own).unwrap(), None);
     }
 
     #[test]

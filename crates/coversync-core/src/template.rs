@@ -4,6 +4,14 @@
 //! starts a folder; the file extension is added automatically. `{track_number}`
 //! is zero-padded to two digits. `{album:40}` keeps at most 40 characters of
 //! the value, cut at a word break when one is close.
+//!
+//! Every name a template makes can be written on Windows, SMB shares and
+//! FAT32 or exFAT cards: values have the characters those can't hold
+//! replaced, a template's own text can't have them, names Windows keeps
+//! for devices (CON, NUL, COM1, …) get a `_` in front, and no name ends in
+//! a dot or space or is `..`. A folder name or a file's name before its
+//! extension is at most [`MAX_NAME`] bytes. How long a whole path may be is
+//! up to where it goes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,8 +30,8 @@ pub const SUGGESTIONS: &[&str] = &[
 
 /// `{year}` is the first four digits of the date tag.
 pub const YEAR: &str = "year";
-/// The longest a variable can be limited to; a whole component is capped
-/// at 180 bytes anyway.
+/// The longest a variable can be limited to; a folder name or a file's
+/// name before its extension is capped at [`MAX_NAME`] bytes anyway.
 pub const MAX_LIMIT: usize = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +87,7 @@ impl Template {
                     }
                     Some(i) => {
                         if i > 0 {
-                            parts.push(Part::Text(rest[..i].to_string()));
+                            parts.push(text(&rest[..i])?);
                         }
                         let Some(end) = rest[i..].find('}') else {
                             return invalid(format!("Unclosed {{ in '{raw}'."));
@@ -107,7 +115,7 @@ impl Template {
                         rest = &rest[i + end + 1..];
                     }
                     None => {
-                        parts.push(Part::Text(rest.to_string()));
+                        parts.push(text(rest)?);
                         rest = "";
                     }
                 }
@@ -171,6 +179,22 @@ impl Template {
         values: &HashMap<&'static str, String>,
         extension: &str,
     ) -> std::result::Result<PathBuf, Vec<&'static str>> {
+        let (path, missing) = self.render_partial(values, extension);
+        if missing.is_empty() {
+            Ok(path)
+        } else {
+            Err(missing)
+        }
+    }
+
+    /// The relative path even when variables have no value: those are left
+    /// empty, and a name left empty is `_`. Also gives the variables that
+    /// had no value.
+    pub fn render_partial(
+        &self,
+        values: &HashMap<&'static str, String>,
+        extension: &str,
+    ) -> (PathBuf, Vec<&'static str>) {
         let mut missing = Vec::new();
         let mut path = PathBuf::new();
         let last = self.segments.len() - 1;
@@ -196,6 +220,9 @@ impl Template {
                 }
             }
             let mut name = finish(&text);
+            if reserved(&name) {
+                name = finish(&format!("_{name}"));
+            }
             if name.is_empty() {
                 name = "_".into();
             }
@@ -204,11 +231,7 @@ impl Template {
             }
             path.push(name);
         }
-        if missing.is_empty() {
-            Ok(path)
-        } else {
-            Err(missing)
-        }
+        (path, missing)
     }
 }
 
@@ -279,22 +302,114 @@ fn shorten(value: &str, max: usize) -> String {
 }
 
 /// Trim, drop trailing dots (Windows), and cap the length of one component.
+/// Dots and spaces go together, so no name is left as `.` or `..`.
 fn finish(component: &str) -> String {
-    let mut s = component
-        .trim()
-        .trim_end_matches('.')
-        .trim_end()
-        .to_string();
-    const MAX: usize = 180;
-    if s.len() > MAX {
-        let mut cut = MAX;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-        s = s.trim_end().to_string();
+    let trailing = |c: char| c == '.' || c.is_whitespace();
+    let s = component.trim().trim_end_matches(trailing);
+    cut(s, MAX_NAME).trim_end_matches(trailing).to_string()
+}
+
+/// The most bytes of UTF-8 a folder name, or a file's name before its
+/// extension, gets: leaving room for the extension within what Linux (255
+/// bytes), FAT32 and exFAT (255 UTF-16 units) allow.
+pub const MAX_NAME: usize = 180;
+
+/// At most `max` bytes of `s`, never splitting a character. Nor does it
+/// part a character from the common marks that combine with it (accents,
+/// dakuten, variation selectors, emoji joined by ZWJ; see
+/// [`joins_previous`]), though it doesn't know every script's.
+pub fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
     }
-    s
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let next = s[end..].chars().next();
+        let last = s[..end].chars().next_back();
+        // A mark after the cut belongs to the character before it; a
+        // joiner before the cut joins that character to the next.
+        if next.is_some_and(joins_previous) || last == Some('\u{200d}') {
+            end -= last.map_or(0, char::len_utf8);
+        } else {
+            return &s[..end];
+        }
+        if end == 0 {
+            return "";
+        }
+    }
+}
+
+/// Characters drawn together with the one before them.
+fn joins_previous(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}' // combining diacritical marks
+        | '\u{1ab0}'..='\u{1aff}'
+        | '\u{1dc0}'..='\u{1dff}'
+        | '\u{200c}'..='\u{200d}' // zero-width (non-)joiner
+        | '\u{20d0}'..='\u{20ff}'
+        | '\u{3099}'..='\u{309a}' // kana voicing marks
+        | '\u{fe00}'..='\u{fe0f}' // variation selectors
+        | '\u{fe20}'..='\u{fe2f}'
+        | '\u{1f3fb}'..='\u{1f3ff}' // skin tones
+        | '\u{e0020}'..='\u{e007f}' // emoji tag sequences
+        | '\u{e0100}'..='\u{e01ef}')
+}
+
+/// Characters a name can't hold on Windows, SMB shares, or FAT32 and
+/// exFAT cards, besides `/` and control characters. Values have them
+/// replaced (see [`clean`]); a template's own text can't have them.
+pub(crate) const NOT_IN_NAMES: &[char] = &['"', '*', ':', '<', '>', '?', '\\', '|'];
+
+/// Text a template writes as it is, if a name can hold it.
+fn text(t: &str) -> Result<Part> {
+    match t
+        .chars()
+        .find(|c| c.is_control() || NOT_IN_NAMES.contains(c))
+    {
+        Some(c) => Err(Error::Invalid(format!(
+            "{} can't be in a file or folder name on Windows or a memory card; use - or _ instead.",
+            if c.is_control() {
+                "A control character".to_string()
+            } else {
+                format!("'{c}'")
+            }
+        ))),
+        None => Ok(Part::Text(t.to_string())),
+    }
+}
+
+/// A file name's stem and its extension, dot included ("" for none).
+pub fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot)
+            if name.len() - dot <= 17 && name.len() - dot > 1 && !name[dot..].contains(' ') =>
+        {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    }
+}
+
+/// Whether Windows keeps `stem` (up to its first dot) for a device, as
+/// CON, NUL, COM1 and the like, which FAT cards and SMB shares can't hold
+/// either. Such a name gets a `_` in front.
+pub(crate) fn reserved(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or_default().trim_end();
+    let upper = base.to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|port| {
+        upper.strip_prefix(port).is_some_and(|n| {
+            let mut n = n.chars();
+            n.next()
+                .is_some_and(|d| d.is_ascii_digit() || "¹²³".contains(d))
+                && n.next().is_none()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +465,20 @@ mod tests {
     }
 
     #[test]
+    fn a_name_is_never_dots_alone() {
+        // With the value missing, or there, the folder isn't `..`.
+        let t = Template::parse(".. .{composer}/{title}").unwrap();
+        let (path, missing) = t.render_partial(&vals(&[("title", "T")]), "flac");
+        assert_eq!(
+            (path, missing),
+            (PathBuf::from("_/T.flac"), vec!["composer"])
+        );
+        let t = Template::parse("{album}/{title}").unwrap();
+        let v = vals(&[("album", ".. ."), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("_/T.flac"));
+    }
+
+    #[test]
     fn limits_cut_values_at_word_breaks() {
         assert_eq!(
             shorten("MADE IN ABYSS ORIGINAL SOUNDTRACK", 20),
@@ -391,6 +520,34 @@ mod tests {
     }
 
     #[test]
+    fn names_windows_keeps_for_itself_get_a_mark() {
+        let t = Template::parse("{album}/{title}").unwrap();
+        for (album, title, path) in [
+            ("CON", "nul", "_CON/_nul.flac"),
+            ("Aux. Live", "LPT¹", "_Aux. Live/_LPT¹.flac"),
+            ("COM10", "Console", "COM10/Console.flac"),
+        ] {
+            let v = vals(&[("album", album), ("title", title)]);
+            assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from(path));
+        }
+        // Also when the length cut leaves one behind.
+        let padded = format!("CON{}X", " ".repeat(178));
+        let v = vals(&[("album", padded.as_str()), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("_CON/T.flac"));
+    }
+
+    #[test]
+    fn cuts_keep_characters_whole() {
+        // Never inside a character, between a letter and its accent, or
+        // inside an emoji.
+        assert_eq!(cut(&"曲".repeat(100), MAX_NAME), "曲".repeat(60));
+        let accent = format!("{}e\u{301}x", "a".repeat(179));
+        assert_eq!(cut(&accent, MAX_NAME), "a".repeat(179));
+        let family = format!("{}👨\u{200d}👩", "b".repeat(170));
+        assert_eq!(cut(&family, MAX_NAME), "b".repeat(170));
+    }
+
+    #[test]
     fn reports_missing_variables() {
         let t = Template::parse(DEFAULT).unwrap();
         let v = vals(&[("album_artist", "A"), ("album", " "), ("title", "T")]);
@@ -413,6 +570,9 @@ mod tests {
             "{album:-3}/{title}",
             "{album:999}/{title}",
             "{album:}/{title}",
+            "{album_artist}: {album}/{title}",
+            "{album}/{track_number} | {title}",
+            "{album}/a\\b {title}",
         ] {
             assert!(Template::parse(bad).is_err(), "{bad}");
         }

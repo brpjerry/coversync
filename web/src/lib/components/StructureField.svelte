@@ -15,8 +15,17 @@
 		suggestions: string[];
 		variables: { id: string; label: string; group: string }[];
 		label: (id: string) => string;
+		/** A device's folder structure: files with gaps still go, so nothing is required. */
+		device?: boolean;
 	}
-	let { value = $bindable(), folder, suggestions, variables, label }: Props = $props();
+	let {
+		value = $bindable(),
+		folder,
+		suggestions,
+		variables,
+		label,
+		device = false
+	}: Props = $props();
 
 	let input = $state<HTMLInputElement>();
 	let preview = $state<StructurePreview | null>(null);
@@ -102,8 +111,11 @@
 
 	<div class="suggestions" role="group" aria-label="Suggested structures">
 		{#each suggestions as s (s)}
-			<button class="suggestion" class:on={value.trim() === s} onclick={() => (value = s)}
-				>{s}</button
+			<button
+				type="button"
+				class="suggestion"
+				class:on={value.trim() === s}
+				onclick={() => (value = s)}>{s}</button
 			>
 		{/each}
 	</div>
@@ -151,7 +163,15 @@
 			{:else}
 				<p class="muted">Nothing in the Inbox to preview with yet.</p>
 			{/each}
-			{#if preview.requires.length}
+			{#if device && preview.examples.length}
+				<p class="requires">Inbox files as examples, before numbers for names that clash.</p>
+			{/if}
+			{#if preview.requires.length && device}
+				<p class="requires">
+					A file without a value for one of these leaves that part empty, or <b>_</b> for a whole name.
+					It still goes to the device.
+				</p>
+			{:else if preview.requires.length}
 				<p class="requires">
 					Imported files need
 					{#each preview.requires as id, i (id)}<b>{label(id)}</b>{i < preview.requires.length - 1
@@ -165,6 +185,7 @@
 	<div class="core-vars" role="group" aria-label="Insert a core variable">
 		{#each coreVars as v (v.id)}
 			<button
+				type="button"
 				class="var-chip"
 				onclick={() => insert(v.id)}
 				title="Insert {`{${v.id}}`} ({v.label})"
@@ -177,7 +198,7 @@
 		<input class="var-filter" placeholder="Filter variables" bind:value={varFilter} />
 		<div class="var-grid">
 			{#each shownVars as v (v.id)}
-				<button class="var" onclick={() => insert(v.id)} title="Insert {`{${v.id}}`}">
+				<button type="button" class="var" onclick={() => insert(v.id)} title="Insert {`{${v.id}}`}">
 					<code>{`{${v.id}}`}</code><span>{v.label}</span>
 				</button>
 			{/each}

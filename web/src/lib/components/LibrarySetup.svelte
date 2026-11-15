@@ -105,8 +105,18 @@
 	const isOpen = (id: string) => terms.length > 0 || !!open[id];
 
 	/** The cover file name as it will be saved (the daemon trims the same way). */
-	let artName = $derived(setup.art.file_name.trim().replace(/\.(jpe?g|png|webp)$/i, '') || 'cover');
-	let artNameBad = $derived(/[/\\]/.test(artName) || artName.startsWith('.'));
+	let artName = $derived(
+		setup.art.file_name
+			.trim()
+			.replace(/(?:\.(?:jpe?g|png|webp)\s*)+$/i, '')
+			.trimEnd() || 'cover'
+	);
+	let artNameBad = $derived(
+		/[/\\:*?"<>|]/.test(artName) ||
+			artName.startsWith('.') ||
+			// Names Windows keeps for devices, as the server refuses them.
+			/^(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[0-9¹²³])\s*(\.|$)/i.test(artName)
+	);
 	/** Offered beside the separator field. */
 	const SEPARATORS = [';', '; ', '/', ' / '];
 	const joinedExample = (separator: string) => `Rock${separator}Pop`;
@@ -457,7 +467,8 @@
 						</div>
 						<p class="name-hint" class:bad={artNameBad}>
 							{#if artNameBad}
-								A file name can't contain slashes or start with a dot.
+								A file name can't contain / \\ : * ? &quot; &lt; &gt; |, start with a dot, or be a
+								name Windows keeps for itself, such as CON.
 							{:else}
 								Whatever the image was called in the Inbox, it's saved as <code>{artName}.jpg</code
 								>, or <code>.png</code> / <code>.webp</code> to match the image. Other images stay behind.

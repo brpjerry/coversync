@@ -10,15 +10,20 @@
 //! Only a password login may change any of it: an app's token, or a cookie
 //! traded for one, can list the devices but not add, change or revoke them,
 //! so a lost phone can't add devices or lock out the others.
+//!
+//! Each device also has sync settings (SYN-03), and the paths its Library
+//! files take under them. A password login reads and changes any device's;
+//! an app may only read its own, even with a `sync` token.
 
 use std::net::IpAddr;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
+use coversync_core::sync::{DeviceSettings, DeviceSync};
 use serde::{Deserialize, Serialize};
 
 use super::pairing::{self, Cancelled, Refused};
@@ -41,6 +46,11 @@ pub fn router() -> Router<Shared> {
         .route("/api/devices", get(list))
         .route("/api/devices/{id}", put(update).delete(remove))
         .route("/api/devices/{id}/revoke", post(revoke))
+        .route(
+            "/api/devices/{id}/sync/settings",
+            get(sync_settings).put(save_sync_settings),
+        )
+        .route("/api/devices/{id}/sync/paths", get(sync_paths))
         .route("/api/pairings", post(create))
         .route("/api/pairings/{id}", get(status).delete(close))
         .route("/api/pairing/setup", get(setup).put(save_setup))
@@ -173,9 +183,18 @@ pub(super) fn app_version(headers: &HeaderMap) -> Option<String> {
         .flatten()
 }
 
+/// A device as Sync setup lists it.
+#[derive(Serialize)]
+struct Listed {
+    #[serde(flatten)]
+    info: DeviceInfo,
+    /// Its sync settings, if this request may read them (see [`may_read`]).
+    sync: Option<DeviceSync>,
+}
+
 #[derive(Serialize)]
 struct Devices {
-    devices: Vec<DeviceInfo>,
+    devices: Vec<Listed>,
     /// The device this request comes from, for an app's token.
     this_device: Option<i64>,
     /// This request may change devices: it comes from a password login.
@@ -183,13 +202,142 @@ struct Devices {
 }
 
 async fn list(State(state): State<Shared>, Extension(access): Extension<Access>) -> Answer {
-    let devices = db(&state, |s| s.devices()).await?;
+    let (devices, mut syncs) = db(&state, |s| Ok((s.devices()?, s.device_syncs()?))).await?;
+    let devices = devices
+        .into_iter()
+        .map(|info| Listed {
+            // One added since has no settings saved yet.
+            sync: may_read(&access, info.id).then(|| syncs.remove(&info.id).unwrap_or_default()),
+            info,
+        })
+        .collect();
     Ok(Json(Devices {
         devices,
         this_device: access.device,
         can_manage: access.password_login(),
     })
     .into_response())
+}
+
+/// Whether this request may read device `id`'s sync settings and paths: a
+/// password login may read any device's, and an app (its token, or a
+/// session traded for it) only its own.
+fn may_read(access: &Access, id: i64) -> bool {
+    access.password_login() || access.device == Some(id)
+}
+
+fn own_device_only(access: &Access, id: i64) -> Result<(), Refusal> {
+    if may_read(access, id) {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        StatusCode::FORBIDDEN,
+        "other_device",
+        "An app can only read its own sync settings and paths.",
+    ))
+}
+
+/// Routes a `sync` token may use besides [`super::SYNC_OPEN`]: reading a
+/// device's sync settings and paths, which their handlers allow for its own
+/// device only.
+pub(super) fn sync_readable(method: &Method, path: &str) -> bool {
+    let Some((id, what)) = path
+        .strip_prefix("/api/devices/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    method == Method::GET
+        && id.parse::<i64>().is_ok()
+        && matches!(what, "sync/settings" | "sync/paths")
+}
+
+/// A device's sync settings and their version.
+async fn sync_settings(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> Answer {
+    own_device_only(&access, id)?;
+    let sync = db(&state, move |s| s.device_sync(id))
+        .await?
+        .ok_or_else(Refusal::no_device)?;
+    Ok(Json(sync).into_response())
+}
+
+/// Change a device's sync settings. Saving them unchanged keeps their
+/// version, and with it the paths worked out for them.
+async fn save_sync_settings(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+    Json(settings): Json<DeviceSettings>,
+) -> Answer {
+    password_only(&access)?;
+    let settings = settings.normalize().map_err(|e| {
+        Refusal::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad_settings",
+            e.to_string(),
+        )
+    })?;
+    let s = state.clone();
+    let sync = blocking(move || {
+        let saved = s.auth.store.set_device_sync(id, &settings)?;
+        if saved.is_some() {
+            // Other browsers showing Sync setup read it again.
+            s.events.publish(Notice::SetupSaved {
+                setup: events::Setup::Sync,
+            });
+        }
+        Ok::<_, rusqlite::Error>(saved)
+    })
+    .await?
+    .map_err(Refusal::failed)?
+    .ok_or_else(Refusal::no_device)?;
+    tracing::info!(
+        device = id,
+        version = sync.version,
+        "saved a device's sync settings"
+    );
+    Ok(Json(sync).into_response())
+}
+
+/// Where every Library file goes on a device: worked out once per version
+/// of its settings and of the Library (see `coversync_core::sync`).
+async fn sync_paths(
+    State(state): State<Shared>,
+    Extension(access): Extension<Access>,
+    Path(id): Path<i64>,
+) -> Answer {
+    own_device_only(&access, id)?;
+    let s = state.clone();
+    let body = blocking(move || -> Result<Vec<u8>, Refusal> {
+        let sync = s
+            .auth
+            .store
+            .device_sync(id)
+            .map_err(Refusal::failed)?
+            .ok_or_else(Refusal::no_device)?;
+        let paths = s
+            .device_paths
+            .paths(&s.lib, id, &sync)
+            .map_err(Refusal::failed)?;
+        let body = match paths {
+            Some(paths) => serde_json::to_vec(&*paths),
+            // No Library folder: nothing to sync.
+            None => serde_json::to_vec(&serde_json::json!({
+                "library": null,
+                "settings_version": sync.version,
+                "incomplete": 0,
+                "renamed": 0,
+                "files": [],
+            })),
+        };
+        body.map_err(Refusal::failed)
+    })
+    .await??;
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
 #[derive(Deserialize)]
@@ -254,8 +402,9 @@ async fn remove(
     if !db(&state, move |s| s.remove_device(id)).await? {
         return Err(Refusal::no_device());
     }
-    // A code that would have brought it back goes too.
+    // A code that would have brought it back goes too, as do its paths.
     state.auth.pairings().forget_device(id);
+    state.device_paths.forget(id);
     tracing::info!(device = id, "removed a device");
     Ok(StatusCode::NO_CONTENT.into_response())
 }

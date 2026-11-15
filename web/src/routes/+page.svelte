@@ -956,6 +956,7 @@
 		poll();
 		appearance.refresh();
 		syncSetup.refresh();
+		devices.load();
 		setup.refresh();
 		inboxSetup.refresh();
 		dataGeneration++;
@@ -1024,7 +1025,11 @@
 				inboxSetup.refresh();
 				dataGeneration++;
 			} else if (saved === 'appearance') appearance.refresh();
-			else return syncSetup.refresh();
+			else {
+				// Sync setup also shows each device's sync settings.
+				devices.load();
+				return syncSetup.refresh();
+			}
 			loadAlbums();
 		},
 		resync

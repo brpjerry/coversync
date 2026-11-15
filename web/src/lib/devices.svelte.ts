@@ -1,9 +1,10 @@
 // The devices paired with this server: listed in the sidebar's Sync section
-// and in Sync setup, where they're added, renamed, re-scoped and revoked.
-// Changes are made at once, not through the save bar.
+// and in Sync setup, where they're added, renamed, re-scoped and revoked, and
+// their sync settings changed. Changes are made at once, not through the
+// save bar.
 
 import { createSubscriber } from 'svelte/reactivity';
-import { api, ApiError, type Device, type Scope } from './api';
+import { api, ApiError, type Device, type DeviceSettings, type Scope } from './api';
 import { toast } from './toast.svelte';
 
 class DevicesStore {
@@ -41,7 +42,8 @@ class DevicesStore {
 
 	#put(device: Device) {
 		const i = this.list.findIndex((d) => d.id === device.id);
-		if (i >= 0) this.list[i] = device;
+		// A change's answer leaves out the sync settings, which stay.
+		if (i >= 0) this.list[i] = { ...this.list[i], ...device };
 		else this.list.push(device);
 	}
 
@@ -56,11 +58,12 @@ class DevicesStore {
 			return true;
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : failed, 'error', 6000);
-			// It may be gone, or changed elsewhere.
-			if (e instanceof ApiError && e.status === 404) this.load();
 			return false;
 		} finally {
 			delete this.busy[id];
+			// A load answered during the change was dropped, and the device
+			// may be gone or changed elsewhere: read the list again.
+			void this.load();
 		}
 	}
 
@@ -70,6 +73,19 @@ class DevicesStore {
 
 	revoke(id: number) {
 		return this.#change(id, () => api.revokeDevice(id), 'Revoking the device failed');
+	}
+
+	saveSync(id: number, settings: DeviceSettings) {
+		return this.#change(
+			id,
+			async () => {
+				const sync = await api.saveDeviceSync(id, settings);
+				const device = this.list.find((d) => d.id === id);
+				// Not over newer settings a reload already brought.
+				if (device && (!device.sync || device.sync.version <= sync.version)) device.sync = sync;
+			},
+			'Saving the sync settings failed'
+		);
 	}
 
 	remove(id: number) {

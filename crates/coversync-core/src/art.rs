@@ -15,7 +15,7 @@ use image::{ImageFormat, ImageReader};
 use lofty::picture::{MimeType, Picture, PictureType};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, template};
 
 /// Stands for album art among required tag kinds in attention flags.
 pub const ART: &str = "album_art";
@@ -67,24 +67,41 @@ impl Default for ArtRules {
     }
 }
 
+/// A cover file name as typed, without its extension: "cover.jpg" means
+/// "cover", as the extension follows the image, and nothing means "cover".
+/// Every image extension at the end goes, so a name taken once stays.
+/// With `used` (a cover file is written), a name no file can have is
+/// refused; one kept while it's off is only tidied.
+pub fn cover_file_name(typed: &str, used: bool) -> Result<String> {
+    let mut name = typed.trim();
+    while let Some((stem, ext)) = name.rsplit_once('.')
+        && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    {
+        name = stem.trim_end();
+    }
+    if name.is_empty() {
+        name = FILE_NAMES[0];
+    }
+    if used
+        && (name.contains('/')
+            || name.contains(template::NOT_IN_NAMES)
+            || name.chars().any(char::is_control)
+            || name.starts_with('.')
+            || template::reserved(name)
+            || name.chars().count() > 64)
+    {
+        return Err(Error::Invalid(
+            "The cover file name can't contain / \\ : * ? \" < > |, start with a dot, or be \
+             a name Windows keeps for itself, such as CON."
+                .into(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
 impl ArtRules {
     pub fn normalize(mut self) -> Result<Self> {
-        let mut name = self.file_name.trim();
-        // "cover.jpg" means "cover": the extension follows the image.
-        if let Some((stem, ext)) = name.rsplit_once('.')
-            && IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
-        {
-            name = stem.trim_end();
-        }
-        if name.is_empty() {
-            name = FILE_NAMES[0];
-        }
-        if name.contains(['/', '\\', '\0']) || name.starts_with('.') || name.chars().count() > 64 {
-            return Err(Error::Invalid(
-                "The cover file name can't contain slashes or start with a dot.".into(),
-            ));
-        }
-        self.file_name = name.to_string();
+        self.file_name = cover_file_name(&self.file_name, self.placement.file())?;
         Ok(self)
     }
 
@@ -226,6 +243,19 @@ mod tests {
         assert_eq!(rules("front.art").unwrap().file_name, "front.art");
         assert!(rules("art/cover").is_err());
         assert!(rules(".cover").is_err());
+        assert!(rules("art: front").is_err());
+        assert!(rules("CON").is_err());
+        // A name kept while no cover file is written is only tidied.
+        let embedded = |name: &str| {
+            ArtRules {
+                placement: Placement::Embedded,
+                file_name: name.into(),
+                ..Default::default()
+            }
+            .normalize()
+        };
+        assert_eq!(embedded("art: front.jpg").unwrap().file_name, "art: front");
+        assert_eq!(embedded(" ").unwrap().file_name, "cover");
     }
 
     #[test]

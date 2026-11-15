@@ -25,7 +25,7 @@ use crate::model::{
     KindCoverage, LibraryChanges, LibraryVersion, RemovedTrack, TagCoverage, Track,
 };
 use crate::rules::{self, LibrarySetup};
-use crate::sync::SyncSetup;
+use crate::sync::{Catalog, CatalogTrack, SyncSetup};
 use crate::tags::TrackTags;
 use crate::{Error, Result};
 
@@ -1450,6 +1450,33 @@ impl Library {
             tracks,
             removed,
         }))
+    }
+
+    /// Every Library track's id, album and path, and with `values` its tag
+    /// values, read at once with the Library version they belong to (see
+    /// [`crate::sync::device_paths`]). None without a Library folder.
+    pub fn sync_catalog(&self, values: bool) -> Result<Option<Catalog>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let (Some(library), Some(a)) = (library_version(&tx)?, attached(&tx)?) else {
+            return Ok(None);
+        };
+        let tracks = tx
+            .prepare(
+                "SELECT id, path, album_id, CASE WHEN ?1 THEN tag_values ELSE '' END
+                FROM lib.tracks ORDER BY path",
+            )?
+            .query_map([values], |r| {
+                Ok(CatalogTrack {
+                    id: -(a.prefix * ID_SPAN + r.get::<_, i64>(0)?),
+                    path: r.get(1)?,
+                    album_id: r.get(2)?,
+                    values: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        Ok(Some(Catalog { library, tracks }))
     }
 
     /// Path -> (mtime, size, collection) for every indexed file.

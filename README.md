@@ -39,7 +39,11 @@ used on a home server.
   `{album_artist}/{year} - {album}/{track_number} - {title}`.
   `{track_number}` is zero-padded and the extension is added. `{album:40}`
   keeps at most 40 characters of a value, cut at a word break when one is
-  close. Tags a template uses count as required on import. The rules and the
+  close. Every name it makes works on Windows, SMB shares and FAT32 or exFAT
+  cards: tag values have `/ \ : * ? " < > |` replaced, the template's own
+  text can't contain them, names Windows keeps for itself (CON, NUL, COM1,
+  …) get a `_` in front, and no name ends in a dot or space. Tags a template
+  uses count as required on import. The rules and the
   Library's index live in the Library folder itself (see
   [Moving the Library](#moving-the-library)).
 - **Import** (right-click an Inbox album): checks the rules and the template's
@@ -75,8 +79,11 @@ used on a home server.
   filters by, and the cover size.
 - **Sync** (planned): devices pair with the server from Sync setup, each with
   a token of its own (see [Pairing devices](#pairing-devices)), and the
-  sidebar's Sync section lists them. Copying the Library to them comes later.
-  Sync setup can turn the section off.
+  sidebar's Sync section lists them. Each device gets the whole Library, with
+  settings of its own in Sync setup: the Library's folders or its own, and
+  its art (a cover file, and the widest art). The server works out
+  every file's path on each device; copying the files comes later. Sync setup
+  can turn the section off.
 - **Live updates**: tag edits, imports and saved setups made in one browser,
   and scans, show in every other open browser as they happen, without
   reloading. They come from the daemon's event stream, `/api/events`; while
@@ -201,7 +208,8 @@ until the command is run on the server.
 - **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
   (see [Pairing devices](#pairing-devices)), one per device, each with a
   scope: `manage` (everything a browser can do, except managing devices) or
-  `sync` (syncing only; refused with 403 for now, but for `GET /api/session`).
+  `sync` (syncing only; refused with 403 for now, but for `GET /api/session`
+  and its own `GET /api/devices/{id}/sync/settings` and `/sync/paths`).
   `POST /api/login/token` trades a token for a session cookie, for an app's
   web view; that session has the device's scope and isn't a password login.
 - **Everything under `/api` needs one or the other**, except `GET /api/hello`
