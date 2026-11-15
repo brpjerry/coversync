@@ -105,7 +105,8 @@ impl System {
                         // Each for itself: one that isn't there mustn't
                         // keep the other's answer waiting. And each asked
                         // again now and then: a service that starts after
-                        // the agent has things to say from then on.
+                        // the agent has things to say from then on, and one
+                        // that goes away takes what it said with it.
                         let network = async {
                             let mut said = false;
                             loop {
@@ -118,7 +119,9 @@ impl System {
                                          counts as unmetered until it's there"
                                     );
                                 }
-                                conditions.send_if_modified(|c| settle(c, true, false));
+                                // What it said last is no longer true to anything.
+                                conditions
+                                    .send_if_modified(|c| c.metered.replace(false) != Some(false));
                                 tokio::time::sleep(LISTEN_AGAIN).await;
                             }
                         };
@@ -134,7 +137,9 @@ impl System {
                                          until it's there"
                                     );
                                 }
-                                conditions.send_if_modified(|c| settle(c, false, true));
+                                conditions.send_if_modified(|c| {
+                                    c.on_battery.replace(false) != Some(false)
+                                });
                                 tokio::time::sleep(LISTEN_AGAIN).await;
                             }
                         };
@@ -223,13 +228,14 @@ async fn network(
     conditions: &watch::Sender<Conditions>,
     nudges: &mpsc::UnboundedSender<Nudge>,
 ) -> zbus::Result<()> {
-    let nm = Proxy::new(
+    let nm = within(Proxy::new(
         bus,
         "org.freedesktop.NetworkManager",
         "/org/freedesktop/NetworkManager",
         "org.freedesktop.NetworkManager",
-    )
+    ))
     .await?;
+    let mut owner = within(nm.receive_owner_changed()).await?;
     let mut metered = nm.receive_property_changed::<u32>("Metered").await;
     let mut state = nm.receive_property_changed::<u32>("State").await;
     let mut primary = nm
@@ -237,7 +243,7 @@ async fn network(
         .await;
     // Asked once as well: the streams only tell of what the service says
     // from here on when it has said nothing yet.
-    let now = Some(is_metered(nm.get_property::<u32>("Metered").await?));
+    let now = Some(is_metered(within(nm.get_property::<u32>("Metered")).await?));
     conditions.send_if_modified(|c| std::mem::replace(&mut c.metered, now) != now);
     let mut link = Link::default();
     loop {
@@ -262,29 +268,47 @@ async fn network(
                     let _ = nudges.send(Nudge::NetworkBack);
                 }
             }
+            // The service is gone (or another took its name): what it
+            // said doesn't hold any more, and it's looked for afresh.
+            Some(_) = owner.next() => return Ok(()),
             else => return Ok(()),
         }
     }
 }
 
 async fn power(bus: &Connection, conditions: &watch::Sender<Conditions>) -> zbus::Result<()> {
-    let upower = Proxy::new(
+    let upower = within(Proxy::new(
         bus,
         "org.freedesktop.UPower",
         "/org/freedesktop/UPower",
         "org.freedesktop.UPower",
-    )
+    ))
     .await?;
+    let mut owner = within(upower.receive_owner_changed()).await?;
     let mut on_battery = upower.receive_property_changed::<bool>("OnBattery").await;
-    let now = Some(upower.get_property::<bool>("OnBattery").await?);
+    let now = Some(within(upower.get_property::<bool>("OnBattery")).await?);
     conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
-    while let Some(change) = on_battery.next().await {
-        if let Ok(now) = change.get().await {
-            let now = Some(now);
-            conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
+    loop {
+        tokio::select! {
+            Some(change) = on_battery.next() => {
+                if let Ok(now) = change.get().await {
+                    let now = Some(now);
+                    conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
+                }
+            }
+            Some(_) = owner.next() => return Ok(()),
+            else => return Ok(()),
         }
     }
-    Ok(())
+}
+
+/// A request to a service, given up on after [`ANSWER_WAIT`]: one that
+/// takes the question and never answers would otherwise keep its listener
+/// from ever trying again.
+async fn within<T>(asked: impl Future<Output = zbus::Result<T>>) -> zbus::Result<T> {
+    tokio::time::timeout(ANSWER_WAIT, asked)
+        .await
+        .unwrap_or_else(|_| Err(zbus::Error::Failure("no answer in time".into())))
 }
 
 async fn sleep(bus: &Connection, nudges: &mpsc::UnboundedSender<Nudge>) -> zbus::Result<()> {

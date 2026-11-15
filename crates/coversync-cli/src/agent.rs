@@ -99,7 +99,8 @@ pub trait Shows: Send + Sync {
 /// Why a sync that's wanted waits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
-    /// Auto sync is off for this device: nothing waits, either.
+    /// Auto sync is off for this device. What was wanted stays wanted
+    /// until it's on again.
     Off,
     Metered,
     Battery,

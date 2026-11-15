@@ -699,7 +699,9 @@ page instead: choose the folder there and turn **Sync this computer** on.
   takes a code from Add device and keeps the token in the keychain, or with
   `--token-file` in a file only you can read, for a computer with no
   keychain. With the app open, pair in its window: the keychain's token is
-  the app's too, and `coversync pair` waits for it to be closed.
+  the app's too, and `coversync pair` waits for it to be closed. A token
+  file is one server's token: `coversync setup --server` to another server
+  stops using it, and `coversync run --server` refuses to send it there.
 - **What's kept on the computer** is the server, the folder and, if one is
   used, where the token file is: in
   `~/.config/io.github.brpjerry.coversync/sync.json`, which `coversync setup`
