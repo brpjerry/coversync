@@ -347,8 +347,9 @@ impl Panel {
         Ok(Overview {
             installed: state.installed,
             server: server.map(str::to_owned),
-            // A token file is this computer's token wherever it came from.
-            paired: paired || config.token_file.is_some(),
+            // A token file is this computer's token for the server it was
+            // set up with, and for no other.
+            paired: paired || (config.token_file.is_some() && config.server.as_deref() == server),
             syncs_with: config.server,
             folder: config.root.map(|root| root.display().to_string()),
             on: state.enabled,
@@ -379,7 +380,12 @@ impl Panel {
                 "Open a server first: sync is with the server the app shows.",
             ));
         };
-        if !paired && config.token_file.is_none() {
+        // A token file is the token of the server it was set up with. For
+        // another server it mustn't be used (that would hand this one the
+        // other's sign-in): the app's own pairing is, from the keychain.
+        let moving = config.server.as_deref() != Some(server);
+        let own_file = config.token_file.is_some() && !moving;
+        if !paired && !own_file {
             return Err(cant(
                 "This computer isn't paired with the server. Pair it first: Add device, in the \
                  server's Sync setup.",
@@ -388,8 +394,9 @@ impl Panel {
         if config.root.is_none() {
             return Err(cant("Choose the folder for the copy first."));
         }
-        if config.server.as_deref() != Some(server) {
+        if moving {
             config.server = Some(server.to_owned());
+            config.token_file = None;
             self.save(&config)?;
         }
         let started = self.service.turn(true).and_then(|()| {
@@ -408,11 +415,17 @@ impl Panel {
     pub fn set_folder(&self, chosen: &Path) -> Result<(), Problem> {
         let root = folder(chosen).map_err(|why| Problem::new("That folder can't be used", why))?;
         let mut config = self.config()?;
-        if config.root.as_deref() == Some(root.as_path()) {
+        if config.root.as_deref() != Some(root.as_path()) {
+            config.root = Some(root);
+            self.save(&config)?;
+        }
+        // Only an agent that's running has anything to take up, and only
+        // one that's installed can be told. The same folder chosen again
+        // still tells it: the last time may have got no further than the
+        // settings.
+        if !self.service.state().active {
             return Ok(());
         }
-        config.root = Some(root);
-        self.save(&config)?;
         self.service
             .restart()
             .map_err(|why| Problem::new("The sync agent couldn't be started again", why))
@@ -476,7 +489,10 @@ mod tests {
 
         fn restart(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("restart");
-            Ok(())
+            match self.fails.lock().unwrap().clone() {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
         }
     }
 
@@ -503,9 +519,7 @@ mod tests {
             "a folder that isn't there"
         );
         fs::create_dir(&music).unwrap();
-        panel.set_folder(&music).unwrap();
-        assert_eq!(service.calls(), ["restart"]);
-        // The same folder again changes nothing.
+        // With no agent running there's nobody to tell.
         panel.set_folder(&music).unwrap();
         assert!(service.calls().is_empty());
 
@@ -552,6 +566,86 @@ mod tests {
         assert!(!overview.on && !overview.running);
         // Off keeps the folder and the server for next time.
         assert!(overview.folder.is_some() && overview.syncs_with.is_some());
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_folder_is_kept_whatever_the_agent_and_a_running_agent_is_told_until_it_hears() {
+        let dir = scratch("panel-folder");
+        let file = dir.join("sync.json");
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let folder_kept = || Config::load(&file).unwrap().root;
+
+        // The agent isn't installed: the folder is kept all the same, and
+        // nothing is asked of a service that isn't there.
+        let missing = Arc::new(Fake::default());
+        let panel = Panel::new(file.clone(), missing.clone());
+        panel.set_folder(&one).unwrap();
+        assert_eq!(folder_kept(), Some(one.clone()));
+        assert!(missing.calls().is_empty());
+
+        // Running: it's started again to take the folder up.
+        let service = Fake::installed();
+        service.turn(true).unwrap();
+        service.calls();
+        let panel = Panel::new(file.clone(), service.clone());
+        panel.set_folder(&two).unwrap();
+        assert_eq!(service.calls(), ["restart"]);
+
+        // The restart fails: the folder is kept, and the failure said.
+        *service.fails.lock().unwrap() = Some("Unit is busy.".into());
+        let failed = panel.set_folder(&one).unwrap_err();
+        assert_eq!(failed.message, "Unit is busy.");
+        assert_eq!(folder_kept(), Some(one.clone()));
+        assert_eq!(service.calls(), ["restart"]);
+        // Choosing the same folder again tries the restart again: the
+        // agent is still in the old one.
+        *service.fails.lock().unwrap() = None;
+        panel.set_folder(&one).unwrap();
+        assert_eq!(service.calls(), ["restart"]);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_token_file_is_one_servers_and_isnt_taken_to_another() {
+        let dir = scratch("panel-token-file");
+        let file = dir.join("sync.json");
+        let (a, b) = ("https://a.example/", "https://b.example/");
+        let set_up = || {
+            Config {
+                server: Some(a.into()),
+                root: Some(dir.clone()),
+                token_file: Some(dir.join("a-token")),
+                ..Default::default()
+            }
+            .save(&file)
+            .unwrap()
+        };
+        let service = Fake::installed();
+        let panel = Panel::new(file.clone(), service.clone());
+
+        // For its own server the file counts as the pairing.
+        set_up();
+        assert!(panel.overview(Some(a), false).unwrap().paired);
+        panel.turn(true, Some(a), false).unwrap();
+        assert!(Config::load(&file).unwrap().token_file.is_some());
+
+        // For another server it doesn't: the app has to be paired there.
+        assert!(!panel.overview(Some(b), false).unwrap().paired);
+        let refused = panel.turn(true, Some(b), false).unwrap_err();
+        assert!(refused.message.contains("isn't paired"), "{refused:?}");
+        let kept = Config::load(&file).unwrap();
+        assert_eq!(kept.server.as_deref(), Some(a), "nothing moved");
+        assert!(kept.token_file.is_some());
+
+        // Paired with the other server: sync moves there with the app's
+        // own token, and a's file is let go of, never sent to b.
+        panel.turn(true, Some(b), true).unwrap();
+        let moved = Config::load(&file).unwrap();
+        assert_eq!(moved.server.as_deref(), Some(b));
+        assert_eq!(moved.token_file, None);
     }
 
     // Bugs caught: 0, False positives: 0

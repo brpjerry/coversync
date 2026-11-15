@@ -176,8 +176,6 @@ impl Builder {
         self
     }
 
-    /// Listens on 127.0.0.1, on the preferred port or a random one, and
-    /// serves for as long as the tokio runtime runs.
     /// What this computer holds of the server's Library: a track it holds
     /// is played from its own disk instead of the server's (see
     /// [`LocalFiles`]). Without it, everything comes from the server.
@@ -186,6 +184,8 @@ impl Builder {
         self
     }
 
+    /// Listens on 127.0.0.1, on the preferred port or a random one, and
+    /// serves for as long as the tokio runtime runs.
     pub async fn start(self) -> io::Result<Proxy> {
         let preferred = match self.port {
             Some(port) if port != 0 => TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.ok(),

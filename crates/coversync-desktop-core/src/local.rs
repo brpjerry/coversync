@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +31,10 @@ use crate::sync::{Config, Service};
 const FRESH: Duration = Duration::from_secs(300);
 /// How soon the server is asked again after it couldn't be.
 const RETRY: Duration = Duration::from_secs(30);
+/// How long a list goes on being used without looking whether sync is
+/// still on for this server and folder: it can be turned off from a
+/// terminal, where nothing tells the app.
+const STILL_ON: Duration = Duration::from_secs(10);
 /// More pages than any inventory has: a server that never ends its list is
 /// given up on.
 const MOST_PAGES: usize = 10_000;
@@ -69,6 +74,8 @@ struct State {
     /// Goes up whenever what's known is dropped: an answer asked for
     /// before that is about how things were, and isn't kept.
     age: u64,
+    /// When sync was last seen to be on for the list's server and folder.
+    seen_on: Option<Instant>,
 }
 
 impl State {
@@ -112,6 +119,8 @@ impl State {
                 );
                 self.held = Some(Arc::new(held));
                 self.again = Some(now + FRESH);
+                // The asking looked.
+                self.seen_on = Some(now);
             }
             Err(why) => {
                 tracing::debug!("not playing from this computer's copy: {why}");
@@ -143,6 +152,20 @@ impl Local {
     /// what's known is dropped, and asked for afresh.
     pub fn forget(&self) {
         self.state.lock().expect("local lock").start_over(None);
+    }
+
+    /// Whether sync is on now for the server and the folder `held` is of.
+    /// Blocks for as long as systemd takes to say.
+    fn still_on(&self, held: &Held) -> bool {
+        let Ok(config) = Config::load(&self.file) else {
+            return false;
+        };
+        config.server.as_deref() == Some(held.server.as_str())
+            && config
+                .root
+                .and_then(|root| std::fs::canonicalize(root).ok())
+                .is_some_and(|root| root == held.root)
+            && self.service.state().enabled
     }
 
     /// The folder and the list for `server`, if sync is on for it. Blocks
@@ -232,6 +255,13 @@ fn open(root: &Path, path: &str, size: u64) -> Option<File> {
         return None;
     }
     let file = File::open(&real).ok()?;
+    // The path can have changed between the look and the open (a link put
+    // where a folder was): what counts is the file that was opened, and
+    // the kernel says where that one is.
+    let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+    if opened != real {
+        return None;
+    }
     let meta = file.metadata().ok()?;
     (meta.is_file() && meta.len() == size).then_some(file)
 }
@@ -253,10 +283,35 @@ impl LocalFiles for Local {
                     state.finish(ticket, answer, Instant::now());
                 });
             }
-            state.held.clone()?
+            let held = state.held.clone()?;
+            let looked = state
+                .seen_on
+                .is_some_and(|at| at + STILL_ON > Instant::now());
+            (held, looked, state.age)
         };
+        let (held, looked, age) = held;
         if held.server != server {
             return None;
+        }
+        // Sync can be turned off, or moved, without the app hearing of it
+        // (systemctl, `coversync setup`): looked at again every little
+        // while, on this thread, which may wait for it.
+        if !looked {
+            let on = self.still_on(&held);
+            let mut state = self.state.lock().expect("local lock");
+            if state.age == age {
+                if on {
+                    state.seen_on = Some(Instant::now());
+                } else {
+                    tracing::debug!("sync is no longer on here: not playing from the copy");
+                    state.start_over(Some(server.clone()));
+                    // Asked again in a while, not at every track.
+                    state.again = Some(Instant::now() + RETRY);
+                }
+            }
+            if !on {
+                return None;
+            }
         }
         let (path, size) = held.tracks.get(&id)?;
         let content_type = content_type(path)?;
@@ -375,6 +430,68 @@ mod tests {
             state.held.as_ref().map(|h| h.server.as_str()),
             Some("https://b/")
         );
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn sync_turned_off_or_moved_behind_the_apps_back_is_seen() {
+        use crate::sync::ServiceState;
+
+        struct Switch(Mutex<bool>);
+        impl Service for Switch {
+            fn state(&self) -> ServiceState {
+                ServiceState {
+                    installed: true,
+                    enabled: *self.0.lock().unwrap(),
+                    ..Default::default()
+                }
+            }
+            fn turn(&self, on: bool) -> Result<(), String> {
+                *self.0.lock().unwrap() = on;
+                Ok(())
+            }
+            fn restart(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let dir = scratch("still-on");
+        let (root, other) = (dir.join("music"), dir.join("other"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let file = dir.join("sync.json");
+        let set = |server: &str, root: &Path| {
+            Config {
+                server: Some(server.into()),
+                root: Some(root.to_owned()),
+                ..Default::default()
+            }
+            .save(&file)
+            .unwrap()
+        };
+        let switch = Arc::new(Switch(Mutex::new(true)));
+        let local = Local::new(file.clone(), switch.clone());
+        let list = Held {
+            server: "https://a/".into(),
+            root: root.clone(),
+            tracks: HashMap::new(),
+        };
+        set("https://a/", &root);
+        assert!(local.still_on(&list));
+        // Turned off from a terminal.
+        switch.turn(false).unwrap();
+        assert!(!local.still_on(&list));
+        switch.turn(true).unwrap();
+        // Moved to another folder, or another server, with `coversync setup`.
+        set("https://a/", &other);
+        assert!(!local.still_on(&list));
+        set("https://b/", &root);
+        assert!(!local.still_on(&list));
+        set("https://a/", &root);
+        assert!(local.still_on(&list));
+        // The settings gone altogether.
+        std::fs::remove_file(&file).unwrap();
+        assert!(!local.still_on(&list));
     }
 
     // Bugs caught: 0, False positives: 0

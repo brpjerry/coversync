@@ -651,8 +651,14 @@ folder, and the server isn't asked. Which tracks those are comes from the
 server's inventory for this computer's device, asked again every five
 minutes; a file is used only if it is in the folder itself with the size the
 server has for it, and anything else is streamed as before
-(`crates/coversync-desktop-core/src/local.rs`). With sync off, nothing is
-played from the copy.
+(`crates/coversync-desktop-core/src/local.rs`). A copy is told by its place
+and its size, as the sync engine tells one, and isn't read through first: a
+file changed on the computer without changing its length is played as it
+is, until **Check files** in Sync setup finds it. The inventory is asked for
+as the app's own device, so the app has to be paired with the server, not
+signed in with the password. With sync off, nothing is played from the
+copy, within ten seconds of turning it off, from the page or from a
+terminal.
 
 Qt WebEngine has no momentum for two-finger scrolling on Linux, so the app
 carries a scroll on itself once the fingers lift (`cpp/momentum.h`, which
