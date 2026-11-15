@@ -10,3 +10,7 @@ description = "The sync API's requests and replies, shared by coversyncd and its
 blake3 = "1.8.7"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+# The example client.
+ureq = "3.5.0"
