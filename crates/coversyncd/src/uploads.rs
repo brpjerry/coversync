@@ -11,16 +11,16 @@
 //! - `POST /api/uploads/{id}/finish` moves the files into the uploads folder
 //!   and starts a scan, so the album shows up in the Inbox.
 //!   `DELETE /api/uploads/{id}` cancels.
-//! - `GET /api/uploads/albums?folder=NAME` names the Inbox albums with files
-//!   in that folder of the uploads folder, once a scan has found them: the
-//!   albums a finished upload became.
+//! - `GET /api/uploads/albums?path=PATH` names the Inbox albums with files
+//!   in the folder a finished upload went into, once a scan has found them:
+//!   the albums it became.
 //!
 //! Uploads take no lock that other uploads, scans or imports wait on, and
 //! never the jobs lock: chunks stream from the network to their file at
 //! their offset through large buffers, the disk writes overlapping the
 //! network reads.
 
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -112,8 +112,9 @@ async fn status(
 
 #[derive(Deserialize)]
 struct AlbumsQuery {
-    /// A folder in the uploads folder, as finishing named it.
-    folder: String,
+    /// Where an upload went, as finishing answered: it stays that folder
+    /// after the uploads folder changes.
+    path: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -121,24 +122,21 @@ struct AlbumsResponse {
     albums: Vec<String>,
 }
 
-/// The Inbox albums with files in a folder of the uploads folder, such as the
-/// one a finished upload went into, as the last scan found them.
+/// The Inbox albums with files in the folder a finished upload went into, as
+/// the last scan found them.
 async fn albums(
     State(state): State<Shared>,
     Query(q): Query<AlbumsQuery>,
 ) -> ApiResult<Json<AlbumsResponse>> {
     blocking(&state, move |s| {
-        let name = q.folder;
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        let dir = q.path;
+        if !dir.is_absolute() || dir.components().any(|c| c == Component::ParentDir) {
             return Err(coversync_core::Error::Invalid(format!(
-                "“{name}” isn't a folder name in the uploads folder."
+                "“{}” isn't where an upload went: an absolute path, as finishing answered.",
+                dir.display()
             )));
         }
-        let Some(uploads) = s.uploads.folder() else {
-            return Ok(AlbumsResponse { albums: Vec::new() });
-        };
         // As the scan found it: links followed.
-        let dir = uploads.join(&name);
         let dir = dir.canonicalize().unwrap_or(dir);
         Ok(AlbumsResponse {
             albums: s.lib.inbox_albums_under(&dir)?,

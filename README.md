@@ -265,11 +265,10 @@ changing it.
    while it runs, gives the same answer, for a day (until coversyncd
    restarts).
    `DELETE /api/uploads/{id}` cancels.
-5. `GET /api/uploads/albums?folder=NAME` names the Inbox albums with files in
-   that folder of the uploads folder (the one finishing answered with), once
-   a scan has found them: `{"albums": [id, …]}`. A folder such as `CD1`
-   uploaded on its own counts too, though its album is filed under the
-   folder above.
+5. `GET /api/uploads/albums?path=PATH`, with the `path` finishing answered
+   with, names the Inbox albums with files in that folder, once a scan has
+   found them: `{"albums": [id, …]}`. A folder such as `CD1` uploaded on its
+   own counts too, though its album is filed under the folder above.
 
 Until it's finished, an upload is kept in `.coversync-uploads` in the uploads
 folder, which the scanner skips. Chunks are written straight into the files

@@ -150,13 +150,13 @@ new MutationObserver(look).observe(document.body, {subtree: true, childList: tru
 
 # The same files, sent by plain XMLHttpRequests, K in flight, then finished.
 RAW = """
-const [base, K, done] = arguments;
+const [base, K, paths, done] = arguments;
 const files = [...document.querySelector('#stash').files];
 const CHUNK = 16 << 20;
 (async () => {
   const t0 = performance.now();
   const start = await fetch(base + 'api/uploads', {method: 'POST', headers: {'content-type': 'application/json'},
-    body: JSON.stringify({folder: 'raw', files: files.map((f) => ({path: f.name, size: f.size}))})}).then((r) => r.json());
+    body: JSON.stringify({folder: 'raw', files: files.map((f, i) => ({path: paths[i], size: f.size}))})}).then((r) => r.json());
   if (!start.id) throw JSON.stringify(start);
   const jobs = [];
   files.forEach((f, i) => { for (let o = 0; o < f.size; o += CHUNK) jobs.push([i, o, Math.min(CHUNK, f.size - o)]); });
@@ -239,6 +239,10 @@ def main():
                " && !document.querySelector('[aria-busy=true]')", 60)
         info = d.run("const [path, done] = arguments; fetch(path + 'api/uploads').then((r) => r.json()).then(done)", path)
         files = files_in(folders, set(info["extensions"]))
+        # For --raw, each file's path under its folder, numbered by folder:
+        # CD1/01.flac and CD2/01.flac stay apart.
+        relative = [f"{i}/{os.path.relpath(f, folder)}" for i, folder in enumerate(folders)
+                    for f in files_in([folder], set(info["extensions"]))]
         size = sum(os.path.getsize(f) for f in files)
         proto = d.js("return performance.getEntriesByType('navigation')[0].nextHopProtocol")
         print(f"{args.browser} over {proto}: {len(files)} files, {size} bytes", flush=True)
@@ -246,7 +250,7 @@ def main():
         if args.raw:
             d.js("const i = document.createElement('input'); i.type = 'file'; i.multiple = true; i.id = 'stash'; document.body.append(i)")
             d.set_files("#stash", files)
-            r = d.run(RAW, path, args.raw)
+            r = d.run(RAW, path, args.raw, relative)
             if "error" in r:
                 sys.exit(f"raw: {r['error']}")
             print(f"plain XHRs, {args.raw} in flight: {r['total']:.2f} s, {rate(r['bytes'], r['total'])}"
@@ -305,6 +309,9 @@ def main():
                 print(f"    {at['done']:.2f} s, {rate(size, at['done'])}"
                       f" (sending {at['done'] - finishing - at.get('sending', 0):.2f} s, finishing {finishing:.2f} s)")
             print(f"    {ps[-1]['text']}")
+        failed = [ps[-1] for ps in by.values() if ps[-1]["phase"] == "failed"]
+        if failed:
+            sys.exit("failed: " + "; ".join(f"{p['name']}: {p['text']}" for p in failed))
         if args.album:
             began = time.time()
             d.wait(f"return document.querySelectorAll('.panel li.done .act').length >= {expected}", 300)

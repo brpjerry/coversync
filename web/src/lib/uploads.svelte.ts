@@ -40,6 +40,8 @@ export interface UploadItem {
 	skipped: string[];
 	/** Where it went on the server, once done. */
 	path: string | null;
+	/** Cancel can stop it now (not while it's finishing). */
+	cancellable: boolean;
 	/** The Inbox albums found in it, once scanned. */
 	albums: string[];
 	/** The Inbox has been scanned since it was done. */
@@ -169,6 +171,7 @@ class Uploads {
 			retryAt: null,
 			skipped: [],
 			path: null,
+			cancellable: true,
 			albums: [],
 			scanned: false,
 			...item
@@ -237,16 +240,17 @@ class Uploads {
 		const done = this.#doneAt.get(item.key);
 		if (item.phase !== 'done' || done === undefined) return;
 		let albums = item.albums;
-		if (Date.now() - done < LOOK_MS) {
+		if (item.path && Date.now() - done < LOOK_MS) {
 			const n = (this.#lookups.get(item.key) ?? 0) + 1;
 			this.#lookups.set(item.key, n);
-			const found = await api.uploadAlbums(item.folder).then(
+			const found = await api.uploadAlbums(item.path).then(
 				(r) => r.albums,
 				() => null
 			);
-			// A later lookup answered first, or it couldn't be had: leave it.
-			if (this.#lookups.get(item.key) !== n || !found) return;
-			albums = found;
+			// A later lookup answered first: it says.
+			if (this.#lookups.get(item.key) !== n) return;
+			// One that couldn't be had keeps what was found before.
+			if (found) albums = found;
 		}
 		const shown = albums.filter((id) => this.#shown.has(id));
 		if (shown.join() !== item.albums.join()) this.#update(item.key, { albums: shown });
@@ -372,6 +376,7 @@ class Uploads {
 		}
 		this.#update(key, {
 			phase: u.phase,
+			cancellable: u.cancellable,
 			received: u.received,
 			error: u.error,
 			retryAt: u.retryAt,

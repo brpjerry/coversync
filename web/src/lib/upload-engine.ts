@@ -136,6 +136,18 @@ export class Upload {
 		return Math.max(this.held, Math.min(n, this.size));
 	}
 
+	/**
+	 * Whether Cancel can stop it: not once it's finishing, nor while a finish
+	 * whose answer was lost is asked again, as it may have gone through.
+	 */
+	get cancellable() {
+		return (
+			this.active &&
+			this.phase !== 'finishing' &&
+			!(this.phase === 'retrying' && this.step === 'finish')
+		);
+	}
+
 	get active() {
 		return (
 			this.phase === 'queued' ||
@@ -174,7 +186,7 @@ export class Uploader {
 
 	/** Stop an upload, and remove what the server has of it. Finishing can't be stopped. */
 	cancel(u: Upload) {
-		if (!u.active || u.phase === 'finishing') return;
+		if (!u.cancellable) return;
 		const id = u.id;
 		// Being started: the start's answer is dropped when it comes.
 		this.#halt(u, 'cancelled');
@@ -213,12 +225,14 @@ export class Uploader {
 	 */
 	abandon() {
 		for (const id of this.#deleting) this.transport.cancel(id, true).catch(() => {});
-		for (const u of this.#uploads) {
-			if (!u.active || u.phase === 'finishing') continue;
+		const stopped = this.#uploads.filter((u) => u.cancellable);
+		for (const u of stopped) {
 			const id = u.id;
 			this.#halt(u, 'cancelled');
 			if (id) this.transport.cancel(id, true).catch(() => {});
 		}
+		// Once the cancels are out: a page kept in the back-forward cache shows them when it's back.
+		for (const u of stopped) this.#changed(u);
 	}
 
 	#changed(u: Upload, progress = false) {

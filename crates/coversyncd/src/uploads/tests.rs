@@ -413,12 +413,12 @@ async fn upload(app: &App, folder: &str, files: &[(&str, &[u8])]) -> Value {
 }
 
 #[tokio::test]
-async fn an_uploads_albums_are_found_by_its_folder() {
+async fn an_uploads_albums_are_found_where_it_went() {
     let app = app("albums");
     let src = app.dir.join("src");
     let one = wav(&src, "One", "Two Discs", 1);
     let two = wav(&src, "Two", "Two Discs", 1);
-    upload(
+    let discs = upload(
         &app,
         "Two Discs",
         &[("CD1/01 One.wav", &one), ("CD2/01 Two.wav", &two)],
@@ -428,26 +428,34 @@ async fn an_uploads_albums_are_found_by_its_folder() {
     // A disc folder uploaded on its own: the scan files its album under the
     // folder above, the uploads folder.
     let solo = wav(&src, "Solo", "Lone Disc", 1);
-    let done = upload(&app, "CD1", &[("01 Solo.wav", &solo)]).await;
-    assert_eq!(done["folder"], "CD1");
+    let disc = upload(&app, "CD1", &[("01 Solo.wav", &solo)]).await;
     let lone = app.album_appears("Lone Disc").await;
     let app = &app;
-    let albums = |folder: &'static str| async move {
-        let path = format!("/api/uploads/albums?folder={folder}");
+    let albums = |path: String| async move {
+        let path = format!("/api/uploads/albums?path={}", path.replace(' ', "%20"));
         app.call(Method::GET, &path, None).await
     };
+    let at = |done: &Value| done["path"].as_str().unwrap().to_owned();
     assert_eq!(
-        albums("Two%20Discs").await,
+        albums(at(&discs)).await,
         (StatusCode::OK, json!({ "albums": [both["id"]] }))
     );
     assert_eq!(
-        albums("CD1").await,
+        albums(at(&disc)).await,
         (StatusCode::OK, json!({ "albums": [lone["id"]] }))
     );
-    // Not a prefix of another folder's name, and nothing outside the uploads folder.
-    assert_eq!(albums("Two").await.1, json!({ "albums": [] }));
-    assert_eq!(albums("..").await.0, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(albums("a%2F..").await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    // Not a prefix of another folder's name; only absolute paths, without `..`.
+    let uploads = app.inbox.join("Uploads").display().to_string();
+    assert_eq!(
+        albums(format!("{uploads}/Two")).await.1,
+        json!({ "albums": [] })
+    );
+    assert_eq!(
+        albums("Uploads/CD1".into()).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let up = format!("{uploads}/CD1/..");
+    assert_eq!(albums(up).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]

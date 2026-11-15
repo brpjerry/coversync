@@ -753,9 +753,9 @@ export const api = {
 	upload: (id: string) => request<ServerUpload>(`/api/uploads/${encodeURIComponent(id)}`),
 	finishUpload: (id: string) =>
 		request<FinishedUpload>(`/api/uploads/${encodeURIComponent(id)}/finish`, { method: 'POST' }),
-	/** The Inbox albums with files in `folder` of the uploads folder, as the last scan found them. */
-	uploadAlbums: (folder: string) =>
-		request<{ albums: string[] }>(`/api/uploads/albums?folder=${encodeURIComponent(folder)}`),
+	/** The Inbox albums with files where an upload went (finishing's `path`), as the last scan found them. */
+	uploadAlbums: (path: string) =>
+		request<{ albums: string[] }>(`/api/uploads/albums?path=${encodeURIComponent(path)}`),
 	/** `keepalive`: sent even as the page goes away. */
 	cancelUpload: (id: string, keepalive = false) =>
 		request<void>(`/api/uploads/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),

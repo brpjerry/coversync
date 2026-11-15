@@ -116,7 +116,7 @@
 								<span class="mark bad"><TriangleAlert size={15} strokeWidth={2.2} /></span>
 							{/if}
 							<span class="name" title={name(item)}>{name(item)}</span>
-							{#if isActive(item.phase) && item.phase !== 'finishing'}
+							{#if isActive(item.phase) && item.phase !== 'finishing' && item.cancellable}
 								<button
 									class="icon-btn small"
 									onclick={() => uploads.cancel(item.key)}
