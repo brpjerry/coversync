@@ -1429,4 +1429,7 @@ async fn an_app_reads_only_its_own_sync_settings() {
         .call("GET", &url(player, "settings"), &cookie, None)
         .await;
     assert_eq!(body(res).await["settings"]["fat_safe"], json!(true));
+    let listed = app.devices(&cookie).await;
+    let all = listed["devices"].as_array().unwrap();
+    assert!(all.iter().all(|d| d["sync"].is_object()), "{listed}");
 }

@@ -233,7 +233,7 @@ fn own_device_only(access: &Access, id: i64) -> Result<(), Refusal> {
     Err(Refusal::new(
         StatusCode::FORBIDDEN,
         "other_device",
-        "An app can only read its own sync settings.",
+        "An app can only read its own sync settings and paths.",
     ))
 }
 

@@ -944,6 +944,7 @@
 		poll();
 		appearance.refresh();
 		syncSetup.refresh();
+		devices.load();
 		setup.refresh();
 		inboxSetup.refresh();
 		dataGeneration++;

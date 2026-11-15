@@ -116,7 +116,8 @@
 		const sent = JSON.stringify(syncDraft);
 		const width = syncDraft.maxWidth;
 		const settings: DeviceSettings = {
-			structure: syncDraft.own ? syncDraft.structure.trim() || null : null,
+			// Its own left blank is refused, not taken for the Library's.
+			structure: syncDraft.own ? syncDraft.structure : null,
 			fat_safe: syncDraft.fatSafe,
 			art: {
 				cover_file: syncDraft.coverFile,

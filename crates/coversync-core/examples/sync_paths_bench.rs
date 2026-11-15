@@ -1,6 +1,7 @@
 //! Time working out where every Library file goes on a device: the catalog
 //! read and the paths, for the Library's folder structure and a device's
-//! own, each with and without FAT-safe names.
+//! own, each with and without FAT-safe names, and for one that puts
+//! thousands of files at the same path, to be numbered.
 //!
 //! Usage: cargo run --release -p coversync-core --example sync_paths_bench -- STATE [--create]
 //!
@@ -29,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, true),
         (Some(DEFAULT), false),
         (Some(DEFAULT), true),
+        (Some("{genre}"), false),
     ] {
         let settings = DeviceSettings {
             structure: structure.map(str::to_string),

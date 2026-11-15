@@ -363,11 +363,12 @@ pub fn fat_name(name: &str, file: bool) -> String {
         (clean.as_str(), "")
     };
     let tidy = |s: &str| s.trim().trim_end_matches(['.', ' ']).to_string();
-    let mut stem = tidy(stem);
+    let max = MAX_NAME - ext.len();
+    let mut stem = tidy(cut(&tidy(stem), max));
+    // Checked once cut, which can leave a reserved name behind.
     if reserved(&stem) {
-        stem.insert(0, '_');
+        stem = tidy(cut(&format!("_{stem}"), max));
     }
-    let stem = tidy(cut(&stem, MAX_NAME - ext.len()));
     if stem.is_empty() {
         format!("_{ext}")
     } else {
@@ -524,6 +525,9 @@ mod tests {
         assert_eq!(fat_name(&accent, true), format!("{}.flac", "a".repeat(174)));
         let family = format!("{}👨\u{200d}👩", "b".repeat(170));
         assert_eq!(fat_name(&family, false), "b".repeat(170));
+        // A name the cut leaves reserved is caught too.
+        let padded = format!("CON{}X.flac", " ".repeat(174));
+        assert_eq!(fat_name(&padded, true), "_CON.flac");
     }
 
     #[test]

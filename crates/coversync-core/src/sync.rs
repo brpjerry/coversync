@@ -71,17 +71,21 @@ impl Default for DeviceArt {
 }
 
 impl DeviceSettings {
-    /// Check settings as typed, and tidy them: a blank folder structure is
-    /// the Library's.
+    /// Check settings as typed, and tidy them. A folder structure of its
+    /// own must be one: a blank one is refused, not taken for the Library's.
     pub fn normalize(mut self) -> Result<Self> {
-        self.structure = self
-            .structure
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        self.structure = self.structure.map(|s| s.trim().to_string());
         if let Some(structure) = &self.structure {
             Template::parse(structure)?;
         }
         self.art.cover_name = art::cover_file_name(&self.art.cover_name)?;
+        if self.fat_safe && template::fat_name(&self.art.cover_name, false) != self.art.cover_name {
+            return Err(Error::Invalid(
+                "With FAT-safe names, the cover file name can't hold : ? * \" < > | or end in a \
+                 dot or space, nor be a name Windows keeps for itself, such as CON."
+                    .into(),
+            ));
+        }
         if let Some(width) = self.art.max_width
             && !ART_WIDTHS.contains(&width)
         {
@@ -226,21 +230,56 @@ fn tag_values(json: &str, kinds: &[&'static str]) -> HashMap<&'static str, Strin
         .collect()
 }
 
-/// Number the files whose path, case aside, an earlier one has. Returns
-/// how many were numbered.
+/// Number the files whose path, case aside, a folder or an earlier file
+/// has. Returns how many were numbered.
 fn keep_apart(files: &mut [DeviceFile]) -> usize {
-    let mut taken: HashSet<String> = HashSet::with_capacity(files.len());
+    let mut taken: HashSet<String> = HashSet::with_capacity(files.len() * 2);
+    // Folders first: a file can take another name, a folder holds files.
+    // Once a folder is taken, so are the folders it is in.
+    let mut last = "";
+    for file in files.iter() {
+        let mut dir = file.path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        if dir == last {
+            continue;
+        }
+        last = dir;
+        while !dir.is_empty() && taken.insert(case_key(dir)) {
+            dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
     let clashes: Vec<usize> = (0..files.len())
-        .filter(|&i| !taken.insert(files[i].path.to_lowercase()))
+        .filter(|&i| !taken.insert(case_key(&files[i].path)))
         .collect();
+    // The next number for each path, so files sharing one are numbered in
+    // one count rather than each from 2.
+    let mut next: HashMap<String, usize> = HashMap::new();
     for &i in &clashes {
-        let path = &files[i].path;
-        files[i].path = (2..)
-            .map(|n| numbered(path, n))
-            .find(|p| taken.insert(p.to_lowercase()))
-            .expect("some number is free");
+        let path = std::mem::take(&mut files[i].path);
+        let n = next.entry(case_key(&path)).or_insert(2);
+        files[i].path = loop {
+            let candidate = numbered(&path, *n);
+            *n += 1;
+            if taken.insert(case_key(&candidate)) {
+                break candidate;
+            }
+        };
     }
     clashes.len()
+}
+
+/// A path as FAT, exFAT and Android's shared storage compare names: each
+/// letter as its capital, so case aside, and σ and ς alike.
+fn case_key(path: &str) -> String {
+    path.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(u), None) => u,
+                // ß has no one-letter capital, and stays itself.
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 /// `path` with " (n)" after its file name's stem.
@@ -379,6 +418,36 @@ mod tests {
             ]
         );
         assert_eq!(renamed, 2);
+    }
+
+    #[test]
+    fn clashing_paths_are_numbered() {
+        let tracks = [
+            ("A.flac", ""),
+            ("X.flac", ""),
+            ("a.flac/1.flac", ""),
+            ("x (2).flac", ""),
+            ("x.flac", ""),
+            ("Σ.flac", ""),
+            ("ς.flac", ""),
+        ];
+        let (got, _, renamed) = paths(&tracks, DeviceSettings::default());
+        assert_eq!(
+            got,
+            [
+                // A folder has the name, case aside.
+                "A (2).flac",
+                "X.flac",
+                "a.flac/1.flac",
+                "x (2).flac",
+                // Its first free number.
+                "x (3).flac",
+                "Σ.flac",
+                // ς's capital is Σ.
+                "ς (2).flac",
+            ]
+        );
+        assert_eq!(renamed, 3);
     }
 
     #[test]

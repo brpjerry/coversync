@@ -67,7 +67,7 @@ const OPEN: &[&str] = &[
 ];
 
 /// Routes a `sync` token may use besides SYN-04's: checking how it's signed
-/// in. It may also read its own sync settings (see
+/// in. It may also read its own sync settings and paths (see
 /// [`devices::sync_readable`]).
 const SYNC_OPEN: &[&str] = &["/api/session"];
 
@@ -504,7 +504,7 @@ pub async fn guard(State(state): State<Shared>, mut req: Request, next: Next) ->
             error(
                 StatusCode::FORBIDDEN,
                 "sync_only",
-                "This device may only sync, and syncing isn't available yet.",
+                "This device may only sync; it can't use this route.",
             )
         }
         Ok(access) => {

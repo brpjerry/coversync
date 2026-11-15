@@ -111,8 +111,11 @@
 
 	<div class="suggestions" role="group" aria-label="Suggested structures">
 		{#each suggestions as s (s)}
-			<button class="suggestion" class:on={value.trim() === s} onclick={() => (value = s)}
-				>{s}</button
+			<button
+				type="button"
+				class="suggestion"
+				class:on={value.trim() === s}
+				onclick={() => (value = s)}>{s}</button
 			>
 		{/each}
 	</div>
@@ -179,6 +182,7 @@
 	<div class="core-vars" role="group" aria-label="Insert a core variable">
 		{#each coreVars as v (v.id)}
 			<button
+				type="button"
 				class="var-chip"
 				onclick={() => insert(v.id)}
 				title="Insert {`{${v.id}}`} ({v.label})"
@@ -191,7 +195,7 @@
 		<input class="var-filter" placeholder="Filter variables" bind:value={varFilter} />
 		<div class="var-grid">
 			{#each shownVars as v (v.id)}
-				<button class="var" onclick={() => insert(v.id)} title="Insert {`{${v.id}}`}">
+				<button type="button" class="var" onclick={() => insert(v.id)} title="Insert {`{${v.id}}`}">
 					<code>{`{${v.id}}`}</code><span>{v.label}</span>
 				</button>
 			{/each}
