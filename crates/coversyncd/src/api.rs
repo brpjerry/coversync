@@ -916,9 +916,9 @@ struct TagWrite {
     /// an edit elsewhere that gave it a new id (a new title does) is
     /// reported as a conflict with the album under its new id. A track
     /// counts only at the path it had, since a removed track's id can go to
-    /// a new file. When none of them is left (its files were all re-created
-    /// or renamed, say), or without them, the album is the one its id names
-    /// now.
+    /// a new file in a database restored from an older copy. When none of
+    /// them is left (its files were all re-created or renamed, say), or
+    /// without them, the album is the one its id names now.
     #[serde(default)]
     base_tracks: Option<Vec<BaseTrack>>,
 }
@@ -1442,6 +1442,25 @@ mod tests {
         }
     }
 
+    /// Give the Inbox file at `path` the track id `id`, as a local database
+    /// restored from an older copy can: the ids it had given out since the
+    /// copy was made go to other files.
+    fn give_id(inbox: &FsPath, path: &FsPath, id: i64) {
+        let db = inbox
+            .parent()
+            .unwrap()
+            .join("state")
+            .join(coversync_core::db::LOCAL_DB);
+        let moved = rusqlite::Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE tracks SET id = ?1 WHERE path = ?2",
+                rusqlite::params![id, path.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "{}", path.display());
+    }
+
     /// The genre each of an album's files is tagged with now.
     fn genres(state: &Shared, album: &AlbumDetail) -> Vec<Option<String>> {
         album
@@ -1615,21 +1634,17 @@ mod tests {
     #[tokio::test]
     async fn a_track_id_used_again_comes_back_at_another_path() {
         let (state, inbox) = editing_daemon("conflict-reused-id");
-        // The track with the highest id: SQLite gives the next row its id
-        // once it's gone.
-        let albums = [detail(&state, "Record"), detail(&state, "Other")];
-        let (base, last) = albums
-            .iter()
-            .flat_map(|a| a.tracks.iter().map(move |t| (a, t)))
-            .max_by_key(|(_, t)| t.id)
-            .unwrap();
+        let base = detail(&state, "Record");
+        let last = base.tracks.last().unwrap();
         let folder = inbox.join(&base.album.title);
         std::fs::remove_file(inbox.join(&last.rel_path)).unwrap();
         rescan_now(&state);
         track(&inbox, &base.album.title, 9);
         rescan_now(&state);
+        // The new file gets the removed track's id.
+        give_id(&inbox, &folder.join("09.flac"), last.id);
         let now =
-            conflict(put(&state, &base.album.id, save_on(base, genre("Rock"))).await).unwrap();
+            conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).unwrap();
         let again = now
             .tracks
             .iter()
@@ -1643,18 +1658,17 @@ mod tests {
     #[tokio::test]
     async fn an_album_whose_ids_all_went_to_new_files_is_not_followed() {
         let (state, inbox) = editing_daemon("conflict-reused-album");
-        // The album holding the highest ids: SQLite gives them to the next
-        // files once it's gone.
-        let base = [detail(&state, "Record"), detail(&state, "Other")]
-            .into_iter()
-            .max_by_key(|a| a.tracks.iter().map(|t| t.id).max())
-            .unwrap();
+        let base = detail(&state, "Record");
         std::fs::remove_dir_all(inbox.join(&base.album.title)).unwrap();
         rescan_now(&state);
         for n in 1..=base.tracks.len() {
             track(&inbox, "Fresh", n as u32);
         }
         rescan_now(&state);
+        // The new files get the removed tracks' ids.
+        for (n, t) in (1..).zip(&base.tracks) {
+            give_id(&inbox, &inbox.join(format!("Fresh/{n:02}.flac")), t.id);
+        }
         let fresh = detail(&state, "Fresh");
         let ids = |a: &AlbumDetail| {
             let mut ids: Vec<i64> = a.tracks.iter().map(|t| t.id).collect();
