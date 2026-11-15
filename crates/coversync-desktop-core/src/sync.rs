@@ -67,11 +67,22 @@ impl Config {
         let mut text = serde_json::to_vec_pretty(&config)
             .map_err(|e| format!("{} can't be written: {e}.", file.display()))?;
         text.push(b'\n');
-        let tmp = file.with_extension("json.new");
-        let mut out = fs::File::create(&tmp).map_err(failed)?;
-        out.write_all(&text).map_err(failed)?;
-        out.sync_all().map_err(failed)?;
-        fs::rename(&tmp, file).map_err(failed)
+        // A file of this save's own: two saves at once (the app and the
+        // command, say) mustn't write into each other's.
+        let tmp = file.with_extension(format!("json.{}.new", std::process::id()));
+        let written = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut out| {
+                out.write_all(&text)?;
+                out.sync_all()
+            })
+            .and_then(|()| fs::rename(&tmp, file));
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written.map_err(failed)
     }
 }
 

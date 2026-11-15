@@ -662,3 +662,52 @@ async fn a_folder_emptied_under_a_running_agent_is_filled_again_by_sync_now() {
     a.caught_up(&d, before, "Sync now filling it").await;
     assert_eq!(a.stop().await, Ok(()));
 }
+
+// Bugs caught: 0, False positives: 0
+#[tokio::test]
+async fn a_wake_that_waited_is_still_owed_after_auto_sync_was_off_for_a_while() {
+    let d = Daemon::new("agent-wake-off-on");
+    let (id, token) = quick(&d, Scope::Sync);
+    covers_made(&d, &token).await;
+    let addr = serve(&d).await;
+    // The device is current as far as the server knows: a first folder
+    // holds everything.
+    std::fs::create_dir_all(d.dir.join("first")).unwrap();
+    let a = start(&d, addr, &token, "first");
+    a.caught_up(&d, 0, "the first folder's sync").await;
+    assert_eq!(a.stop().await, Ok(()));
+
+    // Another, empty folder is chosen, on a metered network: the look at
+    // it that starting owes has to wait.
+    std::fs::create_dir_all(d.dir.join("second")).unwrap();
+    let a = start_with(&d, addr, &token, "second", Conditions::known(true, false));
+    until(&a.lines, "waiting for the network", || {
+        a.lines.said("unmetered network") > 0
+    })
+    .await;
+    // Auto sync is turned off, then on again. The server has nothing
+    // pending for the device, so nothing it says would start a sync.
+    let auto = |enabled| DeviceSettings {
+        auto: AutoSync {
+            enabled,
+            quiet_seconds: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    d.settings(id, auto(false));
+    until(&a.lines, "saying auto sync is off", || {
+        a.lines.said("Auto sync is off") > 0
+    })
+    .await;
+    d.settings(id, auto(true));
+    until(&a.lines, "saying auto sync is on again", || {
+        a.lines.said("on again") > 0
+    })
+    .await;
+    assert!(tree(&a.root).is_empty(), "synced on a metered network");
+    // Unmetered: what was owed all along is done, and the folder fills.
+    a.feed.conditions.send(Conditions::FINE).unwrap();
+    a.caught_up(&d, 0, "the new folder filling").await;
+    assert_eq!(a.stop().await, Ok(()));
+}

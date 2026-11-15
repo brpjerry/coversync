@@ -30,7 +30,7 @@ use std::time::Duration;
 use coversync_proxy::Token;
 use coversync_replica::{
     Again, AutoSync, CancellationToken, Engine, Error, FsStorage, Observer, Options, Outcome,
-    Phase, Progress, Reason, Report, Server, Storage, Tls, Watch, WatchOptions,
+    Phase, Progress, Reason, Report, Server, StatusCheck, Storage, Tls, Watch, WatchOptions,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -152,6 +152,17 @@ pub fn may_sync(
     } else {
         Ok(())
     }
+}
+
+/// Why a sync under way for `reason` has to stop now, if it has to: one of
+/// the device's conditions no longer holds. Auto sync turned off lets the
+/// one under way finish, and takes none of its other conditions away.
+pub fn must_stop(reason: Reason, auto: Option<AutoSync>, now: Conditions) -> Option<Hold> {
+    let running = auto.map(|auto| AutoSync {
+        enabled: true,
+        ..auto
+    });
+    may_sync(reason, running, now, false).err()
 }
 
 /// The sync that's wanted, and when it may next be tried.
@@ -356,6 +367,8 @@ struct Memory {
     marked_before: bool,
     /// Whether the file says so too.
     saved: bool,
+    /// Whether a failure to write it has been said.
+    warned: bool,
 }
 
 impl Memory {
@@ -375,6 +388,14 @@ impl Memory {
             this,
             marked_before,
             saved: marked_before,
+            warned: false,
+        }
+    }
+
+    /// Writes down what's remembered, if that hasn't worked yet.
+    fn save(&mut self) {
+        if self.marked_before && !self.saved {
+            self.marked();
         }
     }
 
@@ -390,14 +411,28 @@ impl Memory {
             version: 1,
             marked: Some(self.this.clone()),
         };
+        // Whole and on the disk before it counts: the next run may be
+        // after a power cut, with the folder's disk not there.
+        let tmp = file.with_extension(format!("json.{}.new", std::process::id()));
         let written = file
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| serde_json::to_vec(&state).map_err(std::io::Error::other))
-            .and_then(|state| std::fs::write(file, state));
+            .and_then(|state| {
+                use std::io::Write;
+                let mut out = std::fs::File::create(&tmp)?;
+                out.write_all(&state)?;
+                out.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, file));
         match written {
             Ok(()) => self.saved = true,
-            Err(e) => tracing::warn!("couldn't note the sync in {}: {e}", file.display()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                if !std::mem::replace(&mut self.warned, true) {
+                    tracing::warn!("couldn't note the sync in {}: {e}", file.display());
+                }
+            }
         }
     }
 }
@@ -407,12 +442,16 @@ struct Progressing {
     shows: Arc<dyn Shows>,
     began: Instant,
     last: AtomicU64,
+    /// Told once the plan is in: the engine has put its marker in the
+    /// folder by then, and the downloads are about to start.
+    planned: Arc<tokio::sync::Notify>,
 }
 
 impl Observer for Progressing {
     fn phase(&self, phase: Phase) {
         match phase {
             Phase::Listing | Phase::Sampling { .. } => self.shows.status("Checking the folder."),
+            Phase::Planned { .. } => self.planned.notify_one(),
             _ => {}
         }
     }
@@ -610,7 +649,7 @@ impl Session<'_> {
             // is. (Turned on again, the watch asks the server for what was
             // left meanwhile.)
             let off = self.watch.auto().is_some_and(|auto| !auto.enabled);
-            if pending.reason.is_none() && off != off_shown {
+            if off != off_shown {
                 off_shown = off;
                 self.shows.status(if off {
                     Hold::Off.text()
@@ -618,6 +657,8 @@ impl Session<'_> {
                     "Auto sync is on again."
                 });
             }
+            // What couldn't be written down before may be now.
+            self.memory.save();
             let now = Instant::now();
             // A sync the agent starts by itself keeps to the device's
             // settings, so it waits for a new watch (after waking, or with
@@ -660,16 +701,16 @@ impl Session<'_> {
                         }
                         continue;
                     }
-                    Err(Hold::Off) => {
-                        pending.clear();
-                        held = None;
-                        off_shown = true;
-                        self.shows.status(Hold::Off.text());
-                    }
+                    // With auto sync off it waits like any other: what was
+                    // owed (a wake's look at the folder, say) is still owed
+                    // when it's turned on again. That it's off is said
+                    // above, whether anything waits or not.
                     Err(hold) => {
                         if held != Some(hold) {
-                            tracing::info!("{}", hold.text());
-                            self.shows.status(hold.text());
+                            if hold != Hold::Off {
+                                tracing::info!("{}", hold.text());
+                                self.shows.status(hold.text());
+                            }
                             held = Some(hold);
                         }
                     }
@@ -712,6 +753,17 @@ impl Session<'_> {
         }
     }
 
+    /// Whether the server has nothing more for this device and nobody has
+    /// asked. False when it can't be told.
+    async fn nothing_left(&self) -> bool {
+        match self.engine.status(None).await {
+            Ok(StatusCheck::Changed { status, .. }) => {
+                status.pending.files == 0 && status.preparing == 0 && !status.requested
+            }
+            _ => false,
+        }
+    }
+
     fn nudged(&mut self, nudge: Nudge) {
         match nudge {
             // A new watch: its first check is the device waking, and its
@@ -733,10 +785,12 @@ impl Session<'_> {
         tracing::info!(?reason, "syncing");
         self.shows.status("Syncing.");
         let cancel = CancellationToken::new();
+        let planned = Arc::new(tokio::sync::Notify::new());
         let observer = Arc::new(Progressing {
             shows: self.shows.clone(),
             began: Instant::now(),
             last: AtomicU64::new(u64::MAX),
+            planned: planned.clone(),
         });
         let sync = self.engine.sync(reason, observer, cancel.clone());
         tokio::pin!(sync);
@@ -746,6 +800,10 @@ impl Session<'_> {
         let mut hold: Option<Hold> = None;
         let mut woke = false;
         let mut network_back = false;
+        // When the device's settings are next looked at: kept across the
+        // loop's turns, so that other things happening often can't put it
+        // off for ever.
+        let mut look = Instant::now() + self.settings.look_again;
         let result = loop {
             tokio::select! {
                 result = &mut sync => break result,
@@ -765,27 +823,32 @@ impl Session<'_> {
                     self.conditions_gone = changed.is_err();
                     let conditions = *self.system.conditions.borrow();
                     // An auto sync goes on only while its conditions hold.
-                    // (Auto sync turned off lets the one under way finish.)
-                    match may_sync(reason, self.watch.auto(), conditions, false) {
-                        Err(why) if why != Hold::Off && hold.is_none() => {
-                            tracing::info!("stopping the sync: {}", why.text());
-                            hold = Some(why);
-                            cancel.cancel();
-                        }
-                        _ => {}
+                    if hold.is_none()
+                        && let Some(why) = must_stop(reason, self.watch.auto(), conditions)
+                    {
+                        tracing::info!("stopping the sync: {}", why.text());
+                        hold = Some(why);
+                        cancel.cancel();
                     }
                 }
                 // The device's settings can change under a sync as well
                 // (the watch hears of it without a word): looked at now
                 // and then, like the desktop's.
-                _ = tokio::time::sleep(self.settings.look_again), if hold.is_none() => {
+                _ = tokio::time::sleep_until(look), if hold.is_none() => {
+                    look = Instant::now() + self.settings.look_again;
                     let conditions = *self.system.conditions.borrow();
-                    if let Err(why) = may_sync(reason, self.watch.auto(), conditions, false)
-                        && why != Hold::Off
-                    {
+                    if let Some(why) = must_stop(reason, self.watch.auto(), conditions) {
                         tracing::info!("stopping the sync: {}", why.text());
                         hold = Some(why);
                         cancel.cancel();
+                    }
+                }
+                // The plan is in, so the engine's marker is in the folder:
+                // remembered now, before the downloads, which a power cut
+                // or a kill could end without another word.
+                _ = planned.notified() => {
+                    if self.folder.has_marker().await {
+                        self.memory.marked();
                     }
                 }
                 nudge = self.system.nudges.recv(), if !self.nudges_gone => match nudge {
@@ -838,6 +901,17 @@ impl Session<'_> {
                     // server tells of it again.
                     if report.outcome == Some(Outcome::Complete) {
                         self.watch.synced(report.target.as_deref());
+                        // A change heard while this sync ran may be one it
+                        // took along (a sync longer than the quiet period
+                        // hears of its own target that way): the server
+                        // says whether anything is left, which costs less
+                        // than a sync that finds nothing. Someone asking,
+                        // and a wake's look at the folder, stand.
+                        if matches!(queued, Some(Reason::Event | Reason::Timer))
+                            && self.nothing_left().await
+                        {
+                            queued = None;
+                        }
                     }
                     match follow_up(&report, failures) {
                         Some(wait) => Next::Retry(reason, wait),
@@ -918,6 +992,29 @@ mod tests {
             Err(Hold::Metered)
         );
         assert_eq!(may_sync(Reason::Wake, None, battery, false), Ok(()));
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_sync_under_way_keeps_its_conditions_when_auto_sync_is_turned_off() {
+        let off = AutoSync {
+            enabled: false,
+            ..AUTO
+        };
+        let metered = Conditions::known(true, false);
+        let battery = Conditions::known(false, true);
+        for reason in [Reason::Event, Reason::Timer, Reason::Wake] {
+            // Turning auto sync off doesn't stop it by itself...
+            assert_eq!(must_stop(reason, Some(off), FINE), None);
+            // ...and doesn't take its other conditions away either.
+            assert_eq!(must_stop(reason, Some(off), metered), Some(Hold::Metered));
+            assert_eq!(must_stop(reason, Some(off), battery), Some(Hold::Battery));
+            assert_eq!(must_stop(reason, Some(AUTO), metered), Some(Hold::Metered));
+            assert_eq!(must_stop(reason, Some(AUTO), FINE), None);
+        }
+        // Someone asked for this one: nothing stops it.
+        assert_eq!(must_stop(Reason::User, Some(off), metered), None);
+        assert_eq!(must_stop(Reason::User, Some(AUTO), battery), None);
     }
 
     // Bugs caught: 0, False positives: 0
@@ -1160,8 +1257,36 @@ mod tests {
         assert!(memory.marked_before && !memory.saved);
         assert!(!Memory::open(&elsewhere()).marked_before);
         std::fs::remove_file(&blocked).unwrap();
-        memory.marked();
+        // The loop's look, now and then, is enough: no new sync needed.
+        memory.save();
         assert!(memory.saved);
         assert!(Memory::open(&elsewhere()).marked_before);
+        // Nothing but the file is left where it's kept.
+        assert_eq!(std::fs::read_dir(&blocked).unwrap().count(), 1);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[tokio::test]
+    async fn the_plan_coming_in_is_passed_on_for_the_marker_to_be_remembered() {
+        struct Quiet;
+        impl Shows for Quiet {
+            fn status(&self, _: &str) {}
+        }
+        let planned = Arc::new(tokio::sync::Notify::new());
+        let observer = Progressing {
+            shows: Arc::new(Quiet),
+            began: Instant::now(),
+            last: AtomicU64::new(u64::MAX),
+            planned: planned.clone(),
+        };
+        let wait = |ms| tokio::time::timeout(Duration::from_millis(ms), planned.notified());
+        observer.phase(Phase::Starting);
+        observer.phase(Phase::Listing);
+        assert!(wait(20).await.is_err(), "told before the plan was in");
+        // Told from the engine's side before anyone waits: not lost.
+        observer.phase(Phase::Planned {
+            totals: Default::default(),
+        });
+        assert!(wait(1000).await.is_ok());
     }
 }

@@ -12,6 +12,7 @@ use coversync_cli::config::{self, Config};
 use coversync_cli::notify::Notifier;
 use coversync_cli::system::System;
 use coversync_cli::tokens::Source;
+use coversync_desktop_core::ConfigLock;
 use coversync_proxy::{AboutApp, Upstream};
 use coversync_replica::{CancellationToken, Options, WatchOptions};
 use tokio::signal::unix::{SignalKind, signal};
@@ -218,6 +219,23 @@ async fn run(
     }
 }
 
+/// Keeps the app out while a pairing replaces the keychain's token, which
+/// is the app's too. An app that's open still holds the token being
+/// replaced, and would take the server's refusal of that one as reason to
+/// remove the new one. So the app's own lock on its settings folder is
+/// held for the pairing, and an app that's open means no pairing here. A
+/// token file is nobody else's: no lock.
+fn apps_lock(tokens: &Source, settings: Option<&Path>) -> Result<Option<ConfigLock>, String> {
+    match (tokens, settings) {
+        (Source::Keychain, Some(settings)) => ConfigLock::take(settings).map(Some).map_err(|_| {
+            "The coversync app is open. Pair in its window instead, or close it first: it would \
+             undo a pairing made behind its back."
+                .to_owned()
+        }),
+        _ => Ok(None),
+    }
+}
+
 /// What the agent runs with, once the command's options and the settings
 /// file are put together.
 #[derive(Debug, PartialEq)]
@@ -313,6 +331,7 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
         None => config.token_file.clone(),
     };
     let tokens = token_file.clone().map_or(Source::Keychain, Source::File);
+    let _apps_lock = apps_lock(&tokens, config::file().parent()).map_err(setup_error)?;
     // Before the code is spent: there has to be somewhere for the token.
     tokens.ready().await.map_err(setup_error)?;
     let about = AboutApp {
@@ -405,6 +424,27 @@ mod tests {
         };
         let missing = resolve(no_folder, None, None, None).unwrap_err();
         assert!(missing.contains("No folder is set"), "{missing}");
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_keychain_isnt_paired_behind_the_open_apps_back() {
+        let dir = std::env::temp_dir().join(format!("coversync-cli-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // No app open: the pairing holds the lock itself, for as long as
+        // it takes.
+        let held = apps_lock(&Source::Keychain, Some(&dir)).unwrap();
+        assert!(held.is_some());
+        // The app (here, whoever holds its lock) is open: not now.
+        let refused = apps_lock(&Source::Keychain, Some(&dir))
+            .err()
+            .expect("refused while the lock is held");
+        assert!(refused.contains("app is open"), "{refused}");
+        // A token file is the command's own business either way.
+        let file = Source::File(dir.join("token"));
+        assert!(apps_lock(&file, Some(&dir)).unwrap().is_none());
+        drop(held);
+        assert!(apps_lock(&Source::Keychain, Some(&dir)).unwrap().is_some());
     }
 
     // Bugs caught: 0, False positives: 0
