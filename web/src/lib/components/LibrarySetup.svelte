@@ -105,7 +105,12 @@
 	const isOpen = (id: string) => terms.length > 0 || !!open[id];
 
 	/** The cover file name as it will be saved (the daemon trims the same way). */
-	let artName = $derived(setup.art.file_name.trim().replace(/\.(jpe?g|png|webp)$/i, '') || 'cover');
+	let artName = $derived(
+		setup.art.file_name
+			.trim()
+			.replace(/(?:\.(?:jpe?g|png|webp)\s*)+$/i, '')
+			.trimEnd() || 'cover'
+	);
 	let artNameBad = $derived(
 		/[/\\:*?"<>|]/.test(artName) ||
 			artName.startsWith('.') ||

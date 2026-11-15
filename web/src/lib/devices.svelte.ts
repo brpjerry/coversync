@@ -58,11 +58,12 @@ class DevicesStore {
 			return true;
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : failed, 'error', 6000);
-			// It may be gone, or changed elsewhere.
-			if (e instanceof ApiError && e.status === 404) this.load();
 			return false;
 		} finally {
 			delete this.busy[id];
+			// A load answered during the change was dropped, and the device
+			// may be gone or changed elsewhere: read the list again.
+			void this.load();
 		}
 	}
 
@@ -80,7 +81,8 @@ class DevicesStore {
 			async () => {
 				const sync = await api.saveDeviceSync(id, settings);
 				const device = this.list.find((d) => d.id === id);
-				if (device) device.sync = sync;
+				// Not over newer settings a reload already brought.
+				if (device && (!device.sync || device.sync.version <= sync.version)) device.sync = sync;
 			},
 			'Saving the sync settings failed'
 		);

@@ -9,8 +9,9 @@
 //! FAT32 or exFAT cards: values have the characters those can't hold
 //! replaced, a template's own text can't have them, names Windows keeps
 //! for devices (CON, NUL, COM1, …) get a `_` in front, and no name ends in
-//! a dot or space, is `..`, or is longer than [`MAX_NAME`] bytes. How long
-//! a whole path may be is up to where it goes.
+//! a dot or space or is `..`. A folder name or a file's name before its
+//! extension is at most [`MAX_NAME`] bytes. How long a whole path may be is
+//! up to where it goes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,8 +30,8 @@ pub const SUGGESTIONS: &[&str] = &[
 
 /// `{year}` is the first four digits of the date tag.
 pub const YEAR: &str = "year";
-/// The longest a variable can be limited to; a whole component is capped
-/// at [`MAX_NAME`] bytes anyway.
+/// The longest a variable can be limited to; a folder name or a file's
+/// name before its extension is capped at [`MAX_NAME`] bytes anyway.
 pub const MAX_LIMIT: usize = 180;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,8 +309,9 @@ fn finish(component: &str) -> String {
     cut(s, MAX_NAME).trim_end_matches(trailing).to_string()
 }
 
-/// The most bytes of UTF-8 a file or folder name gets: below what Linux
-/// (255 bytes), FAT32 and exFAT (255 UTF-16 units) allow.
+/// The most bytes of UTF-8 a folder name, or a file's name before its
+/// extension, gets: leaving room for the extension within what Linux (255
+/// bytes), FAT32 and exFAT (255 UTF-16 units) allow.
 pub const MAX_NAME: usize = 180;
 
 /// At most `max` bytes of `s`, never splitting a character. Nor does it

@@ -94,7 +94,10 @@ pub fn cover_file_name(typed: &str) -> Result<String> {
 
 impl ArtRules {
     pub fn normalize(mut self) -> Result<Self> {
-        self.file_name = cover_file_name(&self.file_name)?;
+        // A name kept while no cover file is written isn't checked.
+        if self.placement.file() {
+            self.file_name = cover_file_name(&self.file_name)?;
+        }
         Ok(self)
     }
 
@@ -229,6 +232,12 @@ mod tests {
         assert!(rules(".cover").is_err());
         assert!(rules("art: front").is_err());
         assert!(rules("CON").is_err());
+        let embedded = ArtRules {
+            placement: Placement::Embedded,
+            file_name: "art: front".into(),
+            ..Default::default()
+        };
+        assert!(embedded.normalize().is_ok());
     }
 
     #[test]
