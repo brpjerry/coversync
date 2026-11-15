@@ -885,6 +885,12 @@ async fn a_sync_that_never_finished_has_its_folder_checked() {
     assert!(matches!(cancelled, Err(Error::Cancelled)), "{cancelled:?}");
     assert!(!note.exists());
     assert!(sync(&e).await.reconciled.is_none());
+
+    // A facts journal that can't be read whole may have lost what an
+    // earlier sync did: checked too.
+    std::fs::write(root.join(".coversync-replica/facts"), b"{not a fact\n").unwrap();
+    assert!(sync(&e).await.reconciled.is_some());
+    assert!(sync(&e).await.reconciled.is_none());
 }
 
 #[tokio::test]

@@ -15,6 +15,8 @@ const BATCH: usize = 5000;
 
 pub(crate) struct Facts {
     storage: Arc<dyn Storage>,
+    /// The journal couldn't be read whole when loaded.
+    damaged: bool,
     inner: Mutex<Inner>,
     lost: std::sync::atomic::AtomicBool,
 }
@@ -35,20 +37,28 @@ pub(crate) struct Batch {
 impl Facts {
     /// The facts an earlier sync left unconfirmed.
     pub(crate) fn load(storage: Arc<dyn Storage>) -> Self {
+        let mut damaged = false;
         let unconfirmed = match storage.read_journal() {
             Ok(bytes) => bytes
                 .split(|&b| b == b'\n')
                 .filter(|l| !l.is_empty())
-                // A line cut short by a crash is dropped: its operation
-                // only repeats.
-                .filter_map(|l| serde_json::from_slice(l).ok())
+                .filter_map(|l| {
+                    let fact = serde_json::from_slice(l).ok();
+                    damaged |= fact.is_none();
+                    fact
+                })
                 .collect(),
             Err(e) => {
                 tracing::warn!("couldn't read the facts journal: {e}");
+                damaged = true;
                 Vec::new()
             }
         };
+        if damaged {
+            tracing::warn!("the facts journal is damaged: the folder will be checked");
+        }
         Self {
+            damaged,
             storage,
             inner: Mutex::new(Inner {
                 unconfirmed,
@@ -95,6 +105,12 @@ impl Facts {
         i.unconfirmed.push(fact);
     }
 
+    /// The journal couldn't be read whole: facts of an earlier sync may be
+    /// gone.
+    pub(crate) fn damaged(&self) -> bool {
+        self.damaged
+    }
+
     /// A fact couldn't be journaled: it lives only in memory until the
     /// server confirms it.
     pub(crate) fn lost(&self) -> bool {
@@ -130,7 +146,10 @@ impl Facts {
             rest.push(b'\n');
         }
         if let Err(e) = self.storage.replace_journal(&rest) {
-            tracing::debug!("couldn't trim the facts journal: {e}");
+            // Emptied first, it may now hold none of the facts still
+            // unconfirmed.
+            tracing::warn!("couldn't trim the facts journal: {e}");
+            self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

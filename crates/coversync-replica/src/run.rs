@@ -63,16 +63,26 @@ pub(crate) async fn sync(
     // folder can't be trusted to match what the server knows.
     let mut lost = false;
     let result = loop {
-        let (report, refused, lost_facts) = match session(
-            &api, &storage, &options, reason, check, &observer, &cancel, began,
+        let mut lost_facts = false;
+        let session = session(
+            &api,
+            &storage,
+            &options,
+            reason,
+            check,
+            &observer,
+            &cancel,
+            began,
+            &mut lost_facts,
         )
-        .await
-        {
+        .await;
+        // Whatever ended the session, the token refused included.
+        lost |= lost_facts;
+        let (report, refused) = match session {
             Ok(r) => r,
             Err(e) => break Err(e),
         };
         checked |= report.reconciled.is_some();
-        lost |= lost_facts;
         // A step the folder refused (a file that wasn't what the server
         // thought): the server's idea of the folder is wrong, so check it.
         if refused && !check && !cancel.is_cancelled() {
@@ -314,8 +324,8 @@ impl Ctx {
     }
 }
 
-/// One session. Returns its report, whether a step was refused, and whether
-/// facts the journal couldn't keep never reached the server.
+/// One session. Returns its report and whether a step was refused; `lost`
+/// says whether facts the journal couldn't keep never reached the server.
 #[allow(clippy::too_many_arguments)]
 async fn session(
     api: &Arc<Api>,
@@ -326,7 +336,8 @@ async fn session(
     observer: &Arc<dyn Observer>,
     cancel: &CancellationToken,
     began: Instant,
-) -> Result<(Report, bool, bool), Error> {
+    lost: &mut bool,
+) -> Result<(Report, bool), Error> {
     observer.phase(Phase::Starting);
     let s = storage.clone();
     let (marker, free, spare, facts) = blocking(move || {
@@ -340,6 +351,9 @@ async fn session(
         (marker, free, spare, Facts::load(s))
     })
     .await?;
+    // A journal that couldn't be read whole may have lost facts of what an
+    // earlier sync did: the folder is checked.
+    let check = check || facts.damaged();
     // Partial files are room the engine can take back: counted as free, so
     // that a download cut short still fits the plan when only its rest does.
     let free = free.map(|f| f.saturating_add(spare.values().sum()));
@@ -386,6 +400,7 @@ async fn session(
     };
 
     let ran = run(&ctx, &started, &mut report).await;
+    *lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
     let stop = ctx.stop.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let s = &ctx.stats;
     report.files = s.puts.load(Ordering::Relaxed);
@@ -515,8 +530,8 @@ async fn session(
         }
     }
     tracing::info!(?report, "sync session ended");
-    let lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
-    Ok((report, matches!(stop, Some(Stop::Refused)), lost))
+    *lost = ctx.facts.lost() && ctx.facts.unconfirmed() > 0;
+    Ok((report, matches!(stop, Some(Stop::Refused))))
 }
 
 async fn run(ctx: &Arc<Ctx>, started: &SessionStarted, report: &mut Report) -> Result<(), Error> {
