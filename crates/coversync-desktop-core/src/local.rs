@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use coversync_proxy::{Asker, LocalFile, LocalFiles};
 use serde::Deserialize;
 
-use crate::sync::{Config, Service};
+use crate::sync::{Config, Service, same_server};
 
 /// How long a list of what's held is used before the server is asked
 /// again. A track synced since then is streamed until it shows up.
@@ -160,7 +160,10 @@ impl Local {
         let Ok(config) = Config::load(&self.file) else {
             return false;
         };
-        config.server.as_deref() == Some(held.server.as_str())
+        config
+            .server
+            .as_deref()
+            .is_some_and(|kept| same_server(kept, &held.server))
             && config
                 .root
                 .and_then(|root| std::fs::canonicalize(root).ok())
@@ -181,7 +184,7 @@ impl Local {
         .map_err(|e| e.to_string())??;
         let (config, on) = settings;
         let root = match (on, config.server.as_deref(), config.root) {
-            (true, Some(with), Some(root)) if with == server => root,
+            (true, Some(with), Some(root)) if same_server(with, &server) => root,
             _ => return Err("sync isn't on for this server".to_owned()),
         };
         let root = std::fs::canonicalize(&root)

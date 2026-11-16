@@ -249,14 +249,6 @@ fn apps_lock(tokens: &Source, settings: Option<&Path>) -> Result<Option<ConfigLo
     Ok(Some(lock))
 }
 
-/// Whether the server the settings name is `server` (as
-/// [`config::server_url`] writes one). The settings' may be spelled
-/// another way, by an older build or by hand; one that isn't an address at
-/// all is no server's.
-fn same_server(kept: &str, server: &str) -> bool {
-    config::server_url(kept).is_ok_and(|kept| kept == server)
-}
-
 /// Tells the app, in its settings, of a pairing that put a token in the
 /// keychain for `url`. A token that manages is one the app signs in with:
 /// the server is listed as paired, as if the app had paired itself. A
@@ -303,7 +295,7 @@ fn resolve(
     // to the first. Another server needs its own named.
     if let (Some(given), Some(kept), Some(file), None) =
         (&given, &config.server, &config.token_file, &token_file)
-        && !same_server(kept, given)
+        && !config::same_server(kept, given)
     {
         return Err(format!(
             "The token file in the settings ({}) is this computer's token for {kept}, not for \
@@ -351,7 +343,7 @@ fn setup(
         let moved = config
             .server
             .as_ref()
-            .is_some_and(|kept| !same_server(kept, &server));
+            .is_some_and(|kept| !config::same_server(kept, &server));
         if moved && token_file.is_none() {
             let_go = config.token_file.take();
         }
@@ -410,7 +402,7 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
         // isn't written over it: an agent still running for the first
         // would read it there, and send it to the wrong one.
         None => match (&config.token_file, &config.server) {
-            (Some(file), Some(kept)) if !same_server(kept, &url) => {
+            (Some(file), Some(kept)) if !config::same_server(kept, &url) => {
                 return Err(setup_error(format!(
                     "The token file in the settings ({}) is this computer's token for {kept}. \
                      Name a file for {url}'s with --token-file.",
@@ -522,12 +514,15 @@ mod tests {
         };
         let same = resolve(by_hand, Some("https://saved.example/".into()), None, None).unwrap();
         assert_eq!(same.tokens, Source::File("/saved/token".into()));
-        assert!(same_server("saved.example", "https://saved.example/"));
-        assert!(!same_server(
+        assert!(config::same_server(
+            "saved.example",
+            "https://saved.example/"
+        ));
+        assert!(!config::same_server(
             "https://other.example/",
             "https://saved.example/"
         ));
-        assert!(!same_server("", "https://saved.example/"));
+        assert!(!config::same_server("", "https://saved.example/"));
 
         // No token file anywhere: the keychain.
         let keychain = Config {

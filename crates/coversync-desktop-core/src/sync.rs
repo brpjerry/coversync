@@ -124,6 +124,13 @@ pub fn server_url(input: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Whether the server the settings name is `server` (as [`server_url`]
+/// writes one). The settings' may be spelled another way, by an older
+/// build or by hand; one that isn't an address at all is no server's.
+pub fn same_server(kept: &str, server: &str) -> bool {
+    server_url(kept).is_ok_and(|kept| kept == server)
+}
+
 /// A path to keep in the settings, made absolute. One that isn't valid
 /// UTF-8 can't be written there (the file is JSON), nor remembered between
 /// runs, so it's turned away.
@@ -349,7 +356,9 @@ impl Panel {
             server: server.map(str::to_owned),
             // A token file is this computer's token for the server it was
             // set up with, and for no other.
-            paired: paired || (config.token_file.is_some() && config.server.as_deref() == server),
+            paired: paired
+                || (config.token_file.is_some()
+                    && matches!((&config.server, server), (Some(kept), Some(shown)) if same_server(kept, shown))),
             syncs_with: config.server,
             folder: config.root.map(|root| root.display().to_string()),
             on: state.enabled,
@@ -383,7 +392,10 @@ impl Panel {
         // A token file is the token of the server it was set up with. For
         // another server it mustn't be used (that would hand this one the
         // other's sign-in): the app's own pairing is, from the keychain.
-        let moving = config.server.as_deref() != Some(server);
+        let moving = !config
+            .server
+            .as_deref()
+            .is_some_and(|kept| same_server(kept, server));
         let own_file = config.token_file.is_some() && !moving;
         if !paired && !own_file {
             return Err(cant(
@@ -626,7 +638,17 @@ mod tests {
         let service = Fake::installed();
         let panel = Panel::new(file.clone(), service.clone());
 
-        // For its own server the file counts as the pairing.
+        // For its own server the file counts as the pairing, however the
+        // settings spell that server.
+        Config {
+            server: Some("a.example".into()),
+            root: Some(dir.clone()),
+            token_file: Some(dir.join("a-token")),
+            ..Default::default()
+        }
+        .save(&file)
+        .unwrap();
+        assert!(panel.overview(Some(a), false).unwrap().paired);
         set_up();
         assert!(panel.overview(Some(a), false).unwrap().paired);
         panel.turn(true, Some(a), false).unwrap();
