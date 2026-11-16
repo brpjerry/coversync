@@ -819,9 +819,12 @@ async fn files_a_check_cant_tell_yet_are_left_alone() {
     assert_eq!(tree(&tablet.root), want);
 }
 
-/// Page through the device's inventory from `after`: the paths, and how
+/// A file in a device's inventory: its path, hash and size.
+type HeldLine = (String, String, u64);
+
+/// Page through the device's inventory from `after`: its files, and how
 /// many pages it took.
-async fn read_inventory(d: &Daemon, token: &str, after: Option<&str>) -> (Vec<String>, usize) {
+async fn read_inventory(d: &Daemon, token: &str, after: Option<&str>) -> (Vec<HeldLine>, usize) {
     let mut after = after.map(str::to_string);
     let mut seen = Vec::new();
     let mut pages = 0;
@@ -842,11 +845,13 @@ async fn read_inventory(d: &Daemon, token: &str, after: Option<&str>) -> (Vec<St
             .collect();
         let end = lines.pop().unwrap();
         pages += 1;
-        seen.extend(
-            lines
-                .iter()
-                .map(|l| l["path"].as_str().unwrap().to_string()),
-        );
+        seen.extend(lines.iter().map(|l| {
+            (
+                l["path"].as_str().unwrap().to_string(),
+                l["hash"].as_str().unwrap().to_string(),
+                l["size"].as_u64().unwrap(),
+            )
+        }));
         match end["next"].as_str() {
             Some(next) => after = Some(next.to_string()),
             None => return (seen, pages),
@@ -883,9 +888,12 @@ async fn the_inventory_pages_in_path_order() {
             .store
             .reconciled(id, &held, &Default::default(), "epoch")
             .unwrap();
-        let mut paths: Vec<String> = held.into_keys().collect();
-        paths.sort();
-        paths
+        let mut files: Vec<HeldLine> = held
+            .into_iter()
+            .map(|(path, file)| (path, file.hash, file.size))
+            .collect();
+        files.sort();
+        files
     };
 
     // Nothing held: one page, empty.
@@ -897,8 +905,11 @@ async fn the_inventory_pages_in_path_order() {
     assert_eq!(read_inventory(&d, &token, None).await, (want.clone(), 2));
     // From a cursor between two paths, and from one past the last.
     let (rest, _) = read_inventory(&d, &token, Some("a0")).await;
-    assert_eq!(rest, want[want.partition_point(|p| p.as_str() <= "a0")..]);
-    let last = want.last().unwrap();
+    assert_eq!(
+        rest,
+        want[want.partition_point(|(p, ..)| p.as_str() <= "a0")..]
+    );
+    let (last, ..) = want.last().unwrap();
     assert_eq!(read_inventory(&d, &token, Some(last)).await, (vec![], 1));
     assert_eq!(
         read_inventory(&d, &token, Some("\u{10FFFF}")).await,
