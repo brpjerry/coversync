@@ -711,7 +711,14 @@ impl Session<'_> {
                 }
             }
             // Wait for word: from the watch, the desktop, or the clock.
-            let look = pending.look_at(Instant::now(), self.settings.look_again);
+            // Each look cuts short what the watch is asking the server. A
+            // sync that's held is looked at often; with nothing wanted, or
+            // while the settings are still being asked for, the watch gets
+            // longer than the engine gives a reply (a minute), so a slow
+            // answer is never cut off for good.
+            let waiting_on_watch = pending.reason.is_none() || !settled;
+            let interval = self.settings.look_again * if waiting_on_watch { 3 } else { 1 };
+            let look = pending.look_at(Instant::now(), interval);
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ended::Stopped,
                 trigger = self.watch.next() => match trigger {
@@ -786,6 +793,25 @@ impl Session<'_> {
             last: AtomicU64::new(u64::MAX),
             planned: planned.clone(),
         });
+        // A folder with no marker yet is looked at for one while the sync
+        // runs. On a task of its own: a clock in the loop below would cut
+        // the watch's requests short at every tick.
+        let looking = (!self.memory.marked_before).then(|| {
+            let (storage, seen) = (self.folder.storage.clone(), planned.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(MARKER_LOOK).await;
+                    let storage = storage.clone();
+                    let there = tokio::task::spawn_blocking(move || {
+                        matches!(storage.read_marker(), Ok(Some(_)))
+                    });
+                    if there.await.unwrap_or(false) {
+                        seen.notify_one();
+                        return;
+                    }
+                }
+            })
+        });
         let sync = self.engine.sync(reason, observer, cancel.clone());
         tokio::pin!(sync);
         let mut queued: Option<Reason> = None;
@@ -838,15 +864,11 @@ impl Session<'_> {
                     }
                 }
                 // The engine puts its marker in a new folder before it asks
-                // for the plan. Remembered as soon as it's seen there, and
-                // at the latest when the plan is in, before the downloads:
-                // a power cut or a kill ends a sync without another word.
+                // for the plan. Remembered as soon as it's seen there (the
+                // task above looks), and at the latest when the plan is in,
+                // before the downloads: a power cut or a kill ends a sync
+                // without another word.
                 _ = planned.notified(), if !self.memory.marked_before => {
-                    if self.folder.has_marker().await {
-                        self.memory.marked();
-                    }
-                }
-                _ = tokio::time::sleep(MARKER_LOOK), if !self.memory.marked_before => {
                     if self.folder.has_marker().await {
                         self.memory.marked();
                     }
@@ -860,10 +882,8 @@ impl Session<'_> {
                 },
             }
         };
-        if woke {
-            self.nudged(Nudge::Woke);
-        } else if network_back {
-            self.nudged(Nudge::NetworkBack);
+        if let Some(looking) = looking {
+            looking.abort();
         }
         // However the sync ended, even stopped part-way: a folder it put
         // its marker in is one to tell from an empty mount point later.
@@ -944,6 +964,15 @@ impl Session<'_> {
                 }
             }
         };
+        // Only now, with this sync's target told to the watch that saw it
+        // start: a watch made for a wake owes a look of its own, at the
+        // folder as it is after the sleep, and this sync's end mustn't
+        // settle that.
+        if woke {
+            self.nudged(Nudge::Woke);
+        } else if network_back {
+            self.nudged(Nudge::NetworkBack);
+        }
         (next, queued)
     }
 }

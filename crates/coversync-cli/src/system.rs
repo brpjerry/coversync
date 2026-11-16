@@ -111,6 +111,9 @@ impl System {
                             let mut said = false;
                             loop {
                                 let ended = network(&bus, &conditions, &nudges).await;
+                                if !falls_back(&ended) {
+                                    continue;
+                                }
                                 if !std::mem::replace(&mut said, true) {
                                     let why =
                                         ended.err().map_or(String::new(), |e| format!(" ({e})"));
@@ -129,6 +132,9 @@ impl System {
                             let mut said = false;
                             loop {
                                 let ended = power(&bus, &conditions).await;
+                                if !falls_back(&ended) {
+                                    continue;
+                                }
                                 if !std::mem::replace(&mut said, true) {
                                     let why =
                                         ended.err().map_or(String::new(), |e| format!(" ({e})"));
@@ -183,6 +189,34 @@ fn settle(conditions: &mut Conditions, network: bool, power: bool) -> bool {
     changed
 }
 
+/// Why a listener stopped listening without anything going wrong.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// The service gave up its name: nobody is there to ask.
+    Gone,
+    /// The name has an owner it didn't have: the service started (asking
+    /// it something can do that) or was replaced. It's there to ask again.
+    Replaced,
+}
+
+impl Ended {
+    /// What a change of the service's name on the bus comes to.
+    fn by(new_owner: Option<zbus::names::UniqueName<'_>>) -> Self {
+        match new_owner {
+            Some(_) => Ended::Replaced,
+            None => Ended::Gone,
+        }
+    }
+}
+
+/// Whether a listener that stopped leaves its condition to the fallback,
+/// to be looked for again later: the service is gone, or couldn't be
+/// asked. One that only changed hands is listened to again at once, and
+/// what it said stands until it says otherwise.
+fn falls_back(ended: &zbus::Result<Ended>) -> bool {
+    !matches!(ended, Ok(Ended::Replaced))
+}
+
 /// NetworkManager's `Metered`: yes, or guessed to be.
 fn is_metered(value: u32) -> bool {
     matches!(value, 1 | 3)
@@ -227,7 +261,7 @@ async fn network(
     bus: &Connection,
     conditions: &watch::Sender<Conditions>,
     nudges: &mpsc::UnboundedSender<Nudge>,
-) -> zbus::Result<()> {
+) -> zbus::Result<Ended> {
     let nm = within(Proxy::new(
         bus,
         "org.freedesktop.NetworkManager",
@@ -248,35 +282,30 @@ async fn network(
     let mut link = Link::default();
     loop {
         tokio::select! {
+            // Reading a change can mean asking the service again (it may
+            // say only that the value changed): bounded like any request,
+            // and a service that doesn't answer is listened to afresh.
             Some(change) = metered.next() => {
-                if let Ok(value) = change.get().await {
-                    let now = Some(is_metered(value));
-                    conditions.send_if_modified(|c| std::mem::replace(&mut c.metered, now) != now);
-                }
+                let now = Some(is_metered(within(change.get()).await?));
+                conditions.send_if_modified(|c| std::mem::replace(&mut c.metered, now) != now);
             }
             Some(change) = state.next() => {
-                if let Ok(value) = change.get().await
-                    && link.state(value)
-                {
+                if link.state(within(change.get()).await?) {
                     let _ = nudges.send(Nudge::NetworkBack);
                 }
             }
             Some(change) = primary.next() => {
-                if let Ok(path) = change.get().await
-                    && link.primary(path.as_str())
-                {
+                if link.primary(within(change.get()).await?.as_str()) {
                     let _ = nudges.send(Nudge::NetworkBack);
                 }
             }
-            // The service is gone (or another took its name): what it
-            // said doesn't hold any more, and it's looked for afresh.
-            Some(_) = owner.next() => return Ok(()),
-            else => return Ok(()),
+            Some(new) = owner.next() => return Ok(Ended::by(new)),
+            else => return Ok(Ended::Gone),
         }
     }
 }
 
-async fn power(bus: &Connection, conditions: &watch::Sender<Conditions>) -> zbus::Result<()> {
+async fn power(bus: &Connection, conditions: &watch::Sender<Conditions>) -> zbus::Result<Ended> {
     let upower = within(Proxy::new(
         bus,
         "org.freedesktop.UPower",
@@ -291,13 +320,11 @@ async fn power(bus: &Connection, conditions: &watch::Sender<Conditions>) -> zbus
     loop {
         tokio::select! {
             Some(change) = on_battery.next() => {
-                if let Ok(now) = change.get().await {
-                    let now = Some(now);
-                    conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
-                }
+                let now = Some(within(change.get()).await?);
+                conditions.send_if_modified(|c| std::mem::replace(&mut c.on_battery, now) != now);
             }
-            Some(_) = owner.next() => return Ok(()),
-            else => return Ok(()),
+            Some(new) = owner.next() => return Ok(Ended::by(new)),
+            else => return Ok(Ended::Gone),
         }
     }
 }
@@ -349,6 +376,23 @@ mod tests {
         let mut conditions = Conditions::UNKNOWN;
         assert!(settle(&mut conditions, true, true));
         assert_eq!(conditions, Conditions::FINE);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_service_starting_isnt_taken_for_one_going_away() {
+        let owner = zbus::names::UniqueName::try_from(":1.42").unwrap();
+        // Its name taken (it started, as asking it can make it, or another
+        // took over): listened to again at once, nothing assumed meanwhile.
+        assert_eq!(Ended::by(Some(owner)), Ended::Replaced);
+        assert!(!falls_back(&Ok(Ended::Replaced)));
+        // Its name given up, or a request that failed or went unanswered:
+        // the fallback, and another look later.
+        assert_eq!(Ended::by(None), Ended::Gone);
+        assert!(falls_back(&Ok(Ended::Gone)));
+        assert!(falls_back(&Err(zbus::Error::Failure(
+            "no answer in time".into()
+        ))));
     }
 
     // Bugs caught: 0, False positives: 0

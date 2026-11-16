@@ -22,8 +22,9 @@ use crate::upstream::Upstream;
 const ANSWER_LIMIT: usize = 64 * 1024;
 
 /// A device's token for a server. It is a secret: it never shows in a log
-/// (its `Debug` hides it), a URL or a file, and goes nowhere but to the
-/// keychain and, as a header, to its server.
+/// (its `Debug` hides it) or a URL, and goes nowhere but to the keychain
+/// (or, on a computer without one, to a file only its user can read) and,
+/// as a header, to its server.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
 
