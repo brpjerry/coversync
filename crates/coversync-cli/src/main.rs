@@ -249,6 +249,14 @@ fn apps_lock(tokens: &Source, settings: Option<&Path>) -> Result<Option<ConfigLo
     Ok(Some(lock))
 }
 
+/// Whether the server the settings name is `server` (as
+/// [`config::server_url`] writes one). The settings' may be spelled
+/// another way, by an older build or by hand; one that isn't an address at
+/// all is no server's.
+fn same_server(kept: &str, server: &str) -> bool {
+    config::server_url(kept).is_ok_and(|kept| kept == server)
+}
+
 /// Tells the app, in its settings, of a pairing that put a token in the
 /// keychain for `url`. A token that manages is one the app signs in with:
 /// the server is listed as paired, as if the app had paired itself. A
@@ -295,7 +303,7 @@ fn resolve(
     // to the first. Another server needs its own named.
     if let (Some(given), Some(kept), Some(file), None) =
         (&given, &config.server, &config.token_file, &token_file)
-        && given != kept
+        && !same_server(kept, given)
     {
         return Err(format!(
             "The token file in the settings ({}) is this computer's token for {kept}, not for \
@@ -340,7 +348,10 @@ fn setup(
     let mut let_go = None;
     if let Some(server) = server {
         let server = config::server_url(&server).map_err(setup_error)?;
-        let moved = config.server.as_ref().is_some_and(|kept| *kept != server);
+        let moved = config
+            .server
+            .as_ref()
+            .is_some_and(|kept| !same_server(kept, &server));
         if moved && token_file.is_none() {
             let_go = config.token_file.take();
         }
@@ -395,7 +406,19 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
     // a token nobody finds again.
     let token_file = match token_file {
         Some(path) => Some(config::path(&path).map_err(setup_error)?),
-        None => config.token_file.clone(),
+        // The settings' token file is one server's. Another server's token
+        // isn't written over it: an agent still running for the first
+        // would read it there, and send it to the wrong one.
+        None => match (&config.token_file, &config.server) {
+            (Some(file), Some(kept)) if !same_server(kept, &url) => {
+                return Err(setup_error(format!(
+                    "The token file in the settings ({}) is this computer's token for {kept}. \
+                     Name a file for {url}'s with --token-file.",
+                    file.display()
+                )));
+            }
+            (file, _) => file.clone(),
+        },
     };
     let tokens = token_file.clone().map_or(Source::Keychain, Source::File);
     let _apps_lock = apps_lock(&tokens, config::file().parent()).map_err(setup_error)?;
@@ -490,8 +513,21 @@ mod tests {
         let other = resolve(saved(), Some("https://other.example".into()), None, None);
         let why = other.unwrap_err();
         assert!(why.contains("not for https://other.example/"), "{why}");
-        // The same server spelled another way is the same server.
+        // The same server spelled another way is the same server, on the
+        // command line or in a settings file written by hand.
         assert!(resolve(saved(), Some("saved.example".into()), None, None).is_ok());
+        let by_hand = Config {
+            server: Some("https://saved.example".into()),
+            ..saved()
+        };
+        let same = resolve(by_hand, Some("https://saved.example/".into()), None, None).unwrap();
+        assert_eq!(same.tokens, Source::File("/saved/token".into()));
+        assert!(same_server("saved.example", "https://saved.example/"));
+        assert!(!same_server(
+            "https://other.example/",
+            "https://saved.example/"
+        ));
+        assert!(!same_server("", "https://saved.example/"));
 
         // No token file anywhere: the keychain.
         let keychain = Config {
