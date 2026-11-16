@@ -96,9 +96,10 @@ function clearFailure() {
 	failed.textContent = '';
 }
 
-// A read of the settings is on its way: the next one waits for it, so two never arrive out
-// of order.
-let reading = false;
+// The turn of the read of the settings that's on its way, if one is. Another read in the same
+// turn waits for it, so two never arrive out of order. A read wanted after a command started
+// or ended doesn't wait for one from before: that one's answer won't be shown.
+let reading = null;
 
 /**
  * Reads the settings and shows them, unless a command started or ended meanwhile. A read that
@@ -106,9 +107,9 @@ let reading = false;
  * the place for failures is for things that were asked for, and stays.
  */
 async function read() {
-	if (reading) return;
-	reading = true;
+	if (reading === turn) return;
 	const asked = turn;
+	reading = asked;
 	try {
 		const overview = await invoke('settings');
 		if (asked === turn) show(overview);
@@ -118,7 +119,8 @@ async function read() {
 			notice.textContent = [problem?.title, problem?.message].filter(Boolean).join(': ');
 		}
 	} finally {
-		reading = false;
+		// Only its own mark: a newer read's stays.
+		if (reading === asked) reading = null;
 	}
 }
 

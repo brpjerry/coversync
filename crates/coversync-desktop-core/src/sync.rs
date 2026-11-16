@@ -229,11 +229,36 @@ pub trait Service: Send + Sync {
     /// Starts a running agent again, to take up new settings. One that
     /// isn't running stays off.
     fn restart(&self) -> Result<(), String>;
-    /// The settings file the agent reads, when that can be told: the
-    /// service has an environment of its own, which needn't be the app's
-    /// (an app started with a settings folder of its own, say).
-    fn settings_file(&self) -> Option<PathBuf> {
-        None
+    /// Which settings file the agent reads: the service has an environment
+    /// of its own, which needn't be the app's (an app started with a
+    /// settings folder of its own, say).
+    fn reads(&self) -> Reads {
+        Reads::Apps
+    }
+}
+
+/// Which settings file a service's agent reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reads {
+    /// Whichever the app writes: the service has no environment apart from
+    /// the app's.
+    Apps,
+    /// This one.
+    File(PathBuf),
+    /// It couldn't be found out. Nothing is taken for granted then: sync
+    /// isn't changed, and the copy isn't played from.
+    Unknown,
+}
+
+impl Reads {
+    /// Whether the agent reads `file`, as far as can be told. An unknown
+    /// file isn't taken for it.
+    pub fn is(&self, file: &Path) -> bool {
+        match self {
+            Reads::Apps => true,
+            Reads::File(theirs) => same_file(theirs, file),
+            Reads::Unknown => false,
+        }
     }
 }
 
@@ -274,7 +299,9 @@ fn environment(line: &str) -> Vec<String> {
                 }
                 any = true;
             }
-            c if c.is_whitespace() && !quoted => {
+            // The spaces systemd puts between words, and no others: a
+            // value can hold a no-break space unquoted.
+            ' ' | '\t' | '\n' if !quoted => {
                 if any {
                     words.push(std::mem::take(&mut word));
                     any = false;
@@ -400,19 +427,25 @@ impl Service for Systemd {
         systemctl(&["try-restart", UNIT]).map(|_| ())
     }
 
-    fn settings_file(&self) -> Option<PathBuf> {
+    fn reads(&self) -> Reads {
         let mut reads = self.reads.lock().expect("reads lock");
         if let Some((asked, file)) = &*reads
             && asked.elapsed() < READS_FOR
         {
-            return Some(file.clone());
+            return Reads::File(file.clone());
         }
         // Not kept when it couldn't be had: asked again the next time.
-        let unit = systemctl(&["show", UNIT, "-p", "Environment"]).ok()?;
-        let manager = systemctl(&["show", "-p", "Environment"]).ok()?;
-        let file = agents_file(&unit, &manager)?;
-        *reads = Some((std::time::Instant::now(), file.clone()));
-        Some(file)
+        let found = systemctl(&["show", UNIT, "-p", "Environment"])
+            .and_then(|unit| Ok((unit, systemctl(&["show", "-p", "Environment"])?)))
+            .ok()
+            .and_then(|(unit, manager)| agents_file(&unit, &manager));
+        match found {
+            Some(file) => {
+                *reads = Some((std::time::Instant::now(), file.clone()));
+                Reads::File(file)
+            }
+            None => Reads::Unknown,
+        }
     }
 }
 
@@ -459,21 +492,22 @@ impl Panel {
 
     /// What to show, for a window showing `server` (as [`server_url`]
     /// writes it) that this computer is, or isn't, `paired` with.
-    /// The settings file the agent reads, if it isn't the one this panel
-    /// writes.
+    /// The settings file the agent reads, if it's known and isn't the one
+    /// this panel writes.
     fn others(&self) -> Option<PathBuf> {
-        self.service
-            .settings_file()
-            .filter(|theirs| !same_file(theirs, &self.file))
+        match self.service.reads() {
+            Reads::File(theirs) if !same_file(&theirs, &self.file) => Some(theirs),
+            _ => None,
+        }
     }
 
     /// Refuses a change to sync from a window whose settings the agent
-    /// doesn't read: it would show as done here and happen to another
-    /// server and folder, or not at all.
+    /// doesn't read, or can't be told to read: it would show as done here
+    /// and happen to another server and folder, or not at all.
     fn own(&self) -> Result<(), Problem> {
-        match self.others() {
-            None => Ok(()),
-            Some(theirs) => Err(Problem::new(
+        match self.service.reads() {
+            reads if reads.is(&self.file) => Ok(()),
+            Reads::File(theirs) => Err(Problem::new(
                 "Sync isn't this window's to set",
                 format!(
                     "The sync agent on this computer reads {}, and this window was started with \
@@ -481,6 +515,11 @@ impl Panel {
                     theirs.display(),
                     self.file.display()
                 ),
+            )),
+            _ => Err(Problem::new(
+                "Sync can't be set just now",
+                "The app couldn't find out which settings the sync agent reads (systemd didn't \
+                 say). Try again in a moment.",
             )),
         }
     }
@@ -610,7 +649,7 @@ mod tests {
         calls: Mutex<Vec<&'static str>>,
         fails: Mutex<Option<String>>,
         /// The settings file its agent reads, when it says.
-        reads: Mutex<Option<PathBuf>>,
+        reads: Mutex<Option<Reads>>,
     }
 
     impl Fake {
@@ -652,8 +691,8 @@ mod tests {
             }
         }
 
-        fn settings_file(&self) -> Option<PathBuf> {
-            self.reads.lock().unwrap().clone()
+        fn reads(&self) -> Reads {
+            self.reads.lock().unwrap().clone().unwrap_or(Reads::Apps)
         }
     }
 
@@ -830,17 +869,17 @@ mod tests {
         let panel = Panel::new(mine.clone(), service.clone());
 
         // The agent reads this window's file, or doesn't say: all as usual.
-        *service.reads.lock().unwrap() = Some(mine.clone());
+        *service.reads.lock().unwrap() = Some(Reads::File(mine.clone()));
         assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
         panel.set_folder(&dir.join("music")).unwrap();
         // The same file reached through a link to its folder is the same.
         std::os::unix::fs::symlink(dir.join("mine"), dir.join("alias")).unwrap();
-        *service.reads.lock().unwrap() = Some(dir.join("alias/sync.json"));
+        *service.reads.lock().unwrap() = Some(Reads::File(dir.join("alias/sync.json")));
         assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
 
         // It reads another: the page is told which, and nothing is
         // changed or started from here.
-        *service.reads.lock().unwrap() = Some(theirs.clone());
+        *service.reads.lock().unwrap() = Some(Reads::File(theirs.clone()));
         let overview = panel.overview(Some("https://a/"), true).unwrap();
         assert_eq!(overview.agent_reads, Some(theirs.display().to_string()));
         let before = fs::read(&mine).unwrap();
@@ -857,6 +896,23 @@ mod tests {
         }
         assert_eq!(fs::read(&mine).unwrap(), before);
         assert!(service.calls().is_empty());
+
+        // It can't be found out which: nothing is taken for granted, and
+        // nothing changed, until it can.
+        *service.reads.lock().unwrap() = Some(Reads::Unknown);
+        assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
+        for refused in [
+            panel.turn(true, Some("https://a/"), true),
+            panel.turn(false, None, false),
+            panel.set_folder(&dir),
+        ] {
+            let why = refused.unwrap_err();
+            assert!(why.message.contains("couldn't find out"), "{why:?}");
+        }
+        assert_eq!(fs::read(&mine).unwrap(), before);
+        assert!(service.calls().is_empty());
+        assert!(!Reads::Unknown.is(&mine));
+        assert!(Reads::Apps.is(&mine));
     }
 
     // Bugs caught: 0, False positives: 0
@@ -898,6 +954,8 @@ mod tests {
             ))
         );
         assert_eq!(environment("Environment=\n"), Vec::<String>::new());
+        // A no-break space is part of a value, which systemd leaves bare.
+        assert_eq!(environment("A=/x/a\u{a0}b B=2"), ["A=/x/a\u{a0}b", "B=2"]);
         assert_eq!(environment(r#"A=1  "B=" C="x y""#), ["A=1", "B=", "C=x y"]);
     }
 
