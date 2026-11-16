@@ -333,6 +333,35 @@ impl Store {
         })
     }
 
+    /// Up to `limit` files of the device's inventory in path order, after
+    /// `after` (paths are never empty), read through the primary key. Paths
+    /// compare as bytes, as Rust's strings do.
+    pub fn inventory_page(
+        &self,
+        id: i64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, Held)>> {
+        let conn = self.conn();
+        conn.prepare_cached(
+            "SELECT path, hash, size, track, album FROM sync_inventory
+             WHERE device_id = ?1 AND path > ?2
+             ORDER BY path LIMIT ?3",
+        )?
+        .query_map(params![id, after.unwrap_or(""), limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Held {
+                    hash: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    track: r.get(3)?,
+                    album: r.get(4)?,
+                },
+            ))
+        })?
+        .collect()
+    }
+
     /// Puts that failed on the device, newest first.
     pub fn failures(&self, id: i64) -> rusqlite::Result<Vec<FailedPut>> {
         let conn = self.conn();

@@ -818,3 +818,71 @@ async fn files_a_check_cant_tell_yet_are_left_alone() {
     want.insert("mine.bin".into(), vec![9u8; size]);
     assert_eq!(tree(&tablet.root), want);
 }
+
+#[tokio::test]
+async fn the_inventory_pages_in_path_order() {
+    use coversync_protocol::PAGE_OPS;
+    let d = Daemon::new("inventory");
+    let (id, token) = d.device(Scope::Sync);
+    // Exactly two pages, with paths whose byte order isn't their order by
+    // case or by character.
+    let mut held = std::collections::HashMap::new();
+    for i in 0..2 * PAGE_OPS {
+        let path = match i % 4 {
+            0 => format!("a/{i:05}.flac"),
+            1 => format!("B/{i:05}.flac"),
+            2 => format!("é/{i:05}.flac"),
+            _ => format!("z/{i:05}.flac"),
+        };
+        held.insert(
+            path,
+            super::plan::Held {
+                hash: format!("{i:064x}"),
+                size: i as u64,
+                track: None,
+                album: None,
+            },
+        );
+    }
+    d.state
+        .sync
+        .store
+        .reconciled(id, &held, &Default::default(), "epoch")
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    let mut after: Option<String> = None;
+    loop {
+        let url = match &after {
+            None => "/api/sync/v1/inventory".to_string(),
+            Some(a) => {
+                let a: String = a.bytes().map(|b| format!("%{b:02X}")).collect();
+                format!("/api/sync/v1/inventory?after={a}")
+            }
+        };
+        let res = d.call("GET", &url, &token, None, &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = String::from_utf8(bytes(res).await).unwrap();
+        let mut lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let end = lines.pop().unwrap();
+        pages += 1;
+        for l in lines {
+            let path = l["path"].as_str().unwrap().to_string();
+            assert_eq!(l["size"].as_u64(), Some(held[&path].size));
+            seen.push(path);
+        }
+        match end["next"].as_str() {
+            Some(next) => after = Some(next.to_string()),
+            None => break,
+        }
+    }
+    // No empty page after the last full one.
+    assert_eq!(pages, 2);
+    let mut want: Vec<String> = held.keys().cloned().collect();
+    want.sort();
+    assert_eq!(seen, want);
+}

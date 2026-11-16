@@ -1242,16 +1242,15 @@ async fn inventory(
     let s = state.clone();
     blocking(move || {
         let target = target(&s, device).ok();
-        let mut held: Vec<(String, HeldFile)> =
-            s.sync.store.files(device)?.inventory.into_iter().collect();
-        held.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let start = match cursor.after.as_deref() {
-            None => 0,
-            Some(after) => held.partition_point(|(p, _)| p.as_str() <= after),
-        };
-        let page = &held[start.min(held.len())..(start + PAGE_OPS).min(held.len())];
+        // One row past the page says whether there's another.
+        let mut page =
+            s.sync
+                .store
+                .inventory_page(device, cursor.after.as_deref(), PAGE_OPS + 1)?;
+        let more = page.len() > PAGE_OPS;
+        page.truncate(PAGE_OPS);
         let mut body = String::new();
-        for (path, h) in page {
+        for (path, h) in &page {
             let entry = target
                 .as_ref()
                 .and_then(|t| t.at(path))
@@ -1266,9 +1265,7 @@ async fn inventory(
             body.push_str(&serde_json::to_string(&line).expect("inventory serializes"));
             body.push('\n');
         }
-        let next = (start + page.len() < held.len())
-            .then(|| page.last().map(|(p, _)| p.clone()))
-            .flatten();
+        let next = more.then(|| page.last().map(|(p, _)| p.clone())).flatten();
         body.push_str(&PlanLine::End(PlanEnd { next }).to_line());
         body.push('\n');
         Ok(ndjson(body))
