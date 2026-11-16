@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import X from '@lucide/svelte/icons/x';
@@ -76,8 +77,14 @@
 	const tracks = initial.tracks;
 	const failing = initial.failing;
 	/** Album-wide tags the tracks differ in, which the folder structure needs alike. */
-	const disagree = initial.disagree.filter((k) => !failing.includes(k));
-	const albumCols = [...failing.filter((k) => albumKinds.includes(k)), ...disagree];
+	const opened = initial.disagree.filter((k) => !failing.includes(k));
+	/**
+	 * Those, and any a later plan finds: filling in one field can show an
+	 * optional part of the folder structure whose tags differ. A field stays
+	 * once it's there.
+	 */
+	let disagree = $state([...opened]);
+	let albumCols = $derived([...failing.filter((k) => albumKinds.includes(k)), ...disagree]);
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
 	const original = (id: number, k: string) => tracks.find((t) => t.id === id)?.values[k] ?? '';
 
@@ -90,9 +97,10 @@
 		}
 		return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
 	}
-	const prefilled = new Set(albumCols.filter((k) => consensus(k)));
+	const startCols = untrack(() => albumCols);
+	const prefilled = new SvelteSet(startCols.filter((k) => consensus(k)));
 	let albumValues = $state<Record<string, string>>(
-		Object.fromEntries(albumCols.map((k) => [k, consensus(k)]))
+		Object.fromEntries(startCols.map((k) => [k, consensus(k)]))
 	);
 	let trackValues = $state<Record<number, Record<string, string>>>(
 		Object.fromEntries(
@@ -118,17 +126,28 @@
 	}
 	const missingOnTracks = (k: string) => tracks.filter((t) => !t.values[k]?.trim()).length;
 
-	// Album fields count once (one input), track fields once per track. A
-	// field for tracks that differ needs a value even though each has one.
+	/** A field a later plan added, rather than one the dialog opened with. */
+	const added = (k: string) => !failing.includes(k) && !opened.includes(k);
+	/**
+	 * Whether an album field still needs a value. One for tracks that differ
+	 * needs it even though each has one; one a later plan added, only while
+	 * the latest plan still finds them differing.
+	 */
+	function needsValue(k: string) {
+		if (added(k)) return !albumValues[k].trim() && live.disagree.includes(k);
+		return (
+			(opened.includes(k) && !albumValues[k].trim()) || tracks.some((t) => !effective(t.id, k))
+		);
+	}
+
+	// Album fields count once (one input), track fields once per track.
 	let missing = $derived(
-		albumCols.filter(
-			(k) =>
-				(disagree.includes(k) && !albumValues[k].trim()) || tracks.some((t) => !effective(t.id, k))
-		).length + tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
+		albumCols.filter(needsValue).length +
+			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
 	);
 	/** The rules require album art and the album has none. */
 	const artNeeded = initial.art.missing;
-	const total = albumCols.length + tracks.length * trackCols.length + (artNeeded ? 1 : 0);
+	let total = $derived(albumCols.length + tracks.length * trackCols.length + (artNeeded ? 1 : 0));
 
 	type Upload = {
 		url: string;
@@ -258,6 +277,20 @@
 			}
 		}, 350);
 		return () => clearTimeout(timer);
+	});
+
+	// Fields for tags a later plan finds the tracks differing in, filled in
+	// with what most have, as the dialog's own are.
+	$effect(() => {
+		const found = live.disagree.filter((k) => !failing.includes(k) && !disagree.includes(k));
+		if (!found.length) return;
+		untrack(() => {
+			for (const k of found) {
+				albumValues[k] = consensus(k);
+				if (albumValues[k]) prefilled.add(k);
+			}
+			disagree = [...disagree, ...found];
+		});
 	});
 
 	let destDir = $derived.by(() => {
@@ -519,8 +552,9 @@
 					<div class="album-fields">
 						{#each albumCols as k (k)}
 							{@const differs = disagree.includes(k)}
-							{@const empty =
-								!albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
+							{@const empty = added(k)
+								? needsValue(k)
+								: !albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
 							<label class="field">
 								<span class="field-label">
 									{label(k)}
