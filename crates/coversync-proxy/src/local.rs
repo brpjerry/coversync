@@ -68,6 +68,17 @@ impl Asker {
         &self.upstream
     }
 
+    /// A number that stands for the token this asks with, and changes when
+    /// the token does; none without a token. For telling what one device
+    /// was told from what the next one is owed: it says nothing of the
+    /// token itself.
+    pub fn device_mark(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut mark = std::collections::hash_map::DefaultHasher::new();
+        self.upstream.authorization()?.as_bytes().hash(&mut mark);
+        Some(mark.finish())
+    }
+
     /// `GET`s `path` (below the server's prefix: `/api/sync/v1/inventory`)
     /// and returns the answer's body, if the server said yes.
     pub async fn get(&self, path: &str) -> Result<Vec<u8>, String> {

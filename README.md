@@ -644,6 +644,9 @@ command (`open-settings`), which it offers only in an app that lists
   computer and never sent to the server.
 - What the computer gets and when it syncs by itself are the device's
   settings, in the server's Sync setup.
+- An app started with a settings folder of its own (another
+  `XDG_CONFIG_HOME`) can't set sync: the agent reads the usual one, and the
+  page says so.
 
 While sync is on, a track the computer holds a copy of is played from the
 copy: the app's proxy answers the UI's request for its audio from the sync

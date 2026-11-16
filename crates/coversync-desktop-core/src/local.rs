@@ -71,6 +71,8 @@ struct State {
     held: Option<Arc<Held>>,
     /// The server the last answer (or lack of one) was for.
     server: Option<String>,
+    /// The device it was asked as ([`Asker::device_mark`]).
+    device: Option<u64>,
     /// When the server is to be asked again.
     again: Option<Instant>,
     asking: bool,
@@ -82,22 +84,26 @@ struct State {
 }
 
 impl State {
-    /// Drops what's known, for `server` from here on (none: for whichever
-    /// asks next).
-    fn start_over(&mut self, server: Option<String>) {
+    /// Drops what's known, for `server` asked as `device` from here on
+    /// (none: for whichever asks next).
+    fn start_over(&mut self, server: Option<String>, device: Option<u64>) {
         *self = State {
             server,
+            device,
             age: self.age + 1,
             ..State::default()
         };
     }
 
-    /// Whether to ask `server` what's held now: its ticket, to hand back
-    /// with the answer. None while an answer is fresh or on its way.
-    fn begin(&mut self, server: &str, now: Instant) -> Option<u64> {
-        // Another server's list says nothing here.
-        if self.server.as_deref() != Some(server) {
-            self.start_over(Some(server.to_owned()));
+    /// Whether to ask `server`, as `device`, what's held now: its ticket,
+    /// to hand back with the answer. None while an answer is fresh or on
+    /// its way.
+    fn begin(&mut self, server: &str, device: u64, now: Instant) -> Option<u64> {
+        // Another server's list says nothing here, and neither does what
+        // another device was told: paired again, the computer is one the
+        // server may hold nothing for.
+        if self.server.as_deref() != Some(server) || self.device != Some(device) {
+            self.start_over(Some(server.to_owned()), Some(device));
         }
         let due = self.again.is_none_or(|at| at <= now);
         (due && !self.asking).then(|| {
@@ -156,7 +162,10 @@ impl Local {
     /// The sync settings changed (sync turned on or off, another folder):
     /// what's known is dropped, and asked for afresh.
     pub fn forget(&self) {
-        self.state.lock().expect("local lock").start_over(None);
+        self.state
+            .lock()
+            .expect("local lock")
+            .start_over(None, None);
     }
 
     /// Whether sync is on now for the server and the folder `held` is of.
@@ -182,6 +191,11 @@ impl Local {
         let server = asker.server().url();
         let seen_on = Instant::now();
         let settings = tokio::task::spawn_blocking(move || {
+            // An agent that goes by other settings than this app's keeps
+            // a copy this app knows nothing of.
+            if service.settings_file().is_some_and(|theirs| theirs != file) {
+                return Err("the sync agent reads other settings than this app's".to_owned());
+            }
             let config = Config::load(&file)?;
             let on = service.state().enabled;
             Ok::<_, String>((config, on))
@@ -198,25 +212,8 @@ impl Local {
         let mut tracks = HashMap::new();
         let mut after: Option<String> = None;
         for _ in 0..MOST_PAGES {
-            let path = match &after {
-                None => "/api/sync/v1/inventory".to_owned(),
-                Some(after) => {
-                    let after: String =
-                        url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
-                    format!("/api/sync/v1/inventory?after={after}")
-                }
-            };
-            let page = asker.get(&path).await?;
-            let mut next = None;
-            for line in page.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
-                let Ok(line) = serde_json::from_slice::<Line>(line) else {
-                    continue;
-                };
-                if let (Some(path), Some(size), Some(track)) = (line.path, line.size, line.track) {
-                    tracks.insert(track, (path, size));
-                }
-                next = next.or(line.next);
-            }
+            let page = asker.get(&page_path(after.as_deref())).await?;
+            let next = read_page(&page, &mut tracks);
             match next {
                 // A cursor that doesn't move on would never end.
                 Some(next) if after.as_ref() != Some(&next) => after = Some(next),
@@ -232,6 +229,35 @@ impl Local {
         }
         Err("the server's list of what this computer holds didn't end".to_owned())
     }
+}
+
+/// Where a page of the inventory is asked for: the first, or the one after
+/// the cursor the last page gave (a path in the folder, so anything a file
+/// name can hold).
+fn page_path(after: Option<&str>) -> String {
+    match after {
+        None => "/api/sync/v1/inventory".to_owned(),
+        Some(after) => {
+            let after: String = url::form_urlencoded::byte_serialize(after.as_bytes()).collect();
+            format!("/api/sync/v1/inventory?after={after}")
+        }
+    }
+}
+
+/// Takes a page's tracks into `tracks`, and returns the cursor for the
+/// next page, if there is one.
+fn read_page(page: &[u8], tracks: &mut HashMap<i64, (String, u64)>) -> Option<String> {
+    let mut next = None;
+    for line in page.split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        let Ok(line) = serde_json::from_slice::<Line>(line) else {
+            continue;
+        };
+        if let (Some(path), Some(size), Some(track)) = (line.path, line.size, line.track) {
+            tracks.insert(track, (path, size));
+        }
+        next = next.or(line.next);
+    }
+    next
 }
 
 /// The type the server sends a file of this name as: only audio the copy is
@@ -279,11 +305,18 @@ fn open(root: &Path, path: &str, size: u64) -> Option<File> {
 impl LocalFiles for Local {
     fn track(&self, id: i64, ask: &Asker) -> Option<LocalFile> {
         let server = ask.server().url();
+        // Only as a device: without a token (signed in by password, or
+        // the token just refused and removed) the server has no copy of
+        // this computer's to speak of, and none is played from.
+        let Some(device) = ask.device_mark() else {
+            self.forget();
+            return None;
+        };
         let held = {
             let mut state = self.state.lock().expect("local lock");
             // On the proxy's runtime: this thread is one of its own.
             if let Ok(runtime) = tokio::runtime::Handle::try_current()
-                && let Some(ticket) = state.begin(&server, Instant::now())
+                && let Some(ticket) = state.begin(&server, device, Instant::now())
             {
                 let (file, service) = (self.file.clone(), self.service.clone());
                 let (asker, shared) = (ask.clone(), self.state.clone());
@@ -314,7 +347,7 @@ impl LocalFiles for Local {
                     state.seen_on = Some(Instant::now());
                 } else {
                     tracing::debug!("sync is no longer on here: not playing from the copy");
-                    state.start_over(Some(server.clone()));
+                    state.start_over(Some(server.clone()), Some(device));
                     // Asked again in a while, not at every track.
                     state.again = Some(Instant::now() + RETRY);
                 }
@@ -389,21 +422,27 @@ mod tests {
     fn the_server_is_asked_once_at_a_time_and_again_when_its_answer_is_old() {
         let (a, start) = ("https://a/", Instant::now());
         let mut state = State::default();
-        let ticket = state.begin(a, start).expect("nothing is known: ask");
+        let ticket = state.begin(a, 1, start).expect("nothing is known: ask");
         // While that's on its way, nobody else asks.
-        assert_eq!(state.begin(a, start), None);
+        assert_eq!(state.begin(a, 1, start), None);
         assert!(state.held.is_none());
         state.finish(ticket, Ok(held(a, 3)), start);
         assert_eq!(state.held.as_ref().map(|h| h.tracks.len()), Some(3));
         // Fresh for a while, then asked again, with the old list still used.
-        assert_eq!(state.begin(a, start + FRESH - Duration::from_secs(1)), None);
-        let ticket = state.begin(a, start + FRESH).expect("old: ask again");
+        assert_eq!(
+            state.begin(a, 1, start + FRESH - Duration::from_secs(1)),
+            None
+        );
+        let ticket = state.begin(a, 1, start + FRESH).expect("old: ask again");
         assert!(state.held.is_some());
         // The server away: nothing is held, and it's asked again sooner.
         state.finish(ticket, Err("away".into()), start + FRESH);
         assert!(state.held.is_none());
-        assert_eq!(state.begin(a, start + FRESH + Duration::from_secs(1)), None);
-        assert!(state.begin(a, start + FRESH + RETRY).is_some());
+        assert_eq!(
+            state.begin(a, 1, start + FRESH + Duration::from_secs(1)),
+            None
+        );
+        assert!(state.begin(a, 1, start + FRESH + RETRY).is_some());
     }
 
     // Bugs caught: 0, False positives: 0
@@ -411,27 +450,27 @@ mod tests {
     fn an_answer_from_before_the_settings_changed_isnt_kept() {
         let (a, now) = ("https://a/", Instant::now());
         let mut state = State::default();
-        let before = state.begin(a, now).unwrap();
+        let before = state.begin(a, 1, now).unwrap();
         // Sync is turned off (the settings page says so), and a track is
         // asked for at once, while the first asking is still on its way.
-        state.start_over(None);
-        let after = state.begin(a, now).expect("asked afresh");
+        state.start_over(None, None);
+        let after = state.begin(a, 1, now).expect("asked afresh");
         assert_ne!(before, after);
         // The old answer (sync was on) arrives first, then the new one.
         state.finish(before, Ok(held(a, 3)), now);
         assert!(state.held.is_none(), "kept what was true before");
-        assert_eq!(state.begin(a, now), None, "the new asking is still on");
+        assert_eq!(state.begin(a, 1, now), None, "the new asking is still on");
         state.finish(after, Err("sync isn't on for this server".into()), now);
         assert!(state.held.is_none());
 
         // Another server shown: the first one's list is dropped, and an
         // answer about it that arrives late is too.
         let mut state = State::default();
-        let first = state.begin(a, now).unwrap();
+        let first = state.begin(a, 1, now).unwrap();
         state.finish(first, Ok(held(a, 3)), now);
-        let again = state.begin(a, now + FRESH).unwrap();
+        let again = state.begin(a, 1, now + FRESH).unwrap();
         let other = state
-            .begin("https://b/", now + FRESH)
+            .begin("https://b/", 1, now + FRESH)
             .expect("another server: ask it");
         assert!(state.held.is_none());
         state.finish(again, Ok(held(a, 3)), now + FRESH);
@@ -445,10 +484,61 @@ mod tests {
 
     // Bugs caught: 0, False positives: 0
     #[test]
+    fn what_one_device_was_told_isnt_used_for_the_next() {
+        let (a, now) = ("https://a/", Instant::now());
+        let mut state = State::default();
+        let first = state.begin(a, 1, now).unwrap();
+        state.finish(first, Ok(held(a, 3)), now);
+        assert!(state.held.is_some());
+        assert_eq!(state.begin(a, 1, now), None, "fresh, for the same device");
+        // Paired again (another token): the list goes, and the server is
+        // asked as the new device at once.
+        let second = state.begin(a, 2, now).expect("asked as the new device");
+        assert!(state.held.is_none());
+        // The old device's answer, if one was still on its way, is dropped.
+        state.finish(first, Ok(held(a, 3)), now);
+        assert!(state.held.is_none());
+        state.finish(second, Ok(held(a, 0)), now);
+        assert_eq!(state.held.as_ref().map(|h| h.tracks.len()), Some(0));
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_inventory_is_read_a_page_at_a_time_whatever_its_paths_hold() {
+        assert_eq!(page_path(None), "/api/sync/v1/inventory");
+        // The cursor is a path: spaces, other scripts and what a URL
+        // means something by all go as the path's own bytes.
+        assert_eq!(
+            page_path(Some("Björk & Co/100% Hits? #1/01 A+B=C.flac")),
+            "/api/sync/v1/inventory?after=Bj%C3%B6rk+%26+Co%2F100%25+Hits%3F+%231%2F01+A%2BB%3DC.flac"
+        );
+        let mut tracks = HashMap::new();
+        let page = br#"{"path":"A/1.flac","hash":"h1","size":10,"track":-5,"album":"x"}
+{"path":"A/cover.jpg","hash":"h2","size":3}
+{"path":"A/2.flac","hash":"h3","size":20}
+not json at all
+{"next":"A/2.flac"}
+"#;
+        // Only files that are tracks, in their current version, count; a
+        // line this build can't read is passed over.
+        assert_eq!(read_page(page, &mut tracks).as_deref(), Some("A/2.flac"));
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[&-5], ("A/1.flac".to_owned(), 10));
+        // The last page says so by naming no next.
+        let last = br#"{"path":"B/1.flac","hash":"h4","size":7,"track":-6}
+{"next":null}
+"#;
+        assert_eq!(read_page(last, &mut tracks), None);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(read_page(b"{}\n", &mut tracks), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
     fn a_slow_answer_doesnt_count_as_a_fresh_look_at_whether_sync_is_on() {
         let (a, start) = ("https://a/", Instant::now());
         let mut state = State::default();
-        let ticket = state.begin(a, start).unwrap();
+        let ticket = state.begin(a, 1, start).unwrap();
         // Sync was seen on when the asking began; the server took a
         // minute to answer.
         let answer = Held {

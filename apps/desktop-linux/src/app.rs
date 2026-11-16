@@ -156,7 +156,7 @@ impl App {
 
         // Tracks this computer holds a copy of are played from the copy,
         // while sync is on.
-        let local = Arc::new(Local::new(sync::file(), Arc::new(Systemd)));
+        let local = Arc::new(Local::new(sync::file(), Arc::new(Systemd::default())));
         let (notifications, found) = watch::channel(None);
         let desktop = Desktop {
             notifications: found,
@@ -208,7 +208,7 @@ impl App {
             questions: Mutex::new(HashMap::new()),
             folders: Mutex::new(HashMap::new()),
             next_question: AtomicU64::new(1),
-            sync: Panel::new(sync::file(), Arc::new(Systemd)),
+            sync: Panel::new(sync::file(), Arc::new(Systemd::default())),
             local,
             notifications,
             _lock: lock,

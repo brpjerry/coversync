@@ -8,6 +8,7 @@ import { invoke } from './bridge.js';
 const $ = (id) => document.getElementById(id);
 const closeButton = $('close');
 const notice = $('notice');
+const failed = $('failed');
 const folder = $('folder');
 const chooseButton = $('choose');
 const server = $('server');
@@ -25,6 +26,9 @@ const SETTLE_MS = 600;
 
 // A command is under way, or the page has only just come up: the controls wait.
 let working = true;
+// Goes up whenever a command starts or ends. A read of the settings that was asked for before
+// that is about how things were, and isn't shown: it could put the switch back the way it was.
+let turn = 0;
 
 /** A server's address without its scheme, as people say it. */
 const plain = (url) => url.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -50,7 +54,9 @@ function show(overview) {
 
 	// What stands in the way of turning it on, most basic first.
 	let blocked = null;
-	if (!overview.installed)
+	if (overview.agent_reads)
+		blocked = `Sync on this computer is set from the app started the usual way: its agent reads ${overview.agent_reads}, and this window has settings of its own.`;
+	else if (!overview.installed)
 		blocked = "The sync agent isn't installed on this computer. It comes in the coversync-agent package.";
 	else if (overview.unpaired)
 		blocked =
@@ -61,9 +67,12 @@ function show(overview) {
 	notice.hidden = blocked === null;
 	notice.textContent = blocked ?? '';
 
-	const ready = overview.installed && (on || (overview.server && overview.paired && overview.folder));
+	const ready =
+		!overview.agent_reads &&
+		overview.installed &&
+		(on || (overview.server && overview.paired && overview.folder));
 	toggle.disabled = working || !ready;
-	chooseButton.disabled = working;
+	chooseButton.disabled = working || Boolean(overview.agent_reads);
 	if (on && overview.running) status.textContent = overview.status || 'Starting.';
 	else if (on) status.textContent = overview.unpaired ? '' : 'Sync is on, and not running right now.';
 	else if (elsewhere) status.textContent = overview.status;
@@ -72,31 +81,45 @@ function show(overview) {
 	else status.textContent = 'Sync is off.';
 }
 
-/** Says what went wrong: `problem` is the app's `Problem`. */
+/**
+ * Says what went wrong with the last thing asked for: `problem` is the app's `Problem`. It has
+ * a place of its own, apart from what `show` writes, so the next look at the settings doesn't
+ * take it away: it stays until something else is asked for.
+ */
 function fail(problem) {
-	notice.hidden = false;
-	notice.textContent = [problem?.title, problem?.message].filter(Boolean).join(': ');
+	failed.hidden = false;
+	failed.textContent = [problem?.title, problem?.message].filter(Boolean).join(': ');
 }
 
-async function refresh() {
-	if (working) return;
+function clearFailure() {
+	failed.hidden = true;
+	failed.textContent = '';
+}
+
+/** Reads the settings and shows them, unless a command started or ended meanwhile. */
+async function read() {
+	const asked = turn;
 	try {
 		const overview = await invoke('settings');
-		if (!working) show(overview);
+		if (asked === turn) show(overview);
 	} catch (problem) {
-		fail(problem);
+		if (asked === turn) fail(problem);
 	}
 }
 
+function refresh() {
+	if (!working) return read();
+}
+
 // What there is to see shows at once; only the controls wait.
-invoke('settings')
-	.then(show)
-	.catch(fail);
+read();
 
 /** Runs a command that answers with the overview, keeping the controls still meanwhile. */
 async function run(cmd, args, doing) {
 	if (working) return;
 	working = true;
+	turn += 1;
+	clearFailure();
 	toggle.disabled = chooseButton.disabled = true;
 	busy.hidden = false;
 	busy.textContent = doing;
@@ -108,11 +131,12 @@ async function run(cmd, args, doing) {
 		problem = err;
 	}
 	working = false;
+	turn += 1;
 	busy.hidden = true;
 	if (overview) show(overview);
 	else {
-		await refresh();
 		fail(problem);
+		await read();
 	}
 }
 
@@ -129,6 +153,7 @@ document.addEventListener('keydown', (event) => {
 toggle.disabled = chooseButton.disabled = true;
 setTimeout(() => {
 	working = false;
-	refresh();
+	turn += 1;
+	read();
 }, SETTLE_MS);
 setInterval(refresh, REFRESH_MS);

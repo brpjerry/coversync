@@ -229,10 +229,40 @@ pub trait Service: Send + Sync {
     /// Starts a running agent again, to take up new settings. One that
     /// isn't running stays off.
     fn restart(&self) -> Result<(), String>;
+    /// The settings file the agent reads, when that can be told: the
+    /// service has an environment of its own, which needn't be the app's
+    /// (an app started with a settings folder of its own, say).
+    fn settings_file(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// The agent's systemd user unit, through `systemctl --user`.
-pub struct Systemd;
+#[derive(Default)]
+pub struct Systemd {
+    /// The settings file the unit's agent reads: asked for once.
+    reads: std::sync::OnceLock<Option<PathBuf>>,
+}
+
+/// The settings file an agent reads that is started with these
+/// environments: the unit's own (`systemctl show -p Environment`: one
+/// line, `Environment=A=1 B=2`), over the service manager's (`systemctl
+/// show-environment`: a line each). None when neither says where the
+/// home folder is.
+fn agents_file(unit: &str, manager: &str) -> Option<PathBuf> {
+    let unit = unit.trim().strip_prefix("Environment=").unwrap_or("");
+    let get = |name: &str| {
+        let prefix = format!("{name}=");
+        let unquoted = |word: &str| word.trim_matches('"').to_owned();
+        unit.split_whitespace()
+            .map(unquoted)
+            .chain(manager.lines().map(str::to_owned))
+            .find_map(|pair| pair.strip_prefix(&prefix).map(str::to_owned))
+            .filter(|value| !value.is_empty())
+    };
+    get("HOME")?;
+    Some(file_from(&get))
+}
 
 fn systemctl(args: &[&str]) -> Result<String, String> {
     let output = Command::new("systemctl")
@@ -307,6 +337,16 @@ impl Service for Systemd {
     fn restart(&self) -> Result<(), String> {
         systemctl(&["try-restart", UNIT]).map(|_| ())
     }
+
+    fn settings_file(&self) -> Option<PathBuf> {
+        self.reads
+            .get_or_init(|| {
+                let unit = systemctl(&["show", UNIT, "-p", "Environment"]).ok()?;
+                let manager = systemctl(&["show-environment"]).ok()?;
+                agents_file(&unit, &manager)
+            })
+            .clone()
+    }
 }
 
 /// What the app's settings page shows of sync.
@@ -332,6 +372,10 @@ pub struct Overview {
     /// The agent ended because the server no longer takes this computer's
     /// token.
     pub unpaired: bool,
+    /// The settings file the agent reads, when it isn't this window's: the
+    /// app was started with a settings folder of its own, and the agent
+    /// on this computer goes by another. Sync isn't this window's to set.
+    pub agent_reads: Option<String>,
 }
 
 /// Sync as the app's settings page works it: the settings file and the
@@ -348,10 +392,37 @@ impl Panel {
 
     /// What to show, for a window showing `server` (as [`server_url`]
     /// writes it) that this computer is, or isn't, `paired` with.
+    /// The settings file the agent reads, if it isn't the one this panel
+    /// writes.
+    fn others(&self) -> Option<PathBuf> {
+        self.service
+            .settings_file()
+            .filter(|theirs| *theirs != self.file)
+    }
+
+    /// Refuses a change to sync from a window whose settings the agent
+    /// doesn't read: it would show as done here and happen to another
+    /// server and folder, or not at all.
+    fn own(&self) -> Result<(), Problem> {
+        match self.others() {
+            None => Ok(()),
+            Some(theirs) => Err(Problem::new(
+                "Sync isn't this window's to set",
+                format!(
+                    "The sync agent on this computer reads {}, and this window was started with \
+                     settings of its own ({}). Set sync up in the app started the usual way.",
+                    theirs.display(),
+                    self.file.display()
+                ),
+            )),
+        }
+    }
+
     pub fn overview(&self, server: Option<&str>, paired: bool) -> Result<Overview, Problem> {
         let config = self.config()?;
         let state = self.service.state();
         Ok(Overview {
+            agent_reads: self.others().map(|theirs| theirs.display().to_string()),
             installed: state.installed,
             server: server.map(str::to_owned),
             // A token file is this computer's token for the server it was
@@ -359,7 +430,10 @@ impl Panel {
             paired: paired
                 || (config.token_file.is_some()
                     && matches!((&config.server, server), (Some(kept), Some(shown)) if same_server(kept, shown))),
-            syncs_with: config.server,
+            // As the window's server is written, so the page can tell
+            // them apart by looking; one that isn't an address stays as it
+            // is, to be seen.
+            syncs_with: config.server.map(|kept| server_url(&kept).unwrap_or(kept)),
             folder: config.root.map(|root| root.display().to_string()),
             on: state.enabled,
             running: state.active,
@@ -371,6 +445,7 @@ impl Panel {
     /// Turns sync on, with the server the window shows, or off.
     pub fn turn(&self, on: bool, server: Option<&str>, paired: bool) -> Result<(), Problem> {
         let cant = |why: &str| Problem::new("Sync can't be turned on yet", why);
+        self.own()?;
         if !on {
             return self
                 .service
@@ -425,6 +500,7 @@ impl Panel {
     /// Sets the folder the copy is kept in. It has to exist. A running
     /// agent starts again to take it up; what's in the old folder stays.
     pub fn set_folder(&self, chosen: &Path) -> Result<(), Problem> {
+        self.own()?;
         let root = folder(chosen).map_err(|why| Problem::new("That folder can't be used", why))?;
         let mut config = self.config()?;
         if config.root.as_deref() != Some(root.as_path()) {
@@ -466,6 +542,8 @@ mod tests {
         state: Mutex<ServiceState>,
         calls: Mutex<Vec<&'static str>>,
         fails: Mutex<Option<String>>,
+        /// The settings file its agent reads, when it says.
+        reads: Mutex<Option<PathBuf>>,
     }
 
     impl Fake {
@@ -505,6 +583,10 @@ mod tests {
                 Some(why) => Err(why),
                 None => Ok(()),
             }
+        }
+
+        fn settings_file(&self) -> Option<PathBuf> {
+            self.reads.lock().unwrap().clone()
         }
     }
 
@@ -550,6 +632,7 @@ mod tests {
                 running: true,
                 status: String::new(),
                 unpaired: false,
+                agent_reads: None,
             }
         );
         // The file holds the server and the folder, and nothing else.
@@ -668,6 +751,95 @@ mod tests {
         let moved = Config::load(&file).unwrap();
         assert_eq!(moved.server.as_deref(), Some(b));
         assert_eq!(moved.token_file, None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_window_with_settings_the_agent_doesnt_read_cant_set_sync() {
+        let dir = scratch("panel-other-profile");
+        fs::create_dir_all(dir.join("music")).unwrap();
+        let (mine, theirs) = (dir.join("mine/sync.json"), dir.join("theirs/sync.json"));
+        let service = Fake::installed();
+        let panel = Panel::new(mine.clone(), service.clone());
+
+        // The agent reads this window's file, or doesn't say: all as usual.
+        *service.reads.lock().unwrap() = Some(mine.clone());
+        assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
+        panel.set_folder(&dir.join("music")).unwrap();
+
+        // It reads another: the page is told which, and nothing is
+        // changed or started from here.
+        *service.reads.lock().unwrap() = Some(theirs.clone());
+        let overview = panel.overview(Some("https://a/"), true).unwrap();
+        assert_eq!(overview.agent_reads, Some(theirs.display().to_string()));
+        let before = fs::read(&mine).unwrap();
+        for refused in [
+            panel.turn(true, Some("https://a/"), true),
+            panel.turn(false, None, false),
+            panel.set_folder(&dir),
+        ] {
+            let why = refused.unwrap_err();
+            assert!(
+                why.message.contains(&theirs.display().to_string()),
+                "{why:?}"
+            );
+        }
+        assert_eq!(fs::read(&mine).unwrap(), before);
+        assert!(service.calls().is_empty());
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_agents_settings_file_follows_its_own_environment() {
+        let manager = "HOME=/home/a\nLANG=C\nXDG_CONFIG_HOME=/home/a/.config\n";
+        let default = Path::new("/home/a/.config/io.github.brpjerry.coversync/sync.json");
+        assert_eq!(
+            agents_file("Environment=", manager).as_deref(),
+            Some(default)
+        );
+        assert_eq!(agents_file("", "HOME=/home/a\n").as_deref(), Some(default));
+        // The unit's own environment comes first.
+        let unit =
+            "Environment=XDG_CONFIG_HOME=/rig/config \"DBUS_SESSION_BUS_ADDRESS=unix:path=/x\"\n";
+        assert_eq!(
+            agents_file(unit, manager).as_deref(),
+            Some(Path::new(
+                "/rig/config/io.github.brpjerry.coversync/sync.json"
+            ))
+        );
+        // Nothing to go by: not told, rather than guessed.
+        assert_eq!(agents_file("", ""), None);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn the_server_sync_is_with_is_shown_as_the_windows_is_written() {
+        let dir = scratch("panel-spelling");
+        let file = dir.join("sync.json");
+        let panel = Panel::new(file.clone(), Fake::installed());
+        let kept = |server: &str| {
+            Config {
+                server: Some(server.into()),
+                ..Default::default()
+            }
+            .save(&file)
+            .unwrap();
+            panel
+                .overview(Some("https://music.example/"), true)
+                .unwrap()
+                .syncs_with
+        };
+        // Spelled another way in the file: the same server to the page.
+        assert_eq!(
+            kept("music.example").as_deref(),
+            Some("https://music.example/")
+        );
+        assert_eq!(
+            kept("https://music.example").as_deref(),
+            Some("https://music.example/")
+        );
+        // What isn't an address at all is shown as it is.
+        assert_eq!(kept("").as_deref(), Some(""));
     }
 
     // Bugs caught: 0, False positives: 0

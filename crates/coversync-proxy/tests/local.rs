@@ -175,6 +175,13 @@ async fn the_app_asks_the_server_as_this_computers_device() {
     // The window's sign-in is no part of it.
     assert!(seen.headers.get(COOKIE).is_none());
 
+    // The token it asks with has a mark, the same each time.
+    let mark = asker.device_mark();
+    assert!(mark.is_some());
+    window.get("/coversync/api/tracks/7/stream").await;
+    let again = copy.asker.lock().unwrap().clone().unwrap();
+    assert_eq!(again.device_mark(), mark);
+
     // A computer that isn't paired has nothing to ask with.
     let unpaired = Window::open_with(
         Proxy::builder()
@@ -185,4 +192,5 @@ async fn the_app_asks_the_server_as_this_computers_device() {
     unpaired.get("/api/tracks/7/stream").await;
     let asker = copy.asker.lock().unwrap().clone().unwrap();
     assert!(asker.get("/api/sync/v1/inventory").await.is_err());
+    assert_eq!(asker.device_mark(), None);
 }

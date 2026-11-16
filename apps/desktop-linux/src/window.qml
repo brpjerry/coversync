@@ -42,6 +42,9 @@ Window {
 
     // The app's settings page, over the page the window is on, which stays as it is (and goes on playing).
     function openSettings() {
+        // Not over a question that's waiting for its answer: the settings would take the keyboard from it.
+        if (dialog.visible)
+            return;
         settingsPane.open();
     }
     function closeSettings() {
