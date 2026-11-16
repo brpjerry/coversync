@@ -251,6 +251,13 @@ impl Template {
         out
     }
 
+    /// Whether an optional part depends on the album having one disc (see
+    /// [`one_disc`]): one holds the disc or track number.
+    pub fn counts_discs(&self) -> bool {
+        self.all_vars()
+            .any(|(v, _, optional)| optional && (v == "disc_number" || v == "track_number"))
+    }
+
     /// Catalog kinds whose values this template reads: every variable's,
     /// and the disc and track numbers and totals when an optional part
     /// depends on the album having one disc or one track.
@@ -298,6 +305,8 @@ impl Template {
         let last = self.segments.len() - 1;
         for (i, segment) in self.segments.iter().enumerate() {
             let mut text = String::new();
+            // Whether the folder is nothing but optional parts, all left out.
+            let mut left_out = segment.iter().all(|p| matches!(p, Part::Optional(_)));
             for part in segment {
                 match part {
                     Part::Text(t) => text.push_str(t),
@@ -312,15 +321,15 @@ impl Template {
                     Part::Optional(parts) => {
                         if let Some(t) = optional(parts, values) {
                             text.push_str(&t);
+                            left_out = false;
                         }
                     }
                 }
             }
-            let mut name = finish(&text);
-            // A folder of optional parts alone, all left out, isn't one.
-            if name.is_empty() && i != last && vars(segment).all(|(_, _, optional)| optional) {
+            if left_out && i != last {
                 continue;
             }
+            let mut name = finish(&text);
             if reserved(&name) {
                 name = finish(&format!("_{name}"));
             }
@@ -389,15 +398,15 @@ fn total(values: &HashMap<&'static str, String>, what: &str) -> Option<u32> {
         .or_else(|| number(get(&format!("{what}_number"))?.split_once('/')?.1))
 }
 
-/// Whether the album has one disc: a disc total of 1, or no disc number or
-/// total at all. A disc number without a total could be either, so it
-/// counts as more than one.
-fn one_disc(values: &HashMap<&'static str, String>) -> bool {
+/// Whether a track's album has one disc, as optional parts decide it: a
+/// disc total of 1, or no disc number or total at all. A disc number
+/// without a total, or a total that isn't 1 or can't be read, could be one
+/// of several, so it doesn't count.
+pub fn one_disc(values: &HashMap<&'static str, String>) -> bool {
+    let empty = |k: &str| values.get(k).is_none_or(|v| v.trim().is_empty());
     match total(values, "disc") {
-        Some(n) => n <= 1,
-        None => values
-            .get("disc_number")
-            .is_none_or(|v| v.trim().is_empty()),
+        Some(n) => n == 1,
+        None => empty("disc_number") && empty("disc_total"),
     }
 }
 
@@ -655,8 +664,19 @@ mod tests {
                 &[("disc_number", "2/2"), ("track_number", "1/1")],
                 "2-01 - T",
             ),
-            // A disc number without a total could be one of several.
+            // A disc number without a total could be one of several, as
+            // could a total of 0 or one that can't be read.
             (&[("disc_number", "1"), ("track_number", "5")], "1-05 - T"),
+            (
+                &[
+                    ("disc_number", "2"),
+                    ("disc_total", "0"),
+                    ("track_number", "1"),
+                    ("track_total", "1"),
+                ],
+                "2-01 - T",
+            ),
+            (&[("disc_total", "?"), ("track_number", "1/1")], "01 - T"),
             (&[("disc_number", "1"), ("track_number", "1/1")], "1-01 - T"),
             // No track number: left out, not missing.
             (&[("disc_number", "1/1")], "T"),
@@ -719,6 +739,17 @@ mod tests {
             (path, missing),
             (PathBuf::from("B/_/T.flac"), vec!["genre"])
         );
+        // A folder of text alone, or an optional part that's there but
+        // makes no name, is `_` as before.
+        let v = vals(&[("album", "B"), ("genre", "..."), ("title", "T")]);
+        for structure in ["{album}/.../{title}", "{album}/<{genre}>/{title}"] {
+            let t = Template::parse(structure).unwrap();
+            assert_eq!(
+                t.render(&v, "flac").unwrap(),
+                PathBuf::from("B/_/T.flac"),
+                "{structure}"
+            );
+        }
         // Structures without < > render as they did.
         let t = Template::parse("{album}/{disc_number}-{track_number} - {title}").unwrap();
         let v = vals(&[

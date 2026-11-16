@@ -242,19 +242,9 @@ pub fn read_album(
 
 /// Album-wide kinds among the folder structure's `variables` on which
 /// `tracks` differ, which would spread the album over several folders.
-/// Dates count by year when the structure shows only the year.
-/// Variables and kinds the folder structure needs the same on every track
-/// of an album: its variables (only album-wide kinds count), and the disc
-/// total when an optional part depends on the album having one disc, so
-/// that one album's discs are named alike.
-fn album_wide(template: &Template) -> Vec<&'static str> {
-    let mut out = template.variables();
-    if template.value_kinds().contains(&"disc_total") && !out.contains(&"disc_total") {
-        out.push("disc_total");
-    }
-    out
-}
-
+/// Dates count by year when the structure shows only the year. A track
+/// without a value differs from one with it: an optional part would be left
+/// out for one and not the other.
 fn disagreeing(
     variables: &[&'static str],
     tracks: &[&HashMap<&'static str, String>],
@@ -270,14 +260,14 @@ fn disagreeing(
             continue;
         }
         let mut seen: Vec<&str> = Vec::new();
-        for value in tracks.iter().filter_map(|t| t.get(kind)) {
-            let value = value.trim();
+        for track in tracks {
+            let value = track.get(kind).map_or("", |v| v.trim());
             let value = if year {
                 value.get(..4).unwrap_or(value)
             } else {
                 value
             };
-            if !value.is_empty() && !seen.contains(&value) {
+            if !seen.contains(&value) {
                 seen.push(value);
             }
         }
@@ -313,7 +303,7 @@ pub fn plan(
     let detail = lib.album(album_id)?.ok_or(Error::NotFound)?;
     let template = Template::parse(&setup.structure)?;
     let kinds = needed_kinds(&setup.rules.required_tags, &template);
-    let wide = album_wide(&template);
+    let reads = template.value_kinds();
     let folder = setup.folder.clone();
     let mut problems = Vec::new();
 
@@ -346,6 +336,8 @@ pub fn plan(
     let mut tracks = Vec::new();
     // Each track's disc, to tell why file names clash.
     let mut discs = Vec::new();
+    // Whether each track's album has one disc, as optional parts see it.
+    let mut one_disc = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
         let path = read.path;
         let mut values = read.values;
@@ -385,14 +377,16 @@ pub fn plan(
                 .ok()
                 .map(|rel| Path::new(f).join(rel))
         });
+        one_disc.push(template::one_disc(&values));
         discs.push(values.get("disc_number").map(|v| {
             let n = v.split('/').next().unwrap_or(v).trim();
             n.trim_start_matches('0').to_string()
         }));
-        // The disc total too when it has to agree, to tell how.
+        // What's required, and what the structure reads, so that what it
+        // needs alike on every track can be checked.
         let shown: HashMap<&'static str, String> = values
             .into_iter()
-            .filter(|(k, _)| kinds.contains(k) || (*k == "disc_total" && wide.contains(k)))
+            .filter(|(k, _)| kinds.contains(k) || reads.contains(k))
             .collect();
         tracks.push((
             path,
@@ -455,13 +449,23 @@ pub fn plan(
         ));
     }
 
-    let failing = kinds
+    let failing: Vec<&'static str> = kinds
         .iter()
         .copied()
         .filter(|k| tracks.iter().any(|(_, t)| t.missing.contains(k)))
         .collect();
     let values: Vec<_> = tracks.iter().map(|(_, t)| &t.values).collect();
-    let disagree = disagreeing(&wide, &values);
+    let mut disagree = disagreeing(&template.variables(), &values);
+    // One album's discs are named alike only if every track counts the
+    // same number of discs.
+    if template.counts_discs()
+        && one_disc.iter().any(|o| *o != one_disc[0])
+        && !disagree.contains(&"disc_total")
+    {
+        disagree.push("disc_total");
+    }
+    // Missing on some tracks already; that says what to fill in.
+    disagree.retain(|k| !failing.contains(k));
     let autofilled = rules::CATALOG
         .iter()
         .map(|k| k.id)
@@ -774,41 +778,15 @@ mod tests {
         let c = track(&[("album", "chiptune collection 1"), ("title", "c")]);
         let vars = ["album_artist", "album", "year", "track_number", "title"];
         // Case alone makes another folder; one year is one folder.
-        assert_eq!(disagreeing(&vars, &[&a, &b, &c]), ["album"]);
-        assert!(disagreeing(&vars, &[&a, &c]).is_empty());
+        assert_eq!(disagreeing(&vars, &[&a, &b]), ["album"]);
+        // A track without a date differs from those with one.
+        assert_eq!(disagreeing(&vars, &[&a, &b, &c]), ["album", "date"]);
+        // None has an album artist: that's alike.
+        assert!(!disagreeing(&vars, &[&a, &c]).contains(&"album_artist"));
         // The full date, when the structure shows it.
         assert_eq!(disagreeing(&["date"], &[&a, &b]), ["date"]);
         // Titles are per track.
         assert!(disagreeing(&["title"], &[&a, &b]).is_empty());
-    }
-
-    #[test]
-    fn a_disc_total_the_structure_depends_on_has_to_agree() {
-        let track = |pairs: &[(&'static str, &str)]| -> HashMap<&'static str, String> {
-            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
-        };
-        let plain = Template::parse("{album}/{disc_number}-{track_number} - {title}").unwrap();
-        assert!(!album_wide(&plain).contains(&"disc_total"));
-        let optional = Template::parse(crate::template::DEFAULT).unwrap();
-        let wide = album_wide(&optional);
-        assert!(wide.contains(&"disc_total"));
-        // Disc 1 tagged "of 1" and disc 2 "of 2" would name disc 1 alone
-        // without its number.
-        let one = track(&[("disc_number", "1"), ("disc_total", "1"), ("title", "a")]);
-        let two = track(&[("disc_number", "2"), ("disc_total", "2"), ("title", "b")]);
-        assert_eq!(disagreeing(&wide, &[&one, &two]), ["disc_total"]);
-        // Track totals are per disc, so they may differ.
-        let three = track(&[
-            ("disc_number", "2"),
-            ("disc_total", "2"),
-            ("track_total", "9"),
-        ]);
-        let four = track(&[
-            ("disc_number", "1"),
-            ("disc_total", "2"),
-            ("track_total", "12"),
-        ]);
-        assert!(disagreeing(&wide, &[&three, &four]).is_empty());
     }
 
     #[test]
