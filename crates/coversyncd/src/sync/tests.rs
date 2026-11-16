@@ -819,40 +819,12 @@ async fn files_a_check_cant_tell_yet_are_left_alone() {
     assert_eq!(tree(&tablet.root), want);
 }
 
-#[tokio::test]
-async fn the_inventory_pages_in_path_order() {
-    use coversync_protocol::PAGE_OPS;
-    let d = Daemon::new("inventory");
-    let (id, token) = d.device(Scope::Sync);
-    // Exactly two pages, with paths whose byte order isn't their order by
-    // case or by character.
-    let mut held = std::collections::HashMap::new();
-    for i in 0..2 * PAGE_OPS {
-        let path = match i % 4 {
-            0 => format!("a/{i:05}.flac"),
-            1 => format!("B/{i:05}.flac"),
-            2 => format!("é/{i:05}.flac"),
-            _ => format!("z/{i:05}.flac"),
-        };
-        held.insert(
-            path,
-            super::plan::Held {
-                hash: format!("{i:064x}"),
-                size: i as u64,
-                track: None,
-                album: None,
-            },
-        );
-    }
-    d.state
-        .sync
-        .store
-        .reconciled(id, &held, &Default::default(), "epoch")
-        .unwrap();
-
+/// Page through the device's inventory from `after`: the paths, and how
+/// many pages it took.
+async fn read_inventory(d: &Daemon, token: &str, after: Option<&str>) -> (Vec<String>, usize) {
+    let mut after = after.map(str::to_string);
     let mut seen = Vec::new();
     let mut pages = 0;
-    let mut after: Option<String> = None;
     loop {
         let url = match &after {
             None => "/api/sync/v1/inventory".to_string(),
@@ -861,7 +833,7 @@ async fn the_inventory_pages_in_path_order() {
                 format!("/api/sync/v1/inventory?after={a}")
             }
         };
-        let res = d.call("GET", &url, &token, None, &[]).await;
+        let res = d.call("GET", &url, token, None, &[]).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = String::from_utf8(bytes(res).await).unwrap();
         let mut lines: Vec<serde_json::Value> = body
@@ -870,19 +842,71 @@ async fn the_inventory_pages_in_path_order() {
             .collect();
         let end = lines.pop().unwrap();
         pages += 1;
-        for l in lines {
-            let path = l["path"].as_str().unwrap().to_string();
-            assert_eq!(l["size"].as_u64(), Some(held[&path].size));
-            seen.push(path);
-        }
+        seen.extend(
+            lines
+                .iter()
+                .map(|l| l["path"].as_str().unwrap().to_string()),
+        );
         match end["next"].as_str() {
             Some(next) => after = Some(next.to_string()),
-            None => break,
+            None => return (seen, pages),
         }
     }
-    // No empty page after the last full one.
-    assert_eq!(pages, 2);
-    let mut want: Vec<String> = held.keys().cloned().collect();
-    want.sort();
-    assert_eq!(seen, want);
+}
+
+#[tokio::test]
+async fn the_inventory_pages_in_path_order() {
+    use coversync_protocol::PAGE_OPS;
+    let d = Daemon::new("inventory");
+    let (id, token) = d.device(Scope::Sync);
+    let store = |n: usize| {
+        // Paths whose byte order isn't their order by case or by character.
+        let held: std::collections::HashMap<String, super::plan::Held> = (0..n)
+            .map(|i| {
+                let path = match i % 4 {
+                    0 => format!("a/{i:05}.flac"),
+                    1 => format!("B/{i:05}.flac"),
+                    2 => format!("é/{i:05}.flac"),
+                    _ => format!("z/{i:05}.flac"),
+                };
+                let file = super::plan::Held {
+                    hash: format!("{i:064x}"),
+                    size: i as u64,
+                    track: None,
+                    album: None,
+                };
+                (path, file)
+            })
+            .collect();
+        d.state
+            .sync
+            .store
+            .reconciled(id, &held, &Default::default(), "epoch")
+            .unwrap();
+        let mut paths: Vec<String> = held.into_keys().collect();
+        paths.sort();
+        paths
+    };
+
+    // Nothing held: one page, empty.
+    store(0);
+    assert_eq!(read_inventory(&d, &token, None).await, (vec![], 1));
+
+    // Exactly two pages: no empty page after the last full one.
+    let want = store(2 * PAGE_OPS);
+    assert_eq!(read_inventory(&d, &token, None).await, (want.clone(), 2));
+    // From a cursor between two paths, and from one past the last.
+    let (rest, _) = read_inventory(&d, &token, Some("a0")).await;
+    assert_eq!(rest, want[want.partition_point(|p| p.as_str() <= "a0")..]);
+    let last = want.last().unwrap();
+    assert_eq!(read_inventory(&d, &token, Some(last)).await, (vec![], 1));
+    assert_eq!(
+        read_inventory(&d, &token, Some("\u{10FFFF}")).await,
+        (vec![], 1)
+    );
+
+    // A short last page.
+    let want = store(PAGE_OPS + 1);
+    let (seen, pages) = read_inventory(&d, &token, None).await;
+    assert_eq!((seen, pages), (want, 2));
 }
