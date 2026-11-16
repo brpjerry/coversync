@@ -20,6 +20,11 @@ server = ["dep:flate2", "dep:getrandom", "dep:image", "dep:ureq", "dep:walkdir"]
 name = "change_counter"
 required-features = ["server"]
 
+# It plans imports.
+[[test]]
+name = "import_structure"
+required-features = ["server"]
+
 [dependencies]
 coversync-protocol = { version = "0.1.0", path = "../coversync-protocol" }
 image = { version = "0.25.10", optional = true, default-features = false, features = ["jpeg", "png", "webp", "gif"] }

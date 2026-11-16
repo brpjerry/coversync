@@ -45,7 +45,7 @@
 </script>
 
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { fade, fly, slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
@@ -332,6 +332,24 @@
 		}
 		return out;
 	}
+
+	// The dialog adds album fields as its plans find tracks differing in a
+	// tag. A suggestion already shown for one, the same for every track,
+	// fills that field in from then on, as if it had been there when the
+	// lookup came back; one that was ticked fills it in now.
+	$effect(() => {
+		const album = fields.album;
+		untrack(() => {
+			for (const row of rows) {
+				if (row.field || row.scope !== 'album' || !album.includes(row.kind)) continue;
+				if (row.ids.length !== tracks.length) continue;
+				const ticked = chosen.delete(row.key);
+				row.field = 'album';
+				row.core = true;
+				if (ticked) toggle(row, true);
+			}
+		});
+	});
 
 	function isOn(row: Row) {
 		if (row.ids.some((id) => !row.values[id].trim())) return false;

@@ -120,6 +120,12 @@
 		{/each}
 	</div>
 
+	<p class="requires">
+		A part in <code>&lt; &gt;</code> is left out when its variable has no value, a disc number when
+		the album has one disc, and a track number when it's a single:
+		<code>&lt;{'{'}disc_number{'}'}-&gt;</code>.
+	</p>
+
 	{#if limits.length}
 		<div class="limits" role="group" aria-label="Maximum lengths">
 			<span class="limits-label"><Ruler size={14} /> Max length</span>

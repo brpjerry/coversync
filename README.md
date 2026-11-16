@@ -40,11 +40,16 @@ used on a home server.
   `{album_artist}/{year} - {album}/{track_number} - {title}`.
   `{track_number}` is zero-padded and the extension is added. `{album:40}`
   keeps at most 40 characters of a value, cut at a word break when one is
-  close. Every name it makes works on Windows, SMB shares and FAT32 or exFAT
+  close. A part in `< >` is optional: it's left out when a variable in it
+  has no value, when it holds `{disc_number}` and the album has one disc, or
+  when it holds `{track_number}` and the album is a single. The default,
+  `{album_artist}/{album}/<{disc_number}-><{track_number} - >{title}`, names
+  files `2-05 - Title`, `05 - Title` or `Title`; `<Disc {disc_number}>/`
+  makes a disc folder only for albums with more than one. Every name it makes works on Windows, SMB shares and FAT32 or exFAT
   cards: tag values have `/ \ : * ? " < > |` replaced, the template's own
   text can't contain them, names Windows keeps for itself (CON, NUL, COM1,
   …) get a `_` in front, and no name ends in a dot or space. Tags a template
-  uses count as required on import. The rules and the
+  uses outside `< >` count as required on import. The rules and the
   Library's index live in the Library folder itself (see
   [Moving the Library](#moving-the-library)).
 - **Import** (right-click an Inbox album): checks the rules and the template's

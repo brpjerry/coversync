@@ -198,7 +198,7 @@ pub fn device_paths(
         .transpose()?;
     let kinds = template
         .as_ref()
-        .map(Template::required_kinds)
+        .map(Template::value_kinds)
         .unwrap_or_default();
     let mut incomplete = 0;
     let mut files = Vec::with_capacity(catalog.tracks.len());
@@ -457,6 +457,24 @@ mod tests {
             ]
         );
         assert_eq!((incomplete, renamed), (1, 1));
+    }
+
+    #[test]
+    fn an_own_structure_sees_the_totals_its_optional_parts_need() {
+        let one = r#"{"album":"One","disc_number":"1","disc_total":"1",
+            "track_number":"3","track_total":"9","title":"T"}"#;
+        let two = r#"{"album":"Two","disc_number":"2","disc_total":"2",
+            "track_number":"3","track_total":"9","title":"T"}"#;
+        let single = r#"{"album":"S","disc_number":"1","disc_total":"1",
+            "track_number":"1","track_total":"1","title":"T"}"#;
+        let tracks = [("a.flac", one), ("b.flac", two), ("c.flac", single)];
+        let own = DeviceSettings {
+            structure: Some("{album}/<{disc_number}-><{track_number} - >{title}".into()),
+            ..Default::default()
+        };
+        let (got, incomplete, _) = paths(&tracks, own);
+        assert_eq!(got, ["One/03 - T.flac", "Two/2-03 - T.flac", "S/T.flac"]);
+        assert_eq!(incomplete, 0);
     }
 
     #[test]

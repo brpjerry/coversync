@@ -5,6 +5,14 @@
 //! is zero-padded to two digits. `{album:40}` keeps at most 40 characters of
 //! the value, cut at a word break when one is close.
 //!
+//! A part in `< >` is optional: `<{disc_number}->` is left out when a
+//! variable in it has no value, when it holds `{disc_number}` and the album
+//! has one disc, or when it holds `{track_number}` and the album is a
+//! single (one track on one disc). A folder that's nothing but such parts
+//! is left out with them. Variables only in optional parts aren't required.
+//! The album's disc and track totals come from the `disc_total` and
+//! `track_total` values, or a `2/3` style number.
+//!
 //! Every name a template makes can be written on Windows, SMB shares and
 //! FAT32 or exFAT cards: values have the characters those can't hold
 //! replaced, a template's own text can't have them, names Windows keeps
@@ -18,14 +26,17 @@ use std::path::PathBuf;
 
 use crate::{Error, Result, rules};
 
-pub const DEFAULT: &str = "{album_artist}/{album}/{track_number} - {title}";
+/// A disc number only when the album has more than one disc, and a track
+/// number unless it's a single.
+pub const DEFAULT: &str = "{album_artist}/{album}/<{disc_number}-><{track_number} - >{title}";
 
 pub const SUGGESTIONS: &[&str] = &[
     DEFAULT,
-    "{album_artist}/{year} - {album}/{track_number} - {title}",
-    "{album_artist}/{album}/{disc_number}-{track_number} - {title}",
-    "{genre}/{album_artist}/{album}/{track_number} - {title}",
-    "{album_artist} - {album}/{track_number} {artist} - {title}",
+    "{album_artist}/{year} - {album}/<{disc_number}-><{track_number} - >{title}",
+    "{album_artist}/{album}/<Disc {disc_number}>/<{track_number} - >{title}",
+    "{album_artist}/{album}/{track_number} - {title}",
+    "{genre}/{album_artist}/{album}/<{disc_number}-><{track_number} - >{title}",
+    "{album_artist} - {album}/<{disc_number}-><{track_number} >{artist} - {title}",
 ];
 
 /// `{year}` is the first four digits of the date tag.
@@ -39,6 +50,9 @@ enum Part {
     Text(String),
     /// A variable, and the most characters of its value to keep.
     Var(&'static str, Option<usize>),
+    /// Text and variables in `< >`, left out as a whole (see the module's
+    /// notes). Never holds another.
+    Optional(Vec<Part>),
 }
 
 /// A parsed structure template: folders separated by `/`, the last being the file name.
@@ -54,10 +68,112 @@ fn known(name: &str) -> Option<&'static str> {
     rules::kind(name).map(|k| k.id)
 }
 
+fn invalid<T>(msg: String) -> Result<T> {
+    Err(Error::Invalid(msg))
+}
+
+/// One folder's or the file name's parts: text, variables and optional
+/// parts in `< >`.
+fn segment(raw: &str) -> Result<Vec<Part>> {
+    let mut parts = Vec::new();
+    let mut rest = raw;
+    loop {
+        match rest.find(['<', '>']) {
+            None => {
+                parts.extend(tokens(rest, raw)?);
+                return Ok(parts);
+            }
+            Some(i) if rest.as_bytes()[i] == b'>' => {
+                return invalid(format!("Unmatched > in '{raw}'."));
+            }
+            Some(i) => {
+                parts.extend(tokens(&rest[..i], raw)?);
+                let inside = &rest[i + 1..];
+                let Some(end) = inside.find(['<', '>']) else {
+                    return invalid(format!("Unclosed < in '{raw}'."));
+                };
+                if inside.as_bytes()[end] == b'<' {
+                    return invalid(format!("A part in < > can't hold another, in '{raw}'."));
+                }
+                let optional = tokens(&inside[..end], raw)?;
+                if !optional.iter().any(|p| matches!(p, Part::Var(..))) {
+                    return invalid(format!(
+                        "A part in < > needs a variable to depend on, like <{{disc_number}}->, in '{raw}'."
+                    ));
+                }
+                parts.push(Part::Optional(optional));
+                rest = &inside[end + 1..];
+            }
+        }
+    }
+}
+
+/// Text and `{variables}` in `chunk`, a piece of the folder `raw`.
+fn tokens(chunk: &str, raw: &str) -> Result<Vec<Part>> {
+    let mut parts = Vec::new();
+    let mut rest = chunk;
+    while !rest.is_empty() {
+        match rest.find(['{', '}']) {
+            Some(i) if rest.as_bytes()[i] == b'}' => {
+                return invalid(format!("Unmatched }} in '{raw}'."));
+            }
+            Some(i) => {
+                if i > 0 {
+                    parts.push(text(&rest[..i])?);
+                }
+                let Some(end) = rest[i..].find('}') else {
+                    return invalid(format!("Unclosed {{ in '{raw}'."));
+                };
+                let inner = rest[i + 1..i + end].trim();
+                let (name, limit) = match inner.split_once(':') {
+                    Some((name, limit)) => (name.trim(), Some(limit.trim())),
+                    None => (inner, None),
+                };
+                let Some(id) = known(name) else {
+                    return invalid(format!("Unknown variable {{{name}}}."));
+                };
+                let limit = match limit {
+                    None => None,
+                    Some(n) => match n.parse::<usize>() {
+                        Ok(n @ 1..=MAX_LIMIT) => Some(n),
+                        _ => {
+                            return invalid(format!(
+                                "{{{inner}}}: a length limit is a number of characters from 1 to {MAX_LIMIT}, like {{{name}:40}}."
+                            ));
+                        }
+                    },
+                };
+                parts.push(Part::Var(id, limit));
+                rest = &rest[i + end + 1..];
+            }
+            None => {
+                parts.push(text(rest)?);
+                rest = "";
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// Every variable part, and whether it's in an optional part.
+fn vars(parts: &[Part]) -> impl Iterator<Item = (&'static str, Option<usize>, bool)> + '_ {
+    parts
+        .iter()
+        .flat_map(|part| -> Box<dyn Iterator<Item = _>> {
+            match part {
+                Part::Text(_) => Box::new(std::iter::empty()),
+                Part::Var(v, limit) => Box::new(std::iter::once((*v, *limit, false))),
+                Part::Optional(inner) => Box::new(inner.iter().filter_map(|p| match p {
+                    Part::Var(v, limit) => Some((*v, *limit, true)),
+                    _ => None,
+                })),
+            }
+        })
+}
+
 impl Template {
     pub fn parse(source: &str) -> Result<Self> {
         let source = source.trim();
-        let invalid = |msg: String| Err(Error::Invalid(msg));
         if source.is_empty() {
             return invalid("The folder structure is empty.".into());
         }
@@ -78,49 +194,7 @@ impl Template {
             if raw == "." || raw == ".." {
                 return invalid(format!("'{raw}' isn't allowed as a folder."));
             }
-            let mut parts = Vec::new();
-            let mut rest = raw;
-            while !rest.is_empty() {
-                match rest.find(['{', '}']) {
-                    Some(i) if rest.as_bytes()[i] == b'}' => {
-                        return invalid(format!("Unmatched }} in '{raw}'."));
-                    }
-                    Some(i) => {
-                        if i > 0 {
-                            parts.push(text(&rest[..i])?);
-                        }
-                        let Some(end) = rest[i..].find('}') else {
-                            return invalid(format!("Unclosed {{ in '{raw}'."));
-                        };
-                        let inner = rest[i + 1..i + end].trim();
-                        let (name, limit) = match inner.split_once(':') {
-                            Some((name, limit)) => (name.trim(), Some(limit.trim())),
-                            None => (inner, None),
-                        };
-                        let Some(id) = known(name) else {
-                            return invalid(format!("Unknown variable {{{name}}}."));
-                        };
-                        let limit = match limit {
-                            None => None,
-                            Some(n) => match n.parse::<usize>() {
-                                Ok(n @ 1..=MAX_LIMIT) => Some(n),
-                                _ => {
-                                    return invalid(format!(
-                                        "{{{inner}}}: a length limit is a number of characters from 1 to {MAX_LIMIT}, like {{{name}:40}}."
-                                    ));
-                                }
-                            },
-                        };
-                        parts.push(Part::Var(id, limit));
-                        rest = &rest[i + end + 1..];
-                    }
-                    None => {
-                        parts.push(text(rest)?);
-                        rest = "";
-                    }
-                }
-            }
-            segments.push(parts);
+            segments.push(segment(raw)?);
         }
         if !segments
             .last()
@@ -128,19 +202,46 @@ impl Template {
             .iter()
             .any(|p| matches!(p, Part::Var(..)))
         {
-            return invalid("The file name (after the last /) needs at least one variable.".into());
+            return invalid(
+                "The file name (after the last /) needs at least one variable outside < >.".into(),
+            );
         }
         Ok(Self { segments })
     }
 
-    /// Variables used, in order of first appearance.
+    fn all_vars(&self) -> impl Iterator<Item = (&'static str, Option<usize>, bool)> + '_ {
+        self.segments.iter().flat_map(|s| vars(s))
+    }
+
+    /// Variables used, in order of first appearance, optional parts' too.
     pub fn variables(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
+        for (v, _, _) in self.all_vars() {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Variables whose values would be in a file's path with these values:
+    /// those outside optional parts, and those in optional parts that
+    /// aren't left out.
+    pub fn shown_variables(&self, values: &HashMap<&'static str, String>) -> Vec<&'static str> {
+        let mut out = Vec::new();
         for part in self.segments.iter().flatten() {
-            if let Part::Var(v, _) = part
-                && !out.contains(v)
-            {
-                out.push(*v);
+            let shown: Vec<&'static str> = match part {
+                Part::Text(_) => continue,
+                Part::Var(v, _) => vec![*v],
+                Part::Optional(parts) if optional(parts, values).is_some() => {
+                    vars(parts).map(|(v, _, _)| v).collect()
+                }
+                Part::Optional(_) => continue,
+            };
+            for v in shown {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
             }
         }
         out
@@ -150,23 +251,50 @@ impl Template {
     /// variable appears more than once).
     pub fn limits(&self) -> Vec<(&'static str, usize)> {
         let mut out: Vec<(&'static str, usize)> = Vec::new();
-        for part in self.segments.iter().flatten() {
-            if let Part::Var(v, Some(max)) = part
-                && !out.iter().any(|(x, _)| x == v)
+        for (v, limit, _) in self.all_vars() {
+            if let Some(max) = limit
+                && !out.iter().any(|(x, _)| *x == v)
             {
-                out.push((*v, *max));
+                out.push((v, max));
             }
         }
         out
     }
 
-    /// Catalog kinds a file needs values for to be placed by this template.
+    /// Catalog kinds a file needs values for to be placed by this template:
+    /// those of the variables outside optional parts.
     pub fn required_kinds(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        for v in self.variables() {
-            let id = if v == YEAR { "date" } else { v };
-            if !out.contains(&id) {
+        for (v, _, optional) in self.all_vars() {
+            let id = kind_of(v);
+            if !optional && !out.contains(&id) {
                 out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Whether an optional part depends on the album having one disc (see
+    /// [`one_disc`]): one holds the disc or track number.
+    pub fn counts_discs(&self) -> bool {
+        self.all_vars()
+            .any(|(v, _, optional)| optional && (v == "disc_number" || v == "track_number"))
+    }
+
+    /// Catalog kinds whose values this template reads: every variable's,
+    /// and the disc and track numbers and totals when an optional part
+    /// depends on the album having one disc or one track.
+    pub fn value_kinds(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for (v, _, optional) in self.all_vars() {
+            let mut kinds = vec![kind_of(v)];
+            if optional && (v == "disc_number" || v == "track_number") {
+                kinds.extend(["disc_number", "disc_total", "track_number", "track_total"]);
+            }
+            for id in kinds {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
             }
         }
         out
@@ -189,7 +317,7 @@ impl Template {
 
     /// The relative path even when variables have no value: those are left
     /// empty, and a name left empty is `_`. Also gives the variables that
-    /// had no value.
+    /// had no value, optional parts' aside.
     pub fn render_partial(
         &self,
         values: &HashMap<&'static str, String>,
@@ -200,24 +328,29 @@ impl Template {
         let last = self.segments.len() - 1;
         for (i, segment) in self.segments.iter().enumerate() {
             let mut text = String::new();
+            // Whether the folder is nothing but optional parts, all left out.
+            let mut left_out = segment.iter().all(|p| matches!(p, Part::Optional(_)));
             for part in segment {
                 match part {
                     Part::Text(t) => text.push_str(t),
                     Part::Var(v, limit) => match value(values, v) {
-                        Some(val) => {
-                            let val = clean(&val);
-                            text.push_str(&match limit {
-                                Some(max) => shorten(&val, *max),
-                                None => val,
-                            })
-                        }
+                        Some(val) => text.push_str(&shown(&val, *limit)),
                         None => {
                             if !missing.contains(v) {
                                 missing.push(*v);
                             }
                         }
                     },
+                    Part::Optional(parts) => {
+                        if let Some(t) = optional(parts, values) {
+                            text.push_str(&t);
+                            left_out = false;
+                        }
+                    }
                 }
+            }
+            if left_out && i != last {
+                continue;
             }
             let mut name = finish(&text);
             if reserved(&name) {
@@ -232,6 +365,71 @@ impl Template {
             path.push(name);
         }
         (path, missing)
+    }
+}
+
+/// The catalog kind a variable's value comes from.
+fn kind_of(var: &'static str) -> &'static str {
+    if var == YEAR { "date" } else { var }
+}
+
+/// A value as a name holds it, cut to `limit` characters.
+fn shown(value: &str, limit: Option<usize>) -> String {
+    let value = clean(value);
+    match limit {
+        Some(max) => shorten(&value, max),
+        None => value,
+    }
+}
+
+/// An optional part's text, or None when it's left out.
+fn optional(parts: &[Part], values: &HashMap<&'static str, String>) -> Option<String> {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            Part::Text(t) => text.push_str(t),
+            Part::Var(v, limit) => {
+                let only = match *v {
+                    "disc_number" => one_disc(values),
+                    "track_number" => one_disc(values) && total(values, "track") == Some(1),
+                    _ => false,
+                };
+                if only {
+                    return None;
+                }
+                text.push_str(&shown(&value(values, v)?, *limit));
+            }
+            Part::Optional(_) => unreachable!("optional parts don't nest"),
+        }
+    }
+    Some(text)
+}
+
+/// The album's disc or track total (`what` is "disc" or "track"): its
+/// `_total` value, or what follows the `/` in a `2/3` style number. Only
+/// the leading digits count, as tags written by hand can have more after.
+fn total(values: &HashMap<&'static str, String>, what: &str) -> Option<u32> {
+    let get = |k: &str| values.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
+    let number = |v: &str| {
+        let v = v.trim();
+        v[..v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len())]
+            .parse::<u32>()
+            .ok()
+    };
+    get(&format!("{what}_total"))
+        .and_then(number)
+        .or_else(|| number(get(&format!("{what}_number"))?.split_once('/')?.1))
+}
+
+/// Whether a track's album has one disc, as optional parts decide it: a
+/// disc total of 1, or no disc number or total at all. A disc number
+/// without a total, or a total that isn't 1 or can't be read, could be one
+/// of several, so it doesn't count.
+pub fn one_disc(values: &HashMap<&'static str, String>) -> bool {
+    let empty = |k: &str| values.get(k).is_none_or(|v| v.trim().is_empty());
+    match total(values, "disc") {
+        Some(n) => n == 1,
+        None => empty("disc_number") && empty("disc_total"),
     }
 }
 
@@ -436,6 +634,165 @@ mod tests {
     }
 
     #[test]
+    fn optional_parts_leave_out_an_only_disc_and_a_single_track_number() {
+        let t = Template::parse(DEFAULT).unwrap();
+        let path = |pairs: &[(&'static str, &str)]| {
+            let mut v = vals(&[("album_artist", "A"), ("album", "B"), ("title", "T")]);
+            v.extend(vals(pairs));
+            t.render(&v, "flac").unwrap()
+        };
+        for (pairs, want) in [
+            // More than one disc: the disc number is there.
+            (
+                &[("disc_number", "2/2"), ("track_number", "5/12")][..],
+                "2-05 - T",
+            ),
+            (
+                &[
+                    ("disc_number", "2"),
+                    ("disc_total", "3"),
+                    ("track_number", "5"),
+                ],
+                "2-05 - T",
+            ),
+            // One disc, by its total or for want of any disc number.
+            (
+                &[("disc_number", "1/1"), ("track_number", "5/12")],
+                "05 - T",
+            ),
+            (
+                &[
+                    ("disc_number", "1"),
+                    ("disc_total", "1"),
+                    ("track_number", "5"),
+                ],
+                "05 - T",
+            ),
+            (&[("track_number", "5")], "05 - T"),
+            // A single: no track number either.
+            (&[("disc_number", "1/1"), ("track_number", "1/1")], "T"),
+            // Totals as tagging tools sometimes leave them.
+            (
+                &[
+                    ("disc_number", "1"),
+                    ("disc_total", "1--tag=totaldiscs="),
+                    ("track_number", "1"),
+                    ("track_total", " 01 "),
+                ],
+                "T",
+            ),
+            (&[("track_number", "1"), ("track_total", "1")], "T"),
+            // A disc of one track on a two-disc album keeps both.
+            (
+                &[("disc_number", "2/2"), ("track_number", "1/1")],
+                "2-01 - T",
+            ),
+            // A disc number without a total could be one of several, as
+            // could a total of 0 or one that can't be read.
+            (&[("disc_number", "1"), ("track_number", "5")], "1-05 - T"),
+            (
+                &[
+                    ("disc_number", "2"),
+                    ("disc_total", "0"),
+                    ("track_number", "1"),
+                    ("track_total", "1"),
+                ],
+                "2-01 - T",
+            ),
+            (&[("disc_total", "?"), ("track_number", "1/1")], "01 - T"),
+            (&[("disc_number", "1"), ("track_number", "1/1")], "1-01 - T"),
+            // No track number: left out, not missing.
+            (&[("disc_number", "1/1")], "T"),
+        ] {
+            assert_eq!(
+                path(pairs),
+                PathBuf::from(format!("A/B/{want}.flac")),
+                "{pairs:?}"
+            );
+        }
+        // Variables only in optional parts aren't required; the totals
+        // they depend on are read.
+        assert_eq!(t.required_kinds(), ["album_artist", "album", "title"]);
+        assert_eq!(
+            t.value_kinds(),
+            [
+                "album_artist",
+                "album",
+                "disc_number",
+                "disc_total",
+                "track_number",
+                "track_total",
+                "title"
+            ]
+        );
+        assert_eq!(
+            t.variables(),
+            [
+                "album_artist",
+                "album",
+                "disc_number",
+                "track_number",
+                "title"
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_parts_go_without_their_values_and_take_their_folder() {
+        let t = Template::parse("{album}< ({year:4})>/<Disc {disc_number}>/{title}").unwrap();
+        assert_eq!(t.required_kinds(), ["album", "title"]);
+        assert_eq!(t.limits(), [("year", 4)]);
+        let v = vals(&[
+            ("album", "B"),
+            ("date", "2003-01-02"),
+            ("disc_number", "2/2"),
+            ("title", "T"),
+        ]);
+        assert_eq!(
+            t.render(&v, "flac").unwrap(),
+            PathBuf::from("B (2003)/Disc 2/T.flac")
+        );
+        assert_eq!(
+            t.shown_variables(&v),
+            ["album", "year", "disc_number", "title"]
+        );
+        // No date, one disc: the year goes, and so does the disc's folder.
+        let v = vals(&[("album", "B"), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("B/T.flac"));
+        assert_eq!(t.shown_variables(&v), ["album", "title"]);
+        // A folder with more than optional parts stays, as `_` if empty.
+        let t = Template::parse("{album}/{genre}<{disc_number}>/{title}").unwrap();
+        let (path, missing) = t.render_partial(&v, "flac");
+        assert_eq!(
+            (path, missing),
+            (PathBuf::from("B/_/T.flac"), vec!["genre"])
+        );
+        // A folder of text alone, or an optional part that's there but
+        // makes no name, is `_` as before.
+        let v = vals(&[("album", "B"), ("genre", "..."), ("title", "T")]);
+        for structure in ["{album}/.../{title}", "{album}/<{genre}>/{title}"] {
+            let t = Template::parse(structure).unwrap();
+            assert_eq!(
+                t.render(&v, "flac").unwrap(),
+                PathBuf::from("B/_/T.flac"),
+                "{structure}"
+            );
+        }
+        // Structures without < > render as they did.
+        let t = Template::parse("{album}/{disc_number}-{track_number} - {title}").unwrap();
+        let v = vals(&[
+            ("album", "B"),
+            ("disc_number", "1/1"),
+            ("track_number", "1/1"),
+            ("title", "T"),
+        ]);
+        assert_eq!(
+            t.render(&v, "flac").unwrap(),
+            PathBuf::from("B/1-01 - T.flac")
+        );
+    }
+
+    #[test]
     fn year_comes_from_date_and_counts_as_date() {
         let t = Template::parse("{album_artist}/{year} - {album}/{title}").unwrap();
         assert_eq!(
@@ -549,7 +906,7 @@ mod tests {
 
     #[test]
     fn reports_missing_variables() {
-        let t = Template::parse(DEFAULT).unwrap();
+        let t = Template::parse("{album_artist}/{album}/{track_number} - {title}").unwrap();
         let v = vals(&[("album_artist", "A"), ("album", " "), ("title", "T")]);
         assert_eq!(t.render(&v, "flac").unwrap_err(), ["album", "track_number"]);
     }
@@ -573,6 +930,15 @@ mod tests {
             "{album_artist}: {album}/{title}",
             "{album}/{track_number} | {title}",
             "{album}/a\\b {title}",
+            "<{album}/{title}",
+            "{album}>/{title}",
+            "{album}/<{track_number} - {title}",
+            "{album}/<<{disc_number}>>{title}",
+            "{album}/<{disc_number}<{track_number}>>{title}",
+            "{album}/<Disc >{title}",
+            "{album}/<>{title}",
+            "{album}/<{track_number} - ><{title}>",
+            "{album}/<{disc_number}-{track_number> {title}",
         ] {
             assert!(Template::parse(bad).is_err(), "{bad}");
         }
