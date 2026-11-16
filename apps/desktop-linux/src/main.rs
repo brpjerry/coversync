@@ -171,6 +171,7 @@ fn main() -> ExitCode {
         scheme: pages::SCHEME.to_owned(),
         origin: pages::ORIGIN.to_owned(),
         bridge_url: pages::BRIDGE.to_owned(),
+        settings_url: pages::SETTINGS.to_owned(),
         icon_file: pages::icon_file(&paths::icon_file())
             .map(|file| file.to_string_lossy().into_owned())
             .unwrap_or_default(),

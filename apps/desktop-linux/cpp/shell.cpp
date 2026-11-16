@@ -41,6 +41,7 @@ bool g_quitAsked = false;
 QPointer<QQuickWindow> g_window;
 QPointer<QObject> g_view;
 QPointer<AppPages> g_pages;
+QPointer<Backend> g_backend;
 
 QString qstring(rust::Str text)
 {
@@ -284,6 +285,7 @@ int run(const Options &options)
     context->setContextProperty(QStringLiteral("appStoragePath"), qstring(options.storage_dir));
     context->setContextProperty(QStringLiteral("appCachePath"), qstring(options.cache_dir));
     context->setContextProperty(QStringLiteral("relayScript"), qstring(options.relay_script));
+    context->setContextProperty(QStringLiteral("settingsUrl"), QUrl(qstring(options.settings_url)));
     engine.loadData(bytes(options.qml));
     if (engine.rootObjects().isEmpty()) {
         std::fprintf(stderr, "coversync: the window couldn't be set up (is Qt WebEngine's QML module installed?)\n");
@@ -302,8 +304,16 @@ int run(const Options &options)
         std::fprintf(stderr, "coversync: the web view keeps nothing on disk (its profile is off the record)\n");
 
     // The app's own pages, before the view loads anything.
+    // The page a command is taken to come from: the settings page while it's up (it is over whatever the
+    // window shows, and has the keyboard), the view's own otherwise.
     auto *pages = new AppPages(bytes(options.csp), bytes(options.origin), QUrl(qstring(options.bridge_url)),
-                               [view = QPointer<QObject>(view)] { return view ? view->property("url").toUrl() : QUrl(); }, &app);
+                               [view = QPointer<QObject>(view), window = QPointer<QQuickWindow>(window)] {
+                                   const QUrl settings = window ? window->property("settingsPage").toUrl() : QUrl();
+                                   if (!settings.isEmpty())
+                                       return settings;
+                                   return view ? view->property("url").toUrl() : QUrl();
+                               },
+                               &app);
     profile->installUrlSchemeHandler(bytes(options.scheme), pages);
 
     // A page's notifications, as the desktop's: only a server's UI gets to show any (window.qml grants it the
@@ -329,6 +339,7 @@ int run(const Options &options)
     g_window = window;
     g_view = view;
     g_pages = pages;
+    g_backend = &backend;
     {
         const std::lock_guard<std::mutex> lock(g_lock);
         g_app = &app;
@@ -410,6 +421,32 @@ void ask(std::uint64_t id, rust::Str message, rust::Str accept, rust::Str cancel
                                          Q_ARG(QVariant, accept), Q_ARG(QVariant, cancel));
         if (!asked)
             answered(id, false);
+    });
+}
+
+void open_settings()
+{
+    onMainThread([] {
+        if (g_window)
+            QMetaObject::invokeMethod(g_window, "openSettings");
+    });
+}
+
+void close_settings()
+{
+    onMainThread([] {
+        if (g_window)
+            QMetaObject::invokeMethod(g_window, "closeSettings");
+    });
+}
+
+void choose_folder(std::uint64_t id)
+{
+    onMainThread([id] {
+        if (g_backend)
+            g_backend->chooseFolder(id);
+        else
+            folder_chosen(id, rust::Str(), false);
     });
 }
 

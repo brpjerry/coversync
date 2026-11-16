@@ -16,6 +16,7 @@
 #include <QtGui/QStyleHints>
 
 #include <cstdio>
+#include <utility>
 
 namespace {
 
@@ -200,10 +201,12 @@ void Backend::consoleMessage(int level, const QString &message, int line, const 
     std::fflush(stdout);
 }
 
-void Backend::chooseFiles(bool multiple, const QStringList &accepted)
+// Opens the portal's file chooser with `options`, in place of one that is open: its request's path. The answer
+// comes to chooserResponse; one that can't be had is told to `failed`.
+QString Backend::openChooser(const QString &title, QVariantMap options)
 {
     QDBusConnection bus = QDBusConnection::sessionBus();
-    // One chooser at a time: the one a page asked for before goes.
+    // One chooser at a time: the one asked for before goes.
     closeRequest();
     // The request's object, which answers: its path follows from this connection's name and a token of ours,
     // so the answer can be listened for before the request is made.
@@ -214,8 +217,34 @@ void Backend::chooseFiles(bool multiple, const QStringList &accepted)
     m_request = request;
     bus.connect(kPortal, request, kRequest, QStringLiteral("Response"), this, SLOT(chooserResponse(uint, QVariantMap)));
 
-    QVariantMap options;
     options.insert(QStringLiteral("handle_token"), token);
+    QDBusMessage open = QDBusMessage::createMethodCall(kPortal, kPortalPath, kFileChooser, QStringLiteral("OpenFile"));
+    // No parent window: the chooser stands on its own.
+    open << QString() << title << options;
+    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(open), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, request](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        const QDBusPendingReply<QDBusObjectPath> reply = *call;
+        // A later request may have taken this one's place meanwhile: that one is the asker's now, and what
+        // became of this one says nothing.
+        if (!reply.isError() || m_request != request)
+            return;
+        std::fprintf(stderr, "coversync: the file chooser couldn't open: %s\n", qUtf8Printable(reply.error().message()));
+        // Qt's own from now on, for a page's files.
+        setFileChooser(false);
+        const bool folder = m_folder != 0;
+        forgetRequest();
+        if (folder)
+            folderChosen(QString(), false);
+        else
+            emit filesChosen({});
+    });
+    return request;
+}
+
+void Backend::chooseFiles(bool multiple, const QStringList &accepted)
+{
+    QVariantMap options;
     options.insert(QStringLiteral("multiple"), multiple);
     Filter filter;
     filter.name = QStringLiteral("Accepted files");
@@ -230,23 +259,37 @@ void Backend::chooseFiles(bool multiple, const QStringList &accepted)
         options.insert(QStringLiteral("filters"), QVariant::fromValue(QList<Filter> { filter }));
         options.insert(QStringLiteral("current_filter"), QVariant::fromValue(filter));
     }
-    QDBusMessage open = QDBusMessage::createMethodCall(kPortal, kPortalPath, kFileChooser, QStringLiteral("OpenFile"));
-    // No parent window: the chooser stands on its own.
-    open << QString() << QCoreApplication::translate("Backend", "Choose a file") << options;
-    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(open), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, request](QDBusPendingCallWatcher *call) {
-        call->deleteLater();
-        const QDBusPendingReply<QDBusObjectPath> reply = *call;
-        // A later request may have taken this one's place meanwhile: that one is the page's now, and what
-        // became of this one says nothing.
-        if (!reply.isError() || m_request != request)
-            return;
-        std::fprintf(stderr, "coversync: the file chooser couldn't open: %s\n", qUtf8Printable(reply.error().message()));
-        // Qt's own from now on.
-        setFileChooser(false);
-        forgetRequest();
+    openChooser(QCoreApplication::translate("Backend", "Choose a file"), options);
+}
+
+void Backend::chooseFolder(quint64 id)
+{
+    if (!m_fileChooser) {
+        const QByteArray none;
+        folder_chosen(id, rust::Str(none.constData(), 0), false);
+        return;
+    }
+    // A page's file chooser that is open goes, and the page is told: nothing chosen.
+    if (!m_request.isEmpty() && m_folder == 0) {
+        closeRequest();
         emit filesChosen({});
-    });
+    }
+    QVariantMap options;
+    options.insert(QStringLiteral("directory"), true);
+    options.insert(QStringLiteral("multiple"), false);
+    openChooser(QCoreApplication::translate("Backend", "Choose a folder"), options);
+    // After the open, which closed whatever was asked for before (and answered it).
+    m_folder = id;
+}
+
+// Answers the app's question the request under way was for, which must be for a folder.
+void Backend::folderChosen(const QString &path, bool available)
+{
+    const quint64 id = std::exchange(m_folder, 0);
+    if (id == 0)
+        return;
+    const QByteArray chosen = path.toUtf8();
+    folder_chosen(id, rust::Str(chosen.constData(), static_cast<std::size_t>(chosen.size())), available);
 }
 
 // Stops listening for the request under way.
@@ -259,13 +302,15 @@ void Backend::forgetRequest()
     m_request.clear();
 }
 
-// Closes the chooser that is open for the request under way, if there is one, and forgets the request.
+// Closes the chooser that is open for the request under way, if there is one, and forgets the request. A
+// folder the app was waiting for is answered: none. (A page's files are the view's to give up, in window.qml.)
 void Backend::closeRequest()
 {
     if (m_request.isEmpty())
         return;
     QDBusConnection::sessionBus().asyncCall(QDBusMessage::createMethodCall(kPortal, m_request, kRequest, QStringLiteral("Close")));
     forgetRequest();
+    folderChosen(QString(), true);
 }
 
 // The answer to a request: the one under way, unless it was on its way here when a later request took that
@@ -285,5 +330,8 @@ void Backend::chooserResponse(uint response, const QVariantMap &results)
                 files.append(file);
         }
     }
-    emit filesChosen(files);
+    if (m_folder != 0)
+        folderChosen(files.value(0), true);
+    else
+        emit filesChosen(files);
 }

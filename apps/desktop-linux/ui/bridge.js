@@ -5,11 +5,11 @@
 /** How long an answer can take: a check gives up after 15 seconds, so this is plenty. */
 const TIMEOUT_MS = 60_000;
 /**
- * Commands that may wait for the user: the keychain can ask for its password, for as long as
- * that takes. They have no deadline: the app goes on with them whatever the page thinks, so
+ * Commands that may wait for the user: the keychain can ask for its password, and the folder
+ * chooser stays open, for as long as that takes. They have no deadline: the app goes on with them whatever the page thinks, so
  * giving up here would only show a failure for something that then happens.
  */
-const MAY_ASK = new Set(['connect', 'pair', 'forget']);
+const MAY_ASK = new Set(['connect', 'pair', 'forget', 'sync_choose_folder']);
 
 let next = 0;
 const waiting = new Map();

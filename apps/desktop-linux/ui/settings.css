@@ -1,0 +1,131 @@
+/* The settings page, on top of the fallback page's styles (fallback.css). The window shows it in a card of
+   its own over the page it was opened from (src/window.qml), so it has the card's colour, not the page's. */
+:root {
+	--card: #17181c;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--card: #ffffff;
+	}
+}
+
+body.settings {
+	display: block;
+	padding: 14px 16px 18px;
+	background: var(--card);
+	overflow-y: auto;
+}
+
+.settings main {
+	width: 100%;
+	gap: 22px;
+}
+
+.settings header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.settings h1 {
+	font-size: 20px;
+}
+
+.settings section {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.settings h2 {
+	margin: 0;
+	font-size: 12px;
+	font-weight: 650;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--text-3);
+}
+
+.lead {
+	color: var(--text-2);
+}
+
+.setting {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 12px 14px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--surface);
+}
+
+.setting .about {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+
+.setting .name {
+	font-weight: 600;
+}
+
+.setting .value {
+	color: var(--text-2);
+	font-size: 13px;
+	overflow-wrap: anywhere;
+}
+
+.setting button {
+	flex: none;
+}
+
+.status {
+	color: var(--text-2);
+	font-size: 13px;
+	min-height: 1.5em;
+}
+
+/* The switch, as the web UI draws its toggles. */
+button[role='switch'] {
+	position: relative;
+	width: 42px;
+	height: 24px;
+	padding: 0;
+	border: 1px solid var(--border-strong);
+	border-radius: 999px;
+	background: var(--surface);
+	cursor: pointer;
+	transition: background 0.15s;
+}
+
+button[role='switch'] .knob {
+	position: absolute;
+	top: 2px;
+	left: 2px;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: var(--text-2);
+	transition:
+		transform 0.15s,
+		background 0.15s;
+}
+
+button[role='switch'][aria-checked='true'] {
+	background: var(--accent);
+	border-color: transparent;
+}
+
+button[role='switch'][aria-checked='true'] .knob {
+	transform: translateX(18px);
+	background: var(--accent-ink);
+}
+
+button[role='switch']:disabled {
+	opacity: 0.5;
+	cursor: default;
+}

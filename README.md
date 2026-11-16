@@ -627,6 +627,42 @@ server's UI send them without asking, and hands them to the desktop's
 notification service (`org.freedesktop.Notifications`), or to the portal in a
 sandbox. Clicking one brings the window up, where the desktop allows that.
 
+The app has a settings page of its own, for what's kept on the computer and
+not on the server: **This app**, under Setup in the sidebar, or Ctrl+comma.
+It opens over the server's page, in a view of its own, so the page under it
+stays as it is and goes on playing. The server's UI opens it with one
+command (`open-settings`), which it offers only in an app that lists
+`settings`. So far the page holds sync:
+
+- **Sync this computer** turns the [sync agent](#sync-agent) on and off
+  (its systemd user unit, enabled and started, or disabled and stopped),
+  for the server the window shows. It needs the `coversync-agent` package,
+  the computer paired with the server, and a folder. The agent's own line
+  of status shows under the switch.
+- **Folder** is where the copy of the Library is kept, chosen with the
+  desktop's folder chooser. It is written to the agent's settings on this
+  computer and never sent to the server.
+- What the computer gets and when it syncs by itself are the device's
+  settings, in the server's Sync setup.
+- An app started with a settings folder of its own (another
+  `XDG_CONFIG_HOME`) can't set sync: the agent reads the usual one, and the
+  page says so.
+
+While sync is on, a track the computer holds a copy of is played from the
+copy: the app's proxy answers the UI's request for its audio from the sync
+folder, and the server isn't asked. Which tracks those are comes from the
+server's inventory for this computer's device, asked again every five
+minutes; a file is used only if it is in the folder itself with the size the
+server has for it, and anything else is streamed as before
+(`crates/coversync-desktop-core/src/local.rs`). A copy is told by its place
+and its size, as the sync engine tells one, and isn't read through first: a
+file changed on the computer without changing its length is played as it
+is, until **Check files** in Sync setup finds it. The inventory is asked for
+as the app's own device, so the app has to be paired with the server, not
+signed in with the password. With sync off, nothing is played from the
+copy, within ten seconds of turning it off, from the page or from a
+terminal.
+
 Qt WebEngine has no momentum for two-finger scrolling on Linux, so the app
 carries a scroll on itself once the fingers lift (`cpp/momentum.h`, which
 lists the environment variables that tune it; `COVERSYNC_MOMENTUM=0` turns it
@@ -662,6 +698,9 @@ coversync setup --server https://n5pro.internal/coversync --root ~/Music/Library
 systemctl --user enable --now coversync-agent
 systemctl --user status coversync-agent    # what it's doing, in a line
 ```
+
+With the [desktop app](#desktop-app), the last three lines are its settings
+page instead: choose the folder there and turn **Sync this computer** on.
 
 - **Pairing.** A computer the desktop app has paired needs nothing more: the
   agent uses the app's token, from the keychain, so the computer is one

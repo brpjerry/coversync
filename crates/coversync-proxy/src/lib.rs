@@ -29,6 +29,7 @@
 mod app;
 mod headers;
 mod jar;
+mod local;
 mod pages;
 mod pair;
 mod unreachable;
@@ -58,6 +59,7 @@ use url::Url;
 pub use app::{AppAnswer, AppCommands, AppError, HEADER as APP_HEADER, RESERVED as APP_PATH};
 pub use headers::SERVER as SERVER_HEADER;
 pub use jar::Cookies;
+pub use local::{Asker, HEADER as LOCAL_HEADER, LocalFile, LocalFiles};
 pub use pair::{AboutApp, PairError, Paired, Token};
 pub use unreachable::Unreachable;
 pub use upstream::{Upstream, UpstreamError};
@@ -81,6 +83,7 @@ pub struct Builder {
     on_unreachable: Option<UnreachableHandler>,
     on_rejected: Option<RejectedHandler>,
     commands: Option<Arc<dyn AppCommands>>,
+    local: Option<Arc<dyn LocalFiles>>,
 }
 
 impl Default for Builder {
@@ -94,6 +97,7 @@ impl Default for Builder {
             on_unreachable: None,
             on_rejected: None,
             commands: None,
+            local: None,
         }
     }
 }
@@ -172,6 +176,14 @@ impl Builder {
         self
     }
 
+    /// What this computer holds of the server's Library: a track it holds
+    /// is played from its own disk instead of the server's (see
+    /// [`LocalFiles`]). Without it, everything comes from the server.
+    pub fn local_files(mut self, local: Arc<dyn LocalFiles>) -> Self {
+        self.local = Some(local);
+        self
+    }
+
     /// Listens on 127.0.0.1, on the preferred port or a random one, and
     /// serves for as long as the tokio runtime runs.
     pub async fn start(self) -> io::Result<Proxy> {
@@ -200,6 +212,7 @@ impl Builder {
             on_unreachable: self.on_unreachable,
             on_rejected: self.on_rejected,
             commands: self.commands,
+            local: self.local,
         });
         let app = Router::new()
             .fallback(handle)
@@ -396,6 +409,8 @@ struct Shared {
     on_rejected: Option<RejectedHandler>,
     /// The app's commands for the server's pages.
     commands: Option<Arc<dyn AppCommands>>,
+    /// What this computer holds of the server's Library.
+    local: Option<Arc<dyn LocalFiles>>,
 }
 
 impl Shared {
@@ -591,6 +606,23 @@ async fn handle(State(proxy): State<Arc<Shared>>, req: Request) -> Response {
             return pages::see_other(&start(Some(&upstream)));
         }
         return pages::text(StatusCode::NOT_FOUND, "Not found.");
+    }
+    // A track this computer holds a copy of is played from the copy.
+    if let Some(local) = &proxy.local
+        && let Some(track) = path
+            .strip_prefix(upstream.prefix())
+            .and_then(|rest| local::track_asked(req.method(), rest))
+    {
+        let local = local.clone();
+        let asker = Asker {
+            client: proxy.client.clone(),
+            upstream: upstream.clone(),
+            timeout: proxy.page_timeout,
+        };
+        let found = tokio::task::spawn_blocking(move || local.track(track, &asker)).await;
+        if let Ok(Some(file)) = found {
+            return local::serve(file, req.method(), req.headers());
+        }
     }
     proxy.forward(&upstream, req).await
 }
