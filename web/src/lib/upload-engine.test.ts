@@ -202,6 +202,9 @@ async function sameBytes(server: FakeServer, picked: Picked) {
 }
 
 describe('Uploader', () => {
+	// Bugs caught: 0, False positives: 1
+	// (Timed out at 5 seconds once on a CI runner, on a change that touched nothing it uses, and
+	// passed on the next run.)
 	it('sends large files in chunks, several at once, with progress that only goes up', async () => {
 		const server = new FakeServer();
 		// Up to 16 requests, but no more than 4 chunks' worth of bytes.
