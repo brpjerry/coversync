@@ -818,3 +818,106 @@ async fn files_a_check_cant_tell_yet_are_left_alone() {
     want.insert("mine.bin".into(), vec![9u8; size]);
     assert_eq!(tree(&tablet.root), want);
 }
+
+/// A file in a device's inventory: its path, hash and size.
+type HeldLine = (String, String, u64);
+
+/// Page through the device's inventory from `after`: its files, and how
+/// many pages it took.
+async fn read_inventory(d: &Daemon, token: &str, after: Option<&str>) -> (Vec<HeldLine>, usize) {
+    let mut after = after.map(str::to_string);
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let url = match &after {
+            None => "/api/sync/v1/inventory".to_string(),
+            Some(a) => {
+                let a: String = a.bytes().map(|b| format!("%{b:02X}")).collect();
+                format!("/api/sync/v1/inventory?after={a}")
+            }
+        };
+        let res = d.call("GET", &url, token, None, &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = String::from_utf8(bytes(res).await).unwrap();
+        let mut lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let end = lines.pop().unwrap();
+        pages += 1;
+        seen.extend(lines.iter().map(|l| {
+            (
+                l["path"].as_str().unwrap().to_string(),
+                l["hash"].as_str().unwrap().to_string(),
+                l["size"].as_u64().unwrap(),
+            )
+        }));
+        match end["next"].as_str() {
+            Some(next) => after = Some(next.to_string()),
+            None => return (seen, pages),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_inventory_pages_in_path_order() {
+    use coversync_protocol::PAGE_OPS;
+    let d = Daemon::new("inventory");
+    let (id, token) = d.device(Scope::Sync);
+    let store = |n: usize| {
+        // Paths whose byte order isn't their order by case or by character.
+        let held: std::collections::HashMap<String, super::plan::Held> = (0..n)
+            .map(|i| {
+                let path = match i % 4 {
+                    0 => format!("a/{i:05}.flac"),
+                    1 => format!("B/{i:05}.flac"),
+                    2 => format!("é/{i:05}.flac"),
+                    _ => format!("z/{i:05}.flac"),
+                };
+                let file = super::plan::Held {
+                    hash: format!("{i:064x}"),
+                    size: i as u64,
+                    track: None,
+                    album: None,
+                };
+                (path, file)
+            })
+            .collect();
+        d.state
+            .sync
+            .store
+            .reconciled(id, &held, &Default::default(), "epoch")
+            .unwrap();
+        let mut files: Vec<HeldLine> = held
+            .into_iter()
+            .map(|(path, file)| (path, file.hash, file.size))
+            .collect();
+        files.sort();
+        files
+    };
+
+    // Nothing held: one page, empty.
+    store(0);
+    assert_eq!(read_inventory(&d, &token, None).await, (vec![], 1));
+
+    // Exactly two pages: no empty page after the last full one.
+    let want = store(2 * PAGE_OPS);
+    assert_eq!(read_inventory(&d, &token, None).await, (want.clone(), 2));
+    // From a cursor between two paths, and from one past the last.
+    let (rest, _) = read_inventory(&d, &token, Some("a0")).await;
+    assert_eq!(
+        rest,
+        want[want.partition_point(|(p, ..)| p.as_str() <= "a0")..]
+    );
+    let (last, ..) = want.last().unwrap();
+    assert_eq!(read_inventory(&d, &token, Some(last)).await, (vec![], 1));
+    assert_eq!(
+        read_inventory(&d, &token, Some("\u{10FFFF}")).await,
+        (vec![], 1)
+    );
+
+    // A short last page.
+    let want = store(PAGE_OPS + 1);
+    let (seen, pages) = read_inventory(&d, &token, None).await;
+    assert_eq!((seen, pages), (want, 2));
+}
