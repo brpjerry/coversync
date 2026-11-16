@@ -202,9 +202,9 @@ async function sameBytes(server: FakeServer, picked: Picked) {
 }
 
 describe('Uploader', () => {
-	// Bugs caught: 0, False positives: 1
-	// (Timed out at 5 seconds once on a CI runner, on a change that touched nothing it uses, and
-	// passed on the next run.)
+	// Bugs caught: 0, False positives: 2
+	// (Timed out twice at the default 5 seconds on a CI runner, on changes that touched nothing it
+	// uses: it takes 3 to 4.5 seconds there, 13 MB through the engine. It has 30 seconds now.)
 	it('sends large files in chunks, several at once, with progress that only goes up', async () => {
 		const server = new FakeServer();
 		// Up to 16 requests, but no more than 4 chunks' worth of bytes.
@@ -232,7 +232,7 @@ describe('Uploader', () => {
 		const second = many.engine.add(album(...files));
 		await many.until(second, 'done');
 		expect(small.maxInflight).toBe(16);
-	});
+	}, 30_000);
 
 	it('carries on from what the server kept after the connection drops mid-chunk', async () => {
 		const server = new FakeServer();
