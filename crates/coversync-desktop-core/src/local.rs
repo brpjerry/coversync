@@ -59,6 +59,9 @@ struct Held {
     root: PathBuf,
     /// Each track's path in the folder, and its size.
     tracks: HashMap<i64, (String, u64)>,
+    /// When sync was seen to be on for them: before the server was asked,
+    /// which can take a while.
+    seen_on: Instant,
 }
 
 /// What's known of the copy, and whether the server is being asked.
@@ -117,10 +120,12 @@ impl State {
                     held.tracks.len(),
                     held.server
                 );
+                // The asking looked, when it began: not now, with the
+                // server's answer in. Sync turned off since is seen at the
+                // first use, if the answer took long.
+                self.seen_on = Some(held.seen_on);
                 self.held = Some(Arc::new(held));
                 self.again = Some(now + FRESH);
-                // The asking looked.
-                self.seen_on = Some(now);
             }
             Err(why) => {
                 tracing::debug!("not playing from this computer's copy: {why}");
@@ -175,6 +180,7 @@ impl Local {
     /// while it asks the server.
     async fn ask(file: PathBuf, service: Arc<dyn Service>, asker: Asker) -> Result<Held, String> {
         let server = asker.server().url();
+        let seen_on = Instant::now();
         let settings = tokio::task::spawn_blocking(move || {
             let config = Config::load(&file)?;
             let on = service.state().enabled;
@@ -219,6 +225,7 @@ impl Local {
                         server,
                         root,
                         tracks,
+                        seen_on,
                     });
                 }
             }
@@ -373,6 +380,7 @@ mod tests {
             tracks: (0..tracks as i64)
                 .map(|id| (id, ("a.flac".into(), 1)))
                 .collect(),
+            seen_on: Instant::now(),
         }
     }
 
@@ -437,6 +445,25 @@ mod tests {
 
     // Bugs caught: 0, False positives: 0
     #[test]
+    fn a_slow_answer_doesnt_count_as_a_fresh_look_at_whether_sync_is_on() {
+        let (a, start) = ("https://a/", Instant::now());
+        let mut state = State::default();
+        let ticket = state.begin(a, start).unwrap();
+        // Sync was seen on when the asking began; the server took a
+        // minute to answer.
+        let answer = Held {
+            seen_on: start,
+            ..held(a, 3)
+        };
+        state.finish(ticket, Ok(answer), start + Duration::from_secs(60));
+        // What counts is when it was looked at, so the first use looks
+        // again.
+        assert_eq!(state.seen_on, Some(start));
+        assert!(state.seen_on.unwrap() + STILL_ON <= start + Duration::from_secs(60));
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
     fn sync_turned_off_or_moved_behind_the_apps_back_is_seen() {
         use crate::sync::ServiceState;
 
@@ -478,6 +505,7 @@ mod tests {
             server: "https://a/".into(),
             root: root.clone(),
             tracks: HashMap::new(),
+            seen_on: Instant::now(),
         };
         set("https://a/", &root);
         assert!(local.still_on(&list));
