@@ -257,6 +257,28 @@ fn same_server(kept: &str, server: &str) -> bool {
     config::server_url(kept).is_ok_and(|kept| kept == server)
 }
 
+/// The settings' token file, for a pairing with `url` that names none of
+/// its own: only if the settings say it's that server's. A token file is
+/// one server's. Another server's token isn't written over it (an agent
+/// still running for the first would read it there, and send it to the
+/// wrong one), and with no server in the settings to say whose it is
+/// (`run --server` goes without one), it isn't taken for this one's.
+fn kept_token_file(config: &Config, url: &str) -> Result<Option<PathBuf>, String> {
+    let Some(file) = &config.token_file else {
+        return Ok(None);
+    };
+    let whose = match &config.server {
+        Some(kept) if same_server(kept, url) => return Ok(Some(file.clone())),
+        Some(kept) => format!("is this computer's token for {kept}"),
+        None => "has no server named with it".to_owned(),
+    };
+    Err(format!(
+        "The token file in the settings ({}) {whose}. Name a file for {url}'s token with \
+         --token-file.",
+        file.display()
+    ))
+}
+
 /// Tells the app, in its settings, of a pairing that put a token in the
 /// keychain for `url`. A token that manages is one the app signs in with:
 /// the server is listed as paired, as if the app had paired itself. A
@@ -406,19 +428,7 @@ async fn pair(file: &Path, server: &str, code: &str, token_file: Option<PathBuf>
     // a token nobody finds again.
     let token_file = match token_file {
         Some(path) => Some(config::path(&path).map_err(setup_error)?),
-        // The settings' token file is one server's. Another server's token
-        // isn't written over it: an agent still running for the first
-        // would read it there, and send it to the wrong one.
-        None => match (&config.token_file, &config.server) {
-            (Some(file), Some(kept)) if !same_server(kept, &url) => {
-                return Err(setup_error(format!(
-                    "The token file in the settings ({}) is this computer's token for {kept}. \
-                     Name a file for {url}'s with --token-file.",
-                    file.display()
-                )));
-            }
-            (file, _) => file.clone(),
-        },
+        None => kept_token_file(&config, &url).map_err(setup_error)?,
     };
     let tokens = token_file.clone().map_or(Source::Keychain, Source::File);
     let _apps_lock = apps_lock(&tokens, config::file().parent()).map_err(setup_error)?;
@@ -616,6 +626,28 @@ mod tests {
         // A folder that isn't there is refused, and the settings stay.
         assert!(setup(&file, None, Some(dir.join("missing")), None, false).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_pairing_reuses_the_settings_token_file_only_for_its_own_server() {
+        let settings = |server: Option<&str>, file: Option<&str>| Config {
+            server: server.map(str::to_owned),
+            token_file: file.map(PathBuf::from),
+            ..Default::default()
+        };
+        let a = "https://a.example/";
+        // The settings' server, however they spell it: its file again.
+        let own = settings(Some("a.example"), Some("/keys/a"));
+        assert_eq!(kept_token_file(&own, a), Ok(Some("/keys/a".into())));
+        // No token file: the keychain.
+        assert_eq!(kept_token_file(&settings(Some(a), None), a), Ok(None));
+        // Another server's file, or one with no server to say whose it
+        // is: never written over.
+        let other = kept_token_file(&own, "https://b.example/").unwrap_err();
+        assert!(other.contains("token for a.example"), "{other}");
+        let unowned = kept_token_file(&settings(None, Some("/keys/a")), a).unwrap_err();
+        assert!(unowned.contains("no server named"), "{unowned}");
     }
 
     // Bugs caught: 0, False positives: 0
