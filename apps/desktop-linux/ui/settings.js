@@ -96,14 +96,29 @@ function clearFailure() {
 	failed.textContent = '';
 }
 
-/** Reads the settings and shows them, unless a command started or ended meanwhile. */
+// A read of the settings is on its way: the next one waits for it, so two never arrive out
+// of order.
+let reading = false;
+
+/**
+ * Reads the settings and shows them, unless a command started or ended meanwhile. A read that
+ * fails says so where the settings' own notice goes, which the next read that works replaces:
+ * the place for failures is for things that were asked for, and stays.
+ */
 async function read() {
+	if (reading) return;
+	reading = true;
 	const asked = turn;
 	try {
 		const overview = await invoke('settings');
 		if (asked === turn) show(overview);
 	} catch (problem) {
-		if (asked === turn) fail(problem);
+		if (asked === turn) {
+			notice.hidden = false;
+			notice.textContent = [problem?.title, problem?.message].filter(Boolean).join(': ');
+		}
+	} finally {
+		reading = false;
 	}
 }
 

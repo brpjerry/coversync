@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use coversync_proxy::{Asker, LocalFile, LocalFiles};
 use serde::Deserialize;
 
-use crate::sync::{Config, Service, same_server};
+use crate::sync::{Config, Service, same_file, same_server};
 
 /// How long a list of what's held is used before the server is asked
 /// again. A track synced since then is streamed until it shows up.
@@ -193,7 +193,10 @@ impl Local {
         let settings = tokio::task::spawn_blocking(move || {
             // An agent that goes by other settings than this app's keeps
             // a copy this app knows nothing of.
-            if service.settings_file().is_some_and(|theirs| theirs != file) {
+            if service
+                .settings_file()
+                .is_some_and(|theirs| !same_file(&theirs, &file))
+            {
                 return Err("the sync agent reads other settings than this app's".to_owned());
             }
             let config = Config::load(&file)?;

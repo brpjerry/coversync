@@ -237,31 +237,93 @@ pub trait Service: Send + Sync {
     }
 }
 
+/// How long what was found out about the agent's settings file is gone by
+/// before it's asked for again: the unit can be installed, or changed,
+/// while the app runs, and an answer that couldn't be had is no answer.
+const READS_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The agent's systemd user unit, through `systemctl --user`.
 #[derive(Default)]
 pub struct Systemd {
-    /// The settings file the unit's agent reads: asked for once.
-    reads: std::sync::OnceLock<Option<PathBuf>>,
+    /// The settings file the unit's agent reads, and when that was asked.
+    reads: std::sync::Mutex<Option<(std::time::Instant, PathBuf)>>,
+}
+
+/// The words of one of systemd's `Environment=` lines (`systemctl show -p
+/// Environment`): separated by spaces, and one that has a space or a quote
+/// in it is in double quotes, with a backslash before a quote or a
+/// backslash.
+fn environment(line: &str) -> Vec<String> {
+    let line = line.trim_end_matches('\n');
+    let line = line.strip_prefix("Environment=").unwrap_or(line);
+    let (mut words, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            '\\' => {
+                // What follows stands for itself, but for the usual two.
+                match chars.next() {
+                    Some('n') => word.push('\n'),
+                    Some('t') => word.push('\t'),
+                    Some(other) => word.push(other),
+                    None => {}
+                }
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    words.push(std::mem::take(&mut word));
+                    any = false;
+                }
+            }
+            c => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        words.push(word);
+    }
+    words
 }
 
 /// The settings file an agent reads that is started with these
-/// environments: the unit's own (`systemctl show -p Environment`: one
-/// line, `Environment=A=1 B=2`), over the service manager's (`systemctl
-/// show-environment`: a line each). None when neither says where the
-/// home folder is.
+/// environments, each as `systemctl show -p Environment` prints it: the
+/// unit's own, over the service manager's. None when neither says where
+/// the home folder is.
 fn agents_file(unit: &str, manager: &str) -> Option<PathBuf> {
-    let unit = unit.trim().strip_prefix("Environment=").unwrap_or("");
+    let pairs: Vec<String> = environment(unit)
+        .into_iter()
+        .chain(environment(manager))
+        .collect();
     let get = |name: &str| {
         let prefix = format!("{name}=");
-        let unquoted = |word: &str| word.trim_matches('"').to_owned();
-        unit.split_whitespace()
-            .map(unquoted)
-            .chain(manager.lines().map(str::to_owned))
+        pairs
+            .iter()
             .find_map(|pair| pair.strip_prefix(&prefix).map(str::to_owned))
             .filter(|value| !value.is_empty())
     };
     get("HOME")?;
     Some(file_from(&get))
+}
+
+/// Whether two paths name the same settings file: the same name in the
+/// same folder, however the folder is reached (a link to it, say). The
+/// file needn't be there yet, and a save puts a new one in its place, so
+/// it's the folder that's looked at.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    let place = |path: &Path| {
+        let name = path.file_name()?.to_owned();
+        let folder = path.parent().filter(|dir| !dir.as_os_str().is_empty())?;
+        let folder = fs::canonicalize(folder).unwrap_or_else(|_| folder.to_owned());
+        Some(folder.join(name))
+    };
+    a == b || matches!((place(a), place(b)), (Some(a), Some(b)) if a == b)
 }
 
 fn systemctl(args: &[&str]) -> Result<String, String> {
@@ -339,13 +401,18 @@ impl Service for Systemd {
     }
 
     fn settings_file(&self) -> Option<PathBuf> {
-        self.reads
-            .get_or_init(|| {
-                let unit = systemctl(&["show", UNIT, "-p", "Environment"]).ok()?;
-                let manager = systemctl(&["show-environment"]).ok()?;
-                agents_file(&unit, &manager)
-            })
-            .clone()
+        let mut reads = self.reads.lock().expect("reads lock");
+        if let Some((asked, file)) = &*reads
+            && asked.elapsed() < READS_FOR
+        {
+            return Some(file.clone());
+        }
+        // Not kept when it couldn't be had: asked again the next time.
+        let unit = systemctl(&["show", UNIT, "-p", "Environment"]).ok()?;
+        let manager = systemctl(&["show", "-p", "Environment"]).ok()?;
+        let file = agents_file(&unit, &manager)?;
+        *reads = Some((std::time::Instant::now(), file.clone()));
+        Some(file)
     }
 }
 
@@ -397,7 +464,7 @@ impl Panel {
     fn others(&self) -> Option<PathBuf> {
         self.service
             .settings_file()
-            .filter(|theirs| *theirs != self.file)
+            .filter(|theirs| !same_file(theirs, &self.file))
     }
 
     /// Refuses a change to sync from a window whose settings the agent
@@ -766,6 +833,10 @@ mod tests {
         *service.reads.lock().unwrap() = Some(mine.clone());
         assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
         panel.set_folder(&dir.join("music")).unwrap();
+        // The same file reached through a link to its folder is the same.
+        std::os::unix::fs::symlink(dir.join("mine"), dir.join("alias")).unwrap();
+        *service.reads.lock().unwrap() = Some(dir.join("alias/sync.json"));
+        assert_eq!(panel.overview(None, false).unwrap().agent_reads, None);
 
         // It reads another: the page is told which, and nothing is
         // changed or started from here.
@@ -791,13 +862,16 @@ mod tests {
     // Bugs caught: 0, False positives: 0
     #[test]
     fn the_agents_settings_file_follows_its_own_environment() {
-        let manager = "HOME=/home/a\nLANG=C\nXDG_CONFIG_HOME=/home/a/.config\n";
+        let manager = "Environment=HOME=/home/a LANG=C XDG_CONFIG_HOME=/home/a/.config\n";
         let default = Path::new("/home/a/.config/io.github.brpjerry.coversync/sync.json");
         assert_eq!(
             agents_file("Environment=", manager).as_deref(),
             Some(default)
         );
-        assert_eq!(agents_file("", "HOME=/home/a\n").as_deref(), Some(default));
+        assert_eq!(
+            agents_file("", "Environment=HOME=/home/a\n").as_deref(),
+            Some(default)
+        );
         // The unit's own environment comes first.
         let unit =
             "Environment=XDG_CONFIG_HOME=/rig/config \"DBUS_SESSION_BUS_ADDRESS=unix:path=/x\"\n";
@@ -809,6 +883,56 @@ mod tests {
         );
         // Nothing to go by: not told, rather than guessed.
         assert_eq!(agents_file("", ""), None);
+
+        // A folder with a space, a quote, a backslash and another script
+        // in its name, as systemd prints one (taken from `systemctl show`).
+        let odd = r#"Environment="XDG_CONFIG_HOME=/tmp/a b/ü\"q'\\x" PLAIN=/x/y"#;
+        assert_eq!(
+            environment(odd),
+            [r#"XDG_CONFIG_HOME=/tmp/a b/ü"q'\x"#, "PLAIN=/x/y"]
+        );
+        assert_eq!(
+            agents_file(odd, manager).as_deref(),
+            Some(Path::new(
+                r#"/tmp/a b/ü"q'\x/io.github.brpjerry.coversync/sync.json"#
+            ))
+        );
+        assert_eq!(environment("Environment=\n"), Vec::<String>::new());
+        assert_eq!(environment(r#"A=1  "B=" C="x y""#), ["A=1", "B=", "C=x y"]);
+    }
+
+    // Bugs caught: 0, False positives: 0
+    #[test]
+    fn a_settings_file_reached_another_way_is_the_same_file() {
+        let dir = scratch("same-file");
+        let real = dir.join("real");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+        // Through a link to its folder, before the file is even there.
+        assert!(same_file(
+            &real.join("sync.json"),
+            &dir.join("link/sync.json")
+        ));
+        assert!(same_file(&real.join("sync.json"), &real.join("sync.json")));
+        // Another name, or another folder.
+        assert!(!same_file(
+            &real.join("sync.json"),
+            &real.join("other.json")
+        ));
+        fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        assert!(!same_file(
+            &real.join("sync.json"),
+            &dir.join("elsewhere/sync.json")
+        ));
+        // Folders that aren't there are compared as written.
+        assert!(same_file(
+            Path::new("/nowhere/a/sync.json"),
+            Path::new("/nowhere/a/sync.json")
+        ));
+        assert!(!same_file(
+            Path::new("/nowhere/a/sync.json"),
+            Path::new("/nowhere/b/sync.json")
+        ));
     }
 
     // Bugs caught: 0, False positives: 0
