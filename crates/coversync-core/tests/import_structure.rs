@@ -153,6 +153,24 @@ fn optional_album_wide_values_have_to_agree() {
 }
 
 #[test]
+fn values_only_in_parts_every_track_leaves_out_needn_t_agree() {
+    let s = setup(
+        "left-out",
+        "{album}< ({genre} {label})>/<{track_number} - >{title}",
+    );
+    // No track has a label: the part goes on both, whatever their genres.
+    let plan = s.plan([&[("genre", "Rock")], &[("genre", "Pop")]]);
+    assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
+    assert_eq!(
+        s.dests(&plan),
+        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+    );
+    // A label on one track keeps the part there: then they differ.
+    let plan = s.plan([&[("genre", "Rock"), ("label", "L")], &[("genre", "Rock")]]);
+    assert_eq!(plan.disagree, ["label"]);
+}
+
+#[test]
 fn an_albums_discs_have_to_count_alike() {
     let s = setup(
         "discs",

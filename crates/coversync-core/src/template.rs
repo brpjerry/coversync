@@ -224,6 +224,29 @@ impl Template {
         out
     }
 
+    /// Variables whose values would be in a file's path with these values:
+    /// those outside optional parts, and those in optional parts that
+    /// aren't left out.
+    pub fn shown_variables(&self, values: &HashMap<&'static str, String>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for part in self.segments.iter().flatten() {
+            let shown: Vec<&'static str> = match part {
+                Part::Text(_) => continue,
+                Part::Var(v, _) => vec![*v],
+                Part::Optional(parts) if optional(parts, values).is_some() => {
+                    vars(parts).map(|(v, _, _)| v).collect()
+                }
+                Part::Optional(_) => continue,
+            };
+            for v in shown {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
     /// Variables with a length limit, and the limit (the first, if a
     /// variable appears more than once).
     pub fn limits(&self) -> Vec<(&'static str, usize)> {
@@ -729,9 +752,14 @@ mod tests {
             t.render(&v, "flac").unwrap(),
             PathBuf::from("B (2003)/Disc 2/T.flac")
         );
+        assert_eq!(
+            t.shown_variables(&v),
+            ["album", "year", "disc_number", "title"]
+        );
         // No date, one disc: the year goes, and so does the disc's folder.
         let v = vals(&[("album", "B"), ("title", "T")]);
         assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("B/T.flac"));
+        assert_eq!(t.shown_variables(&v), ["album", "title"]);
         // A folder with more than optional parts stays, as `_` if empty.
         let t = Template::parse("{album}/{genre}<{disc_number}>/{title}").unwrap();
         let (path, missing) = t.render_partial(&v, "flac");

@@ -338,6 +338,10 @@ pub fn plan(
     let mut discs = Vec::new();
     // Whether each track's album has one disc, as optional parts see it.
     let mut one_disc = Vec::new();
+    // Variables in some track's path: what the album's tracks have to
+    // agree on. One only in optional parts every track leaves out can't
+    // split the album.
+    let mut shown_vars: Vec<&'static str> = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
         let path = read.path;
         let mut values = read.values;
@@ -378,6 +382,11 @@ pub fn plan(
                 .map(|rel| Path::new(f).join(rel))
         });
         one_disc.push(template::one_disc(&values));
+        for v in template.shown_variables(&values) {
+            if !shown_vars.contains(&v) {
+                shown_vars.push(v);
+            }
+        }
         discs.push(values.get("disc_number").map(|v| {
             let n = v.split('/').next().unwrap_or(v).trim();
             n.trim_start_matches('0').to_string()
@@ -455,7 +464,7 @@ pub fn plan(
         .filter(|k| tracks.iter().any(|(_, t)| t.missing.contains(k)))
         .collect();
     let values: Vec<_> = tracks.iter().map(|(_, t)| &t.values).collect();
-    let mut disagree = disagreeing(&template.variables(), &values);
+    let mut disagree = disagreeing(&shown_vars, &values);
     // One album's discs are named alike only if every track counts the
     // same number of discs.
     if template.counts_discs()
