@@ -78,7 +78,8 @@ used on a home server.
   every album is looked up afresh, and no answer is read or saved.
 - **Appearance**: which sorts the sort menu offers, which tags the sidebar
   filters by, and the cover size.
-- **Sync** (the server and the engine every device runs; the device apps
+- **Sync** (the server, the engine every device runs, and the
+  [sync agent](#sync-agent) for desktops and laptops; the other device apps
   come next): devices pair with the
   server from Sync setup, each with a token of its own (see
   [Pairing devices](#pairing-devices)), and the sidebar's Sync section lists
@@ -118,6 +119,8 @@ crates/coversync-protocol  the sync API's requests and replies, shared by the se
                         `cargo run -p coversync-protocol --example sync_client` syncs a folder
 crates/coversync-replica  the sync engine every client runs; `cargo run -p coversync-replica
                         --example replica` syncs a folder with it
+crates/coversync-cli    `coversync`, the command for a computer that keeps a copy of the Library:
+                        `coversync run` is the background sync agent
 crates/coversyncd       axum HTTP API, with the web UI embedded in the binary
 crates/coversync-proxy  the desktop app's proxy to a server, on 127.0.0.1
 crates/coversync-desktop-core  the desktop app's settings, servers and launches, apart from its window
@@ -127,14 +130,17 @@ tools/ui_smoke.py       headless Firefox (geckodriver) smoke test
 tools/player_stall.py   the player's buffering spinner while audio stalls, in headless Firefox
 tools/upload.py         uploads an album folder through the upload API
 tools/browser_upload.py the same through the web UI, in headless Firefox or Chromium, timed
-packaging/arch/         PKGBUILD and systemd user unit for the pacman package
+packaging/arch/         PKGBUILD and systemd user units for the pacman packages
 packaging/notices/      third-party notices for packages: Rust crates and the UI's npm packages
 ```
 
 ## Install on Arch Linux
 
-Each [release](https://github.com/brpjerry/coversync/releases) has a pacman
-package. Install it and start the daemon as a user service:
+Each [release](https://github.com/brpjerry/coversync/releases) has two
+pacman packages: `coversync`, the server, and `coversync-agent`, which keeps
+a copy of a server's Library on another computer (see
+[Sync agent](#sync-agent)). Install the server and start it as a user
+service:
 
 ```sh
 sudo pacman -U coversync-0.1.0-1-x86_64.pkg.tar.zst
@@ -145,7 +151,7 @@ coversyncd set-password                            # the password to sign in wit
 
 The service listens on <http://127.0.0.1:8770/>; sign in, then choose the
 Inbox folder under Setup > Inbox (in the sidebar, under the tag filter). To build the
-package from a checkout instead, run `packaging/arch/build.sh` (it packages
+packages from a checkout instead, run `packaging/arch/build.sh` (it packages
 the current commit into `dist/`).
 
 ## Build and run
@@ -641,6 +647,62 @@ The app has its own Cargo workspace and lockfile, apart from the
 repository's, so building and testing the rest doesn't need Qt.
 `RUST_LOG=coversync_proxy=debug` also logs each request the proxy forwards;
 warnings show either way. The fallback page has no build step.
+
+## Sync agent
+
+`coversync run` keeps a folder on a desktop or laptop in step with a server's
+Library, in the background, with no app open. It runs the engine every
+client runs (`crates/coversync-replica`); the command is in
+`crates/coversync-cli`, and the `coversync-agent` package has it with a
+systemd user unit:
+
+```sh
+sudo pacman -U coversync-agent-0.1.0-1-x86_64.pkg.tar.zst
+coversync setup --server https://n5pro.internal/coversync --root ~/Music/Library
+systemctl --user enable --now coversync-agent
+systemctl --user status coversync-agent    # what it's doing, in a line
+```
+
+- **Pairing.** A computer the desktop app has paired needs nothing more: the
+  agent uses the app's token, from the keychain, so the computer is one
+  device in Sync setup. Without the app, `coversync pair <server> <code>`
+  takes a code from Add device and keeps the token in the keychain, or with
+  `--token-file` in a file only you can read, for a computer with no
+  keychain. With the app open, pair in its window: the keychain's token is
+  the app's too, and `coversync pair` waits for it to be closed. A token
+  file is one server's token: `coversync setup --server` to another server
+  stops using it, and `coversync run --server` refuses to send it there.
+- **What's kept on the computer** is the server, the folder and, if one is
+  used, where the token file is: in
+  `~/.config/io.github.brpjerry.coversync/sync.json`, which `coversync setup`
+  shows and changes. The folder is never sent to the server. Everything else
+  is the device's settings in the server's Sync setup.
+- **When it syncs.** It keeps the server's event stream open and syncs once
+  the Library has been quiet for the device's quiet period, at once for
+  **Sync now**, when it starts and when the computer wakes. It also asks
+  the server hourly, in case the stream dropped without a word, and when
+  the network comes back or changes.
+- **The device's conditions** in Sync setup hold for syncs it starts by
+  itself: on unmetered networks only (as NetworkManager tells it), and
+  while charging only (as UPower does: not on the battery). A sync under way
+  stops when they stop holding, whether the network or the power changed or
+  the device's settings did, and goes on when they hold again. **Sync
+  now** is someone asking, and syncs whatever they say. A computer without
+  NetworkManager or UPower counts as unmetered and on mains power. Until
+  they have answered, a sync that depends on them waits, for ten seconds
+  at most: a service that says nothing by then is taken as not there, and
+  looked for again every minute.
+- **The server or the network being away** is waited out. A sync that failed
+  is tried again after 30 seconds, then at doubling intervals up to 10
+  minutes (5 minutes up to an hour for trouble with the folder).
+- **The folder has to exist.** One that isn't there, such as on a disk that
+  isn't mounted, is waited for and never made. A folder that was synced
+  before and has lost coversync's marker (`.coversync-replica/`) is taken
+  for an empty mount point rather than a wish for a second copy: only
+  **Sync now** fills it.
+- **A token the server refuses** (the device was revoked or removed) ends
+  the agent with exit status 3, and the unit doesn't start it again; pair
+  again, then start it. Status 2 means nothing is set up yet.
 
 ## Develop
 

@@ -614,6 +614,20 @@ fn entry_key(query: Option<&str>) -> Option<&str> {
     query?.split('&').find_map(|pair| pair.strip_prefix("k="))
 }
 
+/// Trades a pairing code from `upstream`'s Add device for a token, as
+/// [`Proxy::pair`] does, for a program with no proxy of its own: the sync
+/// agent's `coversync pair`, on a computer that syncs without the app.
+pub async fn pair(
+    upstream: &Upstream,
+    code: &str,
+    about: &AboutApp,
+    timeout: Duration,
+) -> Result<Paired, PairError> {
+    let client =
+        client().map_err(|e| PairError::new(format!("Couldn't set up a connection: {e}.")))?;
+    pair::pair(&client, upstream, code, about, timeout).await
+}
+
 fn client() -> io::Result<HttpsClient> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);

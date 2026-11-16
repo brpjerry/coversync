@@ -15,6 +15,11 @@ pub mod links;
 pub mod shell;
 pub mod tokens;
 
+/// The app's ID: what its settings folder is called and whose its tokens
+/// are in the keychain. The sync agent (`coversync`) uses both, so the app
+/// and the agent are one device on a server.
+pub const APP_ID: &str = "io.github.brpjerry.coversync";
+
 pub use config::{ConfigLock, Store};
 pub use launch::{EarlyLaunches, PairLink, SERVER_ENV, log_filter, server_arg, with_env_server};
 pub use shell::{Probe, Problem, Save, Shell};

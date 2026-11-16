@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/coversync-core", "crates/coversync-protocol", "crates/coversync-replica", "crates/coversync-desktop-core", "crates/coversync-proxy", "crates/coversyncd"]
+members = ["crates/coversync-core", "crates/coversync-protocol", "crates/coversync-replica", "crates/coversync-desktop-core", "crates/coversync-proxy", "crates/coversync-cli", "crates/coversyncd"]
 # The desktop app builds on its own, with its own lockfile: it needs Qt.
 exclude = ["apps/desktop-linux"]
 

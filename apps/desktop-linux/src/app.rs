@@ -30,7 +30,7 @@ use crate::instance::Launch;
 use crate::pages::FALLBACK;
 use crate::paths;
 
-pub const APP_ID: &str = "io.github.brpjerry.coversync";
+pub const APP_ID: &str = coversync_desktop_core::APP_ID;
 
 /// Qt's `RenderProcessTerminationStatus`, for a page's process that ended
 /// on its own.
