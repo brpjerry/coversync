@@ -75,7 +75,7 @@
 	const initial = untrack(() => $state.snapshot(plan)) as ImportPlan;
 	const tracks = initial.tracks;
 	const failing = initial.failing;
-	/** Album-wide tags the tracks differ in: one value keeps the album in one folder. */
+	/** Album-wide tags the tracks differ in, which the folder structure needs alike. */
 	const disagree = initial.disagree.filter((k) => !failing.includes(k));
 	const albumCols = [...failing.filter((k) => albumKinds.includes(k)), ...disagree];
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
@@ -526,7 +526,7 @@
 									{label(k)}
 									<span class="note" class:bad={empty}>
 										{#if empty && differs}
-											differs between tracks; one value keeps the album in one folder
+											differs between tracks; the folder structure needs one value
 										{:else if empty}
 											missing on {missingOnTracks(k)} of {tracks.length}
 										{:else if differs && albumValues[k] === consensus(k)}
