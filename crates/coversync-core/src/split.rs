@@ -87,14 +87,14 @@ fn word(c: char) -> bool {
     (c.is_alphanumeric() || mark) && !cjk(u)
 }
 
-/// Hangul, kana and the CJK ideographs, with their compatibility and
-/// half-width forms: scripts written without spaces between words.
+/// Hangul, kana and the CJK ideographs, with their symbols (the iteration
+/// mark 々), compatibility and half-width forms: scripts written without
+/// spaces between words.
 fn cjk(u: u32) -> bool {
     matches!(
         u,
         0x1100..=0x11FF
-            | 0x2E80..=0x2FDF
-            | 0x3040..=0x31FF
+            | 0x2E80..=0x31FF
             | 0x3400..=0x4DBF
             | 0x4E00..=0x9FFF
             | 0xA000..=0xA4CF
@@ -510,6 +510,10 @@ mod tests {
         assert_eq!(
             rw(&s, "かめりあfeat.ななひら").as_deref(),
             Some("かめりあ;ななひら")
+        );
+        assert_eq!(
+            rw(&s, "草薙寧々feat.初音ミク").as_deref(),
+            Some("草薙寧々;初音ミク")
         );
         assert_eq!(rw(&s, "Ado feat.: Eve").as_deref(), Some("Ado;Eve"));
         // Across a space, a name's own punctuation stays.
