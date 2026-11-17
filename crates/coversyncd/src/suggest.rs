@@ -51,6 +51,27 @@ impl Jobs {
     }
 }
 
+#[cfg(test)]
+impl Jobs {
+    /// A finished identification of `album_id`, standing in for a real one.
+    pub fn finished(&self, album_id: &str) {
+        let job = Job {
+            release: None,
+            romanize: None,
+            generation: 0,
+            stale: false,
+            finished: Some(Instant::now()),
+            state: JobState::Failed("stand-in".into()),
+            evidence: None,
+        };
+        self.lock().insert(album_id.into(), job);
+    }
+
+    pub fn count(&self) -> usize {
+        self.lock().len()
+    }
+}
+
 struct Job {
     /// The release asked for; None for the best match.
     release: Option<String>,

@@ -1293,6 +1293,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suggestions_are_forgotten_when_names_would_split_or_join_otherwise() {
+        let (state, _, _dir) = daemon("phrases");
+        let library = state.lib.library_setup().unwrap();
+        state.identify.finished("a");
+        // Saved as it was: kept.
+        let _ = save_library_setup(State(state.clone()), Json(library.clone()))
+            .await
+            .unwrap();
+        assert_eq!(state.identify.count(), 1);
+        let mut phrases = library.clone();
+        phrases.rules.split_at = vec!["vs.".into()];
+        let _ = save_library_setup(State(state.clone()), Json(phrases))
+            .await
+            .unwrap();
+        assert_eq!(state.identify.count(), 0);
+        state.identify.finished("a");
+        let mut separator = library;
+        separator.rules.separator = " / ".into();
+        let _ = save_library_setup(State(state.clone()), Json(separator))
+            .await
+            .unwrap();
+        assert_eq!(state.identify.count(), 0);
+    }
+
+    #[tokio::test]
     async fn saved_setups_are_published_and_failed_saves_are_not() {
         let (state, _, dir) = daemon("setups");
         let mut heard = state.events.subscribe();

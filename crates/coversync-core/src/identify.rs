@@ -816,7 +816,7 @@ pub fn identify(
         total: n,
     });
     let inbox = lib.inbox_setup()?;
-    let read = import::read_album(lib, &detail, &inbox.autofill, false)?;
+    let read = import::read_album(lib, &detail, &inbox.autofill, false, split)?;
     let mut tracks: Vec<Local> = detail
         .tracks
         .iter()

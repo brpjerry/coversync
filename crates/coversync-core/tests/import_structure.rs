@@ -276,3 +276,31 @@ fn no_phrases_split_nothing() {
     assert!(plan.split.is_empty());
     assert!(!plan.tracks[0].autofilled.contains_key("artist"));
 }
+
+#[test]
+fn an_album_artist_autofill_fills_from_the_artist_is_split_too() {
+    let s = setup(
+        "split-filled",
+        "{album_artist}/{album}/<{track_number} - >{title}",
+    );
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    for n in [1, 2] {
+        let edit = TagEdit {
+            artist: Some("Ado feat. Eve".into()),
+            ..Default::default()
+        };
+        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+    }
+    let plan = s.plan([&[], &[]]);
+    assert!(
+        plan.autofilled.contains(&"album_artist"),
+        "{:?}",
+        plan.autofilled
+    );
+    assert_eq!(plan.split, ["artist", "album_artist"]);
+    assert_eq!(plan.tracks[0].autofilled["album_artist"], "Ado;Eve");
+    assert_eq!(
+        s.dests(&plan),
+        ["Ado;Eve/Record/01 - One.wav", "Ado;Eve/Record/02 - Two.wav"]
+    );
+}

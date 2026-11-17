@@ -417,6 +417,16 @@ mod tests {
     }
 
     #[test]
+    fn setups_saved_before_phrases_split_at_the_defaults() {
+        let old: LibrarySetup =
+            serde_json::from_str(r#"{"rules":{"required_tags":[],"separator":"; "}}"#).unwrap();
+        assert_eq!(old.rules.split_at, crate::split::DEFAULT_PHRASES);
+        let cleared: LibrarySetup = serde_json::from_str(r#"{"rules":{"split_at":[]}}"#).unwrap();
+        assert!(cleared.rules.split_at.is_empty());
+        assert!(cleared.normalize().unwrap().rules.split_at.is_empty());
+    }
+
+    #[test]
     fn normalize_orders_dedupes_and_rejects_unknown() {
         let setup = LibrarySetup {
             rules: Rules {

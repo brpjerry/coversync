@@ -19,6 +19,7 @@ use crate::db::{CoverSource, FileStat};
 use crate::inbox::IngestMode;
 use crate::model::Collection;
 use crate::scan::{self, Progress};
+use crate::split::Splitter;
 use crate::template::{self, Template};
 use crate::{Error, Library, Result, autofill, rules, tags};
 
@@ -195,19 +196,21 @@ pub struct ReadTrack {
 }
 
 /// Read every track of `detail`, in order, and apply `autofill`, which
-/// looks across the whole album.
+/// looks across the whole album. Names a file holds several times are read
+/// together where `split` would split one (see [`tags::read_kinds_split`]).
 pub fn read_album(
     lib: &Library,
     detail: &crate::AlbumDetail,
     autofill: &autofill::Autofill,
     pictures: bool,
+    split: &Splitter,
 ) -> Result<Vec<ReadTrack>> {
     let mut paths = Vec::new();
     let mut infos = Vec::new();
     let mut extra = Vec::new();
     for track in &detail.tracks {
         let (path, _) = lib.track_root(track.id)?.ok_or(Error::NotFound)?;
-        let read = tags::read_kinds(&path, pictures)?;
+        let read = tags::read_kinds_split(&path, pictures, split)?;
         infos.push(autofill::TrackInfo {
             stem: path
                 .file_stem()
@@ -326,11 +329,13 @@ pub fn plan(
     }
 
     let art_rules = &setup.rules.art;
+    let splitter = setup.rules.splitter();
     let read = read_album(
         lib,
         &detail,
         &inbox.autofill,
         art_rules.placement.embedded(),
+        &splitter,
     )?;
     let gets_art = if upload.is_some() {
         read.len()
@@ -347,7 +352,6 @@ pub fn plan(
     // agree on. One only in optional parts every track leaves out can't
     // split the album.
     let mut shown_vars: Vec<&'static str> = Vec::new();
-    let splitter = setup.rules.splitter();
     // Per track, the kinds autofill filled and the kinds split at phrases,
     // while no edit replaces them.
     let mut filled_by = Vec::new();

@@ -43,9 +43,11 @@ const PHRASE_CHARS: usize = 32;
 /// Opening brackets, as folded, and the brackets that close them.
 const BRACKETS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('【', '】')];
 
-/// Lists of names are punctuated with these; a name never starts or ends
-/// with one, e.g. after "Rin (CV. Iida Riho), Hanayo (CV. Kubo Yurika)".
-const LIST_PUNCTUATION: &[char] = &[',', '、', ';', '&', '/', '×'];
+/// Lists of names are punctuated with these; where a phrase split two
+/// names, neither starts or ends with one, e.g. after "Rin (CV. Iida Riho),
+/// Hanayo (CV. Kubo Yurika)". An `&` goes only standing alone: "&TEAM"
+/// keeps its own.
+const LIST_PUNCTUATION: &[char] = &[',', '、', ';', '/', '×'];
 
 /// For matching: full-width forms as ASCII ("（ＣＶ：" as "(CV:"), and
 /// ASCII letters in lower case.
@@ -67,12 +69,52 @@ fn names(text: &str) -> bool {
     text.chars().map(fold).any(|c| {
         !c.is_whitespace()
             && !LIST_PUNCTUATION.contains(&c)
+            && c != '&'
             && !BRACKETS.iter().any(|(o, cl)| c == *o || c == *cl)
     })
 }
 
-fn trim_name(text: &str) -> &str {
-    text.trim_matches(|c: char| c.is_whitespace() || LIST_PUNCTUATION.contains(&fold(c)))
+/// Part of a word in a script written with spaces between words, so a
+/// phrase can't start or end inside it: "x" isn't in "vōx". Chinese,
+/// Japanese and Korean don't count, so "かめりあfeat.ななひら" splits.
+fn word(c: char) -> bool {
+    c.is_alphanumeric() && (c as u32) < 0x2E80
+}
+
+/// `text` without list punctuation (and spaces) at its start. Right after
+/// a phrase's closing bracket an `&` joins the next credit even attached:
+/// "Rin (CV: Riho)&Hanayo".
+fn trim_list_start(mut text: &str, after_bracket: bool) -> &str {
+    loop {
+        text = text.trim_start();
+        let mut chars = text.chars();
+        let Some(c) = chars.next().map(fold) else {
+            return text;
+        };
+        let alone = after_bracket || chars.next().is_none_or(char::is_whitespace);
+        if LIST_PUNCTUATION.contains(&c) || (c == '&' && alone) {
+            text = &text[text.chars().next().map_or(0, char::len_utf8)..];
+        } else {
+            return text;
+        }
+    }
+}
+
+/// `text` without list punctuation (and spaces) at its end.
+fn trim_list_end(mut text: &str) -> &str {
+    loop {
+        text = text.trim_end();
+        let mut chars = text.chars().rev();
+        let Some(c) = chars.next().map(fold) else {
+            return text;
+        };
+        let alone = chars.next().is_none_or(char::is_whitespace);
+        if LIST_PUNCTUATION.contains(&c) || (c == '&' && alone) {
+            text = &text[..text.len() - text.chars().next_back().map_or(0, char::len_utf8)];
+        } else {
+            return text;
+        }
+    }
 }
 
 /// Library setup's phrases as saved: trimmed, without blanks or repeats
@@ -134,8 +176,8 @@ impl Splitter {
             .filter(|chars| !chars.is_empty())
             .map(|chars| Phrase {
                 opens: closing(chars[0]).is_some(),
-                word_start: chars[0].is_ascii_alphanumeric(),
-                word_end: chars[chars.len() - 1].is_ascii_alphanumeric(),
+                word_start: word(chars[0]),
+                word_end: word(chars[chars.len() - 1]),
                 chars,
             })
             .collect();
@@ -152,8 +194,9 @@ impl Splitter {
     }
 
     /// The names in `value` of `kind`: split at the separator, and at the
-    /// phrases if `kind` names people. Trimmed, without blanks or repeats.
-    pub fn parts<'a>(&self, kind: &str, value: &'a str) -> Vec<String> {
+    /// phrases if `kind` names people (and there is a separator to put in
+    /// their place). Trimmed, without blanks or repeats.
+    pub fn parts(&self, kind: &str, value: &str) -> Vec<String> {
         let cuts = if PEOPLE.contains(&kind) {
             self.cuts(value)
         } else {
@@ -162,7 +205,8 @@ impl Splitter {
         let mut out: Vec<String> = Vec::new();
         let mut from = 0;
         let ends = cuts.iter().map(|c| (c.start, c.end));
-        for (start, end) in ends.chain(std::iter::once((value.len(), value.len()))) {
+        let segments = ends.chain(std::iter::once((value.len(), value.len())));
+        for (i, (start, end)) in segments.enumerate() {
             let segment = &value[from..start];
             from = end;
             let pieces: Vec<&str> = if self.separator.trim().is_empty() {
@@ -170,16 +214,22 @@ impl Splitter {
             } else {
                 segment.split(self.separator.as_str()).collect()
             };
-            // List punctuation goes only where a phrase split the names.
-            let trim = |p: &'a str| {
-                if cuts.is_empty() {
-                    p.trim()
-                } else {
-                    trim_name(p)
+            let last = pieces.len() - 1;
+            for (j, piece) in pieces.into_iter().enumerate() {
+                // List punctuation goes only where a phrase split the names.
+                let mut piece = piece.trim();
+                if i > 0 && j == 0 {
+                    let cut = &value[cuts[i - 1].clone()];
+                    let after_bracket = cut
+                        .chars()
+                        .map(fold)
+                        .any(|c| BRACKETS.iter().any(|(_, close)| c == *close));
+                    piece = trim_list_start(piece, after_bracket);
                 }
-            };
-            for piece in pieces.into_iter().map(trim).filter(|p| !p.is_empty()) {
-                if !out.iter().any(|o| o == piece) {
+                if i < cuts.len() && j == last {
+                    piece = trim_list_end(piece);
+                }
+                if !piece.is_empty() && !out.iter().any(|o| o == piece) {
                     out.push(piece.to_string());
                 }
             }
@@ -218,9 +268,10 @@ impl Splitter {
     /// where the phrase opens a bracket or follows one, that bracket and
     /// the one closing it.
     fn cuts(&self, value: &str) -> Vec<Range<usize>> {
-        if self.phrases.is_empty() {
+        if self.phrases.is_empty() || self.separator.trim().is_empty() {
             return Vec::new();
         }
+        let separator = self.separator.as_str();
         let at: Vec<usize> = value
             .char_indices()
             .map(|(i, _)| i)
@@ -229,6 +280,9 @@ impl Splitter {
         let folded: Vec<char> = value.chars().map(fold).collect();
         let n = folded.len();
         let mut cuts: Vec<Range<usize>> = Vec::new();
+        // Where the name before the next phrase can start: after the last
+        // phrase that split (its closing bracket doesn't count).
+        let mut names_from = 0;
         let mut i = 0;
         while i < n {
             let Some((start, end, close)) = self
@@ -239,10 +293,19 @@ impl Splitter {
                 i += 1;
                 continue;
             };
-            // Only between two names: "X JAPAN" isn't split at a phrase "x".
-            let after = &value[at[end]..close.map_or(value.len(), |c| at[c])];
-            let rest = close.map_or("", |c| &value[at[c + 1]..]);
-            if names(&value[..at[start]]) && (names(after) || names(rest)) {
+            // Only between two names of the same value: "X JAPAN" isn't
+            // split at a phrase "x", nor is "Little Feat.;Eve" at "feat.".
+            let before = &value[names_from.min(at[start])..at[start]];
+            let before = before.rsplit(separator).next().unwrap_or(before);
+            let entry_end = value[at[end]..]
+                .find(separator)
+                .map_or(value.len(), |e| at[end] + e);
+            let after = &value[at[end]..close.map_or(entry_end, |c| at[c].min(entry_end))];
+            let rest = close
+                .filter(|c| at[*c] < entry_end)
+                .map_or("", |c| &value[at[c + 1]..entry_end]);
+            if names(before) && (names(after) || names(rest)) {
+                names_from = at[end];
                 cuts.push(at[start]..at[end]);
                 if let Some(c) = close {
                     cuts.push(at[c]..at[c + 1]);
@@ -276,14 +339,19 @@ impl Splitter {
         if end > n || folded[i..end] != p.chars[..] {
             return None;
         }
-        if p.word_start && i > 0 && folded[i - 1].is_ascii_alphanumeric() {
+        if p.word_start && i > 0 && word(folded[i - 1]) {
             return None;
         }
-        if p.word_end && end < n && folded[end].is_ascii_alphanumeric() {
+        if p.word_end && end < n && word(folded[end]) {
             return None;
         }
-        if p.word_end && end < n && matches!(folded[end], ':' | '.') {
-            end += 1;
+        // "(CV:", "(CV.", "(CV :", "feat.:".
+        let mut past = end;
+        while past < n && folded[past].is_whitespace() {
+            past += 1;
+        }
+        if past < n && matches!(folded[past], ':' | '.') {
+            end = past + 1;
         }
         // The bracket the phrase opens, or one just before it: "(feat. Eve)".
         let (start, open) = if p.opens {
@@ -385,6 +453,21 @@ mod tests {
             rw(&s, "アーリャ(CV.上坂すみれ)×花譜").as_deref(),
             Some("アーリャ;上坂すみれ;花譜")
         );
+        // A phrase right after a closed bracket still has its name before.
+        assert_eq!(
+            rw(&s, "Rin (CV. Riho) feat. Eve").as_deref(),
+            Some("Rin;Riho;Eve")
+        );
+        // Without spaces in Japanese, and with a : or . after any phrase.
+        assert_eq!(
+            rw(&s, "かめりあfeat.ななひら").as_deref(),
+            Some("かめりあ;ななひら")
+        );
+        assert_eq!(rw(&s, "Ado feat.: Eve").as_deref(), Some("Ado;Eve"));
+        assert_eq!(
+            rw(&s, "Natsuhi (CV : Yuri)").as_deref(),
+            Some("Natsuhi;Yuri")
+        );
         // Unclosed, the bracket just goes.
         assert_eq!(rw(&s, "Rin (CV: Riho").as_deref(), Some("Rin;Riho"));
     }
@@ -407,9 +490,44 @@ mod tests {
             rw(&x, "DAOKO × 中田ヤスタカ").as_deref(),
             Some("DAOKO;中田ヤスタカ")
         );
+        // The names have to be in the same value, after any phrase before.
+        assert_eq!(rw(&s, "Little Feat.;Eve"), None);
+        assert_eq!(rw(&s, "Eve;Little Feat."), None);
+        let both = Splitter::new(";", &["feat.".into(), "x".into()]);
+        assert_eq!(
+            rw(&both, "Ado feat. X JAPAN").as_deref(),
+            Some("Ado;X JAPAN")
+        );
+        assert_eq!(rw(&both, "Ado;X JAPAN"), None);
+        // Accented letters are part of words; "x" isn't in "vōx".
+        assert_eq!(rw(&both, "vōx feat. Eve").as_deref(), Some("vōx;Eve"));
         // No phrase: as it was, separators and all.
         assert_eq!(rw(&s, "NayutalieN; Hatsune Miku"), None);
         assert_eq!(rw(&s, "Ookubo Rumi, Tsuda Minami & Taneda Risa"), None);
+    }
+
+    #[test]
+    fn list_punctuation_goes_only_where_a_phrase_split_names() {
+        let s = split();
+        // An & of a name's own stays, at either end of the value.
+        assert_eq!(rw(&s, "Ado feat. &TEAM").as_deref(), Some("Ado;&TEAM"));
+        assert_eq!(
+            rw(&s, "&ME feat. Keinemusik").as_deref(),
+            Some("&ME;Keinemusik")
+        );
+        // One standing alone between two credits goes, as does one right
+        // after a phrase's closing bracket.
+        assert_eq!(
+            rw(&s, "Rin (CV:Riho)&Hanayo (CV:Yurika)").as_deref(),
+            Some("Rin;Riho;Hanayo;Yurika")
+        );
+        assert_eq!(
+            rw(&s, "Rin (CV: Riho) & Hanayo (CV: Yurika)").as_deref(),
+            Some("Rin;Riho;Hanayo;Yurika")
+        );
+        // At the edges of the value, and at the separator, nothing is trimmed.
+        assert_eq!(rw(&s, "Ado feat. Eve, ").as_deref(), Some("Ado;Eve,"));
+        assert_eq!(s.parts("artist", ", A feat. B;/C"), [", A", "B", "/C"]);
     }
 
     #[test]
@@ -449,6 +567,9 @@ mod tests {
             Splitter::default().parts("artist", "A feat. B;C"),
             ["A feat. B;C"]
         );
+        // No separator to put in their place: phrases don't split, as on import.
+        let blank = Splitter::new(" ", &["feat.".to_string()]);
+        assert_eq!(blank.parts("artist", "A feat. B"), ["A feat. B"]);
     }
 
     #[test]

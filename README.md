@@ -61,9 +61,11 @@ used on a home server.
   `Hoshizora Rin (CV. Iida Riho)` becomes `Hoshizora Rin;Iida Riho`. Matching
   ignores case and full-width forms, takes a `:` or `.` right after a
   phrase along, drops the brackets around a phrase that opens one, and
-  never splits inside a word or where there is no name on one side. Values
-  typed in the import dialog are written as typed; the dialog says which
-  tags it split. Filters split names at the phrases too, so an artist can be
+  splits only between two names of the same value, never inside a word
+  (accented letters count; Chinese, Japanese and Korean don't need spaces).
+  A tag a file holds several times (two `ARTIST` comments, say) is read
+  whole when one of them splits, so none is lost. Values typed in the
+  import dialog are written as typed; the dialog says which tags it split. Filters split names at the phrases too, so an artist can be
   picked on its own in the Inbox as well.
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files

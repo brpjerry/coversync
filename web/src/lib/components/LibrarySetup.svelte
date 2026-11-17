@@ -130,8 +130,13 @@
 		['(CV', 'Rin (CV. Riho)', 'Rin|Riho']
 	];
 	let phrase = $state('');
-	/** As the daemon tells phrases apart: full-width forms and case aside. */
-	const phraseKey = (p: string) => p.trim().normalize('NFKC').toLowerCase();
+	/** As the daemon tells phrases apart: full-width ASCII and ASCII case aside. */
+	const phraseKey = (p: string) =>
+		p
+			.trim()
+			.replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+			.replace(/\u3000/g, ' ')
+			.replace(/[A-Z]/g, (c) => c.toLowerCase());
 	const hasPhrase = (p: string) => setup.splitAt.some((q) => phraseKey(q) === phraseKey(p));
 	let phraseBad = $derived([...phrase.trim()].length > 32);
 	let phraseExamples = $derived(
