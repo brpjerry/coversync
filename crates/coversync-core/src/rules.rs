@@ -226,6 +226,18 @@ pub struct Rules {
     /// what MusicBrainz suggests.
     #[serde(default = "default_separator")]
     pub separator: String,
+    /// Phrases that join names in tags naming people, like "feat.": the
+    /// import and MusicBrainz's suggestions put the separator there
+    /// instead, and filters split at them (see [`crate::split`]).
+    #[serde(default = "default_split_at")]
+    pub split_at: Vec<String>,
+}
+
+impl Rules {
+    /// How these rules split tags that hold several values.
+    pub fn splitter(&self) -> crate::split::Splitter {
+        crate::split::Splitter::new(&self.separator, &self.split_at)
+    }
 }
 
 impl Default for Rules {
@@ -234,8 +246,16 @@ impl Default for Rules {
             required_tags: Vec::new(),
             art: Default::default(),
             separator: default_separator(),
+            split_at: default_split_at(),
         }
     }
+}
+
+fn default_split_at() -> Vec<String> {
+    crate::split::DEFAULT_PHRASES
+        .iter()
+        .map(|p| p.to_string())
+        .collect()
 }
 
 /// The separator for multiple values unless Library setup says otherwise.
@@ -347,6 +367,8 @@ impl LibrarySetup {
                     .into(),
             ));
         }
+        self.rules.split_at =
+            crate::split::normalize_phrases(std::mem::take(&mut self.rules.split_at))?;
         if let Some(bad) = self
             .rules
             .required_tags

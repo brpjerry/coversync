@@ -142,6 +142,9 @@ export interface LibrarySetup {
 		art: ArtRules;
 		/** Joins several values of one tag in MusicBrainz suggestions, e.g. ";". */
 		separator: string;
+		/** Phrases like "feat." that join names in tags naming people: the
+		 * import and suggestions put the separator there, and filters split at them. */
+		split_at: string[];
 	};
 	folder: string | null;
 	structure: string;
@@ -192,7 +195,8 @@ export interface ImportTrack {
 	values: Record<string, string>;
 	missing: string[];
 	dest: string | null;
-	/** Empty tags autofill sets on this track, by kind. */
+	/** What the import sets by itself on this track, by kind: empty tags
+	 * autofill fills, and names split at Library setup's phrases. */
 	autofilled: Record<string, string>;
 }
 
@@ -208,6 +212,8 @@ export interface ImportPlan {
 	problems: string[];
 	/** Kinds autofill sets on at least one track. */
 	autofilled: string[];
+	/** Kinds naming people the import splits at Library setup's phrases. */
+	split: string[];
 	art: ArtPlan;
 	/** Smart suggestions are on: the import dialog looks the album up. */
 	suggest: boolean;

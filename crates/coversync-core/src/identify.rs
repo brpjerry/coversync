@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::lookups::{LookupCache, oldest};
 use crate::musicbrainz::{self as mb, AcoustResult, Medium, Release};
 use crate::romanize::{self, sorts_az};
+use crate::split::Splitter;
 use crate::{Error, Library, Result, import, tags};
 
 /// Kinds suggested only for empty tags: genre is a matter of taste, and a
@@ -804,7 +805,7 @@ pub fn identify(
     album_id: &str,
     key: Option<&str>,
     romanize: Option<romanize::Options>,
-    separator: &str,
+    split: &Splitter,
     step: &(dyn Fn(Step) + Sync),
 ) -> Result<(Evidence, Identification)> {
     let detail = lib.album(album_id)?.ok_or(Error::NotFound)?;
@@ -1003,7 +1004,7 @@ pub fn identify(
             &best.id.clone(),
             false,
             romanize,
-            separator,
+            split,
             step,
         )?,
         None => Identification {
@@ -1024,7 +1025,8 @@ pub fn identify(
 /// Suggest tags from release `release_id`; `chosen` when picked by hand.
 /// With `romanize`, titles and names that don't sort A–Z are suggested in
 /// Latin script where MusicBrainz has them, written as its options say.
-/// Tags with several values have them joined by `separator`. Releases are
+/// Tags with several values have them joined by `split`'s separator, and
+/// names are split at its phrases (on the album's side too). Releases are
 /// fetched as `identify` fetched the evidence: from `cache` (if saving) where
 /// they were fetched before, unless it asked the services again.
 pub fn suggest(
@@ -1033,7 +1035,7 @@ pub fn suggest(
     release_id: &str,
     chosen: bool,
     romanize: Option<romanize::Options>,
-    separator: &str,
+    split: &Splitter,
     step: &(dyn Fn(Step) + Sync),
 ) -> Result<Identification> {
     step(Step {
@@ -1101,8 +1103,8 @@ pub fn suggest(
         fingerprinted: evidence.fingerprinted,
         recognized: evidence.recognized,
         tracks: match &shown {
-            Some(romanized) => suggestions(&evidence.tracks, romanized, Some(&release), separator),
-            None => suggestions(&evidence.tracks, &release, None, separator),
+            Some(romanized) => suggestions(&evidence.tracks, romanized, Some(&release), split),
+            None => suggestions(&evidence.tracks, &release, None, split),
         },
         notes: evidence.notes.clone(),
         romanization,
@@ -1448,8 +1450,9 @@ fn suggestions(
     tracks: &[Local],
     release: &Release,
     original: Option<&Release>,
-    separator: &str,
+    split: &Splitter,
 ) -> Vec<TrackSuggestions> {
+    let separator = split.separator();
     let shared = release_values(release, separator);
     let shared_original = original
         .map(|o| release_values(o, separator))
@@ -1487,11 +1490,21 @@ fn suggestions(
                     pos.to_string()
                 });
             }
+            // Names split at Library setup's phrases, as the import splits
+            // them: on both sides, so a credit that only differs by its
+            // "feat." isn't suggested.
+            for (kind, value) in values.iter_mut().chain(originals.iter_mut()) {
+                if let Some(v) = split.rewrite(kind, value.as_str()) {
+                    *value = v;
+                }
+            }
+            let mut ours = local.values.clone();
+            split.rewrite_all(&mut ours);
             // A sort name sorts its artist: only suggest it where the artist
             // agrees with MusicBrainz (or will be filled from it).
             let disagrees = |parent: &str| {
                 let theirs = values.iter().find(|(k, _)| *k == parent).map(|(_, v)| v);
-                match (local.values.get(parent), theirs) {
+                match (ours.get(parent), theirs) {
                     (Some(ours), Some(theirs)) => differs(parent, ours, theirs),
                     _ => false,
                 }
@@ -1509,7 +1522,7 @@ fn suggestions(
                 .filter(|(kind, _)| !unsorted.contains(kind))
                 .filter(|(kind, _)| tags::can_store(local.tag_type, kind))
                 .filter_map(|(kind, value)| {
-                    let current = local.values.get(kind).filter(|v| !v.trim().is_empty());
+                    let current = ours.get(kind).filter(|v| !v.trim().is_empty());
                     let before = originals
                         .iter()
                         .find(|(k, _)| *k == kind)
@@ -1946,7 +1959,7 @@ mod tests {
             local(1, &[("track_number", "1"), ("isrc", "se-abc-15-00001")]),
             local(2, &[("track_number", "2")]),
         ];
-        let out = suggestions(&tracks, &release(), None, ";");
+        let out = suggestions(&tracks, &release(), None, &Splitter::new(";", &[]));
         assert_eq!(out[0].via, Some(Via::Isrc));
         assert_eq!(out[0].position.as_deref(), Some("2"));
         assert_eq!(find(&out[0], "title").unwrap().value, "Don’t Look Back");
@@ -2048,6 +2061,53 @@ mod tests {
     }
 
     #[test]
+    fn names_are_split_at_the_phrases_on_both_sides() {
+        let mut r = release();
+        r.artist_credit = serde_json::from_str(
+            r#"[{"name": "4ikai", "joinphrase": " feat. ", "artist": {"id": "a-1", "sort-name": "Aikai"}},
+                {"name": "Rin (CV. Riho)", "joinphrase": "", "artist": {"id": "a-2", "sort-name": "Riho"}}]"#,
+        )
+        .unwrap();
+        let split = Splitter::new(";", &["feat.".into(), "ft.".into(), "(CV".into()]);
+        // Track 2 has no credit of its own: the release's applies.
+        let track = |artist: &str| {
+            [
+                local(10, &[("track_number", "1"), ("title", "Thaw")]),
+                local(
+                    11,
+                    &[
+                        ("track_number", "2"),
+                        ("title", "Don’t Look Back"),
+                        ("artist", artist),
+                        ("album_artist", "4ikai"),
+                    ],
+                ),
+            ]
+        };
+        let out = suggestions(&track("4ikai ft. Rin (CV: Riho)"), &r, None, &split);
+        let t = &out[1];
+        // Split alike, the credits agree, whatever joined them.
+        assert!(find(t, "artist").is_none());
+        let album_artist = find(t, "album_artist").unwrap();
+        assert_eq!(album_artist.current.as_deref(), Some("4ikai"));
+        assert_eq!(album_artist.value, "4ikai;Rin;Riho");
+        assert_eq!(find(t, "artists").unwrap().value, "4ikai;Rin;Riho");
+        // Sort names sort the whole credit.
+        assert_eq!(find(t, "artist_sort").unwrap().value, "Aikai feat. Riho");
+
+        let out = suggestions(&track("4ikai"), &r, None, &split);
+        let artist = find(&out[1], "artist").unwrap();
+        assert_eq!(artist.current.as_deref(), Some("4ikai"));
+        assert_eq!(artist.value, "4ikai;Rin;Riho");
+        // The tag as the album has it now, split as the import would.
+        let out = suggestions(&track("Rin (CV. Riho)"), &r, None, &split);
+        assert_eq!(
+            find(&out[1], "artist").unwrap().current.as_deref(),
+            Some("Rin;Riho")
+        );
+    }
+
+    #[test]
     fn fills_empty_tags_and_suggests_changes() {
         let mut first = local(
             10,
@@ -2064,7 +2124,7 @@ mod tests {
             .recordings
             .push(("rec-1".into(), "acoustid-1".into(), 0.98));
         let second = local(11, &[("title", "Don't look back"), ("track_number", "2")]);
-        let out = suggestions(&[first, second], &release(), None, ";");
+        let out = suggestions(&[first, second], &release(), None, &Splitter::new(";", &[]));
 
         let t = &out[0];
         assert_eq!(t.via, Some(Via::Acoustid));
@@ -2129,7 +2189,12 @@ mod tests {
                 ("track_number", "2"),
             ],
         );
-        let out = suggestions(&[first, second], &romanized_partly, Some(&original), ";");
+        let out = suggestions(
+            &[first, second],
+            &romanized_partly,
+            Some(&original),
+            &Splitter::new(";", &[]),
+        );
 
         // The tag is the original-script value: a pure romanization.
         let album = find(&out[0], "album").unwrap();
@@ -2148,7 +2213,7 @@ mod tests {
         let mut ours = local(1, &[("artist", "Someone Else"), ("track_number", "1")]);
         ours.recordings.push(("rec-1".into(), "a".into(), 1.0));
         let theirs = local(2, &[("track_number", "2")]);
-        let out = suggestions(&[ours, theirs], &release(), None, ";");
+        let out = suggestions(&[ours, theirs], &release(), None, &Splitter::new(";", &[]));
         // The artist differs: no sort name for an artist the track may keep.
         assert!(find(&out[0], "artist").is_some());
         assert!(find(&out[0], "artist_sort").is_none());
@@ -2164,7 +2229,7 @@ mod tests {
             local(2, &[("title", "Outro"), ("track_number", "2")]),
             local(3, &[("title", "Bonus"), ("track_number", "3")]),
         ];
-        let out = suggestions(&tracks, &release(), None, ";");
+        let out = suggestions(&tracks, &release(), None, &Splitter::new(";", &[]));
         assert!(out.iter().all(|t| t.via.is_none()));
         assert!(find(&out[0], "title").is_none());
     }
@@ -2175,7 +2240,7 @@ mod tests {
             local(1, &[("title", "don't look back")]),
             local(2, &[("title", "Bonus")]),
         ];
-        let out = suggestions(&tracks, &release(), None, ";");
+        let out = suggestions(&tracks, &release(), None, &Splitter::new(";", &[]));
         assert_eq!(out[0].via, Some(Via::Title));
         assert_eq!(out[0].position.as_deref(), Some("2"));
         assert_eq!(out[1].via, None);

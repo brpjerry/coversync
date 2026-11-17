@@ -185,7 +185,7 @@ async fn albums(State(state): State<Shared>, Query(q): Query<AlbumsQuery>) -> Ap
             collection,
             &appearance.extra_sort_keys(),
             &appearance.filter_keys(),
-            &setup.rules.separator,
+            &setup.rules.splitter(),
             &required,
             autofill.as_ref(),
         )
@@ -350,8 +350,10 @@ async fn save_library_setup(
             setup.folder.as_deref(),
         )?;
         let saved = s.lib.set_library_setup(setup.clone())?;
-        // Suggestions joined with the old separator shouldn't linger.
-        if before.rules.separator != saved.rules.separator {
+        // Suggestions joined or split the old way shouldn't linger.
+        if before.rules.separator != saved.rules.separator
+            || before.rules.split_at != saved.rules.split_at
+        {
             s.identify.clear();
         }
         let moved = before.folder != saved.folder;
@@ -686,7 +688,14 @@ async fn structure_preview(
         }
         for album in s
             .lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)?
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )?
             .iter()
             .take(24)
         {
@@ -1188,7 +1197,14 @@ mod tests {
         scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
         let albums = state
             .lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(albums.len(), 1);
         let id = albums[0].id.clone();
@@ -1387,7 +1403,14 @@ mod tests {
     fn detail(state: &Shared, title: &str) -> AlbumDetail {
         let albums = state
             .lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         let album = albums.iter().find(|a| a.title == title).unwrap();
         state.lib.album(&album.id).unwrap().unwrap()
@@ -1729,7 +1752,14 @@ mod tests {
         let late = |state: &Shared| {
             state
                 .lib
-                .albums(Collection::Inbox, &[], &[], "", &[], None)
+                .albums(
+                    Collection::Inbox,
+                    &[],
+                    &[],
+                    &coversync_core::split::Splitter::default(),
+                    &[],
+                    None,
+                )
                 .unwrap()
                 .iter()
                 .find(|a| a.title == "Late")
@@ -1844,7 +1874,14 @@ mod tests {
         assert!(!report.hashes.running);
         let id = state
             .lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap()[0]
             .id
             .clone();
@@ -1976,7 +2013,14 @@ mod tests {
         let library_tracks = |state: &Shared| -> u32 {
             state
                 .lib
-                .albums(Collection::Library, &[], &[], "", &[], None)
+                .albums(
+                    Collection::Library,
+                    &[],
+                    &[],
+                    &coversync_core::split::Splitter::default(),
+                    &[],
+                    None,
+                )
                 .unwrap()
                 .iter()
                 .map(|a| a.track_count)
@@ -2018,7 +2062,14 @@ mod tests {
                 _ => {
                     let album = &state
                         .lib
-                        .albums(Collection::Library, &[], &[], "", &[], None)
+                        .albums(
+                            Collection::Library,
+                            &[],
+                            &[],
+                            &coversync_core::split::Splitter::default(),
+                            &[],
+                            None,
+                        )
                         .unwrap()[0];
                     let first = state.lib.album(&album.id).unwrap().unwrap().tracks[0].id;
                     let first = state.lib.track_path(first).unwrap().unwrap();

@@ -251,7 +251,14 @@ pub fn scan(
     update(progress, |p| p.phase = "covers".into());
     refresh_covers(lib, covers, progress)?;
     let albums = lib
-        .albums(Collection::Inbox, &[], &[], "", &[], None)?
+        .albums(
+            Collection::Inbox,
+            &[],
+            &[],
+            &crate::split::Splitter::default(),
+            &[],
+            None,
+        )?
         .len() as u64;
     update(progress, |p| {
         p.running = false;

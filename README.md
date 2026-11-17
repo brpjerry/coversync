@@ -21,7 +21,7 @@ used on a home server.
   pick a tag such as Genre from its dropdown, search its values, and tick the
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
-  separator) offer each.
+  separator, and names at its phrases, see below) offer each.
 - **Tag editor** (an album's Edit tags): album-wide fields and each track's.
   A save is refused, and nothing written, if the album changed after the
   editor loaded it: saved from another browser or app, or changed on disk
@@ -52,6 +52,19 @@ used on a home server.
   uses outside `< >` count as required on import. The rules and the
   Library's index live in the Library folder itself (see
   [Moving the Library](#moving-the-library)).
+- **Multiple values** (Library setup): the separator that joins several
+  values of one tag (`;` by default), and phrases that join names, `feat.`,
+  `ft.`, `featuring` and `(CV` to start with. In artist, album artist,
+  composer and the other tags that name people (not sort names), a phrase
+  between two names becomes the separator, both in what the import writes
+  and in what MusicBrainz suggests: `Ado feat. Eve` becomes `Ado;Eve`, and
+  `Hoshizora Rin (CV. Iida Riho)` becomes `Hoshizora Rin;Iida Riho`. Matching
+  ignores case and full-width forms, takes a `:` or `.` right after a
+  phrase along, drops the brackets around a phrase that opens one, and
+  never splits inside a word or where there is no name on one side. Values
+  typed in the import dialog are written as typed; the dialog says which
+  tags it split. Filters split names at the phrases too, so an artist can be
+  picked on its own in the Inbox as well.
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never

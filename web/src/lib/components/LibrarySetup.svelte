@@ -18,6 +18,7 @@
 	import FileImage from '@lucide/svelte/icons/file-image';
 	import FileMusic from '@lucide/svelte/icons/file-music';
 	import Combine from '@lucide/svelte/icons/combine';
+	import X from '@lucide/svelte/icons/x';
 	import Toggle from './Toggle.svelte';
 	import type { ArtPlacement, TagKind } from '#lib/api.ts';
 	import { count, fold } from '#lib/format.ts';
@@ -121,6 +122,31 @@
 	const SEPARATORS = [';', '; ', '/', ' / '];
 	const joinedExample = (separator: string) => `Rock${separator}Pop`;
 	let separatorBad = $derived(!setup.separator.trim() || [...setup.separator].length > 8);
+	/** Offered beside the phrases names are split at. */
+	const PHRASES = ['feat.', 'ft.', 'featuring', '(CV', 'vs.', 'with', 'x', '×', '&', ','];
+	/** Shown for the phrases they need, with | for the separator. */
+	const PHRASE_EXAMPLES = [
+		['feat.', 'Ado feat. Eve', 'Ado|Eve'],
+		['(CV', 'Rin (CV. Riho)', 'Rin|Riho']
+	];
+	let phrase = $state('');
+	/** As the daemon tells phrases apart: full-width forms and case aside. */
+	const phraseKey = (p: string) => p.trim().normalize('NFKC').toLowerCase();
+	const hasPhrase = (p: string) => setup.splitAt.some((q) => phraseKey(q) === phraseKey(p));
+	let phraseBad = $derived([...phrase.trim()].length > 32);
+	let phraseExamples = $derived(
+		PHRASE_EXAMPLES.filter(([p]) => hasPhrase(p)).map(([, from, to]) => ({
+			from,
+			to: to.replace('|', setup.separator)
+		}))
+	);
+	function addPhrase(p: string) {
+		const t = p.trim();
+		if (!t || [...t].length > 32) return;
+		if (!hasPhrase(t)) setup.splitAt = [...setup.splitAt, t];
+		phrase = '';
+	}
+	const removePhrase = (p: string) => (setup.splitAt = setup.splitAt.filter((q) => q !== p));
 	const placements: { id: ArtPlacement; label: string; file: boolean; embedded: boolean }[] = [
 		{ id: 'file', label: 'Cover file', file: true, embedded: false },
 		{ id: 'embedded', label: 'Embedded', file: false, embedded: true },
@@ -230,7 +256,8 @@
 					<h2 id="separator-title">Multiple values</h2>
 					<p>
 						When MusicBrainz has several values for one tag, such as artists, genres or release
-						types, they're joined into one with this separator.
+						types, they're joined into one with this separator. Names joined by a phrase like feat.
+						are split apart with it too, so each artist can be filtered on its own.
 					</p>
 				</div>
 			</header>
@@ -262,6 +289,62 @@
 					{:else}
 						Two genres are suggested as <code class="joined">{joinedExample(setup.separator)}</code
 						>. Tags already in your files stay as they are.
+					{/if}
+				</p>
+				<div class="phrases-field">
+					<span class="name-label" id="split-title">Split names at</span>
+					<ul class="phrases" aria-labelledby="split-title">
+						{#each setup.splitAt as p (p)}
+							<li class="phrase" transition:fly={{ y: -4, duration: 160 }}>
+								<span class="joined">{p}</span>
+								<button
+									class="phrase-remove"
+									aria-label={`Don't split at ${p}`}
+									onclick={() => removePhrase(p)}><X size={13} /></button
+								>
+							</li>
+						{/each}
+						<li class="phrase-new" class:bad={phraseBad}>
+							<span class="name-input">
+								<input
+									bind:value={phrase}
+									placeholder="Add…"
+									spellcheck="false"
+									autocomplete="off"
+									aria-label="Add a phrase to split names at"
+									aria-describedby="split-hint"
+									onkeydown={(e) => {
+										if (e.key === 'Enter') {
+											e.preventDefault();
+											addPhrase(phrase);
+										}
+									}}
+									onblur={() => addPhrase(phrase)}
+								/>
+							</span>
+						</li>
+					</ul>
+				</div>
+				{#if PHRASES.some((p) => !hasPhrase(p))}
+					<div class="name-suggestions" role="group" aria-label="Common phrases">
+						{#each PHRASES.filter((p) => !hasPhrase(p)) as p (p)}
+							<button class="suggestion joined" onclick={() => addPhrase(p)}>+ {p}</button>
+						{/each}
+					</div>
+				{/if}
+				<p class="name-hint" class:bad={phraseBad} id="split-hint">
+					{#if phraseBad}
+						A phrase can have at most 32 characters.
+					{:else if setup.splitAt.length}
+						In artist, album artist and other tags naming people, a phrase between two names becomes
+						the separator, on import and in MusicBrainz's suggestions{#if phraseExamples.length}:
+							{#each phraseExamples as ex, i (ex.from)}{i ? ', ' : ''}<code class="joined"
+									>{ex.from}</code
+								>
+								becomes <code class="joined">{ex.to}</code>{/each}{/if}. A : or . right after a
+						phrase goes with it. Filters offer each name on its own.
+					{:else}
+						Names stay as they are.
 					{/if}
 				</p>
 			</div>
@@ -734,6 +817,60 @@
 	}
 	.separator-input input {
 		width: 8ch;
+		text-align: left;
+	}
+	.phrases-field {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px 12px;
+		margin-top: 6px;
+	}
+	.phrases {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	.phrase {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		height: 30px;
+		padding: 0 3px 0 10px;
+		border-radius: 8px;
+		border: 1px solid color-mix(in oklab, var(--accent) 55%, transparent);
+		background: color-mix(in oklab, var(--accent) 10%, var(--surface));
+		font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', monospace;
+		font-size: 12.5px;
+		color: var(--text);
+	}
+	.phrase-remove {
+		display: grid;
+		place-items: center;
+		width: 22px;
+		height: 22px;
+		border-radius: 6px;
+		color: var(--text-3);
+		transition:
+			color 160ms,
+			background 160ms;
+	}
+	.phrase-remove:hover {
+		color: var(--text);
+		background: color-mix(in oklab, var(--text) 8%, transparent);
+	}
+	.phrase-new .name-input {
+		height: 30px;
+		padding: 0 10px;
+		border-radius: 8px;
+		font-size: 12.5px;
+	}
+	.phrase-new .name-input input {
+		width: 9ch;
 		text-align: left;
 	}
 	/* Spaces in a separator are part of it, so they show. */

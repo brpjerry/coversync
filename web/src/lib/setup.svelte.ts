@@ -16,6 +16,9 @@ import {
 import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
+const sameList = (a: string[], b: string[]) =>
+	a.length === b.length && a.every((v, i) => v === b[i]);
+
 class LibrarySetupStore extends SetupStore<SetupResponse> {
 	groups = $state<TagGroup[]>([]);
 	kinds = $state<TagKind[]>([]);
@@ -33,7 +36,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		folder: '',
 		structure: '',
 		art: { required: false, placement: 'file', file_name: 'cover' } as ArtRules,
-		separator: ';'
+		separator: ';',
+		splitAt: [] as string[]
 	});
 	/** Being edited. */
 	required = new SvelteSet<string>();
@@ -42,6 +46,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	art = $state<ArtRules>({ required: false, placement: 'file', file_name: 'cover' });
 	/** Kept as typed, spaces included: "; " isn't ";". */
 	separator = $state(';');
+	/** Phrases names are split at, like "feat.", in order. */
+	splitAt = $state<string[]>([]);
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
 	/** Why the saved folder can't hold the library's database, if it can't. */
@@ -49,7 +55,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
-	/** Tags added or removed, plus a changed folder, structure, art rule or separator. */
+	/** Tags added or removed, plus a changed folder, structure, art rule, separator or phrases. */
 	changes = $derived(
 		this.saved.required.filter((id) => !this.required.has(id)).length +
 			[...this.required].filter((id) => !this.saved.required.includes(id)).length +
@@ -58,7 +64,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			(this.art.required !== this.saved.art.required ? 1 : 0) +
 			(this.art.placement !== this.saved.art.placement ? 1 : 0) +
 			((this.art.file_name.trim() || 'cover') !== this.saved.art.file_name ? 1 : 0) +
-			(this.separator !== this.saved.separator ? 1 : 0)
+			(this.separator !== this.saved.separator ? 1 : 0) +
+			(sameList(this.splitAt, this.saved.splitAt) ? 0 : 1)
 	);
 
 	protected fetch() {
@@ -100,7 +107,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			folder: s.folder ?? '',
 			structure: s.structure,
 			art: s.rules.art,
-			separator: s.rules.separator
+			separator: s.rules.separator,
+			splitAt: s.rules.split_at
 		};
 		const requiredKept =
 			this.required.size === was.required.length &&
@@ -116,6 +124,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		if ((this.art.file_name.trim() || 'cover') === was.art.file_name)
 			this.art.file_name = s.rules.art.file_name;
 		if (this.separator === was.separator) this.separator = s.rules.separator;
+		if (sameList(this.splitAt, was.splitAt)) this.splitAt = [...s.rules.split_at];
 		this.folderStatus = r.folder;
 		this.libraryProblem = r.library_problem;
 	}
@@ -129,6 +138,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.structure = this.saved.structure;
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
+		this.splitAt = [...s.rules.split_at];
 	}
 
 	label(id: string) {
@@ -152,6 +162,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.structure = this.saved.structure;
 		this.art = { ...this.saved.art };
 		this.separator = this.saved.separator;
+		this.splitAt = [...this.saved.splitAt];
 	}
 
 	save() {
@@ -163,7 +174,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 					rules: {
 						required_tags: ids,
 						art: { ...this.art, file_name: this.art.file_name.trim() },
-						separator: this.separator
+						separator: this.separator,
+						split_at: this.splitAt
 					},
 					folder: this.folder.trim() || null,
 					structure: this.structure.trim()

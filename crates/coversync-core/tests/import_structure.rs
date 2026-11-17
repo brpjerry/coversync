@@ -51,7 +51,14 @@ fn setup(name: &str, structure: &str) -> Setup {
     ];
     scan::scan(&lib, &covers, &roots, &Progress::default()).unwrap();
     let album = lib
-        .albums(Collection::Inbox, &[], &[], "", &[], None)
+        .albums(
+            Collection::Inbox,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
         .unwrap()[0]
         .id
         .clone();
@@ -202,4 +209,70 @@ fn an_albums_discs_have_to_count_alike() {
         let plan = s.plan([&edits[0], &edits[1]]);
         assert_eq!(plan.disagree, ["disc_total"], "{edits:?}");
     }
+}
+
+#[test]
+fn names_are_split_at_library_setups_phrases() {
+    let s = setup("split", "{album_artist}/{album}/<{track_number} - >{title}");
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    for (n, artist) in [(1, "Ado feat. Eve"), (2, "Rin (CV. Riho)")] {
+        let edit = TagEdit {
+            artist: Some(artist.into()),
+            album_artist: Some("Ado feat. Eve".into()),
+            ..Default::default()
+        };
+        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+    }
+    let plan = s.plan([&[], &[]]);
+    assert_eq!(plan.split, ["artist", "album_artist"]);
+    // Split, not filled: autofill reports only what it filled.
+    assert!(
+        !plan.autofilled.contains(&"artist") && !plan.autofilled.contains(&"album_artist"),
+        "{:?}",
+        plan.autofilled
+    );
+    assert_eq!(plan.tracks[0].autofilled["artist"], "Ado;Eve");
+    assert_eq!(plan.tracks[1].autofilled["artist"], "Rin;Riho");
+    assert_eq!(
+        s.dests(&plan),
+        ["Ado;Eve/Record/01 - One.wav", "Ado;Eve/Record/02 - Two.wav"]
+    );
+    // What's typed in the dialog stays as typed.
+    let plan = s.plan([&[("artist", "Ado feat. Eve")], &[("artist", "Rin")]]);
+    assert_eq!(plan.split, ["album_artist"]);
+
+    // The copies get the names split.
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    let done = import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    assert_eq!(done.files, 2);
+    let copy =
+        |name: &str| tags::read_kinds(&s.root.join("Ado;Eve/Record").join(name), false).unwrap();
+    assert_eq!(copy("01 - One.wav").values["artist"], "Ado;Eve");
+    assert_eq!(copy("02 - Two.wav").values["artist"], "Rin;Riho");
+    assert_eq!(copy("02 - Two.wav").values["album_artist"], "Ado;Eve");
+}
+
+#[test]
+fn no_phrases_split_nothing() {
+    let s = setup("no-split", "{album}/<{track_number} - >{title}");
+    let mut setup = s.lib.library_setup().unwrap();
+    setup.rules.split_at.clear();
+    s.lib.set_library_setup(setup).unwrap();
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    let edit = TagEdit {
+        artist: Some("Ado feat. Eve".into()),
+        ..Default::default()
+    };
+    tags::write(&inbox.join("1.wav"), &edit).unwrap();
+    let plan = s.plan([&[], &[]]);
+    assert!(plan.split.is_empty());
+    assert!(!plan.tracks[0].autofilled.contains_key("artist"));
 }
