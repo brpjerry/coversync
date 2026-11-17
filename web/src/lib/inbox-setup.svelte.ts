@@ -24,7 +24,8 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 		suggestions: false,
 		preferEnglish: false,
 		familyNameFirst: false,
-		saveLookups: true
+		saveLookups: true,
+		keepAdded: false
 	});
 	ingest = $state<IngestMode>('copy');
 	folder = $state('');
@@ -35,6 +36,8 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 	preferEnglish = $state(false);
 	familyNameFirst = $state(false);
 	saveLookups = $state(true);
+	/** Preserve modification date: imports keep the album's Inbox date as its date added. */
+	keepAdded = $state(false);
 	/** The saved AcoustID key's last characters; null if none is saved. */
 	keyHint = $state<string | null>(null);
 	/** A new AcoustID key to save; '' removes the saved one, null leaves it be. */
@@ -58,6 +61,7 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 			(this.preferEnglish === this.saved.preferEnglish ? 0 : 1) +
 			(this.familyNameFirst === this.saved.familyNameFirst ? 0 : 1) +
 			(this.saveLookups === this.saved.saveLookups ? 0 : 1) +
+			(this.keepAdded === this.saved.keepAdded ? 0 : 1) +
 			(this.keyDraft === null ? 0 : 1)
 	);
 	/** Move deletes originals, so the Inbox folder must be writable. */
@@ -74,7 +78,8 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 			suggestions: r.setup.suggestions.enabled,
 			preferEnglish: r.setup.suggestions.prefer_english,
 			familyNameFirst: r.setup.suggestions.family_name_first,
-			saveLookups: r.setup.suggestions.save_lookups
+			saveLookups: r.setup.suggestions.save_lookups,
+			keepAdded: r.setup.keep_added
 		};
 		// Fields not edited here follow what's saved.
 		const now = this.saved;
@@ -85,6 +90,7 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 		if (this.preferEnglish === was.preferEnglish) this.preferEnglish = now.preferEnglish;
 		if (this.familyNameFirst === was.familyNameFirst) this.familyNameFirst = now.familyNameFirst;
 		if (this.saveLookups === was.saveLookups) this.saveLookups = now.saveLookups;
+		if (this.keepAdded === was.keepAdded) this.keepAdded = now.keepAdded;
 		if (this.autofill && now.autofill)
 			for (const key of Object.keys(now.autofill) as (keyof Autofill)[])
 				if (this.autofill[key] === was.autofill?.[key]) this.autofill[key] = now.autofill[key];
@@ -101,6 +107,7 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 		this.preferEnglish = this.saved.preferEnglish;
 		this.familyNameFirst = this.saved.familyNameFirst;
 		this.saveLookups = this.saved.saveLookups;
+		this.keepAdded = this.saved.keepAdded;
 		this.keyDraft = null;
 	}
 
@@ -132,6 +139,7 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 		this.preferEnglish = this.saved.preferEnglish;
 		this.familyNameFirst = this.saved.familyNameFirst;
 		this.saveLookups = this.saved.saveLookups;
+		this.keepAdded = this.saved.keepAdded;
 		this.keyDraft = null;
 	}
 
@@ -152,7 +160,8 @@ class InboxSetupStore extends SetupStore<InboxSetupResponse> {
 								prefer_english: this.preferEnglish,
 								family_name_first: this.familyNameFirst,
 								save_lookups: this.saveLookups
-							}
+							},
+							keep_added: this.keepAdded
 						},
 						this.keyDraft?.trim() ?? undefined
 					)

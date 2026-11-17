@@ -32,6 +32,12 @@ pub struct InboxSetup {
     pub autofill: crate::autofill::Autofill,
     #[serde(default)]
     pub suggestions: Suggestions,
+    /// Preserve modification date: an imported album keeps the date it has
+    /// in the Inbox (its newest file's modification time) as its date added
+    /// in the Library, instead of the import time, so Recently added lists
+    /// the Library in the Inbox's order.
+    #[serde(default)]
+    pub keep_added: bool,
 }
 
 /// Smart suggestions: identify albums on MusicBrainz when importing and
@@ -189,6 +195,14 @@ pub struct HiddenStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setups_saved_before_keep_the_import_time() {
+        let old: InboxSetup = serde_json::from_str(r#"{"ingest":"copy"}"#).unwrap();
+        assert!(!old.keep_added);
+        let on: InboxSetup = serde_json::from_str(r#"{"keep_added":true}"#).unwrap();
+        assert!(on.keep_added);
+    }
 
     #[test]
     fn defaults_to_copy_and_uses_lowercase_names() {

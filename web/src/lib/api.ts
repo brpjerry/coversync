@@ -217,6 +217,9 @@ export interface ImportPlan {
 	art: ArtPlan;
 	/** Smart suggestions are on: the import dialog looks the album up. */
 	suggest: boolean;
+	/** The date added (Unix seconds) the album keeps in the Library, its Inbox date,
+	 * with Preserve modification date on; null: the import time. */
+	added: number | null;
 }
 
 /** What happens to the album art on import. */
@@ -294,6 +297,8 @@ export interface InboxSetup {
 		/** Keep AcoustID's and MusicBrainz's answers, so an album is looked up once. */
 		save_lookups: boolean;
 	};
+	/** Preserve modification date: imported albums keep their Inbox date as their date added. */
+	keep_added: boolean;
 }
 
 export interface HiddenStats {
