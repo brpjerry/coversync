@@ -142,7 +142,7 @@
 	let phraseExamples = $derived(
 		PHRASE_EXAMPLES.filter(([p]) => hasPhrase(p)).map(([, from, to]) => ({
 			from,
-			to: to.replace('|', setup.separator)
+			to: to.replace('|', () => setup.separator)
 		}))
 	);
 	function addPhrase(p: string) {
@@ -319,7 +319,7 @@
 									aria-label="Add a phrase to split names at"
 									aria-describedby="split-hint"
 									onkeydown={(e) => {
-										if (e.key === 'Enter') {
+										if (e.key === 'Enter' && !e.isComposing) {
 											e.preventDefault();
 											addPhrase(phrase);
 										}

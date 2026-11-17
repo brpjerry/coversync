@@ -1308,8 +1308,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.identify.count(), 0);
+        // The separator alone, from the setup as saved now.
         state.identify.finished("a");
-        let mut separator = library;
+        let mut separator = state.lib.library_setup().unwrap();
         separator.rules.separator = " / ".into();
         let _ = save_library_setup(State(state.clone()), Json(separator))
             .await

@@ -78,20 +78,25 @@ fn names(text: &str) -> bool {
 /// phrase can't start or end inside it: "x" isn't in "vōx". Chinese,
 /// Japanese and Korean don't count, so "かめりあfeat.ななひら" splits.
 fn word(c: char) -> bool {
-    c.is_alphanumeric() && (c as u32) < 0x2E80
+    let u = c as u32;
+    (c.is_alphanumeric() && u < 0x2E80)
+        // Combining marks ("vo\u{304}x") and Latin ligatures.
+        || matches!(
+            u,
+            0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
+                | 0xFE20..=0xFE2F | 0xFB00..=0xFB06
+        )
 }
 
-/// `text` without list punctuation (and spaces) at its start. Right after
-/// a phrase's closing bracket an `&` joins the next credit even attached:
-/// "Rin (CV: Riho)&Hanayo".
-fn trim_list_start(mut text: &str, after_bracket: bool) -> &str {
+/// `text` without list punctuation (and spaces) at its start.
+fn trim_list_start(mut text: &str) -> &str {
     loop {
         text = text.trim_start();
         let mut chars = text.chars();
         let Some(c) = chars.next().map(fold) else {
             return text;
         };
-        let alone = after_bracket || chars.next().is_none_or(char::is_whitespace);
+        let alone = chars.next().is_none_or(char::is_whitespace);
         if LIST_PUNCTUATION.contains(&c) || (c == '&' && alone) {
             text = &text[text.chars().next().map_or(0, char::len_utf8)..];
         } else {
@@ -215,16 +220,21 @@ impl Splitter {
                 segment.split(self.separator.as_str()).collect()
             };
             let last = pieces.len() - 1;
-            for (j, piece) in pieces.into_iter().enumerate() {
+            for (j, raw) in pieces.into_iter().enumerate() {
                 // List punctuation goes only where a phrase split the names.
-                let mut piece = piece.trim();
+                let mut piece = raw.trim();
                 if i > 0 && j == 0 {
                     let cut = &value[cuts[i - 1].clone()];
                     let after_bracket = cut
                         .chars()
                         .map(fold)
                         .any(|c| BRACKETS.iter().any(|(_, close)| c == *close));
-                    piece = trim_list_start(piece, after_bracket);
+                    // Right against a phrase's closing bracket, an & joins
+                    // the next credit: "Rin (CV:Riho)&Hanayo".
+                    if after_bracket && raw.chars().next().map(fold) == Some('&') {
+                        piece = &raw[raw.chars().next().map_or(0, char::len_utf8)..];
+                    }
+                    piece = trim_list_start(piece);
                 }
                 if i < cuts.len() && j == last {
                     piece = trim_list_end(piece);
@@ -345,12 +355,19 @@ impl Splitter {
         if p.word_end && end < n && word(folded[end]) {
             return None;
         }
-        // "(CV:", "(CV.", "(CV :", "feat.:".
+        // "(CV:", "(CV.", "(CV :", "feat.:"; but not the separator, nor,
+        // across spaces, punctuation of the next name's own (".que").
+        let separator: Vec<char> = self.separator.trim().chars().map(fold).collect();
         let mut past = end;
         while past < n && folded[past].is_whitespace() {
             past += 1;
         }
-        if past < n && matches!(folded[past], ':' | '.') {
+        let alone = past == end || folded.get(past + 1).is_none_or(|c| c.is_whitespace());
+        if past < n
+            && matches!(folded[past], ':' | '.')
+            && alone
+            && !folded[past..].starts_with(&separator)
+        {
             end = past + 1;
         }
         // The bracket the phrase opens, or one just before it: "(feat. Eve)".
@@ -464,6 +481,12 @@ mod tests {
             Some("かめりあ;ななひら")
         );
         assert_eq!(rw(&s, "Ado feat.: Eve").as_deref(), Some("Ado;Eve"));
+        // Across a space, a name's own punctuation stays.
+        assert_eq!(rw(&s, "Ado feat. .que").as_deref(), Some("Ado;.que"));
+        assert_eq!(
+            rw(&s, "Ado feat. :wumpscut:").as_deref(),
+            Some("Ado;:wumpscut:")
+        );
         assert_eq!(
             rw(&s, "Natsuhi (CV : Yuri)").as_deref(),
             Some("Natsuhi;Yuri")
@@ -501,6 +524,14 @@ mod tests {
         assert_eq!(rw(&both, "Ado;X JAPAN"), None);
         // Accented letters are part of words; "x" isn't in "vōx".
         assert_eq!(rw(&both, "vōx feat. Eve").as_deref(), Some("vōx;Eve"));
+        assert_eq!(
+            rw(&both, "vo\u{304}x feat. Eve").as_deref(),
+            Some("vo\u{304}x;Eve")
+        );
+        // A : separator isn't taken along as a phrase's own.
+        let colon = Splitter::new(":", &["feat.".into()]);
+        assert_eq!(rw(&colon, "Little Feat.:Eve"), None);
+        assert_eq!(rw(&colon, "Ado feat. Eve").as_deref(), Some("Ado:Eve"));
         // No phrase: as it was, separators and all.
         assert_eq!(rw(&s, "NayutalieN; Hatsune Miku"), None);
         assert_eq!(rw(&s, "Ookubo Rumi, Tsuda Minami & Taneda Risa"), None);
@@ -515,8 +546,17 @@ mod tests {
             rw(&s, "&ME feat. Keinemusik").as_deref(),
             Some("&ME;Keinemusik")
         );
+        // After a bracket, but not against it: a name's own.
+        assert_eq!(
+            rw(&s, "Rin (CV. Riho), &TEAM").as_deref(),
+            Some("Rin;Riho;&TEAM")
+        );
+        assert_eq!(
+            rw(&s, "Ado (feat. Eve) &ME").as_deref(),
+            Some("Ado;Eve;&ME")
+        );
         // One standing alone between two credits goes, as does one right
-        // after a phrase's closing bracket.
+        // against a phrase's closing bracket.
         assert_eq!(
             rw(&s, "Rin (CV:Riho)&Hanayo (CV:Yurika)").as_deref(),
             Some("Rin;Riho;Hanayo;Yurika")

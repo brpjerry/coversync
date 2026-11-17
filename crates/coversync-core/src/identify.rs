@@ -2209,6 +2209,36 @@ mod tests {
     }
 
     #[test]
+    fn romanized_names_are_split_on_every_side() {
+        let credit = |name: &str| -> Vec<mb::Credit> {
+            serde_json::from_value(serde_json::json!([
+                {"name": name, "joinphrase": "", "artist": {"id": "a-1", "sort-name": "Riho"}}
+            ]))
+            .unwrap()
+        };
+        let mut romanized = release();
+        romanized.artist_credit = credit("Rin (CV. Riho)");
+        let mut original = release();
+        original.artist_credit = credit("凛 (CV. 里穂)");
+        let first = local(1, &[("track_number", "1"), ("title", "Thaw")]);
+        let second = local(
+            2,
+            &[
+                ("track_number", "2"),
+                ("title", "Don’t Look Back"),
+                ("artist", "凛（CV：里穂）"),
+            ],
+        );
+        let split = Splitter::new(";", &["(CV".into()]);
+        let out = suggestions(&[first, second], &romanized, Some(&original), &split);
+        let artist = find(&out[1], "artist").unwrap();
+        assert_eq!(artist.value, "Rin;Riho");
+        assert_eq!(artist.current.as_deref(), Some("凛;里穂"));
+        assert_eq!(artist.original.as_deref(), Some("凛;里穂"));
+        assert!(artist.romanizes);
+    }
+
+    #[test]
     fn sort_names_follow_their_artist() {
         let mut ours = local(1, &[("artist", "Someone Else"), ("track_number", "1")]);
         ours.recordings.push(("rec-1".into(), "a".into(), 1.0));
