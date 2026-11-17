@@ -408,3 +408,40 @@ fn without_it_an_import_is_added_when_it_happens() {
         .unwrap();
     assert!(library[0].added_at >= before, "{}", library[0].added_at);
 }
+
+#[test]
+fn with_no_inbox_date_it_falls_back_to_the_import_time() {
+    let s = setup("keep-unknown", "{album}/<{track_number} - >{title}");
+    touch_and_rescan(&s, [0, 0]);
+    assert_eq!(s.lib.album(&s.album).unwrap().unwrap().album.added_at, 0);
+    let mut inbox = s.lib.inbox_setup().unwrap();
+    inbox.keep_added = true;
+    s.lib.set_inbox_setup(inbox).unwrap();
+    assert_eq!(s.plan([&[], &[]]).added, None);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    let library = s
+        .lib
+        .albums(
+            Collection::Library,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(library[0].added_at >= before, "{}", library[0].added_at);
+}
