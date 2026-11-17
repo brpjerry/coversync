@@ -184,6 +184,13 @@
 						</p>
 					</div>
 				{/if}
+				<div class="keep-added">
+					<Toggle
+						bind:checked={inboxSetup.keepAdded}
+						label="Preserve modification date"
+						description="An imported album keeps its Inbox date, its newest file's modification time, as its date added. Recently added then lists the Library in the Inbox's order. Off, an album counts as added when it's imported."
+					/>
+				</div>
 			</div>
 		</section>
 
@@ -646,6 +653,9 @@
 		color: var(--text-3);
 	}
 
+	.keep-added {
+		margin: 14px -14px -4px;
+	}
 	.toggles {
 		display: grid;
 		gap: 2px;

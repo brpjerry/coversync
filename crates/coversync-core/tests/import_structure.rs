@@ -304,3 +304,107 @@ fn an_album_artist_autofill_fills_from_the_artist_is_split_too() {
         ["Ado;Eve/Record/01 - One.wav", "Ado;Eve/Record/02 - Two.wav"]
     );
 }
+
+/// Set the Inbox files' modification times, newest last, and rescan.
+fn touch_and_rescan(s: &Setup, times: [u64; 2]) {
+    let dir = s.root.parent().unwrap();
+    for (n, secs) in [1, 2].into_iter().zip(times) {
+        let file = fs::File::options()
+            .write(true)
+            .open(dir.join(format!("Inbox/Record/{n}.wav")))
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+    let covers = CoverCache::new(dir.join("cache")).unwrap();
+    let roots = [
+        (dir.join("Inbox"), Collection::Inbox),
+        (s.root.clone(), Collection::Library),
+    ];
+    scan::scan(&s.lib, &covers, &roots, &Progress::default()).unwrap();
+}
+
+#[test]
+fn preserve_modification_date_keeps_the_albums_inbox_date() {
+    let s = setup("keep-added", "{album}/<{track_number} - >{title}");
+    touch_and_rescan(&s, [1_500_000_000, 1_600_000_000]);
+    // The Inbox's date: its newest file's.
+    let inbox_date = s.lib.album(&s.album).unwrap().unwrap().album.added_at;
+    assert_eq!(inbox_date, 1_600_000_000);
+    // Off: the import time.
+    assert_eq!(s.plan([&[], &[]]).added, None);
+
+    let mut inbox = s.lib.inbox_setup().unwrap();
+    inbox.keep_added = true;
+    s.lib.set_inbox_setup(inbox).unwrap();
+    assert_eq!(s.plan([&[], &[]]).added, Some(inbox_date));
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    let library = s
+        .lib
+        .albums(
+            Collection::Library,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(library.len(), 1);
+    assert_eq!(library[0].added_at, inbox_date);
+    // A rescan keeps it.
+    touch_and_rescan(&s, [1_500_000_000, 1_600_000_000]);
+    let library = s
+        .lib
+        .albums(
+            Collection::Library,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(library[0].added_at, inbox_date);
+}
+
+#[test]
+fn without_it_an_import_is_added_when_it_happens() {
+    let s = setup("import-time", "{album}/<{track_number} - >{title}");
+    touch_and_rescan(&s, [1_500_000_000, 1_600_000_000]);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    let library = s
+        .lib
+        .albums(
+            Collection::Library,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(library[0].added_at >= before, "{}", library[0].added_at);
+}

@@ -87,6 +87,10 @@ pub struct ImportPlan {
     pub art: ArtPlan,
     /// Smart suggestions are on: the import dialog looks the album up.
     pub suggest: bool,
+    /// With Inbox setup's Preserve modification date: the date added (Unix
+    /// seconds) the album keeps in the Library, its date in the Inbox. None:
+    /// the import time.
+    pub added: Option<i64>,
 }
 
 impl ImportPlan {
@@ -541,6 +545,7 @@ pub fn plan(
         art,
         autofilled,
         split,
+        added: (inbox.keep_added && detail.album.added_at > 0).then_some(detail.album.added_at),
         suggest: inbox.suggestions.enabled,
         album_id: album_id.to_string(),
         mode: inbox.ingest,
@@ -707,8 +712,10 @@ pub fn execute(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     // Index the copies before the originals leave the Inbox, so a failure
-    // here leaves them where they were, and takes the copies back out.
-    let stats = imported_stats(&written, &folder, now)
+    // here leaves them where they were, and takes the copies back out. They
+    // count as added now, or at the album's Inbox date (Preserve
+    // modification date).
+    let stats = imported_stats(&written, &folder, plan.added.unwrap_or(now))
         .into_iter()
         .map(|mut stat| {
             stat.hash = hashes.remove(&stat.path);
@@ -760,13 +767,14 @@ pub fn execute(
     })
 }
 
-/// The files an import wrote into `folder`, ready to index as added `now`.
-fn imported_stats(written: &[PathBuf], folder: &Path, now: i64) -> Vec<FileStat> {
+/// The files an import wrote into `folder`, ready to index as added at
+/// `added`: the import time, or the album's Inbox date.
+fn imported_stats(written: &[PathBuf], folder: &Path, added: i64) -> Vec<FileStat> {
     written
         .iter()
         .filter_map(|p| scan::stat(p.clone(), folder, Collection::Library))
         .map(|s| FileStat {
-            added: Some(now),
+            added: Some(added),
             ..s
         })
         .collect()

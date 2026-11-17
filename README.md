@@ -16,7 +16,8 @@ used on a home server.
   top bar, search, a player, and a tag editor. "Recently added" means newest
   files first in the Inbox, and most recently imported first in the Library
   (the import time is kept in the Library's database, so tag edits and moves
-  don't change it). "Needs attention" lists albums missing tags or art the
+  don't change it), or, with Inbox setup's Preserve modification date, in
+  the Inbox's order. "Needs attention" lists albums missing tags or art the
   rules require. The sidebar filters albums by tag:
   pick a tag such as Genre from its dropdown, search its values, and tick the
   ones to show. Ticked values of one tag widen the choice, values of several
@@ -71,9 +72,13 @@ used on a home server.
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never
   written and is hidden from the Inbox afterwards.
-- **Inbox setup**: Copy or Move, autofill for empty tags that are safe to
-  assume (album artist from artist, track numbers from file names, …), and
-  the uploads folder (see [Uploading albums](#uploading-albums)).
+- **Inbox setup**: Copy or Move; Preserve modification date, which gives an
+  imported album its Inbox date (its newest file's modification time) as its
+  date added instead of the import time, so the Library's Recently added
+  keeps the Inbox's order (the import dialog shows the date it keeps);
+  autofill for empty tags that are safe to assume (album artist from
+  artist, track numbers from file names, …); and the uploads folder (see
+  [Uploading albums](#uploading-albums)).
 - **Uploads**: drop album folders (or files) on the Inbox, or pick them with
   the top bar's Upload button, and they go to the server's uploads folder and
   show up in the Inbox, folders such as `CD1/` and `CD2/` kept. A panel shows

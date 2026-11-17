@@ -87,6 +87,9 @@
 	let disagree = $state([...opened]);
 	let albumCols = $derived([...failing.filter((k) => albumKinds.includes(k)), ...disagree]);
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
+	/** The date added an album keeps (Preserve modification date), as a date. */
+	const addedDate = (seconds: number) =>
+		new Date(seconds * 1000).toLocaleDateString(undefined, { dateStyle: 'medium' });
 	const original = (id: number, k: string) => tracks.find((t) => t.id === id)?.values[k] ?? '';
 
 	/** The value most tracks already agree on, used to pre-fill album fields. */
@@ -655,7 +658,7 @@
 				<span class="mode">
 					{#if live.mode === 'copy'}<Copy size={13} /> Copy · the original stays untouched{:else}<Move
 							size={13}
-						/> Move · the original leaves the Inbox{/if}
+						/> Move · the original leaves the Inbox{/if}{#if live.added}{` · keeps its Inbox date, ${addedDate(live.added)}`}{/if}
 				</span>
 				<span class="dest-path" title={destDir ?? ''}>
 					{#if planning}<span class="spin"><LoaderCircle size={13} /></span>{/if}
