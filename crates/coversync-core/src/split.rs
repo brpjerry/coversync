@@ -79,13 +79,32 @@ fn names(text: &str) -> bool {
 /// Japanese and Korean don't count, so "かめりあfeat.ななひら" splits.
 fn word(c: char) -> bool {
     let u = c as u32;
-    (c.is_alphanumeric() && u < 0x2E80)
-        // Combining marks ("vo\u{304}x") and Latin ligatures.
-        || matches!(
-            u,
-            0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF
-                | 0xFE20..=0xFE2F | 0xFB00..=0xFB06
-        )
+    // Combining marks, as in a decomposed "vo\u{304}x".
+    let mark = matches!(
+        u,
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    );
+    (c.is_alphanumeric() || mark) && !cjk(u)
+}
+
+/// Hangul, kana and the CJK ideographs, with their compatibility and
+/// half-width forms: scripts written without spaces between words.
+fn cjk(u: u32) -> bool {
+    matches!(
+        u,
+        0x1100..=0x11FF
+            | 0x2E80..=0x2FDF
+            | 0x3040..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7FF
+            | 0xF900..=0xFAFF
+            | 0xFF66..=0xFFDC
+            | 0x1B000..=0x1B16F
+            | 0x20000..=0x3FFFF
+    )
 }
 
 /// `text` without list punctuation (and spaces) at its start.
@@ -232,7 +251,7 @@ impl Splitter {
                     // Right against a phrase's closing bracket, an & joins
                     // the next credit: "Rin (CV:Riho)&Hanayo".
                     if after_bracket && raw.chars().next().map(fold) == Some('&') {
-                        piece = &raw[raw.chars().next().map_or(0, char::len_utf8)..];
+                        piece = &piece[piece.chars().next().map_or(0, char::len_utf8)..];
                     }
                     piece = trim_list_start(piece);
                 }
@@ -282,6 +301,11 @@ impl Splitter {
             return Vec::new();
         }
         let separator = self.separator.as_str();
+        // Where the separator already splits the value.
+        let boundaries: Vec<Range<usize>> = value
+            .match_indices(separator)
+            .map(|(p, s)| p..p + s.len())
+            .collect();
         let at: Vec<usize> = value
             .char_indices()
             .map(|(i, _)| i)
@@ -303,6 +327,15 @@ impl Splitter {
                 i += 1;
                 continue;
             };
+            // A phrase running into the separator ("Feat." with separator
+            // "." or ":" after it) isn't inside one value.
+            if boundaries
+                .iter()
+                .any(|b| b.start < at[end] && at[start] < b.end)
+            {
+                i = end.max(i + 1);
+                continue;
+            }
             // Only between two names of the same value: "X JAPAN" isn't
             // split at a phrase "x", nor is "Little Feat.;Eve" at "feat.".
             let before = &value[names_from.min(at[start])..at[start]];
@@ -355,19 +388,17 @@ impl Splitter {
         if p.word_end && end < n && word(folded[end]) {
             return None;
         }
-        // "(CV:", "(CV.", "(CV :", "feat.:"; but not the separator, nor,
-        // across spaces, punctuation of the next name's own (".que").
-        let separator: Vec<char> = self.separator.trim().chars().map(fold).collect();
+        // "(CV:", "(CV.", "(CV :", "(CV :)", "feat.:"; but across spaces,
+        // not punctuation of the next name's own (".que").
         let mut past = end;
         while past < n && folded[past].is_whitespace() {
             past += 1;
         }
-        let alone = past == end || folded.get(past + 1).is_none_or(|c| c.is_whitespace());
-        if past < n
-            && matches!(folded[past], ':' | '.')
-            && alone
-            && !folded[past..].starts_with(&separator)
-        {
+        let alone = past == end
+            || folded
+                .get(past + 1)
+                .is_none_or(|c| c.is_whitespace() || BRACKETS.iter().any(|(_, close)| c == close));
+        if past < n && matches!(folded[past], ':' | '.') && alone {
             end = past + 1;
         }
         // The bracket the phrase opens, or one just before it: "(feat. Eve)".
@@ -487,6 +518,7 @@ mod tests {
             rw(&s, "Ado feat. :wumpscut:").as_deref(),
             Some("Ado;:wumpscut:")
         );
+        assert_eq!(rw(&s, "Rin (CV :) Riho").as_deref(), Some("Rin;Riho"));
         assert_eq!(
             rw(&s, "Natsuhi (CV : Yuri)").as_deref(),
             Some("Natsuhi;Yuri")
@@ -528,10 +560,27 @@ mod tests {
             rw(&both, "vo\u{304}x feat. Eve").as_deref(),
             Some("vo\u{304}x;Eve")
         );
-        // A : separator isn't taken along as a phrase's own.
+        assert_eq!(
+            rw(&both, "M\u{1D552}x feat. Eve").as_deref(),
+            Some("M\u{1D552}x;Eve")
+        );
+        assert_eq!(
+            rw(&both, "v\u{A733}x feat. Eve").as_deref(),
+            Some("v\u{A733}x;Eve")
+        );
+        // A phrase running into the separator isn't within one value.
         let colon = Splitter::new(":", &["feat.".into()]);
         assert_eq!(rw(&colon, "Little Feat.:Eve"), None);
         assert_eq!(rw(&colon, "Ado feat. Eve").as_deref(), Some("Ado:Eve"));
+        let dot = Splitter::new(". ", &["feat.".into()]);
+        assert_eq!(rw(&dot, "Little Feat. Eve"), None);
+        assert_eq!(
+            rw(&Splitter::new(".", &["feat.".into()]), "Little Feat.Eve"),
+            None
+        );
+        // A separator that only looks like a phrase's colon doesn't stop it.
+        let spaced = Splitter::new(" : ", &["(CV".into()]);
+        assert_eq!(rw(&spaced, "Rin (CV:Riho)").as_deref(), Some("Rin : Riho"));
         // No phrase: as it was, separators and all.
         assert_eq!(rw(&s, "NayutalieN; Hatsune Miku"), None);
         assert_eq!(rw(&s, "Ookubo Rumi, Tsuda Minami & Taneda Risa"), None);
@@ -560,6 +609,10 @@ mod tests {
         assert_eq!(
             rw(&s, "Rin (CV:Riho)&Hanayo (CV:Yurika)").as_deref(),
             Some("Rin;Riho;Hanayo;Yurika")
+        );
+        assert_eq!(
+            rw(&s, "Rin (CV:Riho)&Hanayo ;Hanayo").as_deref(),
+            Some("Rin;Riho;Hanayo")
         );
         assert_eq!(
             rw(&s, "Rin (CV: Riho) & Hanayo (CV: Yurika)").as_deref(),
