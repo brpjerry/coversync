@@ -310,6 +310,39 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
+/// As [`read_kinds`], but a tag naming people that the file holds several
+/// times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them
+/// all, joined by `split`'s separator, when one has a phrase to split at:
+/// the import then rewrites the tag, and would otherwise keep only the first.
+pub fn read_kinds_split(
+    path: &Path,
+    pictures: bool,
+    split: &crate::split::Splitter,
+) -> Result<KindValues> {
+    let file = probe(path, pictures)?;
+    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let mut values = tag.map(values_of).unwrap_or_default();
+    if let Some(tag) = tag {
+        for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
+            let all: Vec<&str> = kind
+                .keys
+                .iter()
+                .flat_map(|key| tag.get_strings(*key))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .collect();
+            if all.len() > 1 && all.iter().any(|v| split.rewrite(kind.id, v).is_some()) {
+                values.insert(kind.id, all.join(split.separator()));
+            }
+        }
+    }
+    Ok(KindValues {
+        values,
+        has_art: pictures && has_pictures(&file),
+        tag_type: file.primary_tag_type(),
+    })
+}
+
 /// The UPC some stores tag files with instead of a barcode, which lofty
 /// leaves out of its generic tags: a Vorbis comment (FLAC, Ogg) or an ID3v2
 /// TXXX frame (MP3, or an ID3v2 tag on a FLAC file).
@@ -762,6 +795,33 @@ mod tests {
         flac_with_comments(&path, &["TITLE=もし、"]);
         assert_eq!(upc(&path), None);
         assert_eq!(upc(&dir.join("missing.flac")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_held_several_times_are_read_together_when_one_splits() {
+        let dir = std::env::temp_dir().join(format!("coversync-multi-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        let split = crate::split::Splitter::new(";", &["feat.".into()]);
+        flac_with_comments(&path, &["ARTIST=A feat. B", "ARTIST=C", "TITLE=T"]);
+        let read = read_kinds_split(&path, false, &split).unwrap();
+        assert_eq!(read.values["artist"], "A feat. B;C");
+        assert_eq!(
+            split.rewrite("artist", &read.values["artist"]).unwrap(),
+            "A;B;C"
+        );
+        // As read_kinds sees it.
+        assert_eq!(
+            read_kinds(&path, false).unwrap().values["artist"],
+            "A feat. B"
+        );
+        // Nothing to split: the first, as ever, and the file's own left alone.
+        flac_with_comments(&path, &["ARTIST=A", "ARTIST=C"]);
+        assert_eq!(
+            read_kinds_split(&path, false, &split).unwrap().values["artist"],
+            "A"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

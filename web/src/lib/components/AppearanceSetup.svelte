@@ -133,7 +133,8 @@
 					<h2 id="filters-title">Tag filters</h2>
 					<p>
 						The tags the sidebar can filter albums by, in the order its dropdown lists them. A tag
-						with several values, split by Library setup's separator, offers each of them.
+						with several values, split by Library setup's separator (and names at its phrases, like
+						feat.), offers each of them.
 					</p>
 				</div>
 			</header>

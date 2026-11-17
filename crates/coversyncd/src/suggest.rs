@@ -51,6 +51,27 @@ impl Jobs {
     }
 }
 
+#[cfg(test)]
+impl Jobs {
+    /// A finished identification of `album_id`, standing in for a real one.
+    pub fn finished(&self, album_id: &str) {
+        let job = Job {
+            release: None,
+            romanize: None,
+            generation: 0,
+            stale: false,
+            finished: Some(Instant::now()),
+            state: JobState::Failed("stand-in".into()),
+            evidence: None,
+        };
+        self.lock().insert(album_id.into(), job);
+    }
+
+    pub fn count(&self) -> usize {
+        self.lock().len()
+    }
+}
+
 struct Job {
     /// The release asked for; None for the best match.
     release: Option<String>,
@@ -174,7 +195,7 @@ pub async fn start(
         };
         let outcome = (|| -> coversync_core::Result<(Option<Evidence>, Identification)> {
             let setup = state.lib.inbox_setup()?.suggestions;
-            let separator = state.lib.library_setup()?.rules.separator;
+            let split = state.lib.library_setup()?.rules.splitter();
             let romanize = asked
                 .unwrap_or(setup.prefer_english)
                 .then_some(romanize::Options {
@@ -196,7 +217,7 @@ pub async fn start(
                         r,
                         release.is_some(),
                         romanize,
-                        &separator,
+                        &split,
                         &progress,
                     )?,
                 )),
@@ -212,13 +233,13 @@ pub async fn start(
                         &album_id,
                         key.as_deref(),
                         romanize,
-                        &separator,
+                        &split,
                         &progress,
                     )?;
                     let result = match release.as_deref() {
-                        Some(r) => identify::suggest(
-                            &ev, lookups, r, true, romanize, &separator, &progress,
-                        )?,
+                        Some(r) => {
+                            identify::suggest(&ev, lookups, r, true, romanize, &split, &progress)?
+                        }
                         None => best,
                     };
                     Ok((Some(ev), result))

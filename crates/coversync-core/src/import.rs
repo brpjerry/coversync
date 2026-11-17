@@ -19,6 +19,7 @@ use crate::db::{CoverSource, FileStat};
 use crate::inbox::IngestMode;
 use crate::model::Collection;
 use crate::scan::{self, Progress};
+use crate::split::Splitter;
 use crate::template::{self, Template};
 use crate::{Error, Library, Result, autofill, rules, tags};
 
@@ -36,7 +37,9 @@ pub struct ImportTrack {
     pub missing: Vec<&'static str>,
     /// Where the file would land, once every folder-structure variable has a value.
     pub dest: Option<String>,
-    /// Empty tags Inbox setup's autofill would set, by kind (edits override these).
+    /// What the import sets by itself, by kind: empty tags Inbox setup's
+    /// autofill fills, and names split at Library setup's phrases (edits
+    /// override these).
     pub autofilled: HashMap<&'static str, String>,
 }
 
@@ -78,6 +81,9 @@ pub struct ImportPlan {
     pub problems: Vec<String>,
     /// Kinds autofill sets on at least one track, in catalog order.
     pub autofilled: Vec<&'static str>,
+    /// Kinds naming people that the import splits into one name each, at
+    /// Library setup's phrases, on at least one track; in catalog order.
+    pub split: Vec<&'static str>,
     pub art: ArtPlan,
     /// Smart suggestions are on: the import dialog looks the album up.
     pub suggest: bool,
@@ -190,19 +196,21 @@ pub struct ReadTrack {
 }
 
 /// Read every track of `detail`, in order, and apply `autofill`, which
-/// looks across the whole album.
+/// looks across the whole album. Names a file holds several times are read
+/// together where `split` would split one (see [`tags::read_kinds_split`]).
 pub fn read_album(
     lib: &Library,
     detail: &crate::AlbumDetail,
     autofill: &autofill::Autofill,
     pictures: bool,
+    split: &Splitter,
 ) -> Result<Vec<ReadTrack>> {
     let mut paths = Vec::new();
     let mut infos = Vec::new();
     let mut extra = Vec::new();
     for track in &detail.tracks {
         let (path, _) = lib.track_root(track.id)?.ok_or(Error::NotFound)?;
-        let read = tags::read_kinds(&path, pictures)?;
+        let read = tags::read_kinds_split(&path, pictures, split)?;
         infos.push(autofill::TrackInfo {
             stem: path
                 .file_stem()
@@ -321,11 +329,13 @@ pub fn plan(
     }
 
     let art_rules = &setup.rules.art;
+    let splitter = setup.rules.splitter();
     let read = read_album(
         lib,
         &detail,
         &inbox.autofill,
         art_rules.placement.embedded(),
+        &splitter,
     )?;
     let gets_art = if upload.is_some() {
         read.len()
@@ -342,12 +352,19 @@ pub fn plan(
     // agree on. One only in optional parts every track leaves out can't
     // split the album.
     let mut shown_vars: Vec<&'static str> = Vec::new();
+    // Per track, the kinds autofill filled and the kinds split at phrases,
+    // while no edit replaces them.
+    let mut filled_by = Vec::new();
+    let mut split_by = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
         let path = read.path;
         let mut values = read.values;
+        // After autofill, so an album artist filled from the artist is split too.
+        let split = splitter.rewrite_all(&mut values);
         let mut autofilled: HashMap<&'static str, String> = read
             .autofilled
             .iter()
+            .chain(&split)
             .map(|k| (*k, values.get(k).cloned().unwrap_or_default()))
             .collect();
         for (kind, value) in edits.get(&track.id).into_iter().flatten() {
@@ -366,6 +383,19 @@ pub fn plan(
                 values.insert(k.id, value.to_string());
             }
         }
+        filled_by.push(
+            read.autofilled
+                .iter()
+                .copied()
+                .filter(|k| autofilled.contains_key(k))
+                .collect::<Vec<_>>(),
+        );
+        split_by.push(
+            split
+                .into_iter()
+                .filter(|k| autofilled.contains_key(k))
+                .collect::<Vec<_>>(),
+        );
         let missing: Vec<&'static str> = kinds
             .iter()
             .copied()
@@ -475,11 +505,15 @@ pub fn plan(
     }
     // Missing on some tracks already; that says what to fill in.
     disagree.retain(|k| !failing.contains(k));
-    let autofilled = rules::CATALOG
-        .iter()
-        .map(|k| k.id)
-        .filter(|k| tracks.iter().any(|(_, t)| t.autofilled.contains_key(k)))
-        .collect();
+    let in_order = |per_track: &[Vec<&'static str>]| -> Vec<&'static str> {
+        rules::CATALOG
+            .iter()
+            .map(|k| k.id)
+            .filter(|k| per_track.iter().any(|t| t.contains(k)))
+            .collect()
+    };
+    let autofilled = in_order(&filled_by);
+    let split = in_order(&split_by);
 
     let found = upload.is_none().then(|| found_art(lib, album_id)).flatten();
     let art = upload
@@ -506,6 +540,7 @@ pub fn plan(
     Ok(ImportPlan {
         art,
         autofilled,
+        split,
         suggest: inbox.suggestions.enabled,
         album_id: album_id.to_string(),
         mode: inbox.ingest,

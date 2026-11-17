@@ -149,7 +149,14 @@ impl Setup {
     /// The id of the album of `collection` titled `title`.
     fn album(&self, collection: Collection, title: &str) -> String {
         self.lib
-            .albums(collection, &[], &[], "", &[], None)
+            .albums(
+                collection,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap()
             .into_iter()
             .find(|a| a.title == title)
@@ -174,7 +181,14 @@ impl Setup {
 
     fn inbox_album(&self) -> String {
         self.lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap()[0]
             .id
             .clone()

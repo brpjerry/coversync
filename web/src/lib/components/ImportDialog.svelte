@@ -16,6 +16,7 @@
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import WandSparkles from '@lucide/svelte/icons/wand-sparkles';
 	import ImageIcon from '@lucide/svelte/icons/image';
+	import Split from '@lucide/svelte/icons/split';
 	import ImagePlus from '@lucide/svelte/icons/image-plus';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import {
@@ -449,6 +450,15 @@
 					<span>
 						Filled in automatically:
 						{live.autofilled.map((k) => label(k)).join(', ')}. Change it in Inbox setup.
+					</span>
+				</p>
+			{/if}
+			{#if live.split.length}
+				<p class="autofilled">
+					<Split size={14} />
+					<span>
+						Split into one name each:
+						{live.split.map((k) => label(k)).join(', ')}. Change the phrases in Library setup.
 					</span>
 				</p>
 			{/if}

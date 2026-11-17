@@ -25,6 +25,7 @@ use crate::model::{
     KindCoverage, LibraryChanges, LibraryVersion, RemovedTrack, TagCoverage, Track,
 };
 use crate::rules::{self, LibrarySetup};
+use crate::split::Splitter;
 use crate::sync::{Catalog, CatalogTrack, Content, SyncSetup};
 use crate::tags::TrackTags;
 use crate::{Error, Result};
@@ -1080,13 +1081,13 @@ fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) 
 const SUMMARY_FILTERS: &[&str] = &["album_artist", "date"];
 
 /// Every value of `key` an album has, in the order found and without repeats;
-/// a value holding several is split at `separator`. `tracks` are the
-/// album's stored tag values.
+/// a value holding several is split as `split` says (names at its phrases
+/// too). `tracks` are the album's stored tag values.
 fn filter_values<'a>(
     key: &str,
     album: &Album,
     tracks: impl Iterator<Item = &'a HashMap<String, String>>,
-    separator: &str,
+    split: &Splitter,
 ) -> Vec<String> {
     let found: Vec<String> = match key {
         "album_artist" => vec![album.artist.clone()],
@@ -1095,14 +1096,9 @@ fn filter_values<'a>(
     };
     let mut out: Vec<String> = Vec::new();
     for value in &found {
-        let parts: Vec<&str> = if separator.trim().is_empty() {
-            vec![value]
-        } else {
-            value.split(separator).collect()
-        };
-        for part in parts.into_iter().map(str::trim).filter(|p| !p.is_empty()) {
-            if !out.iter().any(|o| o == part) {
-                out.push(part.to_string());
+        for part in split.parts(key, value) {
+            if !out.contains(&part) {
+                out.push(part);
             }
         }
     }
@@ -1994,7 +1990,7 @@ impl Library {
     /// Albums of a collection. `sort_keys` are tag kinds whose album-wide
     /// value (what most tracks agree on) each album should carry;
     /// `filter_keys` are kinds whose every value, on any track, it should
-    /// carry, with values that hold several split at `separator`. Albums with
+    /// carry, with values that hold several split as `split` says. Albums with
     /// tracks missing any `required` kind are flagged for attention, after
     /// `autofill` fills what it can (as an import would). `art::ART` among
     /// them requires album art.
@@ -2003,7 +1999,7 @@ impl Library {
         collection: Collection,
         sort_keys: &[&str],
         filter_keys: &[&str],
-        separator: &str,
+        split: &Splitter,
         required: &[&str],
         autofill: Option<&Autofill>,
     ) -> Result<Vec<Album>> {
@@ -2042,8 +2038,7 @@ impl Library {
                     }
                 }
                 for key in filter_keys {
-                    let found =
-                        filter_values(key, &album, idx.iter().map(|i| &values[*i]), separator);
+                    let found = filter_values(key, &album, idx.iter().map(|i| &values[*i]), split);
                     if !found.is_empty() {
                         album.filter_values.insert(key.to_string(), found);
                     }
@@ -2725,7 +2720,14 @@ mod tests {
         let c = file("/m/b/1.flac", "b", &[]);
         lib.upsert(&[a, b, c]).unwrap();
         let albums = lib
-            .albums(Collection::Inbox, &["label"], &[], "", &[], None)
+            .albums(
+                Collection::Inbox,
+                &["label"],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         let get = |id: &str| albums.iter().find(|x| x.id == id).unwrap();
         assert_eq!(
@@ -2734,7 +2736,7 @@ mod tests {
         );
         assert!(get("b").sort_values.is_empty());
         assert!(
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()
                 .iter()
                 .all(|x| x.sort_values.is_empty())
@@ -2755,10 +2757,15 @@ mod tests {
         b.3.artist = Some("Kano".into());
         b.3.year = Some(2005);
         let c = file("/m/b/1.flac", "b", &[]);
-        lib.upsert(&[a, b, c]).unwrap();
+        let mut d = file("/m/d/1.flac", "d", &["genre", "artist"]);
+        d.3.values.insert("genre", "Pop feat. Jazz".into());
+        d.3.values.insert("artist", "Ado feat. Eve".into());
+        d.3.artist = Some("Ado feat. Eve".into());
+        lib.upsert(&[a, b, c, d]).unwrap();
         let keys = ["genre", "artist", "album_artist", "date"];
+        let split = Splitter::new(";", &["feat.".to_string()]);
         let albums = lib
-            .albums(Collection::Inbox, &[], &keys, ";", &[], None)
+            .albums(Collection::Inbox, &[], &keys, &split, &[], None)
             .unwrap();
         let get = |id: &str| &albums.iter().find(|x| x.id == id).unwrap().filter_values;
         let values = |id: &str, key: &str| get(id).get(key).cloned().unwrap_or_default();
@@ -2771,9 +2778,20 @@ mod tests {
         // An untagged album only has the artist the grid shows for it.
         assert_eq!(values("b", "album_artist"), ["Unknown Artist"]);
         assert_eq!(get("b").len(), 1);
+        // Names are split at the phrases too; other tags only at the separator.
+        assert_eq!(values("d", "artist"), ["Ado", "Eve"]);
+        assert_eq!(values("d", "album_artist"), ["Ado", "Eve"]);
+        assert_eq!(values("d", "genre"), ["Pop feat. Jazz"]);
         // Another separator leaves the values whole.
         let whole = lib
-            .albums(Collection::Inbox, &[], &["genre"], " / ", &[], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &["genre"],
+                &Splitter::new(" / ", &[]),
+                &[],
+                None,
+            )
             .unwrap();
         let a = whole.iter().find(|x| x.id == "a").unwrap();
         assert_eq!(a.filter_values["genre"], ["Rock; Pop", "Pop;Jazz;"]);
@@ -2789,7 +2807,14 @@ mod tests {
         ])
         .unwrap();
         let albums = lib
-            .albums(Collection::Inbox, &[], &[], "", &["title", "genre"], None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &Splitter::default(),
+                &["title", "genre"],
+                None,
+            )
             .unwrap();
         let get = |id: &str| {
             albums
@@ -2814,14 +2839,21 @@ mod tests {
         lib.upsert(&[c]).unwrap();
         let req = ["title", "album_artist"];
         let plain = lib
-            .albums(Collection::Inbox, &[], &[], "", &req, None)
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &Splitter::default(),
+                &req,
+                None,
+            )
             .unwrap();
         let filled = lib
             .albums(
                 Collection::Inbox,
                 &[],
                 &[],
-                "",
+                &Splitter::default(),
                 &req,
                 Some(&Autofill::default()),
             )
@@ -2831,7 +2863,7 @@ mod tests {
         assert!(flag(&plain, "c").is_some());
         assert_eq!(flag(&filled, "c"), None);
         let none = lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
             .unwrap();
         assert!(none.iter().all(|x| x.attention.is_none()));
     }
@@ -2853,7 +2885,7 @@ mod tests {
                 Collection::Inbox,
                 &[],
                 &[],
-                "",
+                &Splitter::default(),
                 &["title", crate::art::ART],
                 None,
             )
@@ -2949,7 +2981,7 @@ mod tests {
             }
         );
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()
                 .len(),
             1
@@ -2959,14 +2991,14 @@ mod tests {
         // Hiding is by path, so it survives the file being re-indexed.
         lib.upsert(&[file("/m/a/1.flac", "a", &["title"])]).unwrap();
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(lib.unhide_all().unwrap(), 3);
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()
                 .len(),
             2
@@ -3060,7 +3092,14 @@ mod tests {
         .unwrap();
 
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(albums.len(), 1);
         let detail = lib.album(&albums[0].id).unwrap().unwrap();
@@ -3076,7 +3115,7 @@ mod tests {
             (7, 1, Collection::Library)
         );
         assert_eq!(
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()
                 .len(),
             1
@@ -3125,7 +3164,14 @@ mod tests {
         };
         let added = |title: &str| {
             let albums = lib
-                .albums(Collection::Library, &[], &[], "", &[], None)
+                .albums(
+                    Collection::Library,
+                    &[],
+                    &[],
+                    &Splitter::default(),
+                    &[],
+                    None,
+                )
                 .unwrap();
             let album = albums.iter().find(|a| a.title == title).unwrap();
             let detail = lib.album(&album.id).unwrap().unwrap();
@@ -3155,7 +3201,7 @@ mod tests {
         }])
         .unwrap();
         let inbox = lib
-            .albums(Collection::Inbox, &[], &[], "", &[], None)
+            .albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
             .unwrap();
         assert_eq!(inbox[0].added_at, 40);
     }
@@ -3183,7 +3229,14 @@ mod tests {
 
         let lib = Library::open_in(&dir.join("state")).unwrap();
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(albums[0].added_at, 70);
         let version: i64 = lib
@@ -3988,12 +4041,19 @@ mod tests {
         .unwrap();
         drop(lib);
         let added = |lib: &Library, title: &str| {
-            lib.albums(Collection::Library, &[], &[], "", &[], None)
-                .unwrap()
-                .into_iter()
-                .find(|a| a.title == title)
-                .unwrap()
-                .added_at
+            lib.albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .find(|a| a.title == title)
+            .unwrap()
+            .added_at
         };
 
         // An upgrade cut short after adding the column, and a row an older
@@ -4032,7 +4092,14 @@ mod tests {
         again.0.added = Some(900);
         lib.upsert(&[again]).unwrap();
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(albums[0].added_at, 900);
     }
@@ -4048,7 +4115,14 @@ mod tests {
         lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
             .unwrap();
         let id = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap()[0]
             .id
             .clone();
@@ -4070,14 +4144,28 @@ mod tests {
             (7, 1, Collection::Library)
         );
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(albums[0].id, id);
         // A file added after the move joins the same album.
         lib.upsert(&[library_file(&moved, "A/2.flac", "A", 8)])
             .unwrap();
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!((albums.len(), albums[0].track_count), (1, 2));
 
@@ -4127,7 +4215,7 @@ mod tests {
         let lib = Library::open(&temp_db("coverversion")).unwrap();
         lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();
         let version = |lib: &Library| {
-            lib.albums(Collection::Inbox, &[], &[], "", &[], None)
+            lib.albums(Collection::Inbox, &[], &[], &Splitter::default(), &[], None)
                 .unwrap()[0]
                 .cover_version
                 .clone()
@@ -4176,8 +4264,15 @@ mod tests {
         lib.remove_paths(&[root.join("A/2.flac")]).unwrap();
         let before = lib
             .album_track_ids(
-                &lib.albums(Collection::Library, &[], &[], "", &[], None)
-                    .unwrap()[0]
+                &lib.albums(
+                    Collection::Library,
+                    &[],
+                    &[],
+                    &Splitter::default(),
+                    &[],
+                    None,
+                )
+                .unwrap()[0]
                     .id,
             )
             .unwrap();
@@ -4192,7 +4287,14 @@ mod tests {
         assert_eq!(Library::library_in(&root), Some(1));
         assert_eq!(lib.library_setup().unwrap(), saved);
         let albums = lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap();
         assert_eq!(lib.album_track_ids(&albums[0].id).unwrap(), before);
         assert_eq!(albums[0].added_at, 1);
@@ -4249,7 +4351,14 @@ mod tests {
             lib.upsert(&[library_file(&root, "x/1.flac", "x", 1)])
                 .unwrap();
             let album = &lib
-                .albums(Collection::Library, &[], &[], "", &[], None)
+                .albums(
+                    Collection::Library,
+                    &[],
+                    &[],
+                    &Splitter::default(),
+                    &[],
+                    None,
+                )
                 .unwrap()[0];
             ids.push(lib.album_track_ids(&album.id).unwrap()[0]);
         }
@@ -4280,9 +4389,16 @@ mod tests {
         assert!(lib.library_problem().unwrap().is_some());
         // Still browsable this session.
         assert_eq!(
-            lib.albums(Collection::Library, &[], &[], "", &[], None)
-                .unwrap()
-                .len(),
+            lib.albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None
+            )
+            .unwrap()
+            .len(),
             1
         );
         // Once the folder is fixed, the next import gets its database.
@@ -4339,7 +4455,14 @@ mod tests {
         };
         let lib = open("A/1.flac");
         let album = &lib
-            .albums(Collection::Library, &[], &[], "", &[], None)
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
             .unwrap()[0];
         let id = lib.album_track_ids(&album.id).unwrap()[0];
         drop(lib);
