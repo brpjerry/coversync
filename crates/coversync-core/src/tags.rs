@@ -317,13 +317,14 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     let mut rest = VorbisComments::from(tag.split_tag().0);
-    // Those lofty couldn't read too, so all go back in their order. Blanked
-    // rather than removed: lofty's `remove` reorders the other comments,
-    // and its `push` refuses a nameless one (`=legacy`) a rebuilt list
-    // would need; `insert` keeps the others' order, and an empty value isn't
-    // written.
-    let keys: std::collections::HashSet<String> = ratings
-        .iter()
+    // Those lofty couldn't read too, so all go back in their order. The
+    // ones left here are blanked rather than removed: lofty's `remove`
+    // reorders the other comments, and its `push` refuses a nameless one
+    // (`=legacy`) a rebuilt list would need; `insert` keeps the others'
+    // order, and an empty value isn't written.
+    let keys: std::collections::HashSet<String> = rest
+        .items()
+        .filter(|(k, _)| is_rating(k))
         .map(|(k, _)| k.to_ascii_uppercase())
         .collect();
     for key in keys {
@@ -452,6 +453,12 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
                 "the file has two icons of one kind, which FLAC and Ogg allow one of, so it wasn't changed".into(),
             ));
         }
+    }
+    // Lofty writes no comment block, so no vendor string, for a tag with
+    // no comments (an edit that cleared them all): a blank one, which isn't
+    // written itself, keeps it.
+    if out.items().len() == 0 {
+        out.push("COMMENT".into(), String::new());
     }
     out.save_to_path(path, WriteOptions::default())
         .map_err(tag_err)
@@ -1837,6 +1844,20 @@ mod tests {
             "{items:?}"
         );
         assert!(has(&items, "UPC", "111"));
+        // A file whose only comment was its rating keeps its comment block,
+        // vendor string and all.
+        flac_with_comments(&path("only.flac"), &["RATING=80"]);
+        copy_with_tags(
+            &path("only.flac"),
+            &path("only-out.flac"),
+            &clear,
+            None,
+            false,
+        )
+        .unwrap();
+        let (vendor, items) = vorbis(&path("only-out.flac"));
+        assert_eq!(vendor, "coversync");
+        assert!(items.is_empty(), "{items:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1848,6 +1869,10 @@ mod tests {
         wav.extend_from_slice(b"ID3 ");
         wav.extend_from_slice(&(id3.len() as u32).to_le_bytes());
         wav.extend_from_slice(id3);
+        // RIFF pads an odd-sized chunk; its size doesn't count the pad.
+        if id3.len() % 2 == 1 {
+            wav.push(0);
+        }
         let riff_size = (wav.len() - 8) as u32;
         wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
         fs::write(path, wav).unwrap();
