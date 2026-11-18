@@ -521,6 +521,8 @@ fn an_import_keeps_the_tags_the_catalog_doesnt_know() {
             "CDTOC=1+96+2D2B",
         ],
     );
+    let source = inbox.join("Record/01.flac");
+    let original = fs::read(&source).unwrap();
     let covers = CoverCache::new(dir.join("cache")).unwrap();
     let roots = [
         (inbox.clone(), Collection::Inbox),
@@ -568,6 +570,6 @@ fn an_import_keeps_the_tags_the_catalog_doesnt_know() {
     assert_eq!(vendor, "reference libFLAC 1.2.1 20070917");
     assert!(!items.iter().any(|(k, _)| k == "ENCODER"), "{items:?}");
     // The original is untouched.
-    assert_eq!(comments(&inbox.join("Record/01.flac")).1.len(), 6);
+    assert_eq!(fs::read(&source).unwrap(), original);
     let _ = fs::remove_dir_all(&dir);
 }

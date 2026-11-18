@@ -4,17 +4,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use lofty::ape::ApeTag;
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFile};
-use lofty::id3::v2::Id3v2Tag;
-use lofty::mp4::Ilst;
 use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
-use lofty::tag::{MergeTag, SplitTag, Tag, TagType};
+use lofty::tag::{ItemValue, SplitTag, Tag, TagType};
 
 use crate::model::TagEdit;
 use crate::{Error, Result, rules};
@@ -263,124 +260,127 @@ fn apply(tag: &mut Tag, edit: &TagEdit) -> Result<()> {
     Ok(())
 }
 
-/// What a file's primary tag holds that lofty's generic [`Tag`] can't: the
-/// items it has no key for (Vorbis comments such as `ALBUM_JP` or `CDTOC`,
-/// and ID3v2 frames, MP4 atoms and APE items it doesn't know). A save
-/// through `Tag` writes the primary tag afresh and loses them, so they're
-/// read aside before an edit and merged back into the edited tag (see
-/// [`save`]).
-enum Unmapped {
-    /// With the file's vendor string, and whether it had `ENCODER` comments:
-    /// lofty runs the two together (see [`save_primary`]).
-    Vorbis(<VorbisComments as SplitTag>::Remainder, String, bool),
-    Id3v2(<Id3v2Tag as SplitTag>::Remainder),
-    Ilst(<Ilst as SplitTag>::Remainder),
-    Ape(<ApeTag as SplitTag>::Remainder),
+/// The Vorbis comments of a FLAC or Ogg file that lofty's generic [`Tag`]
+/// has no key for (`ALBUM_JP`, `CDTOC`, a ripper's own), read aside before an
+/// edit: lofty keeps such items of other tag types for its own writer to
+/// put back, but its Vorbis writer leaves them out (see [`save_vorbis`]).
+struct VorbisRest {
+    items: Vec<(String, String)>,
+    /// The vendor string, which lofty also writes as an ENCODER comment.
+    vendor: String,
+    /// Whether the file had ENCODER comments of its own.
+    had_encoder: bool,
 }
 
-/// The file's primary tag, split from what [`Tag`] holds; None for a format
-/// whose primary tag is none of these.
-fn unmapped(path: &Path, file_type: FileType) -> Result<Option<Unmapped>> {
+/// The file's [`VorbisRest`]; None for a file whose primary tag isn't
+/// Vorbis comments.
+fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
     use lofty::file::AudioFile;
-    // Pictures go through `Tag` whole: not read here, so not kept twice.
+    // Pictures go through `Tag`: not read here, so not kept twice.
     let options = ParseOptions::new()
         .read_properties(false)
         .read_cover_art(false);
-    let mut f = fs::File::open(path)?;
-    let mut f = std::io::BufReader::new(&mut f);
-    macro_rules! read {
-        ($file:ty) => {
-            <$file>::read_from(&mut f, options).map_err(tag_err)?
-        };
-    }
-    fn vorbis(tag: VorbisComments) -> Unmapped {
-        let vendor = tag.vendor().to_string();
-        let encoder = tag.get("ENCODER").is_some();
-        Unmapped::Vorbis(tag.split_tag().0, vendor, encoder)
-    }
-    let id3v2 = |tag: Option<Id3v2Tag>| Unmapped::Id3v2(tag.unwrap_or_default().split_tag().0);
-    let ape = |tag: Option<ApeTag>| Unmapped::Ape(tag.unwrap_or_default().split_tag().0);
-    Ok(Some(match file_type {
-        FileType::Flac => vorbis(
-            read!(lofty::flac::FlacFile)
-                .remove_vorbis_comments()
-                .unwrap_or_default(),
-        ),
-        FileType::Vorbis => vorbis(read!(lofty::ogg::VorbisFile).remove_vorbis_comments()),
-        FileType::Opus => vorbis(read!(lofty::ogg::OpusFile).remove_vorbis_comments()),
-        FileType::Speex => vorbis(read!(lofty::ogg::SpeexFile).remove_vorbis_comments()),
-        FileType::Mpeg => id3v2(read!(lofty::mpeg::MpegFile).remove_id3v2()),
-        FileType::Aac => id3v2(read!(lofty::aac::AacFile).remove_id3v2()),
-        FileType::Aiff => id3v2(read!(lofty::iff::aiff::AiffFile).remove_id3v2()),
-        FileType::Wav => id3v2(read!(lofty::iff::wav::WavFile).remove_id3v2()),
-        FileType::Mp4 => Unmapped::Ilst(
-            read!(lofty::mp4::Mp4File)
-                .remove_ilst()
-                .unwrap_or_default()
-                .split_tag()
-                .0,
-        ),
-        FileType::Ape => ape(read!(lofty::ape::ApeFile).remove_ape()),
-        FileType::WavPack => ape(read!(lofty::wavpack::WavPackFile).remove_ape()),
-        FileType::Mpc => ape(read!(lofty::musepack::MpcFile).remove_ape()),
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let tag = match file_type {
+        FileType::Flac => lofty::flac::FlacFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments()
+            .unwrap_or_default(),
+        FileType::Vorbis => lofty::ogg::VorbisFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
+        FileType::Opus => lofty::ogg::OpusFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
+        FileType::Speex => lofty::ogg::SpeexFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
         _ => return Ok(None),
+    };
+    let vendor = tag.vendor().to_string();
+    let had_encoder = tag.get("ENCODER").is_some();
+    let rest = tag.split_tag().0;
+    let items = rest
+        .items()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    Ok(Some(VorbisRest {
+        items,
+        vendor,
+        had_encoder,
     }))
 }
 
-/// Write `tag`, the file's primary tag after an edit, with what it held that
-/// `tag` can't.
-fn save_primary(path: &Path, tag: &Tag, unmapped: Unmapped) -> Result<()> {
-    let options = WriteOptions::default();
-    let tag = tag.clone();
-    match unmapped {
-        Unmapped::Vorbis(rest, vendor, had_encoder) => {
-            // `Tag` holds the file's ENCODER comments, or its vendor string as
-            // one when it had none, and merging makes that the vendor string.
-            // The vendor string stays as it was, and ENCODER comments only
-            // what the file had or the edit set.
-            let encoders: Vec<String> = tag
-                .get_strings(ItemKey::EncoderSoftware)
-                .map(str::to_string)
-                .collect();
-            let vendor_only = !had_encoder && encoders == [vendor.as_str()];
-            let mut merged = rest.merge_tag(tag);
-            merged.set_vendor(vendor);
-            if !vendor_only {
-                for encoder in encoders {
-                    merged.push("ENCODER".into(), encoder);
-                }
-            }
-            merged.save_to_path(path, options)
+/// Write `tag`, a FLAC or Ogg file's primary tag after an edit, as lofty's
+/// own writer does (each item under its usual key, its text as it is), with
+/// `rest` put back. The vendor string stays as it was; ENCODER comments are
+/// the file's own, or one the edit set (`encoder_edited`), never the vendor
+/// string lofty reads as one.
+fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool) -> Result<()> {
+    use lofty::ogg::OggPictureStorage;
+    use lofty::picture::PictureInformation;
+    let encoders: Vec<String> = tag
+        .get_strings(ItemKey::EncoderSoftware)
+        .map(str::to_string)
+        .collect();
+    let vendor_only = !rest.had_encoder && !encoder_edited && encoders == [rest.vendor.as_str()];
+    let mut out = VorbisComments::default();
+    out.set_vendor(rest.vendor);
+    for item in tag.items() {
+        if item.key() == ItemKey::EncoderSoftware {
+            continue;
         }
-        Unmapped::Id3v2(rest) => rest.merge_tag(tag).save_to_path(path, options),
-        Unmapped::Ilst(rest) => rest.merge_tag(tag).save_to_path(path, options),
-        Unmapped::Ape(rest) => rest.merge_tag(tag).save_to_path(path, options),
+        let (ItemValue::Text(value) | ItemValue::Locator(value)) = item.value() else {
+            continue;
+        };
+        if let Some(key) = item.key().map_key(TagType::VorbisComments) {
+            out.push(key.to_string(), value.clone());
+        }
     }
-    .map_err(tag_err)
+    if !vendor_only {
+        for encoder in encoders {
+            out.push("ENCODER".into(), encoder);
+        }
+    }
+    for (key, value) in rest.items {
+        out.push(key, value);
+    }
+    while !tag.pictures().is_empty() {
+        let picture = tag.remove_picture(0);
+        let info = PictureInformation::from_picture(&picture).unwrap_or_default();
+        out.insert_picture(picture, Some(info)).map_err(tag_err)?;
+    }
+    out.save_to_path(path, WriteOptions::default())
+        .map_err(tag_err)
 }
 
-/// Save an edit of `file`, read from `path` (with `unmapped`, read before
-/// the edit): its primary tag, keeping what lofty's `Tag` couldn't hold, and
-/// of its other tags those in `changed`. A format `unmapped` doesn't cover is
-/// saved as lofty saves it.
+/// Save an edit of `file`, read from `path`, with `rest` read before the
+/// edit. A FLAC or Ogg file gets its primary tag written by [`save_vorbis`],
+/// and of its other tags those in `changed` that the format can write; any
+/// other file is saved as lofty saves it.
 fn save(
     path: &Path,
-    file: &TaggedFile,
-    unmapped: Option<Unmapped>,
+    mut file: TaggedFile,
+    rest: Option<VorbisRest>,
     changed: &[TagType],
+    encoder_edited: bool,
 ) -> Result<()> {
-    let (Some(unmapped), Some(primary)) = (unmapped, file.primary_tag()) else {
+    let primary = file.primary_tag_type();
+    let (Some(rest), true) = (rest, file.primary_tag().is_some()) else {
         return file
             .save_to_path(path, WriteOptions::default())
             .map_err(tag_err);
     };
-    for t in changed.iter().filter(|t| **t != primary.tag_type()) {
-        if let Some(tag) = file.tag(*t) {
+    for t in changed.iter().filter(|t| **t != primary) {
+        if file.tag_support(*t).is_writable()
+            && let Some(tag) = file.tag(*t)
+        {
             tag.save_to_path(path, WriteOptions::default())
                 .map_err(tag_err)?;
         }
     }
-    save_primary(path, primary, unmapped)
+    let tag = file.remove(primary).expect("checked above");
+    save_vorbis(path, tag, rest, encoder_edited)
 }
 
 /// Apply `edit` to the file's primary tag. The change is written to a copy
@@ -392,10 +392,10 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
     fs::copy(path, &tmp)?;
     let result = (|| {
         let mut file = probe(&tmp, true)?;
-        let unmapped = unmapped(&tmp, file.file_type())?;
+        let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
         apply(tag, edit)?;
-        save(&tmp, &file, unmapped, &[])?;
+        save(&tmp, file, rest, &[], false)?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -670,9 +670,10 @@ pub fn copy_with_tags_hashed(
         let mut embedded = false;
         if !values.is_empty() || art.is_some() {
             let mut file = probe(&tmp, true)?;
+            let file_type = file.file_type();
             let art = art.filter(|_| replace || !has_pictures(&file));
             if !values.is_empty() || art.is_some() {
-                let unmapped = unmapped(&tmp, file.file_type())?;
+                let rest = vorbis_rest(&tmp, file.file_type())?;
                 // Other tags are only written when their pictures change.
                 let mut changed = Vec::new();
                 if art.is_some() && replace {
@@ -695,14 +696,15 @@ pub fn copy_with_tags_hashed(
                 if let Some(picture) = art {
                     tag.push_picture(picture.clone());
                 }
-                save(&tmp, &file, unmapped, &changed)?;
+                let encoder_edited = values.iter().any(|(id, _)| *id == "encoder");
+                save(&tmp, file, rest, &changed, encoder_edited)?;
             }
             if art.is_some() {
                 // Some tag formats (RIFF INFO, say) silently drop pictures.
                 if !has_pictures(&probe(&tmp, true)?) {
                     return Err(Error::Tags(format!(
                         "{} files can't hold embedded album art",
-                        format_name(file.file_type())
+                        format_name(file_type)
                     )));
                 }
                 embedded = true;
@@ -1114,6 +1116,99 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_keeps_order_ratings_and_flags_as_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &[
+                "ARTIST=A",
+                "ARTIST=B",
+                "RATING=80",
+                "COMPILATION=YES",
+                "TITLE=Song",
+            ],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        // The artists in their order: the first is still the track's artist.
+        assert_eq!(keys(&items, "ARTIST").collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(
+            read(&path("out.flac")).unwrap().artist.as_deref(),
+            Some("A")
+        );
+        // Values lofty would reinterpret are written as they were.
+        assert!(has(&items, "RATING", "80"), "{items:?}");
+        assert!(has(&items, "COMPILATION", "YES"), "{items:?}");
+        assert!(has(&items, "GENRE", "Anime"));
+        // An encoder set to the vendor string, by an edit, is written.
+        let encoder = [("encoder", "coversync".to_string())];
+        copy_with_tags(&path("in.flac"), &path("enc.flac"), &encoder, None, false).unwrap();
+        let (vendor, items) = vorbis(&path("enc.flac"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").collect::<Vec<_>>(), ["coversync"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn replacing_art_leaves_a_tag_the_format_cant_write() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, PrivateFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-roid3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let cover = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            crate::art::Art::new(png.into_inner())
+                .unwrap()
+                .picture()
+                .unwrap()
+        };
+        // A FLAC behind an ID3v2 tag, which lofty reads but won't write there:
+        // a front cover, a title and a private frame.
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Private(PrivateFrame::new(
+            "coversync",
+            vec![1, 2, 3],
+        )));
+        let mut generic: Tag = id3.into();
+        generic.push_picture(cover(4));
+        let id3: Id3v2Tag = generic.into();
+        let mut bytes = Vec::new();
+        id3.dump_to(&mut bytes, WriteOptions::default()).unwrap();
+        bytes.extend(fs::read(path("plain.flac")).unwrap());
+        fs::write(path("in.flac"), bytes).unwrap();
+        let new = cover(8);
+        assert!(
+            copy_with_tags(&path("in.flac"), &path("out.flac"), &[], Some(&new), true).unwrap()
+        );
+        assert_eq!(
+            embedded_cover(&path("out.flac")).unwrap().unwrap(),
+            new.data()
+        );
+        // The ID3v2 tag is as it was, private frame and all.
+        let mut f = fs::File::open(path("out.flac")).unwrap();
+        let flac = lofty::flac::FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let kept = flac.id3v2().unwrap();
+        assert!(kept.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Private(private)
+                if private.owner == "coversync" && private.private_data.as_ref() == [1, 2, 3]
+        )));
+        assert_eq!(kept.title().as_deref(), Some("Song"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[cfg(feature = "server")]
     fn id3v2_frames_lofty_has_no_key_for_are_kept() {
         use lofty::id3::v2::{Frame, Id3v2Tag, PrivateFrame};
@@ -1137,7 +1232,11 @@ mod tests {
         let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
         let tag = wav.id3v2().unwrap();
         assert_eq!(tag.get_user_text("CUSTOM"), Some("kept"));
-        assert!(tag.into_iter().any(|f| f.id_str() == "PRIV"));
+        assert!(tag.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Private(private)
+                if private.owner == "coversync" && private.private_data.as_ref() == [1, 2, 3]
+        )));
         assert_eq!(tag.title().as_deref(), Some("Song"));
         assert_eq!(tag.track(), Some(1));
         let _ = fs::remove_dir_all(&dir);
