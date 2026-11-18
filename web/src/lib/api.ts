@@ -139,6 +139,10 @@ export interface AlbumTags {
 export interface TagWriteResult {
 	album_id: string;
 	files_written: number;
+	/** Files moved to where the folder structure puts them (Library albums), its other files among them. */
+	files_moved: number;
+	/** Saved, but the files couldn't all be moved: why. */
+	warning?: string;
 	album: AlbumDetail | null;
 }
 

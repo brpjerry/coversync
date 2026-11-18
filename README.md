@@ -52,6 +52,13 @@ used on a home server.
   hold, refuses the save before anything is written.
   `GET /api/albums/{id}/tags` gives each track's values by tag kind and
   those other tags; a save can send any tag kind per track (`kinds`).
+  In the Library, saving puts the album's files where Library
+  setup's folder structure says with their new tags (a new album title
+  moves the album to a new folder, its cover file and other files with it,
+  where its old one holds no other audio), and an album imported under an
+  older structure moves to the current one. A save the structure couldn't
+  place (a title cleared, two tracks on one path, a file already there) is
+  refused before anything is written.
   A save is refused, and nothing written, if the album changed after the
   editor loaded it: saved from another browser or app, or changed on disk
   and found by a scan, tracks added or removed included. The album then

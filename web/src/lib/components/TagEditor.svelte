@@ -317,10 +317,15 @@
 				version: sent.version,
 				base_tracks: sent.tracks.map(({ id, rel_path }) => ({ id, rel_path }))
 			});
+			const files = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`;
 			toast(
-				`Saved tags to ${result.files_written} ${result.files_written === 1 ? 'file' : 'files'}`,
+				`Saved tags to ${files(result.files_written)}` +
+					(result.files_moved
+						? `, and moved ${files(result.files_moved)} to fit the folder structure`
+						: ''),
 				'success'
 			);
+			if (result.warning) toast(result.warning, 'error', 10000);
 			// Saved: no longer a draft, while the album is reloaded with them.
 			base = structuredClone($state.snapshot(form));
 			onsaved(result, id);

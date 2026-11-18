@@ -19,7 +19,7 @@ use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
     AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
-    TagEdit, inbox, rules, tags, upload,
+    TagEdit, inbox, relocate, rules, tags, upload,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -1011,7 +1011,61 @@ struct TagWriteResult {
     /// The album's id after the edit; it changes when the album title does.
     album_id: String,
     files_written: usize,
+    /// Files moved to where the folder structure puts them (Library albums),
+    /// the album's other files among them.
+    files_moved: usize,
+    /// Saved, but the files couldn't all be moved: why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
     album: Option<AlbumDetail>,
+}
+
+/// The tag kinds a [`TagEdit`] sets.
+fn edit_kinds(edit: &TagEdit) -> Vec<(&'static str, &String)> {
+    [
+        ("title", &edit.title),
+        ("artist", &edit.artist),
+        ("album", &edit.album),
+        ("album_artist", &edit.album_artist),
+        ("track_number", &edit.track_no),
+        ("disc_number", &edit.disc_no),
+        ("date", &edit.year),
+        ("genre", &edit.genre),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+    .collect()
+}
+
+/// A Library album's files and their tag values, read now, with `edits`
+/// (by track) on top as a save would write them: for placing them by the
+/// folder structure.
+fn album_files(
+    s: &crate::AppState,
+    tracks: &[i64],
+    edits: &HashMap<i64, Vec<(&str, String)>>,
+) -> coversync_core::Result<Vec<(PathBuf, HashMap<&'static str, String>)>> {
+    tracks
+        .iter()
+        .map(|t| {
+            let (path, _) = s
+                .lib
+                .track_root(*t)?
+                .ok_or(coversync_core::Error::NotFound)?;
+            let mut values = tags::read_kinds(&path, false)?.values;
+            for (kind, value) in edits.get(t).into_iter().flatten() {
+                let Some(k) = rules::kind(kind) else { continue };
+                let v = value.trim();
+                if v.is_empty() {
+                    values.remove(k.id);
+                } else {
+                    values.insert(k.id, v.to_string());
+                }
+            }
+            relocate::as_written(&mut values);
+            Ok((path, values))
+        })
+        .collect()
 }
 
 /// The answer to a tag save made on a version of the album that is no
@@ -1159,6 +1213,34 @@ async fn write_tags(
                 coversync_core::Error::Invalid(format!("{name}: {e}"))
             })?;
         }
+        // A Library album keeps to the folder structure: where each of its
+        // files goes with these edits, refused before anything is written
+        // when the structure can't place one.
+        let layout = match collection {
+            Collection::Library => {
+                let template = Template::parse(&s.lib.library_setup()?.structure)?;
+                let root = match ids.first() {
+                    Some(t) => s.lib.track_root(*t)?.map(|(_, root)| root),
+                    None => None,
+                };
+                root.map(|root| (template, root))
+            }
+            Collection::Inbox => None,
+        };
+        if let Some((template, root)) = &layout {
+            let planned: HashMap<i64, Vec<(&str, String)>> = edits
+                .iter()
+                .map(|(t, edit, kinds)| {
+                    let mut all: Vec<(&str, String)> = edit_kinds(edit)
+                        .into_iter()
+                        .map(|(k, v)| (k, v.clone()))
+                        .collect();
+                    all.extend(kinds.iter().cloned());
+                    (*t, all)
+                })
+                .collect();
+            relocate::plan(template, root, &album_files(s, &ids, &planned)?)?;
+        }
         // The files are written and indexed before the tag editor can read
         // them again (see `tag_files`).
         let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
@@ -1182,16 +1264,56 @@ async fn write_tags(
                 }
             }
         }
-        let stats: Vec<FileStat> = written
+        let count = written.len();
+        // Then the files go where their tags now put them (with the values as
+        // written, read back).
+        let mut moved = Vec::new();
+        let mut warning = None;
+        if failed.is_none()
+            && let Some((template, root)) = &layout
+        {
+            let placed = album_files(s, &ids, &HashMap::new())
+                .and_then(|files| relocate::plan(template, root, &files))
+                .and_then(|moves| relocate::apply(root, &moves));
+            match placed {
+                Ok(done) => moved = done,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tags saved, files not moved");
+                    warning = Some(format!("Saved, but the files weren't moved: {e}"));
+                }
+            }
+        }
+        let now = |p: &PathBuf| {
+            moved
+                .iter()
+                .find(|m| &m.from == p)
+                .map_or_else(|| p.clone(), |m| m.to.clone())
+        };
+        let mut paths: Vec<(PathBuf, PathBuf)> = written
+            .iter()
+            .map(|(path, root)| (now(path), root.clone()))
+            .collect();
+        if let Some((_, root)) = &layout {
+            for m in moved.iter().filter(|m| tags::is_audio(&m.to)) {
+                if !paths.iter().any(|(p, _)| *p == m.to) {
+                    paths.push((m.to.clone(), root.clone()));
+                }
+            }
+        }
+        let stats: Vec<FileStat> = paths
             .into_iter()
             .filter_map(|(path, root)| scan::stat(path, &root, collection))
             .collect();
-        let count = stats.len();
         let first = stats.first().map(|f| (f.path.clone(), f.root.clone()));
         // Publishing the edit invalidates old digests immediately. The hash
         // worker queued by exclusively() rehashes after the save can return.
         scan::index_files(&s.lib, stats, &s.progress)?;
-        s.lib.remove_paths(&[])?;
+        let gone: Vec<PathBuf> = moved
+            .iter()
+            .filter(|m| tags::is_audio(&m.from))
+            .map(|m| m.from.clone())
+            .collect();
+        s.lib.remove_paths(&gone)?;
         drop(files);
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
         let new_id = match first {
@@ -1219,6 +1341,8 @@ async fn write_tags(
         Ok(Ok(TagWriteResult {
             album_id: new_id,
             files_written: count,
+            files_moved: moved.len(),
+            warning,
             album,
         }))
     })
@@ -1521,6 +1645,64 @@ mod tests {
             said.contains(".m4a: ") && said.contains("Publisher"),
             "{said}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_library_save_moves_the_files_where_the_structure_says() {
+        let (state, inbox_id, _dir) = daemon("relocate");
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let detail = state.lib.album(&imported.album_id).unwrap().unwrap();
+        let track = detail.tracks[0].id;
+        let (path, root) = state.lib.track_root(track).unwrap().unwrap();
+        assert_eq!(path, root.join("Artist/Record/Song.flac"));
+        // Another file of the album's, which goes with it.
+        std::fs::write(root.join("Artist/Record/cover.jpg"), b"art").unwrap();
+
+        // A new album title: a new folder.
+        let body = TagWrite {
+            kinds: HashMap::from([(
+                track,
+                HashMap::from([("album".to_string(), "Another record".to_string())]),
+            )]),
+            ..Default::default()
+        };
+        let Json(saved) = write_tags(
+            State(state.clone()),
+            Path(imported.album_id.clone()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.files_moved, 2, "the track and its cover");
+        assert!(saved.warning.is_none());
+        let moved = root.join("Artist/Another record");
+        assert!(moved.join("Song.flac").is_file());
+        assert_eq!(std::fs::read(moved.join("cover.jpg")).unwrap(), b"art");
+        assert!(!root.join("Artist/Record").exists());
+        // The index has the file where it is now, and the album under its new id.
+        let album = saved.album.unwrap();
+        assert_eq!(album.tracks.len(), 1);
+        assert_eq!(album.tracks[0].rel_path, "Artist/Another record/Song.flac");
+        assert!(state.lib.album(&imported.album_id).unwrap().is_none());
+
+        // A title cleared would leave the file without a name: refused, nothing written.
+        let track = album.tracks[0].id;
+        let body = TagWrite {
+            kinds: HashMap::from([(track, HashMap::from([("title".to_string(), String::new())]))]),
+            ..Default::default()
+        };
+        let refused = write_tags(
+            State(state.clone()),
+            Path(saved.album_id.clone()),
+            Json(body),
+        )
+        .await;
+        assert!(refused.is_err());
+        let after = tags::read(&moved.join("Song.flac")).unwrap();
+        assert_eq!(after.title.as_deref(), Some("Song"));
     }
 
     #[tokio::test]
@@ -2168,6 +2350,10 @@ mod tests {
 
         let (state, inbox) = editing_daemon("hash-queue");
         with_library(&state, &inbox);
+        // Laid out as `track` lays files, so a save doesn't move them.
+        let mut setup = state.lib.library_setup().unwrap();
+        setup.structure = "{album}/{track_number}".into();
+        state.lib.set_library_setup(setup).unwrap();
         let root = std::path::PathBuf::from(state.lib.library_setup().unwrap().folder.unwrap());
         for n in 1..=3 {
             track(&root, "Library album", n);
