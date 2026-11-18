@@ -7,6 +7,7 @@
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { tick, untrack } from 'svelte';
 	import { expoOut } from 'svelte/easing';
 	import { fade, slide } from 'svelte/transition';
 	import {
@@ -89,6 +90,31 @@
 	$effect(() => {
 		if (!editorLoading && editorHeight > 0) heldHeight = editorHeight;
 	});
+
+	/**
+	 * The album the tag editor shows. A new version makes it anew (its kept
+	 * edits put on the album as it is, say); the one its own save answers is
+	 * handed to it to read in place, so nothing flashes.
+	 */
+	let editorDetail = $state(untrack(() => detail));
+	let editorKey = $state(0);
+	let ownSave = false;
+	$effect(() => {
+		const next = detail;
+		untrack(() => {
+			if (next === editorDetail) return;
+			if (!ownSave || !next || !editorDetail) editorKey++;
+			ownSave = false;
+			editorDetail = next;
+		});
+	});
+	async function saved(result: TagWriteResult, id: string) {
+		ownSave = true;
+		onsaved(result, id);
+		// Answered with the album as saved by now, or not at all.
+		await tick();
+		ownSave = false;
+	}
 
 	/** Leave the tag editor: its edits go, kept ones included. */
 	function showTracks() {
@@ -343,12 +369,12 @@
 				</div>
 			{:else}
 				<div in:fade={{ duration: 200 }} style:min-height={heldHeight ? `${heldHeight}px` : null}>
-					{#key detail}
+					{#key editorKey}
 						<div bind:offsetHeight={editorHeight}>
 							<TagEditor
-								{detail}
+								detail={editorDetail ?? detail}
 								{allowWrites}
-								{onsaved}
+								onsaved={saved}
 								restore={editorView}
 								onview={(v) => (editorView = v)}
 								onloading={(l) => (editorLoading = l)}

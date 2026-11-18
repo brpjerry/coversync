@@ -456,9 +456,17 @@
 	async function close() {
 		const id = openId;
 		if (!id) return;
-		const heroCover = document.querySelector<HTMLElement>('.hero-cover');
+		const hero = document.querySelector<HTMLElement>('.hero-cover');
+		// A cover scrolled out of the window (from the tag editor, say) would fly
+		// in from off screen: then the album just fades in on the grid.
+		const seen = hero?.getBoundingClientRect();
+		const heroCover = seen && seen.bottom > 0 && seen.top < innerHeight ? hero : null;
 		const target = gridCover(id);
 		if (!target || !document.startViewTransition || reducedMotion()) return back();
+		// The sheet names its cover itself (see AlbumDetail): unnamed for this
+		// transition, it fades out with the sheet.
+		const hidden = hero && !heroCover ? hero : null;
+		if (hidden) hidden.style.viewTransitionName = 'none';
 		const vt = document.startViewTransition(async () => {
 			await back();
 			// History can go back to another album, whose sheet stays: then its
@@ -472,7 +480,10 @@
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
 		follow(vt, () => (sheetAlbum ? document.querySelector<HTMLElement>('.hero-cover') : target));
-		vt.finished.finally(() => (target.style.viewTransitionName = ''));
+		vt.finished.finally(() => {
+			target.style.viewTransitionName = '';
+			if (hidden) hidden.style.viewTransitionName = 'album-cover';
+		});
 	}
 
 	async function playAlbum(album: Album) {

@@ -39,7 +39,7 @@
 	import Check from '@lucide/svelte/icons/check';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { fly, slide } from 'svelte/transition';
 	import { SvelteSet } from 'svelte/reactivity';
 	import {
@@ -145,10 +145,12 @@
 	const WIDE = new Set(['album', 'album_artist']);
 	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
 
-	// The editor is made anew for each album version (see AlbumDetail).
+	// The editor is made anew for each album version, except after its own
+	// save, when it reads the album as saved in place (see AlbumDetail): the
+	// tracks are the ones whose tags it shows.
 	// svelte-ignore state_referenced_locally
-	const tracks = detail.tracks;
-	const ids = tracks.map((t) => t.id);
+	let tracks = $state(detail.tracks);
+	let ids = $derived(tracks.map((t) => t.id));
 	const here = (id: number) => (kept ? stillHere(kept, detail, id) : true);
 
 	let loading = $state(true);
@@ -168,10 +170,16 @@
 	let allTags = $state(false);
 	let saving = $state(false);
 
-	async function load() {
-		loading = true;
+	/**
+	 * Read the tags of `detail`. `quiet`: the album as just saved here, read
+	 * in place: what's shown stays until the new values replace it (nothing
+	 * flashes), and edits typed meanwhile stay on top.
+	 */
+	async function load(quiet = false) {
+		if (!quiet) loading = true;
 		failed = null;
 		stale = false;
+		const shown = detail;
 		try {
 			const [tags] = await Promise.all([api.albumTags(detail.id), setup.load()]);
 			// The tag list always has kinds once it's loaded.
@@ -186,12 +194,26 @@
 				stale = true;
 				return;
 			}
+			// Another, newer album came while these were read: it's read next.
+			if (shown !== detail) return;
 			const values: Values = {};
-			for (const id of ids) {
-				const read = tags.tracks.find((t) => t.id === id)?.values ?? {};
+			for (const t of shown.tracks) {
+				const read = tags.tracks.find((x) => x.id === t.id)?.values ?? {};
 				// Every field up front exists on every track, so inputs can bind to it.
-				values[id] = { ...Object.fromEntries(CORE.map((k) => [k, ''])), ...read };
+				values[t.id] = { ...Object.fromEntries(CORE.map((k) => [k, ''])), ...read };
 			}
+			if (quiet) {
+				// What was typed since the save, on the album as saved.
+				const typed = edits(form, base, ids);
+				tracks = shown.tracks;
+				base = structuredClone(values);
+				form = structuredClone(values);
+				for (const [id, fields] of Object.entries(typed))
+					if (form[+id]) Object.assign(form[+id], fields);
+				other = tags.tracks;
+				return;
+			}
+			tracks = shown.tracks;
 			base = structuredClone(values);
 			if (kept) {
 				elsewhere = changedElsewhere(kept, values, here);
@@ -221,6 +243,14 @@
 		}
 	}
 	load();
+	// The album as saved here, handed over by the sheet: read in place.
+	let reading = untrack(() => detail);
+	$effect(() => {
+		const next = detail;
+		if (next === reading) return;
+		reading = next;
+		untrack(() => load(true));
+	});
 
 	$effect(() => onloading?.(loading));
 	$effect(() => {
@@ -471,7 +501,7 @@
 	{:else if failed}
 		<p class="status failed">
 			{failed}
-			<button class="link" onclick={stale && onretry ? onretry : load}>Try again</button>
+			<button class="link" onclick={stale && onretry ? onretry : () => load()}>Try again</button>
 		</p>
 	{:else}
 		<section>
