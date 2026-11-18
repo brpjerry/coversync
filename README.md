@@ -83,8 +83,8 @@ used on a home server.
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never
   written and is hidden from the Inbox afterwards. Tags coversync has no name
-  for stay as they were (`TITLE_JP`, `CDTOC`, a ripper's own), as do ratings
-  and the file's vendor string. Tags it does name are written its usual way:
+  for stay as they were (`TITLE_JP`, `CDTOC`, a ripper's own), as do FLAC
+  and Ogg ratings and the file's vendor string. Tags it does name are written its usual way:
   `ORGANIZATION` as `LABEL`, `TOTALTRACKS` as `TRACKTOTAL`, `TRACKNUMBER=01/12`
   as `TRACKNUMBER=1` and `TRACKTOTAL=12`, and ID3v2 tags as version 2.4. A file
   whose tags can't be written back as they are (an ID3v2 chapter located by

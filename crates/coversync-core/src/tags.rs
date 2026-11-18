@@ -400,6 +400,14 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
             out.push("ENCODER".into(), encoder);
         }
     }
+    // TRACKNUM is an older name readers fall back to for the track number:
+    // blanked (so not written) when the track number is written or edited,
+    // as lofty's own setter does, so a cleared number doesn't come back.
+    if out.get("TRACKNUM").is_some()
+        && (tag.get(ItemKey::TrackNumber).is_some() || edited.contains(&"track_number"))
+    {
+        out.insert("TRACKNUM".into(), String::new());
+    }
     // Ratings: the file's own as written; one from another tag (a FLAC that
     // had only ID3v2) through lofty's conversion, under its provider's key.
     if ratings.is_empty() {
@@ -673,6 +681,23 @@ fn save(
     }
 }
 
+/// The tag kinds (catalog ids) `edit` sets or clears.
+fn edit_kinds(edit: &TagEdit) -> Vec<&'static str> {
+    [
+        ("title", &edit.title),
+        ("artist", &edit.artist),
+        ("album", &edit.album),
+        ("album_artist", &edit.album_artist),
+        ("track_number", &edit.track_no),
+        ("disc_number", &edit.disc_no),
+        ("date", &edit.year),
+        ("genre", &edit.genre),
+    ]
+    .into_iter()
+    .filter_map(|(id, value)| value.is_some().then_some(id))
+    .collect()
+}
+
 /// Apply `edit` to the file's primary tag. The change is written to a copy
 /// beside the file and renamed over it, so a failed write leaves the original.
 pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
@@ -685,7 +710,7 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
         let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
         apply(tag, edit)?;
-        save(&tmp, file, rest, &[], &[])?;
+        save(&tmp, file, rest, &[], &edit_kinds(edit))?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -769,9 +794,11 @@ pub fn upc(path: &Path) -> Option<String> {
         .guess_file_type()
         .ok()?
         .file_type()?;
+    // As written: lofty's number conversions can reorder two UPCs.
     let options = ParseOptions::new()
         .read_properties(false)
-        .read_cover_art(false);
+        .read_cover_art(false)
+        .implicit_conversions(false);
     let mut f = fs::File::open(path).ok()?;
     let found = match file_type {
         FileType::Flac => {
@@ -838,27 +865,20 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
     file.primary_tag_mut().expect("primary tag inserted above")
 }
 
-/// Take the front and untyped covers out of an MP3's APE tag, as written
-/// (lofty keeps APE covers as items, not pictures, so removing pictures
-/// from its generic tag doesn't reach them). Saved only if it had one.
-fn remove_secondary_ape_cover(path: &Path) -> Result<()> {
+/// Whether an MP3's APE tag has a front or untyped cover of its own (lofty
+/// keeps APE covers as items, not pictures, so they aren't in its generic
+/// tag). Such a cover isn't replaced: lofty can't rewrite every APE layout
+/// safely (a tag with only a footer loses 32 bytes of audio).
+fn secondary_ape_cover(path: &Path) -> Result<bool> {
     use lofty::file::AudioFile;
     let options = ParseOptions::new().read_properties(false);
-    let mut mpeg = {
-        let mut f = std::io::BufReader::new(fs::File::open(path)?);
-        lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?
-    };
-    if let Some(mut ape) = mpeg.remove_ape() {
-        let covers = ["Cover Art (Front)", "Cover Art (Other)"];
-        if covers.iter().any(|k| ape.get(k).is_some()) {
-            for key in covers {
-                ape.remove(key);
-            }
-            ape.save_to_path(path, WriteOptions::default())
-                .map_err(tag_err)?;
-        }
-    }
-    Ok(())
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?;
+    Ok(mpeg.ape().is_some_and(|ape| {
+        ["Cover Art (Front)", "Cover Art (Other)"]
+            .iter()
+            .any(|k| ape.get(k).is_some())
+    }))
 }
 
 fn has_pictures(file: &TaggedFile) -> bool {
@@ -991,8 +1011,13 @@ pub fn copy_with_tags_hashed(
                 // Other tags are only written when their pictures change.
                 let mut changed = Vec::new();
                 if art.is_some() && replace {
-                    if file_type == FileType::Mpeg && file.tag(TagType::Ape).is_some() {
-                        remove_secondary_ape_cover(&tmp)?;
+                    if file_type == FileType::Mpeg
+                        && file.tag(TagType::Ape).is_some()
+                        && secondary_ape_cover(&tmp)?
+                    {
+                        return Err(Error::Tags(
+                            "the MP3's APE tag has a cover of its own, which can't be replaced safely, so it wasn't changed".into(),
+                        ));
                     }
                     // Untyped pictures go too: players show them as the cover.
                     // Back covers, booklets and the like stay.
@@ -1281,7 +1306,9 @@ mod tests {
     /// comment, as lofty's generic `Tag` doesn't show them.
     fn vorbis(path: &Path) -> (String, Vec<(String, String)>) {
         let mut f = fs::File::open(path).unwrap();
-        let flac = lofty::flac::FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        // As written: no number conversions.
+        let options = ParseOptions::new().implicit_conversions(false);
+        let flac = lofty::flac::FlacFile::read_from(&mut f, options).unwrap();
         let tag = flac.vorbis_comments().unwrap();
         let items = tag
             .items()
@@ -1527,7 +1554,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "server")]
-    fn replacing_an_mp3_cover_takes_its_ape_front_cover_too() {
+    fn an_mp3_whose_ape_tag_has_a_cover_keeps_its_covers() {
         use lofty::ape::{ApeItem, ApeTag};
         use lofty::id3::v2::Id3v2Tag;
         let dir = std::env::temp_dir().join(format!("coversync-mp3ape-{}", std::process::id()));
@@ -1566,20 +1593,33 @@ mod tests {
         ape.insert(item("Ripper", ItemValue::Text("kept".into())));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
         let new = cover(8);
+        let refused = copy_with_tags(&src, &dest, &[], Some(&new), true);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("APE tag has a cover")
+        );
+        assert!(!dest.exists());
+        // An APE tag with no cover (ReplayGain, say) doesn't stand in the
+        // way, and stays as it was.
+        let mut ape = ApeTag::default();
+        ape.insert(item(
+            "REPLAYGAIN_TRACK_GAIN",
+            ItemValue::Text("-6.1 dB".into()),
+        ));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
         assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
         assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
         let mut f = fs::File::open(&dest).unwrap();
         let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, ParseOptions::new()).unwrap();
         let ape = mpeg.ape().unwrap();
-        assert!(ape.get("Cover Art (Front)").is_none());
-        assert!(matches!(
-            ape.get("Cover Art (Back)").map(|i| i.value()),
-            Some(ItemValue::Binary(b)) if b == b"back.jpg\0back"
-        ));
         assert!(matches!(
             ape.get("Ripper").map(|i| i.value()),
             Some(ItemValue::Text(t)) if t == "kept"
         ));
+        assert!(ape.get("REPLAYGAIN_TRACK_GAIN").is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1972,10 +2012,41 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .collect();
         assert_eq!(upc, ["111", "222"]);
+        // Identify reads the same barcode from the file before and after.
+        assert_eq!(super::upc(&path("in.flac")).as_deref(), Some("111"));
+        assert_eq!(super::upc(&path("out.flac")).as_deref(), Some("111"));
         // The numbers as coversync writes them, the alias under its usual name.
         assert!(has(&items, "TRACKNUMBER", "1"));
         assert!(has(&items, "TRACKTOTAL", "10"));
         assert!(!items.iter().any(|(k, _)| k == "TOTALTRACKS"), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cleared_track_number_doesnt_come_back_from_its_old_name() {
+        let dir = std::env::temp_dir().join(format!("coversync-tracknum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "TRACKNUM=2", "TRACKNUMBER=1", "UPC=111"],
+        );
+        // An unrelated edit: the number under its usual name only.
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("edit.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("edit.flac"));
+        assert!(has(&items, "TRACKNUMBER", "1"));
+        assert!(!items.iter().any(|(k, _)| k == "TRACKNUM"), "{items:?}");
+        // Cleared: gone under both names.
+        let clear = [("track_number", String::new())];
+        copy_with_tags(&path("in.flac"), &path("clear.flac"), &clear, None, false).unwrap();
+        let (_, items) = vorbis(&path("clear.flac"));
+        assert!(
+            !items.iter().any(|(k, _)| k.starts_with("TRACKNUM")),
+            "{items:?}"
+        );
+        assert!(has(&items, "UPC", "111"));
         let _ = fs::remove_dir_all(&dir);
     }
 
