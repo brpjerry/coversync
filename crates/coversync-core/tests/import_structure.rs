@@ -445,3 +445,129 @@ fn with_no_inbox_date_it_falls_back_to_the_import_time() {
         .unwrap();
     assert!(library[0].added_at >= before, "{}", library[0].added_at);
 }
+
+/// A FLAC file with these Vorbis comments and a few bytes standing for its
+/// audio.
+fn flac(path: &Path, comments: &[&str]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut b = b"fLaC".to_vec();
+    // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
+    b.extend([
+        0x00, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+    ]);
+    let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+    b.extend(packed.to_be_bytes());
+    b.extend([0u8; 16]);
+    let mut block = Vec::new();
+    let vendor = b"reference libFLAC 1.2.1 20070917";
+    block.extend((vendor.len() as u32).to_le_bytes());
+    block.extend(vendor);
+    block.extend((comments.len() as u32).to_le_bytes());
+    for c in comments {
+        block.extend((c.len() as u32).to_le_bytes());
+        block.extend(c.as_bytes());
+    }
+    b.push(0x80 | 4);
+    b.extend(&(block.len() as u32).to_be_bytes()[1..]);
+    b.extend(block);
+    b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+    fs::write(path, b).unwrap();
+}
+
+/// A FLAC file's vendor string and its Vorbis comments, as written.
+fn comments(path: &Path) -> (String, Vec<(String, String)>) {
+    use lofty::file::AudioFile;
+    let mut f = fs::File::open(path).unwrap();
+    let flac =
+        lofty::flac::FlacFile::read_from(&mut f, lofty::config::ParseOptions::new()).unwrap();
+    let tag = flac.vorbis_comments().unwrap();
+    let items = tag
+        .items()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    (tag.vendor().to_string(), items)
+}
+
+#[test]
+fn an_import_keeps_the_tags_the_catalog_doesnt_know() {
+    let dir = std::env::temp_dir().join(format!("coversync-unmapped-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for sub in ["Inbox", "Lib", "cache"] {
+        fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let dir = dir.canonicalize().unwrap();
+    let (inbox, root) = (dir.join("Inbox"), dir.join("Lib"));
+    let lib = Library::open_in(&dir.join("state")).unwrap();
+    lib.set_inbox_setup(InboxSetup {
+        folder: Some(inbox.display().to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    lib.set_library_setup(LibrarySetup {
+        folder: Some(root.display().to_string()),
+        structure: "{album}/{track_number} - {title}".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    // Multilingual titles and a rip's table of contents, as a ripper leaves them.
+    flac(
+        &inbox.join("Record/01.flac"),
+        &[
+            "TITLE=Bokura no LIVE",
+            "TITLE_JP=僕らのLIVE",
+            "ALBUM=Record",
+            "ALBUM_JP=レコード",
+            "TRACKNUMBER=01",
+            "CDTOC=1+96+2D2B",
+        ],
+    );
+    let covers = CoverCache::new(dir.join("cache")).unwrap();
+    let roots = [
+        (inbox.clone(), Collection::Inbox),
+        (root.clone(), Collection::Library),
+    ];
+    scan::scan(&lib, &covers, &roots, &Progress::default()).unwrap();
+    let album = lib
+        .albums(
+            Collection::Inbox,
+            &[],
+            &[],
+            &coversync_core::split::Splitter::default(),
+            &[],
+            None,
+        )
+        .unwrap()[0]
+        .id
+        .clone();
+    let track = lib.album(&album).unwrap().unwrap().tracks[0].id;
+    // An edit, so the copy's tags are written, not copied as they are.
+    let edits: Edits = [(
+        track,
+        HashMap::from([("genre".to_string(), "Anime".to_string())]),
+    )]
+    .into();
+    import::execute(&lib, &covers, &album, &edits, None, &Progress::default()).unwrap();
+    let copies: Vec<PathBuf> = fs::read_dir(root.join("Record"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "flac"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copy = &copies[0];
+    let (vendor, items) = comments(copy);
+    let has = |k: &str, v: &str| items.iter().any(|(a, b)| a == k && b == v);
+    for (k, v) in [
+        ("TITLE_JP", "僕らのLIVE"),
+        ("ALBUM_JP", "レコード"),
+        ("CDTOC", "1+96+2D2B"),
+        ("GENRE", "Anime"),
+        ("TITLE", "Bokura no LIVE"),
+    ] {
+        assert!(has(k, v), "{k}={v} missing from {items:?}");
+    }
+    assert_eq!(vendor, "reference libFLAC 1.2.1 20070917");
+    assert!(!items.iter().any(|(k, _)| k == "ENCODER"), "{items:?}");
+    // The original is untouched.
+    assert_eq!(comments(&inbox.join("Record/01.flac")).1.len(), 6);
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -82,7 +82,12 @@ used on a home server.
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never
-  written and is hidden from the Inbox afterwards.
+  written and is hidden from the Inbox afterwards. Only the tags it sets
+  change: others stay as they were, including ones coversync has no name for
+  (`TITLE_JP`, `CDTOC`, a ripper's own) and the file's vendor string. Tags
+  that have another usual name are written under it (`ORGANIZATION` as
+  `LABEL`, `TOTALTRACKS` as `TRACKTOTAL`), and ID3v2 tags as version 2.4.
+  Tag editor saves keep them too.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added
