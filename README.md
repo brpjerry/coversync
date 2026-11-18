@@ -18,7 +18,18 @@ used on a home server.
   (the import time is kept in the Library's database, so tag edits and moves
   don't change it), or, with Inbox setup's Preserve modification date, in
   the Inbox's order. "Needs attention" lists albums missing tags or art the
-  rules require. The sidebar filters albums by tag:
+  rules require, and albums **Incomplete** by their own numbering: track
+  numbers below the last one (or up to the track total) that no track has,
+  and discs below the last one there that no track is on. Discs past the
+  last one aren't counted missing, since a disc total often counts a DVD or
+  Blu-ray, and an album with an unnumbered track isn't judged (it could be
+  any of the gaps). A total for the whole album on every disc counts at
+  least the tracks it lacks even when the tags don't say which disc they're
+  on. The album's page shows the missing numbers in its tracklist (between
+  discs, when the numbering runs straight through them and the tags don't
+  say which disc a gap is on). This needs no
+  MusicBrainz; Smart suggestions (below) list what a release has that the
+  album doesn't. The sidebar filters albums by tag:
   pick a tag such as Genre from its dropdown, search its values, and tick the
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
@@ -92,7 +103,9 @@ used on a home server.
   its title and artist. An artist MusicBrainz credits under another name
   (汐れいら for "Ushio Reira") is found by its sort name or aliases. It
   offers MusicBrainz's tags to tick: values for empty tags and corrections
-  for differing ones. **Prefer English**
+  for differing ones, and lists the release's tracks that none of the
+  album's were paired with (a disc with none paired, such as a DVD, as one
+  line): what the album lacks, if it's that release. **Prefer English**
   suggests romanized or English titles and artist names for releases in other
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first. AcoustID's and MusicBrainz's answers are

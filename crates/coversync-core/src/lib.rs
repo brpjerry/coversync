@@ -12,6 +12,7 @@ pub mod identify;
 #[cfg(feature = "server")]
 pub mod import;
 pub mod inbox;
+pub mod incomplete;
 #[cfg(feature = "server")]
 pub mod lookups;
 pub mod model;

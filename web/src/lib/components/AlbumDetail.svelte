@@ -18,6 +18,7 @@
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { duration, longDuration, quality } from '#lib/format.ts';
+	import { describeIncomplete, unplacedText, withGaps } from '#lib/incomplete.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
@@ -79,12 +80,17 @@
 	let discs = $derived.by(() => {
 		const groups = new Map<number, AlbumDetail['tracks']>();
 		for (const t of detail?.tracks ?? []) {
-			const d = t.disc_no ?? 1;
+			// Disc 0 is no disc, as the server sorts it.
+			const d = t.disc_no || 1;
 			if (!groups.has(d)) groups.set(d, []);
 			groups.get(d)!.push(t);
 		}
 		return [...groups.entries()];
 	});
+	/** What the album's numbering says it lacks, as it is now. */
+	let incomplete = $derived(detail ? detail.incomplete : album.incomplete);
+	/** The discs' tracks with rows for the numbers missing between them, and missing discs. */
+	let rows = $derived(withGaps(discs, incomplete));
 	let isThisAlbum = $derived(player.album?.id === album.id);
 	let first = $derived(detail?.tracks[0]);
 
@@ -158,6 +164,11 @@
 					{#if album.genre}<span>{album.genre}</span>{/if}
 					<span>{album.track_count} {album.track_count === 1 ? 'track' : 'tracks'}</span>
 					<span>{longDuration(album.duration_ms)}</span>
+					{#if incomplete}
+						<span class="incomplete" title={describeIncomplete(incomplete)}>
+							<CircleAlert size={13} strokeWidth={2.2} /> Incomplete
+						</span>
+					{/if}
 				</p>
 				<div class="actions">
 					<button
@@ -226,34 +237,80 @@
 				</div>
 			{:else if mode === 'tracks'}
 				<div in:fade={{ duration: 200 }}>
-					{#each discs as [disc, tracks] (disc)}
-						{#if discs.length > 1}<h3 class="disc">Disc {disc}</h3>{/if}
+					{#each rows as { key, label, rows: items } (key)}
+						{#if rows.length > 1}<h3 class="disc">{label}</h3>{/if}
 						<ol class="tracks">
-							{#each tracks as t (t.id)}
-								{@const index = detail.tracks.indexOf(t)}
-								{@const current = player.isCurrent(t)}
-								<li style:--i={Math.min(index, 24)}>
-									<button class="row" class:current onclick={() => play(index)}>
-										<span class="no tabular">
-											{#if current && player.playing}
-												<span class="eq" aria-label="Playing"><i></i><i></i><i></i></span>
-											{:else}
-												<span class="num">{t.track_no ?? index + 1}</span>
-												<span class="hover-play"
-													><Play size={14} fill="currentColor" strokeWidth={0} /></span
-												>
-											{/if}
-										</span>
-										<span class="title">
-											<span class="name">{t.title}</span>
-											{#if t.artist !== album.artist}<span class="sub">{t.artist}</span>{/if}
-										</span>
-										<span class="dur tabular">{duration(t.duration_ms)}</span>
-									</button>
+							{#if !items}
+								<li class="missing" style:--i={0}>
+									<span class="row">
+										<span class="no tabular">–</span>
+										<span class="title"><span class="name">Not in this album</span></span>
+									</span>
 								</li>
-							{/each}
+							{:else}
+								{#each items as item, j ('track' in item ? item.track.id : `gap ${item.from}`)}
+									{#if 'track' in item}
+										{@const t = item.track}
+										{@const index = detail.tracks.indexOf(t)}
+										{@const current = player.isCurrent(t)}
+										<li style:--i={Math.min(index, 24)}>
+											<button class="row" class:current onclick={() => play(index)}>
+												<span class="no tabular">
+													{#if current && player.playing}
+														<span class="eq" aria-label="Playing"><i></i><i></i><i></i></span>
+													{:else}
+														<span class="num">{t.track_no ?? index + 1}</span>
+														<span class="hover-play"
+															><Play size={14} fill="currentColor" strokeWidth={0} /></span
+														>
+													{/if}
+												</span>
+												<span class="title">
+													<span class="name">{t.title}</span>
+													{#if t.artist !== album.artist}<span class="sub">{t.artist}</span>{/if}
+												</span>
+												<span class="dur tabular">{duration(t.duration_ms)}</span>
+											</button>
+										</li>
+									{:else}
+										<!-- A run of numbers the album's numbering says it lacks. -->
+										<li class="missing" style:--i={Math.min(j, 24)}>
+											<span class="row">
+												<span class="no tabular"
+													>{item.from === item.to ? item.from : `${item.from}–${item.to}`}</span
+												>
+												<span class="title">
+													<span class="name"
+														>{item.from === item.to
+															? 'Missing'
+															: `${item.to - item.from + 1} tracks missing`}</span
+													>
+												</span>
+											</span>
+										</li>
+									{/if}
+								{/each}
+							{/if}
 						</ol>
 					{/each}
+					{#if incomplete?.unplaced}
+						<!-- More missing than the gaps hold, by an album-wide total: on no disc in particular. -->
+						<ol class="tracks">
+							<li class="missing" style:--i={0}>
+								<span class="row">
+									<span class="no tabular">–</span>
+									<span class="title">
+										<span class="name"
+											>Missing {unplacedText(
+												incomplete.unplaced,
+												incomplete.tracks.length > 0 || incomplete.discs.length > 0
+											)}</span
+										>
+									</span>
+								</span>
+							</li>
+						</ol>
+					{/if}
 					<p class="path" title={detail.dir}>{`\u200e${detail.dir}\u200e`}</p>
 				</div>
 			{:else}
@@ -604,6 +661,27 @@
 	.dur {
 		color: var(--text-3);
 		font-size: 13.5px;
+	}
+	/* Tracks (or a disc) the album's numbering says it lacks: a placeholder, not a row to play. */
+	.missing .row:hover {
+		background: none;
+	}
+	.missing .no {
+		white-space: nowrap;
+		font-size: 12.5px;
+	}
+	.missing .name {
+		white-space: normal;
+		font-weight: 450;
+		font-style: italic;
+		color: var(--text-3);
+	}
+	.facts .incomplete {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		color: var(--warn);
+		cursor: help;
 	}
 	.eq {
 		display: flex;

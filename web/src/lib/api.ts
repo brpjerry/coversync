@@ -26,6 +26,21 @@ export interface Album {
 	filter_values?: Record<string, string[]>;
 	/** Present when tracks lack tags the library rules or folder structure need. */
 	attention?: { missing: string[]; tracks: number };
+	/** Present when the album's own track and disc numbers say some are missing. */
+	incomplete?: Incomplete;
+}
+
+/** What an album's numbering says it lacks. */
+export interface Incomplete {
+	/**
+	 * Runs of missing track numbers, in order. `disc` is set when the album has
+	 * (or should have) several discs, each numbered from 1.
+	 */
+	tracks: { disc: number | null; from: number; to: number }[];
+	/** Discs missing below the album's last one. */
+	discs: number[];
+	/** More tracks missing than the gaps hold, by an album-wide total: on no disc in particular. */
+	unplaced?: number;
 }
 
 export type Collection = 'inbox' | 'library';
@@ -369,6 +384,17 @@ export interface Identification {
 		via: 'acoustid' | 'isrc' | 'position' | 'title' | null;
 		position: string | null;
 		suggestions: Suggestion[];
+	}[];
+	/**
+	 * The release's tracks none of the album's were paired with; a disc with
+	 * none paired is in `missing_discs` instead. Both empty when nothing was.
+	 */
+	missing: { position: string; title: string; length_ms: number | null }[];
+	missing_discs: {
+		position: number;
+		format: string | null;
+		title: string | null;
+		tracks: number;
 	}[];
 	notes: string[];
 	/**

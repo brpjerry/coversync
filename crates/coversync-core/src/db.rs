@@ -1073,6 +1073,7 @@ fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) 
         sort_values: HashMap::new(),
         filter_values: HashMap::new(),
         attention: None,
+        incomplete: crate::incomplete::incomplete(tracks),
     }
 }
 
@@ -1137,14 +1138,15 @@ fn album_version(mut tracks: Vec<(i64, i64)>, library: Option<&str>) -> String {
 }
 
 fn sort_tracks(tracks: &mut [Track]) {
+    // Disc 0 is no disc: with the tracks that say none.
     tracks.sort_by(|a, b| {
         (
-            a.disc_no.unwrap_or(1),
+            a.disc_no.unwrap_or(1).max(1),
             a.track_no.unwrap_or(u32::MAX),
             &a.rel_path,
         )
             .cmp(&(
-                b.disc_no.unwrap_or(1),
+                b.disc_no.unwrap_or(1).max(1),
                 b.track_no.unwrap_or(u32::MAX),
                 &b.rel_path,
             ))
@@ -2026,7 +2028,14 @@ impl Library {
             .into_iter()
             .map(|(id, idx)| {
                 let mut ts: Vec<&Track> = idx.iter().map(|i| &rows[*i].track).collect();
-                ts.sort_by_key(|t| (t.disc_no.unwrap_or(1), t.track_no.unwrap_or(u32::MAX)));
+                // As `sort_tracks` sorts them, so the album's summary is the same.
+                ts.sort_by_key(|t| {
+                    (
+                        t.disc_no.unwrap_or(1).max(1),
+                        t.track_no.unwrap_or(u32::MAX),
+                        t.rel_path.as_str(),
+                    )
+                });
                 let added = album_added(collection, idx.iter().map(|i| rows[*i].added));
                 let mut album = summarize(id, &ts, added, covers.get(id));
                 for key in sort_keys {

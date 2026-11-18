@@ -61,6 +61,7 @@
 	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+	import ListX from '@lucide/svelte/icons/list-x';
 	import {
 		api,
 		ApiError,
@@ -71,6 +72,7 @@
 		type ImportTrack,
 		type MbArt
 	} from '#lib/api.ts';
+	import { duration } from '#lib/format.ts';
 	import ShowAll from './ShowAll.svelte';
 	import ArtViewer, { type ViewedArt } from './ArtViewer.svelte';
 
@@ -514,6 +516,47 @@
 	let unpaired = $derived(
 		result?.release ? tracks.filter((t) => !result.tracks.find((x) => x.id === t.id)?.via) : []
 	);
+	/**
+	 * The release's tracks the album has none paired with, whole discs as one
+	 * row each, in release order.
+	 */
+	let missingRows = $derived.by(() => {
+		if (!result?.release) return [];
+		const order = (position: string) => position.split('-').map(Number);
+		const rows = [
+			...result.missing.map((m) => ({
+				key: m.position,
+				tracks: 1,
+				at: order(m.position),
+				position: m.position,
+				title: m.title,
+				detail: m.length_ms ? duration(m.length_ms) : ''
+			})),
+			...result.missing_discs.map((d) => ({
+				key: `disc ${d.position}`,
+				tracks: d.tracks,
+				at: [d.position, 0],
+				position: `Disc ${d.position}`,
+				title: [d.format, d.title].filter(Boolean).join(' · ') || 'Disc',
+				detail: `${d.tracks} ${d.tracks === 1 ? 'track' : 'tracks'}`
+			}))
+		];
+		// One-disc positions ("3") sort as disc 1.
+		const key = (at: number[]) => (at.length === 1 ? [1, at[0]] : at);
+		return rows.sort((a, b) => {
+			const [x, y] = [key(a.at), key(b.at)];
+			return x[0] - y[0] || x[1] - y[1];
+		});
+	});
+	let missingCount = $derived(
+		(result?.missing.length ?? 0) + (result?.missing_discs.reduce((n, d) => n + d.tracks, 0) ?? 0)
+	);
+	/** Missing rows shown before "Show all". */
+	const MISSING_SHOWN = 5;
+	/** Tracks behind "Show all": a whole disc's row counts its tracks. */
+	let missingHidden = $derived(
+		missingRows.slice(MISSING_SHOWN).reduce((n, row) => n + row.tracks, 0)
+	);
 
 	/** Identifiers read better in a fixed-width face. */
 	const ID_KINDS = /^(mb_|acoustid|isrc|barcode)/;
@@ -596,6 +639,14 @@
 		return bits.filter(Boolean).join(' · ');
 	}
 </script>
+
+{#snippet missingRow(m: { position: string; title: string; detail: string })}
+	<li>
+		<span class="position tabular">{m.position}</span>
+		<span class="missing-title">{m.title}</span>
+		<span class="missing-detail tabular">{m.detail}</span>
+	</li>
+{/snippet}
 
 {#snippet reset(row: Row, ids: number[], name: string)}
 	{#if edited(row, ids)}
@@ -899,11 +950,39 @@
 			<p class="note">
 				<Info size={14} />
 				<span
-					>Not on this release, so only album-wide tags are suggested for {unpaired
+					>Not matched on this release, so only album-wide tags are suggested for {unpaired
 						.map((t) => t.title || t.file_name)
 						.join(', ')}.</span
 				>
 			</p>
+		{/if}
+		{#if result.release && missingRows.length}
+			<div class="missing" transition:slide={{ duration: 200 }}>
+				<p class="note">
+					<ListX size={14} />
+					<span
+						>{missingCount} of the release's {result.release.track_count}
+						{result.release.track_count === 1 ? 'track' : 'tracks'}
+						{missingCount === 1 ? 'isn’t' : 'aren’t'} in this album{unpaired.length
+							? `, or ${missingCount === 1 ? 'wasn’t' : 'weren’t'} recognized`
+							: ''}:</span
+					>
+				</p>
+				<ol class="missing-list">
+					{#each missingRows.slice(0, MISSING_SHOWN) as m (m.key)}
+						{@render missingRow(m)}
+					{/each}
+				</ol>
+				{#if missingRows.length > MISSING_SHOWN}
+					<ShowAll label="Show all missing tracks" count={missingHidden}>
+						<ol class="missing-list">
+							{#each missingRows.slice(MISSING_SHOWN) as m (m.key)}
+								{@render missingRow(m)}
+							{/each}
+						</ol>
+					</ShowAll>
+				{/if}
+			</div>
 		{/if}
 
 		{#if rows.length || artRow}
@@ -1146,6 +1225,37 @@
 	}
 	.note.warn {
 		color: var(--warn-text);
+	}
+	/* The release's tracks the album lacks. */
+	.missing {
+		display: grid;
+		gap: 6px;
+	}
+	.missing-list {
+		display: grid;
+		gap: 1px;
+		margin: 0;
+		padding: 0 0 0 22px;
+		list-style: none;
+		font-size: 12.5px;
+	}
+	.missing-list li {
+		display: grid;
+		grid-template-columns: minmax(28px, auto) 1fr auto;
+		gap: 10px;
+		align-items: baseline;
+		color: var(--text-2);
+	}
+	.missing-list .position,
+	.missing-list .missing-detail {
+		color: var(--text-3);
+	}
+	.missing-title {
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.missing :global(.show-all) {
+		padding-left: 16px;
 	}
 	.note.warn :global(svg) {
 		color: var(--warn);

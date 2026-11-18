@@ -59,6 +59,38 @@ pub struct Album {
     /// Set when tracks lack tags the library rules or folder structure need.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<Attention>,
+    /// Set when the album's own track and disc numbers say some are missing
+    /// (see [`crate::incomplete`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<Incomplete>,
+}
+
+/// What an album's numbering says it lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Incomplete {
+    /// Runs of missing track numbers, in order.
+    pub tracks: Vec<Gap>,
+    /// Discs missing below the album's last one.
+    pub discs: Vec<u32>,
+    /// At least this many more tracks missing than the gaps hold, by a total
+    /// for the whole album that every disc has, on no disc in particular.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unplaced: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Track numbers `from` to `to` (inclusive) that aren't there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Gap {
+    /// The disc they're missing from, when the album has (or should have)
+    /// several and numbers each from 1; None on a one-disc album, or one
+    /// numbered straight through its discs.
+    pub disc: Option<u32>,
+    pub from: u32,
+    pub to: u32,
 }
 
 /// What keeps an album from passing the library rules as it stands.
