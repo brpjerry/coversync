@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use coversync_core::appearance::{self, AppearanceSetup};
@@ -37,7 +37,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/albums/{id}", get(album))
         .route("/api/albums/{id}/cover", get(cover))
         .route("/api/albums/{id}/cover/full", get(full_cover))
-        .route("/api/albums/{id}/tags", put(write_tags))
+        .route("/api/albums/{id}/tags", get(album_tags).put(write_tags))
         .route("/api/tracks/{id}/stream", get(stream))
         .route(
             "/api/library/setup",
@@ -905,7 +905,57 @@ async fn stream(
     Ok(serve_file(path, req, "private, max-age=3600").await)
 }
 
-#[derive(Deserialize)]
+/// Every track's tags, for the tag editor.
+#[derive(Serialize)]
+struct AlbumTags {
+    /// The album's version as its tags were read (see [`AlbumDetail`]).
+    version: String,
+    tracks: Vec<TrackTags>,
+}
+
+#[derive(Serialize)]
+struct TrackTags {
+    id: i64,
+    rel_path: String,
+    #[serde(flatten)]
+    tags: tags::FileTags,
+}
+
+async fn album_tags(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AlbumTags>> {
+    blocking(&state, move |s| {
+        let detail = s.lib.album(&id)?.ok_or(coversync_core::Error::NotFound)?;
+        let separator = s.lib.library_setup()?.rules.separator;
+        let tracks = detail
+            .tracks
+            .iter()
+            .map(|t| {
+                let (path, _) = s
+                    .lib
+                    .track_root(t.id)?
+                    .ok_or(coversync_core::Error::NotFound)?;
+                Ok(TrackTags {
+                    id: t.id,
+                    rel_path: t.rel_path.clone(),
+                    tags: tags::file_tags(&path, &separator)?,
+                })
+            })
+            .collect::<coversync_core::Result<_>>()?;
+        Ok(AlbumTags {
+            version: detail.version,
+            tracks,
+        })
+    })
+    .await
+    .map(Json)
+}
+
+/// One track's edit: by field, and by tag kind.
+type TrackEdit<'a> = (i64, TagEdit, Vec<(&'a str, String)>);
+
+#[derive(Deserialize, Default)]
 struct TagWrite {
     /// Applied to every track in the album.
     #[serde(default)]
@@ -930,6 +980,10 @@ struct TagWrite {
     /// without them, the album is the one its id names now.
     #[serde(default)]
     base_tracks: Option<Vec<BaseTrack>>,
+    /// Tag kinds (catalog ids) to set, by track id, after `album` and
+    /// `tracks`; an empty value removes the kind.
+    #[serde(default)]
+    kinds: HashMap<i64, HashMap<String, String>>,
 }
 
 /// A track a tag save's edits were made on.
@@ -1046,31 +1100,53 @@ async fn write_tags(
         let current = current.ok_or(coversync_core::Error::NotFound)?;
         let collection = current.album.collection;
         let ids: Vec<i64> = current.tracks.iter().map(|t| t.id).collect();
-        if let Some(stray) = body.tracks.keys().find(|t| !ids.contains(t)) {
+        if let Some(stray) = body
+            .tracks
+            .keys()
+            .chain(body.kinds.keys())
+            .find(|t| !ids.contains(t))
+        {
             return Err(coversync_core::Error::Tags(format!(
                 "track {stray} is not in this album"
             )));
         }
         // Validate every edit before writing anything, so a bad field can't
         // leave the album half-written.
-        let edits: Vec<(i64, TagEdit)> = ids
+        let kinds_of = |t: &i64| -> Vec<(&str, String)> {
+            let mut kinds: Vec<(&str, String)> = body
+                .kinds
+                .get(t)
+                .map(|k| k.iter().map(|(id, v)| (id.as_str(), v.clone())).collect())
+                .unwrap_or_default();
+            kinds.sort();
+            kinds
+        };
+        let edits: Vec<TrackEdit> = ids
             .iter()
-            .map(|t| (*t, merge(&body.album, body.tracks.get(t))))
-            .filter(|(_, e)| !e.is_empty())
+            .map(|t| (*t, merge(&body.album, body.tracks.get(t)), kinds_of(t)))
+            .filter(|(_, e, k)| !e.is_empty() || !k.is_empty())
             .collect();
-        for (_, edit) in &edits {
+        for (_, edit, kinds) in &edits {
             tags::validate(edit)?;
+            for (id, value) in kinds {
+                if coversync_core::rules::kind(id).is_none() {
+                    return Err(coversync_core::Error::Invalid(format!("unknown tag kind '{id}'")));
+                }
+                tags::validate_kind(id, value)?;
+            }
         }
         // Files written before one fails are indexed all the same, so their
         // tracks (and the album's version) say they changed.
         let mut written = Vec::new();
         let mut failed = None;
-        for (track, edit) in &edits {
+        for (track, edit, kinds) in &edits {
             let file = s
                 .lib
                 .track_root(*track)
                 .and_then(|found| found.ok_or(coversync_core::Error::NotFound))
-                .and_then(|(path, root)| tags::write(&path, edit).map(|()| (path, root)));
+                .and_then(|(path, root)| {
+                    tags::write_with_kinds(&path, edit, kinds).map(|()| (path, root))
+                });
             match file {
                 Ok(file) => written.push(file),
                 Err(e) => {
@@ -1129,7 +1205,7 @@ mod tests {
     use std::path::Path as FsPath;
     use std::sync::Arc;
 
-    /// A FLAC file with no audio, only these Vorbis comments.
+    /// A FLAC file with these Vorbis comments and a few bytes standing for its audio.
     fn flac(path: &FsPath, comments: &[&str]) {
         let mut b = b"fLaC".to_vec();
         // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
@@ -1149,6 +1225,8 @@ mod tests {
         b.push(0x80 | 4);
         b.extend(&(block.len() as u32).to_be_bytes()[1..]);
         b.extend(block);
+        // A frame header's sync code and some bytes: lofty's writer expects audio after the metadata.
+        b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b).unwrap();
     }
@@ -1176,6 +1254,7 @@ mod tests {
                 "ALBUMARTIST=Artist",
                 "ALBUM=Record",
                 "TRACKNUMBER=1",
+                "CDTOC=1+96",
             ],
         );
         std::fs::create_dir_all(dir.join("library")).unwrap();
@@ -1217,7 +1296,80 @@ mod tests {
             tracks: HashMap::new(),
             version: None,
             base_tracks: None,
+            kinds: HashMap::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn the_editor_reads_and_writes_every_kind() {
+        let (state, inbox_id, _dir) = daemon("kinds");
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let id = imported.album_id;
+        let read = |id: &str| album_tags(State(state.clone()), Path(id.to_string()));
+        let Json(tags) = read(&id).await.unwrap();
+        assert_eq!(tags.tracks.len(), 1);
+        let track = &tags.tracks[0];
+        assert_eq!(track.tags.values["title"], "Song");
+        assert_eq!(track.tags.values["album"], "Record");
+        assert!(
+            track.tags.other.contains(&("CDTOC".into(), "1+96".into())),
+            "{:?}",
+            track.tags.other
+        );
+        let detail = state.lib.album(&id).unwrap().unwrap();
+        assert_eq!(tags.version, detail.version);
+
+        // Any kind, on its track; an empty value removes one.
+        let kinds = |pairs: &[(&str, &str)]| {
+            HashMap::from([(
+                track.id,
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )])
+        };
+        let body = TagWrite {
+            kinds: kinds(&[("label", "Lantis"), ("track_total", "1"), ("artist", "")]),
+            ..Default::default()
+        };
+        let Json(saved) = write_tags(State(state.clone()), Path(id.clone()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(saved.files_written, 1);
+        let Json(after) = read(&saved.album_id).await.unwrap();
+        let values = &after.tracks[0].tags.values;
+        assert_eq!(values["label"], "Lantis");
+        assert_eq!(values["track_total"], "1");
+        assert!(!values.contains_key("artist"));
+        // Tags no kind names survive the edit.
+        assert!(
+            after.tracks[0]
+                .tags
+                .other
+                .contains(&("CDTOC".into(), "1+96".into()))
+        );
+
+        // A kind that doesn't exist, one that can't be typed, or a bad
+        // value: refused, and nothing written.
+        for bad in [("nope", "x"), ("rating", "5"), ("track_total", "many")] {
+            let body = TagWrite {
+                kinds: kinds(&[bad, ("label", "Other")]),
+                ..Default::default()
+            };
+            let result = write_tags(
+                State(state.clone()),
+                Path(saved.album_id.clone()),
+                Json(body),
+            )
+            .await;
+            assert!(result.is_err(), "{bad:?}");
+        }
+        let Json(unchanged) = read(&saved.album_id).await.unwrap();
+        assert_eq!(unchanged.tracks[0].tags.values["label"], "Lantis");
     }
 
     #[tokio::test]
@@ -1469,6 +1621,7 @@ mod tests {
             tracks: HashMap::new(),
             version: Some(base.version.clone()),
             base_tracks: Some(base_tracks(base)),
+            kinds: HashMap::new(),
         })
     }
 
@@ -1979,6 +2132,7 @@ mod tests {
             tracks: HashMap::from([(base.tracks[0].id, mine)]),
             version: Some(base.version.clone()),
             base_tracks: Some(base_tracks(&base)),
+            kinds: HashMap::new(),
         });
         let now = conflict(put(&state, &base.album.id, stale).await).unwrap();
         assert_eq!(now.album.genre.as_deref(), Some("Rock"));
@@ -2210,6 +2364,7 @@ mod tests {
             tracks: HashMap::new(),
             version: None,
             base_tracks: None,
+            kinds: HashMap::new(),
         });
         let saved = put(&state, &base.album.id, old).await.unwrap();
         assert_eq!(
@@ -2228,6 +2383,7 @@ mod tests {
                 tracks: HashMap::new(),
                 version: Some(base.version.clone()),
                 base_tracks: None,
+                kinds: HashMap::new(),
             })
         };
         put(&state, &base.album.id, by_id(genre("Rock")))

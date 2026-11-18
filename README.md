@@ -34,7 +34,18 @@ used on a home server.
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
   separator, and names at its phrases, see below) offer each.
-- **Tag editor** (an album's Edit tags): album-wide fields and each track's.
+- **Tag editor** (an album's Edit tags): album-wide fields (album, album
+  artist, date, genre) and each track's (number, disc, title, artist) up
+  front, and **Show all tags** for every other tag the album has, grouped
+  as in Library setup, with **Add a tag** for one it doesn't. An album-wide
+  field shows the value every track shares; where they differ it says so,
+  typing there sets every track, and **Per track** edits each track's own.
+  Date shows the tag as written (`2010.08.25` stays as it is unless edited).
+  Several values of one tag show joined by Library setup's separator. Tags
+  coversync has no name for (`TITLE_JP`, `CDTOC`…) are listed read-only:
+  saves keep them. `GET /api/albums/{id}/tags` gives each track's values by
+  tag kind and those other tags; a save can send any tag kind per track
+  (`kinds`).
   A save is refused, and nothing written, if the album changed after the
   editor loaded it: saved from another browser or app, or changed on disk
   and found by a scan, tracks added or removed included. The album then

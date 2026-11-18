@@ -1,6 +1,6 @@
 //! Reading and writing audio file tags through lofty.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -12,6 +12,7 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemValue, SplitTag, Tag, TagType};
+use serde::Serialize;
 
 use crate::model::TagEdit;
 use crate::{Error, Result, rules};
@@ -653,6 +654,170 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
     .map_err(tag_err)
 }
 
+/// The items of the file's primary tag that lofty's generic [`Tag`] has no
+/// key for, as (key, value) text in the file's own naming; binary ones by
+/// their size. For showing: an edit keeps them (see [`save`]).
+fn unmapped_items(path: &Path, file_type: FileType) -> Result<Vec<(String, String)>> {
+    use lofty::file::AudioFile;
+    use lofty::id3::v2::{Frame, Id3v2Tag};
+    use lofty::mp4::{AtomData, AtomIdent};
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    macro_rules! read {
+        ($file:ty) => {
+            <$file>::read_from(&mut f, options).map_err(tag_err)?
+        };
+    }
+    let bytes = |n: usize| format!("({n} bytes of data)");
+    let id3v2 = |tag: Option<Id3v2Tag>| -> Vec<(String, String)> {
+        let rest = tag.unwrap_or_default().split_tag().0;
+        (&*rest)
+            .into_iter()
+            .map(|frame| {
+                let id = frame.id_str().to_string();
+                match frame {
+                    Frame::Text(f) => (id, f.value.to_string()),
+                    Frame::UserText(f) => {
+                        (format!("{id}:{}", f.description), f.content.to_string())
+                    }
+                    Frame::Comment(f) => (format!("{id}:{}", f.description), f.content.to_string()),
+                    Frame::UnsynchronizedText(f) => {
+                        (format!("{id}:{}", f.description), f.content.to_string())
+                    }
+                    Frame::Url(f) => (id, f.url().to_string()),
+                    Frame::UserUrl(f) => (format!("{id}:{}", f.description), f.content.to_string()),
+                    Frame::UniqueFileIdentifier(f) => (
+                        format!("{id}:{}", f.owner),
+                        String::from_utf8_lossy(&f.identifier).into_owned(),
+                    ),
+                    Frame::Private(f) => (format!("{id}:{}", f.owner), bytes(f.private_data.len())),
+                    _ => (id, "(data)".to_string()),
+                }
+            })
+            .collect()
+    };
+    let ape = |tag: Option<lofty::ape::ApeTag>| -> Vec<(String, String)> {
+        let rest = tag.unwrap_or_default().split_tag().0;
+        (&*rest)
+            .into_iter()
+            .map(|item| (item.key().to_string(), value_text(item.value())))
+            .collect()
+    };
+    Ok(match file_type {
+        FileType::Flac | FileType::Vorbis | FileType::Opus | FileType::Speex => {
+            // As read: what lofty has no key for, ratings it can't read
+            // included.
+            vorbis_comments(path, file_type)?
+                .map(|(tag, _)| {
+                    VorbisComments::from(tag.split_tag().0)
+                        .items()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        FileType::Mpeg => id3v2(read!(lofty::mpeg::MpegFile).remove_id3v2()),
+        FileType::Aac => id3v2(read!(lofty::aac::AacFile).remove_id3v2()),
+        FileType::Aiff => id3v2(read!(lofty::iff::aiff::AiffFile).remove_id3v2()),
+        FileType::Wav => id3v2(read!(lofty::iff::wav::WavFile).remove_id3v2()),
+        FileType::Ape => ape(read!(lofty::ape::ApeFile).remove_ape()),
+        FileType::WavPack => ape(read!(lofty::wavpack::WavPackFile).remove_ape()),
+        FileType::Mpc => ape(read!(lofty::musepack::MpcFile).remove_ape()),
+        FileType::Mp4 => {
+            let rest = read!(lofty::mp4::Mp4File)
+                .remove_ilst()
+                .unwrap_or_default()
+                .split_tag()
+                .0;
+            (&*rest)
+                .into_iter()
+                .map(|atom| {
+                    let key = match atom.ident() {
+                        AtomIdent::Fourcc(code) => String::from_utf8_lossy(code).into_owned(),
+                        AtomIdent::Freeform { mean, name } => format!("----:{mean}:{name}"),
+                    };
+                    let values: Vec<String> = atom
+                        .data()
+                        .map(|d| match d {
+                            AtomData::UTF8(t) | AtomData::UTF16(t) => t.clone(),
+                            AtomData::SignedInteger(n) => n.to_string(),
+                            AtomData::UnsignedInteger(n) => n.to_string(),
+                            AtomData::Bool(b) => b.to_string(),
+                            _ => "(data)".to_string(),
+                        })
+                        .collect();
+                    (key, values.join("; "))
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    })
+}
+
+/// An item's value as text; binary ones by their size.
+fn value_text(value: &ItemValue) -> String {
+    match value {
+        ItemValue::Text(t) | ItemValue::Locator(t) => t.clone(),
+        ItemValue::Binary(b) => format!("({} bytes of data)", b.len()),
+    }
+}
+
+/// A file's tags as the tag editor shows them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FileTags {
+    /// Every catalog kind the file has, by id; one held several times has
+    /// its values joined by the Library's separator, as an import writes them.
+    pub values: BTreeMap<&'static str, String>,
+    /// The rest of the primary tag, as (key, value) in the file's own naming:
+    /// tags no kind names, which an edit keeps but can't change.
+    pub other: Vec<(String, String)>,
+}
+
+/// The file's tags for the tag editor (see [`FileTags`]). Pictures aren't read.
+pub fn file_tags(path: &Path, separator: &str) -> Result<FileTags> {
+    let file = probe(path, false)?;
+    let mut out = FileTags::default();
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(out);
+    };
+    for kind in rules::CATALOG {
+        let mut values: Vec<&str> = Vec::new();
+        for v in kind
+            .keys
+            .iter()
+            .flat_map(|k| tag.get_strings(*k))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if !values.contains(&v) {
+                values.push(v);
+            }
+        }
+        if !values.is_empty() {
+            out.values.insert(kind.id, values.join(separator));
+        }
+    }
+    // What lofty knows by a key no kind covers…
+    let covered: Vec<ItemKey> = rules::CATALOG
+        .iter()
+        .flat_map(|k| k.keys.iter().copied())
+        .collect();
+    for item in tag.items().filter(|i| !covered.contains(&i.key())) {
+        let key = item
+            .key()
+            .map_key(tag.tag_type())
+            .map_or_else(|| format!("{:?}", item.key()), str::to_string);
+        out.other.push((key, value_text(item.value())));
+    }
+    // …and what it has no key for.
+    if file.primary_tag().is_some() {
+        out.other.extend(unmapped_items(path, file.file_type())?);
+    }
+    Ok(out)
+}
+
 /// Save an edit of `file`, read from `path` (`rest`, for Vorbis comments,
 /// read before the edit): its primary tag, keeping what lofty's generic tag
 /// couldn't hold, and of its other tags only those in `changed` (pictures
@@ -703,6 +868,12 @@ fn edit_kinds(edit: &TagEdit) -> Vec<&'static str> {
 /// Apply `edit` to the file's primary tag. The change is written to a copy
 /// beside the file and renamed over it, so a failed write leaves the original.
 pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
+    write_with_kinds(path, edit, &[])
+}
+
+/// As [`write`], then set tag kinds (catalog ids) as an import does; an
+/// empty value removes the kind.
+pub fn write_with_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Result<()> {
     // Keep the real extension last: lofty picks the format from it.
     let name = path.file_name().ok_or(Error::NotFound)?.to_string_lossy();
     let tmp = path.with_file_name(format!(".coversync-tmp-{name}"));
@@ -712,7 +883,10 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
         let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
         apply(tag, edit)?;
-        save(&tmp, file, rest, &[], &edit_kinds(edit))?;
+        apply_kinds(tag, kinds)?;
+        let mut edited = edit_kinds(edit);
+        edited.extend(kinds.iter().map(|(id, _)| *id));
+        save(&tmp, file, rest, &[], &edited)?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -2328,6 +2502,84 @@ mod tests {
         )));
         assert_eq!(tag.title().as_deref(), Some("Song"));
         assert_eq!(tag.track(), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_sees_every_kind_and_the_tags_no_kind_names() {
+        let dir = std::env::temp_dir().join(format!("coversync-filetags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(
+            &path,
+            &[
+                "TITLE=Song",
+                "ARTISTS=Rin",
+                "ARTISTS=Riho",
+                "LABEL=Lantis",
+                "TRACKTOTAL=13",
+                "ALBUM_JP=アルバム",
+                "CDTOC=1+96",
+                "rating:MusicBee=60",
+            ],
+        );
+        let tags = file_tags(&path, "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song");
+        // Held twice: both, joined as an import writes them.
+        assert_eq!(tags.values["artists"], "Rin; Riho");
+        assert_eq!(tags.values["label"], "Lantis");
+        assert_eq!(tags.values["track_total"], "13");
+        assert!(!tags.values.contains_key("album"));
+        let other: Vec<(&str, &str)> = tags
+            .other
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(other.contains(&("ALBUM_JP", "アルバム")), "{other:?}");
+        assert!(other.contains(&("CDTOC", "1+96")), "{other:?}");
+        // A rating lofty can't read, as written; no blanks.
+        assert!(other.contains(&("rating:MusicBee", "60")), "{other:?}");
+        assert!(other.iter().all(|(_, v)| !v.is_empty()), "{other:?}");
+        // Nothing a kind names is "other".
+        assert!(
+            !other.iter().any(|(k, _)| *k == "LABEL" || *k == "TITLE"),
+            "{other:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_sets_any_kind_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("coversync-kindedit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(
+            &path,
+            &["TITLE=Song", "LABEL=Lantis", "GENRE=Idol", "TITLE_JP=歌"],
+        );
+        let kinds = [
+            ("label", "Lantis Company, Limited".to_string()),
+            ("track_total", "13".to_string()),
+            ("genre", String::new()),
+        ];
+        let edit = TagEdit {
+            title: Some("Song!".into()),
+            ..Default::default()
+        };
+        write_with_kinds(&path, &edit, &kinds).unwrap();
+        let tags = file_tags(&path, "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song!");
+        assert_eq!(tags.values["label"], "Lantis Company, Limited");
+        assert_eq!(tags.values["track_total"], "13");
+        // An empty value removes the kind.
+        assert!(!tags.values.contains_key("genre"));
+        assert!(has(&vorbis(&path).1, "TITLE_JP", "歌"));
+        // A bad value writes nothing.
+        let bad = [("track_total", "thirteen".to_string())];
+        assert!(write_with_kinds(&path, &TagEdit::default(), &bad).is_err());
+        assert_eq!(file_tags(&path, "; ").unwrap().values["track_total"], "13");
         let _ = fs::remove_dir_all(&dir);
     }
 
