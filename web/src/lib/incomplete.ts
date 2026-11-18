@@ -83,10 +83,11 @@ function placeOf<T extends Numbered>(
 	if (before !== undefined && after !== undefined)
 		return { key: before + 0.5, label: `Between discs ${before} and ${after}` };
 	if (before !== undefined) {
-		const declared = discs.flatMap(([, ts]) =>
-			ts.map((t) => t.disc_total ?? 0).filter((n) => n <= 999)
-		);
-		const last = Math.max(0, ...declared);
+		// The highest usable disc total (a loop: an album can have many files).
+		let last = 0;
+		for (const [, ts] of discs) {
+			for (const { disc_total: n } of ts) if (n && n <= 999) last = Math.max(last, n);
+		}
 		return last === before ? disc(before) : { key: before + 0.5, label: `After disc ${before}` };
 	}
 	const next = after ?? discs[0][0];
