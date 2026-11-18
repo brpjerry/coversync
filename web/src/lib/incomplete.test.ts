@@ -83,8 +83,8 @@ describe('withGaps', () => {
 			disc(1, [{ track: t(1) }, { track: t(2) }]),
 			disc(1.5, [{ from: 3, to: 4 }], 'Between discs 1 and 3'),
 			disc(2, null),
-			disc(3, [{ track: t(5) }, { track: t(6) }]),
-			disc(3.5, [{ from: 7, to: 8 }], 'After disc 3')
+			// No later disc declared: 7-8 end disc 3.
+			disc(3, [{ track: t(5) }, { track: t(6) }, { from: 7, to: 8 }])
 		]);
 		// Disc 1 missing, before the first there.
 		expect(
@@ -101,6 +101,34 @@ describe('withGaps', () => {
 			disc(2, [{ track: t(3) }]),
 			disc(3, [{ track: t(4) }])
 		]);
+	});
+
+	it('puts end gaps on disc 1, and on the last disc when no later one is declared', () => {
+		const first = { track_no: 2, disc_total: 2 };
+		const last = { track_no: 3, disc_total: 2 };
+		expect(
+			withGaps(
+				[
+					[1, [first]],
+					[2, [last]]
+				],
+				{ tracks: [gap(1, 1), gap(4, 4)], discs: [] }
+			)
+		).toEqual([
+			disc(1, [{ from: 1, to: 1 }, { track: first }]),
+			disc(2, [{ track: last }, { from: 4, to: 4 }])
+		]);
+		// A third disc declared (a DVD, maybe) could hold track 4.
+		const third = { track_no: 3, disc_total: 3 };
+		expect(
+			withGaps(
+				[
+					[1, [first]],
+					[2, [third]]
+				],
+				{ tracks: [gap(4, 4)], discs: [] }
+			).at(-1)
+		).toEqual(disc(2.5, [{ from: 4, to: 4 }], 'After disc 2'));
 	});
 
 	it('leaves a complete album as it is', () => {

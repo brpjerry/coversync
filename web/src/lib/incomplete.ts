@@ -57,13 +57,17 @@ export interface Group<T> {
 	rows: Row<T>[] | null;
 }
 
+/** What placing a gap needs of a track. */
+type Numbered = { track_no: number | null; disc_total?: number | null };
+
 /**
  * Where a gap with no disc of its own (numbered straight through the discs)
- * goes: on the disc whose tracks surround it; otherwise the tags don't say
- * whether it ends one disc, starts the next or fills one between, so it
- * goes between them.
+ * goes: on the disc whose tracks surround it, on disc 1 before its tracks,
+ * or on the last disc after its tracks when no file says another follows.
+ * Otherwise the tags don't say whether it ends one disc, starts the next or
+ * fills one between, so it goes between them.
  */
-function placeOf<T extends { track_no: number | null }>(
+function placeOf<T extends Numbered>(
 	g: { from: number; to: number },
 	discs: [number, T[]][]
 ): { key: number; label: string } {
@@ -78,9 +82,14 @@ function placeOf<T extends { track_no: number | null }>(
 	const after = discs.find(([, ts]) => numbers(ts).every((n) => n > g.to))?.[0];
 	if (before !== undefined && after !== undefined)
 		return { key: before + 0.5, label: `Between discs ${before} and ${after}` };
-	if (before !== undefined) return { key: before + 0.5, label: `After disc ${before}` };
+	if (before !== undefined) {
+		const later = discs.some(([, ts]) =>
+			ts.some((t) => (t.disc_total ?? 0) > before && (t.disc_total ?? 0) <= 999)
+		);
+		return later ? { key: before + 0.5, label: `After disc ${before}` } : disc(before);
+	}
 	const next = after ?? discs[0][0];
-	return { key: next - 0.5, label: `Before disc ${next}` };
+	return next === 1 ? disc(1) : { key: next - 0.5, label: `Before disc ${next}` };
 }
 
 /**
@@ -88,7 +97,7 @@ function placeOf<T extends { track_no: number | null }>(
  * runs of numbers it lacks where they belong (or between discs, where the
  * tags don't say which), and missing discs with no rows.
  */
-export function withGaps<T extends { track_no: number | null }>(
+export function withGaps<T extends Numbered>(
 	discs: [number, T[]][],
 	inc: Incomplete | undefined
 ): Group<T>[] {

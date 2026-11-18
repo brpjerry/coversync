@@ -1280,11 +1280,20 @@ fn map_tracks(
             out[i] = Some((m, t, Via::Position));
         }
     }
-    if out.iter().all(Option::is_some) {
+    let titled = tracks
+        .iter()
+        .zip(&out)
+        .any(|(local, mapped)| mapped.is_none() && local.values.contains_key("title"));
+    // Only the positions still free, in release order (which breaks ties).
+    let positions: Vec<(usize, usize, u32, u32)> = positions
+        .into_iter()
+        .filter(|(m, t, _, _)| !taken.contains(&(*m, *t)))
+        .collect();
+    if !titled || positions.is_empty() {
         return out;
     }
-    // The release's titles as compared, each folded once; romanized or not,
-    // the album's title may be either.
+    // Their titles as compared, each folded once; romanized or not, the
+    // album's title may be either.
     let keys = |r: &Release| -> Vec<String> {
         positions
             .iter()
