@@ -317,7 +317,9 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
         .collect();
     let rest = VorbisComments::from(tag.split_tag().0);
     // Ratings lofty couldn't read stay with the rest, once.
-    ratings.retain(|(k, v)| !rest.items().any(|(rk, rv)| rk == k && rv == v));
+    let retained: std::collections::HashSet<(&str, &str)> =
+        rest.items().filter(|(k, _)| is_rating(k)).collect();
+    ratings.retain(|(k, v)| !retained.contains(&(k.as_str(), v.as_str())));
     Ok(Some(VorbisRest {
         rest,
         vendor,
@@ -342,9 +344,10 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
     let mut out = rest.rest;
     out.set_vendor(rest.vendor);
     for item in tag.items() {
-        if item.key() == ItemKey::EncoderSoftware
-            || (item.key() == ItemKey::Popularimeter && !rest.ratings.is_empty())
-        {
+        if matches!(
+            item.key(),
+            ItemKey::EncoderSoftware | ItemKey::Popularimeter
+        ) {
             continue;
         }
         let (ItemValue::Text(value) | ItemValue::Locator(value)) = item.value() else {
@@ -359,9 +362,21 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
             out.push("ENCODER".into(), encoder);
         }
     }
+    // Ratings: the file's own as written; one from another tag (a FLAC that
+    // had only ID3v2) through lofty's conversion, under its provider's key.
     if tag.get(ItemKey::Popularimeter).is_some() {
-        for (key, value) in rest.ratings {
-            out.push(key, value);
+        if rest.ratings.is_empty() {
+            let mut ratings = Tag::new(TagType::VorbisComments);
+            for item in tag.items().filter(|i| i.key() == ItemKey::Popularimeter) {
+                ratings.push(item.clone());
+            }
+            for (key, value) in VorbisComments::from(ratings).items() {
+                out.push(key.to_string(), value.to_string());
+            }
+        } else {
+            for (key, value) in rest.ratings {
+                out.push(key, value);
+            }
         }
     }
     // From the end, so each move is cheap; then in their order.
@@ -371,36 +386,20 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
     }
     for picture in pictures.into_iter().rev() {
         let info = PictureInformation::from_picture(&picture).unwrap_or_default();
-        out.insert_picture(picture, Some(info)).map_err(tag_err)?;
+        // Lofty keeps one icon of each kind, as the format says; a file
+        // with two isn't saved rather than lose one.
+        if out
+            .insert_picture(picture, Some(info))
+            .map_err(tag_err)?
+            .is_some()
+        {
+            return Err(Error::Tags(
+                "the file has two icons of one kind, which FLAC and Ogg allow one of, so it wasn't changed".into(),
+            ));
+        }
     }
     out.save_to_path(path, WriteOptions::default())
         .map_err(tag_err)
-}
-
-/// The ID3v2 tag's header flags as the file has them (CRC, restrictions…),
-/// which a tag converted from lofty's generic one would lose.
-fn id3v2_flags(path: &Path, file_type: FileType) -> Result<Option<lofty::id3::v2::Id3v2TagFlags>> {
-    use lofty::file::AudioFile;
-    let options = ParseOptions::new()
-        .read_properties(false)
-        .read_cover_art(false);
-    let mut f = std::io::BufReader::new(fs::File::open(path)?);
-    let tag = match file_type {
-        FileType::Mpeg => lofty::mpeg::MpegFile::read_from(&mut f, options)
-            .map_err(tag_err)?
-            .remove_id3v2(),
-        FileType::Aac => lofty::aac::AacFile::read_from(&mut f, options)
-            .map_err(tag_err)?
-            .remove_id3v2(),
-        FileType::Aiff => lofty::iff::aiff::AiffFile::read_from(&mut f, options)
-            .map_err(tag_err)?
-            .remove_id3v2(),
-        FileType::Wav => lofty::iff::wav::WavFile::read_from(&mut f, options)
-            .map_err(tag_err)?
-            .remove_id3v2(),
-        _ => None,
-    };
-    Ok(tag.map(|t| *t.flags()))
 }
 
 /// Write `tag`, a primary tag other than Vorbis comments after an edit,
@@ -408,15 +407,22 @@ fn id3v2_flags(path: &Path, file_type: FileType) -> Result<Option<lofty::id3::v2
 /// generic tag, it puts back what the generic tag couldn't hold (custom
 /// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
 /// frames) and joins repeated values as the format wants.
-fn save_owned(path: &Path, file_type: FileType, tag: Tag) -> Result<()> {
+fn save_owned(path: &Path, tag: Tag) -> Result<()> {
     let options = WriteOptions::default();
     match tag.tag_type() {
         TagType::Id3v2 => {
-            let flags = id3v2_flags(path, file_type)?;
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
-            if let Some(flags) = flags {
-                id3.set_flags(flags);
+            // Lofty reads unsynchronised frames decoded and would write them
+            // back flagged, to be decoded twice: not saved rather than corrupted.
+            if (&id3).into_iter().any(|f| f.flags().unsynchronisation) {
+                return Err(Error::Tags(
+                    "the file's ID3v2 tag uses unsynchronisation, which can't be rewritten safely yet, so it wasn't changed".into(),
+                ));
             }
+            // Header flags as lofty writes them by default, as before: it
+            // can't write CRC or restrictions back readably, and
+            // unsynchronisation would decode its frames twice.
+            id3.set_flags(lofty::id3::v2::Id3v2TagFlags::default());
             id3.save_to_path(path, options)
         }
         TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag).save_to_path(path, options),
@@ -441,15 +447,21 @@ fn save_owned(path: &Path, file_type: FileType, tag: Tag) -> Result<()> {
                 tag.remove_key(number);
                 tag.remove_key(total);
             }
-            for value in tag.get_strings(ItemKey::FlagCompilation) {
-                literal.push(("Compilation", value.to_string()));
-            }
+            // Compilation as it was, text, locator or binary, every value.
+            let compilation: Vec<ItemValue> = tag
+                .items()
+                .filter(|i| i.key() == ItemKey::FlagCompilation)
+                .map(|i| i.value().clone())
+                .collect();
             tag.remove_key(ItemKey::FlagCompilation);
             let mut ape = lofty::ape::ApeTag::from(tag);
             for (name, value) in literal {
                 let item = lofty::ape::ApeItem::new(name.into(), ItemValue::Text(value))
                     .map_err(tag_err)?;
                 ape.insert(item);
+            }
+            for value in compilation {
+                ape.push(lofty::ape::ApeItem::new("Compilation".into(), value).map_err(tag_err)?);
             }
             ape.save_to_path(path, options)
         }
@@ -471,7 +483,6 @@ fn save(
     changed: &[TagType],
     encoder_edited: bool,
 ) -> Result<()> {
-    let file_type = file.file_type();
     let primary = file.primary_tag_type();
     for t in changed.iter().filter(|t| **t != primary) {
         if file.tag_support(*t).is_writable()
@@ -486,7 +497,7 @@ fn save(
     };
     match rest {
         Some(rest) => save_vorbis(path, tag, rest, encoder_edited),
-        None => save_owned(path, file_type, tag),
+        None => save_owned(path, tag),
     }
 }
 
@@ -1346,8 +1357,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "server")]
-    fn id3v2_urls_header_flags_and_untouched_tags_are_kept() {
-        use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, Id3v2TagFlags, UrlLinkFrame};
+    fn id3v2_urls_and_untouched_tags_are_kept() {
+        use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, UrlLinkFrame};
         let dir = std::env::temp_dir().join(format!("coversync-id3url-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1366,10 +1377,6 @@ mod tests {
             FrameId::new("WOAR").unwrap(),
             "https://example.com/artist",
         )));
-        id3.set_flags(Id3v2TagFlags {
-            experimental: true,
-            ..Default::default()
-        });
         id3.save_to_path(&src, WriteOptions::default()).unwrap();
         let values = [("track_number", "1".to_string())];
         copy_with_tags(&src, &dest, &values, None, false).unwrap();
@@ -1380,7 +1387,6 @@ mod tests {
             frame,
             Frame::Url(url) if url.url() == "https://example.com/artist"
         )));
-        assert!(tag.flags().experimental);
         assert_eq!(tag.track(), Some(1));
         // The RIFF INFO tag wasn't touched.
         assert_eq!(wav.riff_info().unwrap().get("IXYZ"), Some("kept"));
@@ -1441,6 +1447,7 @@ mod tests {
             "Cover Art (Front)",
             ItemValue::Binary(b"front.jpg\0data".to_vec()),
         ));
+        ape.insert(item("Compilation", ItemValue::Binary(vec![1])));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
         let values = [("title", "New".to_string())];
         copy_with_tags(&src, &dest, &values, None, false).unwrap();
@@ -1455,9 +1462,121 @@ mod tests {
         assert_eq!(text("Track"), Some("A1"));
         assert_eq!(text("Ripper"), Some("kept"));
         assert!(matches!(
+            ape.get("Compilation").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == &[1]
+        ));
+        assert!(matches!(
             ape.get("Cover Art (Front)").map(|i| i.value()),
             Some(ItemValue::Binary(b)) if b == b"front.jpg\0data"
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FLAC file with no Vorbis comments at all, behind `id3`.
+    fn flac_with_only_id3v2(path: &Path, id3: &lofty::id3::v2::Id3v2Tag) {
+        let mut b = Vec::new();
+        id3.dump_to(&mut b, WriteOptions::default()).unwrap();
+        b.extend(b"fLaC");
+        // STREAMINFO, the last block: 4096-sample blocks, 44.1 kHz, stereo, 16 bits.
+        b.extend([
+            0x80, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+        ]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn a_rating_from_another_tag_gets_its_providers_key() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, PopularimeterFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-popm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "MusicBee", 196, 0,
+        )));
+        flac_with_only_id3v2(&path("in.flac"), &id3);
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let ratings: Vec<&(String, String)> = items
+            .iter()
+            .filter(|(k, _)| k.starts_with("RATING"))
+            .collect();
+        assert_eq!(ratings.len(), 1, "{items:?}");
+        assert_eq!(ratings[0].0, "RATING:MusicBee");
+        assert!(!ratings[0].1.contains('|'), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn two_icons_of_one_kind_leave_the_file_unchanged() {
+        let dir = std::env::temp_dir().join(format!("coversync-icons-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(&path("in.flac"), &["TITLE=Song"]);
+        let icon = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            Picture::unchecked(png.into_inner())
+                .pic_type(PictureType::Icon)
+                .mime_type(lofty::picture::MimeType::Png)
+                .build()
+        };
+        // Lofty's own writer puts both in.
+        let mut file = probe(&path("in.flac"), true).unwrap();
+        let tag = primary_tag_mut(&mut file);
+        tag.push_picture(icon(2));
+        tag.push_picture(icon(3));
+        file.save_to_path(path("in.flac"), WriteOptions::default())
+            .unwrap();
+        let genre = [("genre", "Anime".to_string())];
+        let refused = copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false);
+        assert!(refused.unwrap_err().to_string().contains("two icons"));
+        assert!(!path("out.flac").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn unsynchronised_id3v2_frames_leave_the_file_unchanged() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, Id3v2TagFlags, PrivateFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-unsync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        wav_with_info(&src);
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        // A frame lofty keeps aside, with its flags, as read.
+        id3.insert(Frame::Private(PrivateFrame::new(
+            "coversync",
+            vec![0xFF, 0xE0, 1],
+        )));
+        id3.set_flags(Id3v2TagFlags {
+            unsynchronisation: true,
+            ..Default::default()
+        });
+        id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        let result = copy_with_tags(&src, &dest, &values, None, false);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsynchronisation"),
+            "refused"
+        );
+        assert!(!dest.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
