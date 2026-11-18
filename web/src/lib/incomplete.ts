@@ -63,7 +63,7 @@ type Numbered = { track_no: number | null; disc_total?: number | null };
 /**
  * Where a gap with no disc of its own (numbered straight through the discs)
  * goes: on the disc whose tracks surround it, on disc 1 before its tracks,
- * or on the last disc after its tracks when no file says another follows.
+ * or on the last disc after its tracks when the disc total says it's last.
  * Otherwise the tags don't say whether it ends one disc, starts the next or
  * fills one between, so it goes between them.
  */
@@ -83,10 +83,11 @@ function placeOf<T extends Numbered>(
 	if (before !== undefined && after !== undefined)
 		return { key: before + 0.5, label: `Between discs ${before} and ${after}` };
 	if (before !== undefined) {
-		const later = discs.some(([, ts]) =>
-			ts.some((t) => (t.disc_total ?? 0) > before && (t.disc_total ?? 0) <= 999)
+		const declared = discs.flatMap(([, ts]) =>
+			ts.map((t) => t.disc_total ?? 0).filter((n) => n <= 999)
 		);
-		return later ? { key: before + 0.5, label: `After disc ${before}` } : disc(before);
+		const last = Math.max(0, ...declared);
+		return last === before ? disc(before) : { key: before + 0.5, label: `After disc ${before}` };
 	}
 	const next = after ?? discs[0][0];
 	return next === 1 ? disc(1) : { key: next - 0.5, label: `Before disc ${next}` };

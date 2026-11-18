@@ -83,8 +83,9 @@ describe('withGaps', () => {
 			disc(1, [{ track: t(1) }, { track: t(2) }]),
 			disc(1.5, [{ from: 3, to: 4 }], 'Between discs 1 and 3'),
 			disc(2, null),
-			// No later disc declared: 7-8 end disc 3.
-			disc(3, [{ track: t(5) }, { track: t(6) }, { from: 7, to: 8 }])
+			// No disc total to say disc 3 is the last: 7-8 might start a disc 4.
+			disc(3, [{ track: t(5) }, { track: t(6) }]),
+			disc(3.5, [{ from: 7, to: 8 }], 'After disc 3')
 		]);
 		// Disc 1 missing, before the first there.
 		expect(
@@ -103,7 +104,7 @@ describe('withGaps', () => {
 		]);
 	});
 
-	it('puts end gaps on disc 1, and on the last disc when no later one is declared', () => {
+	it('puts end gaps on disc 1, and on the last disc when the disc total says so', () => {
 		const first = { track_no: 2, disc_total: 2 };
 		const last = { track_no: 3, disc_total: 2 };
 		expect(

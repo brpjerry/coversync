@@ -1284,14 +1284,15 @@ fn map_tracks(
         .iter()
         .zip(&out)
         .any(|(local, mapped)| mapped.is_none() && local.values.contains_key("title"));
+    // Each of `taken` is a distinct position: all taken when as many.
+    if !titled || taken.len() == positions.len() {
+        return out;
+    }
     // Only the positions still free, in release order (which breaks ties).
     let positions: Vec<(usize, usize, u32, u32)> = positions
         .into_iter()
         .filter(|(m, t, _, _)| !taken.contains(&(*m, *t)))
         .collect();
-    if !titled || positions.is_empty() {
-        return out;
-    }
     // Their titles as compared, each folded once; romanized or not, the
     // album's title may be either.
     let keys = |r: &Release| -> Vec<String> {
