@@ -262,7 +262,8 @@ pub fn scan(
         .collect();
     tracing::info!(
         total,
-        changed = changed.len(),
+        changed = changed.len() + reread.len(),
+        for_reader = reread.len(),
         removed = removed.len(),
         "scan"
     );
@@ -274,23 +275,27 @@ pub fn scan(
     index_files(lib, changed, progress)?;
     // A collection's marker moves on once every file read again for it
     // was read (an unreadable one is tried again next time; a new file
-    // that can't be read is tried again anyway, and doesn't hold it back).
+    // that can't be read is tried again anyway, and doesn't hold it back),
+    // and after rows of files gone are removed (one coming back unchanged
+    // would otherwise keep its old row).
+    let mut done = Vec::new();
     for (collection, read_by) in readers {
         if read_by >= crate::tags::READER {
             continue;
         }
         let errors = progress.read().map_or(0, |p| p.errors);
-        let again: Vec<FileStat> = reread
-            .iter()
-            .filter(|f| f.collection == collection)
-            .cloned()
-            .collect();
+        let (again, rest): (Vec<FileStat>, Vec<FileStat>) =
+            reread.into_iter().partition(|f| f.collection == collection);
+        reread = rest;
         index_files(lib, again, progress)?;
         if progress.read().map_or(0, |p| p.errors) == errors {
-            lib.set_tag_reader(collection, crate::tags::READER)?;
+            done.push(collection);
         }
     }
     lib.remove_paths(&removed)?;
+    for collection in done {
+        lib.set_tag_reader(collection, crate::tags::READER)?;
+    }
     update(progress, |p| p.phase = "covers".into());
     refresh_covers(lib, covers, progress)?;
     let albums = lib

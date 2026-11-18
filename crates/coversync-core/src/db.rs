@@ -1940,6 +1940,16 @@ impl Library {
         if lib_wrote {
             put_setting(&tx, "lib", GENERATION, &lib_next)?;
         }
+        // Rows this reader wrote into an index a newer one filled: its
+        // marker comes down to this reader, so the newer one reads them again.
+        for (wrote, schema) in [(inbox_wrote, "main"), (lib_wrote, "lib")] {
+            if wrote
+                && get_setting::<u32>(&tx, schema, TAG_READER)?
+                    .is_some_and(|r| r > crate::tags::READER)
+            {
+                put_setting(&tx, schema, TAG_READER, &crate::tags::READER)?;
+            }
+        }
         tx.commit()?;
         if lib_wrote {
             remember_library(&conn);

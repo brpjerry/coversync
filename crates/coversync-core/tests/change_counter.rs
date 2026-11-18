@@ -1023,4 +1023,16 @@ fn a_new_tag_reader_reads_files_again_and_keeps_their_digests() {
         coversync_core::tags::READER
     );
     assert_eq!(s.library().generation, generation);
+
+    // An index a newer reader filled, written to by this one: its marker
+    // comes down, so the newer one reads those rows again.
+    s.lib
+        .set_tag_reader(Collection::Inbox, coversync_core::tags::READER + 1)
+        .unwrap();
+    wav(&s.inbox.join("Other/3.wav"), "Track 3", "Other", 3);
+    s.scan();
+    assert_eq!(
+        s.lib.tag_reader(Collection::Inbox).unwrap(),
+        coversync_core::tags::READER
+    );
 }

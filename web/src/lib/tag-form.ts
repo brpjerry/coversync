@@ -82,7 +82,9 @@ const LAST = '(?:\\d{2}| \\d|\\d (?=Z$))';
 const SEPARATED = new RegExp(
 	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
 );
-const COMPACT = /^\d{4}(?:\d{2}(?:\d{2}(?:T\d{2}(?:\d{2}(?:\d{2})?)?)?)?)?Z?$/;
+const COMPACT = new RegExp(
+	`^\\d{4}(?:\\d{2}(?:\\d{2}(?:T(?:${LAST}|\\d{2}(?:\\d{2}(?:\\d{2})?)?))?)?)?Z?$`
+);
 
 /**
  * Numbers and dates the server would refuse; other kinds take any text. A

@@ -102,7 +102,8 @@ describe('invalid', () => {
 			'202406',
 			'2024-6 -03',
 			'2024-06-03T1 :02',
-			'2024-6 Z'
+			'2024-6 Z',
+			'20240603T 1'
 		];
 		const inPart = [
 			'2010-08-25 12:30',
@@ -117,7 +118,8 @@ describe('invalid', () => {
 			'2024-06-3',
 			'2024-06-03T01:2',
 			'2024-6-03T14:08:4',
-			'2024-06 -03'
+			'2024-06 -03',
+			'2010-08-25T01:30 PM'
 		];
 		for (const date of whole) expect(invalid('date', date), date).toBe(false);
 		for (const date of inPart) expect(invalid('date', date), date).toBe(true);

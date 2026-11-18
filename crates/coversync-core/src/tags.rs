@@ -1226,6 +1226,14 @@ fn values_of(tag: &Tag) -> HashMap<&'static str, String> {
 /// it: the numbers typed, the year first and then two digits a part where
 /// they run together (20100825), are the ones read, in order.
 fn read_whole(typed: &str, read: &Timestamp) -> bool {
+    // Anything but numbers, separators, T and Z (a PM, say) isn't read.
+    if !typed
+        .trim()
+        .chars()
+        .all(|c| c.is_ascii_digit() || "-.: TZ".contains(c))
+    {
+        return false;
+    }
     let mut typed_parts: Vec<u32> = Vec::new();
     let runs = typed
         .split(|c: char| !c.is_ascii_digit())
@@ -1305,9 +1313,6 @@ fn described(item: &TagItem) -> bool {
 fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
     // The kinds given values, to check they're all still there as written.
     let mut set: Vec<(&'static rules::TagKind, String)> = Vec::new();
-    // Numbers before their totals (a pair is written number first).
-    let mut values: Vec<&(&str, String)> = values.iter().collect();
-    values.sort_by_key(|(id, _)| number_of(id).is_some());
     for (id, value) in values {
         let kind =
             rules::kind(id).ok_or_else(|| Error::Invalid(format!("unknown tag kind '{id}'")))?;
@@ -1411,6 +1416,19 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
         }
         set.push((kind, v.to_string()));
     }
+    // A pair is written number first (lofty builds ID3v2's MVIN from the
+    // items in order): each total goes after its number, however they were
+    // set.
+    for key in [
+        ItemKey::TrackTotal,
+        ItemKey::DiscTotal,
+        ItemKey::MovementTotal,
+    ] {
+        let totals: Vec<TagItem> = tag.take(key).collect();
+        for total in totals {
+            tag.push(total);
+        }
+    }
     // Together, as they'll be written: two kinds can share one field (Label
     // and Publisher are both ID3v2's TPUB).
     if let Some((kind, v)) = lost(tag, &set) {
@@ -1496,11 +1514,17 @@ fn lost(
     let id3v2 = tag.tag_type() == TagType::Id3v2;
     let mut alone = Vec::new();
     for (kind, value) in set {
-        // ID3v2 reads dates as timestamps: a date it reads only part of
-        // (a time after a space) loses the rest. Its URL frames hold
-        // Latin-1 only.
+        // ID3v2 reads its date and time frames as timestamps: one it reads
+        // only part of (a time after a space; TBD) loses the rest. Its URL
+        // frames hold Latin-1 only.
         if id3v2
-            && matches!(kind.id, "release_date" | "original_date")
+            && kind.id != "date"
+            && kind.keys.iter().any(|k| {
+                matches!(
+                    k.map_key(TagType::Id3v2),
+                    Some("TDRC" | "TDRL" | "TDOR" | "TDTG" | "TDEN" | "TDLY")
+                )
+            })
             && !value
                 .parse::<Timestamp>()
                 .is_ok_and(|read| read_whole(value, &read))
@@ -1552,7 +1576,16 @@ fn lost(
     if set.len() == 1 {
         return None;
     }
-    let kinds: Vec<&'static rules::TagKind> = set.iter().map(|(k, _)| *k).collect();
+    // Each total with its number (one the file has, if it isn't set too).
+    let mut kinds: Vec<&'static rules::TagKind> = set.iter().map(|(k, _)| *k).collect();
+    for number in set
+        .iter()
+        .filter_map(|(k, _)| number_of(k.id).and_then(rules::kind))
+    {
+        if !kinds.iter().any(|k| k.id == number.id) {
+            kinds.push(number);
+        }
+    }
     let Some(together) = back(&kinds) else {
         return set.first().cloned();
     };
@@ -3303,6 +3336,7 @@ mod tests {
         "2024-6 -03",
         "2024-06-03T1 :02",
         "2024-6 Z",
+        "20240603T 1",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3318,6 +3352,7 @@ mod tests {
         "2024-06-03T01:2",
         "2024-6-03T14:08:4",
         "2024-06 -03",
+        "2010-08-25T01:30 PM",
     ];
 
     #[test]
@@ -3539,11 +3574,13 @@ mod tests {
         assert!(reader_changed(Path::new("/m/a.mp3"), 0));
         assert!(reader_changed(Path::new("/m/a.M4A"), 0));
         assert!(!reader_changed(Path::new("/m/a.Opus"), 0));
-        assert!(reader_changed(Path::new("/m/missing.flac"), 0));
+        // A path under a file can't be opened, wherever this runs.
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml/missing.flac");
+        assert!(reader_changed(&missing, 0));
         // Since 1: only such FLACs.
         assert!(!reader_changed(Path::new("/m/a.mp3"), 1));
-        assert!(reader_changed(Path::new("/m/missing.flac"), 1));
-        assert!(!reader_changed(Path::new("/m/missing.flac"), READER));
+        assert!(reader_changed(&missing, 1));
+        assert!(!reader_changed(&missing, READER));
     }
 
     #[test]
@@ -3650,6 +3687,24 @@ mod tests {
             assert_eq!(values["movement_number"], "2");
             assert_eq!(values["movement_total"], "4");
         }
+        // A total changed beside another field, the number left as it is.
+        write_with_kinds(&path("a.mp3"), &none, &kinds(&[("movement_number", "2")])).unwrap();
+        write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("movement_total", "5"), ("title", "Song")]),
+        )
+        .unwrap();
+        let values = file_tags(&path("a.mp3"), "; ").unwrap().values;
+        assert_eq!(
+            (
+                values["movement_number"].as_str(),
+                values["movement_total"].as_str()
+            ),
+            ("2", "5")
+        );
+        // A time with words after it isn't read whole.
+        assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
         // A field given another way must still have been one.
         let bad = TagEdit {
             track_no: Some("invalid".into()),
