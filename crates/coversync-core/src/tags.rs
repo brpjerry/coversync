@@ -403,8 +403,10 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
     // TRACKNUM is an older name readers fall back to for the track number:
     // blanked (so not written) when the track number is written or edited,
     // as lofty's own setter does, so a cleared number doesn't come back.
+    // A canonical number that isn't one (empty, or a vinyl side like A1)
+    // doesn't stand in for it.
     if out.get("TRACKNUM").is_some()
-        && (tag.get(ItemKey::TrackNumber).is_some() || edited.contains(&"track_number"))
+        && (lofty::tag::Accessor::track(&tag).is_some() || edited.contains(&"track_number"))
     {
         out.insert("TRACKNUM".into(), String::new());
     }
@@ -867,18 +869,32 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
 
 /// Whether an MP3's APE tag has a front or untyped cover of its own (lofty
 /// keeps APE covers as items, not pictures, so they aren't in its generic
-/// tag). Such a cover isn't replaced: lofty can't rewrite every APE layout
-/// safely (a tag with only a footer loses 32 bytes of audio).
-fn secondary_ape_cover(path: &Path) -> Result<bool> {
+/// tag) other than `new`, the image replacing it. Such a cover isn't
+/// replaced: lofty can't rewrite every APE layout safely (a tag with only a
+/// footer loses 32 bytes of audio). An empty one, or one already `new`,
+/// doesn't count.
+fn secondary_ape_cover(path: &Path, new: &[u8]) -> Result<bool> {
     use lofty::file::AudioFile;
     let options = ParseOptions::new().read_properties(false);
     let mut f = std::io::BufReader::new(fs::File::open(path)?);
     let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?;
-    Ok(mpeg.ape().is_some_and(|ape| {
-        ["Cover Art (Front)", "Cover Art (Other)"]
-            .iter()
-            .any(|k| ape.get(k).is_some())
-    }))
+    let Some(ape) = mpeg.ape() else {
+        return Ok(false);
+    };
+    Ok(["Cover Art (Front)", "Cover Art (Other)"]
+        .iter()
+        .filter_map(|k| ape.get(k))
+        .any(|item| match item.value() {
+            // A file name, a zero byte, then the image.
+            ItemValue::Binary(bytes) => {
+                let image = bytes
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map_or(&bytes[..], |at| &bytes[at + 1..]);
+                !image.is_empty() && image != new
+            }
+            ItemValue::Text(text) | ItemValue::Locator(text) => !text.is_empty(),
+        }))
 }
 
 fn has_pictures(file: &TaggedFile) -> bool {
@@ -1013,11 +1029,13 @@ pub fn copy_with_tags_hashed(
                 if art.is_some() && replace {
                     if file_type == FileType::Mpeg
                         && file.tag(TagType::Ape).is_some()
-                        && secondary_ape_cover(&tmp)?
+                        && let Some(new) = art
+                        && secondary_ape_cover(&tmp, new.data())?
                     {
-                        return Err(Error::Tags(
-                            "the MP3's APE tag has a cover of its own, which can't be replaced safely, so it wasn't changed".into(),
-                        ));
+                        return Err(Error::Tags(format!(
+                            "{}: the MP3's APE tag has a cover of its own, which can't be replaced safely, so it wasn't changed",
+                            src.display()
+                        )));
                     }
                     // Untyped pictures go too: players show them as the cover.
                     // Back covers, booklets and the like stay.
@@ -1593,14 +1611,23 @@ mod tests {
         ape.insert(item("Ripper", ItemValue::Text("kept".into())));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
         let new = cover(8);
-        let refused = copy_with_tags(&src, &dest, &[], Some(&new), true);
-        assert!(
-            refused
-                .unwrap_err()
-                .to_string()
-                .contains("APE tag has a cover")
-        );
+        let refused = copy_with_tags(&src, &dest, &[], Some(&new), true)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("APE tag has a cover"), "{refused}");
+        assert!(refused.contains("in.mp3"), "{refused}");
         assert!(!dest.exists());
+        // One that's empty, or already the new image, has nothing to replace.
+        let mut same = b"front.png\0".to_vec();
+        same.extend_from_slice(new.data());
+        for front in [b"front.jpg\0".to_vec(), same] {
+            let mut ape = ApeTag::default();
+            ape.insert(item("Cover Art (Front)", ItemValue::Binary(front)));
+            ape.save_to_path(&src, WriteOptions::default()).unwrap();
+            assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
+            assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
+            fs::remove_file(&dest).unwrap();
+        }
         // An APE tag with no cover (ReplayGain, say) doesn't stand in the
         // way, and stays as it was.
         let mut ape = ApeTag::default();
@@ -2038,6 +2065,23 @@ mod tests {
         let (_, items) = vorbis(&path("edit.flac"));
         assert!(has(&items, "TRACKNUMBER", "1"));
         assert!(!items.iter().any(|(k, _)| k == "TRACKNUM"), "{items:?}");
+        // Next to a number that isn't one, the old name stays.
+        for (n, canonical) in ["TRACKNUMBER=A1", "TRACKNUMBER="].iter().enumerate() {
+            flac_with_comments(
+                &path(&format!("vinyl{n}.flac")),
+                &["TITLE=Song", "TRACKNUM=2", *canonical],
+            );
+            copy_with_tags(
+                &path(&format!("vinyl{n}.flac")),
+                &path(&format!("vinyl{n}-out.flac")),
+                &genre,
+                None,
+                false,
+            )
+            .unwrap();
+            let (_, items) = vorbis(&path(&format!("vinyl{n}-out.flac")));
+            assert!(has(&items, "TRACKNUM", "2"), "{canonical}: {items:?}");
+        }
         // Cleared: gone under both names.
         let clear = [("track_number", String::new())];
         copy_with_tags(&path("in.flac"), &path("clear.flac"), &clear, None, false).unwrap();
