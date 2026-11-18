@@ -58,13 +58,15 @@ pub struct TrackTags {
 /// a file gives changes, so the next scan reads again the files
 /// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
 /// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
-/// for FLACs with an ID3v2 tag, which 1 left out. 3: a FLAC or Ogg file's
-/// vendor string isn't its encoder (see [`drop_vendor_encoder`]).
-pub const READER: u32 = 3;
+/// for FLACs with an ID3v2 tag, which 1 left out. 4: a FLAC or Ogg file's
+/// vendor string isn't its encoder (see [`drop_vendor_encoder`]); 3 said so
+/// too, but named no file to read again.
+pub const READER: u32 = 4;
 
 /// Whether what reading `path` gives has changed since reader `since`: for
 /// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
-/// one, or can't be opened to tell; since 2); Ogg files can't.
+/// one, or can't be opened to tell; since 2); for FLAC and Ogg files, whose
+/// Vorbis comments have a vendor string, since 4.
 pub fn reader_changed(path: &Path, since: u32) -> bool {
     let ext = path
         .extension()
@@ -72,15 +74,8 @@ pub fn reader_changed(path: &Path, since: u32) -> bool {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     match ext.as_str() {
-        "ogg" | "oga" | "opus" | "spx" => false,
-        "flac" => {
-            use std::io::Read;
-            let mut head = [0u8; 3];
-            since < 2
-                && fs::File::open(path)
-                    .and_then(|mut f| f.read_exact(&mut head))
-                    .map_or(true, |()| &head == b"ID3")
-        }
+        "ogg" | "oga" | "opus" | "spx" | "flac" if since < 4 => true,
+        "ogg" | "oga" | "opus" | "spx" | "flac" => false,
         _ => since < 1,
     }
 }
@@ -3798,18 +3793,19 @@ mod tests {
 
     #[test]
     fn files_read_again_for_a_new_reader_are_those_it_reads_differently() {
-        // Since reader 0: MP3s and M4As, not Ogg; a FLAC only with ID3v2
-        // (or if it can't be opened to tell).
+        // Since reader 0: MP3s and M4As (ID3v2 descriptions), and FLAC and
+        // Ogg (vendor strings).
         assert!(reader_changed(Path::new("/m/a.mp3"), 0));
         assert!(reader_changed(Path::new("/m/a.M4A"), 0));
-        assert!(!reader_changed(Path::new("/m/a.Opus"), 0));
-        // A path under a file can't be opened, wherever this runs.
-        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml/missing.flac");
-        assert!(reader_changed(&missing, 0));
-        // Since 1: only such FLACs.
-        assert!(!reader_changed(Path::new("/m/a.mp3"), 1));
-        assert!(reader_changed(&missing, 1));
-        assert!(!reader_changed(&missing, READER));
+        assert!(reader_changed(Path::new("/m/a.Opus"), 0));
+        // Since 1, 2 and 3: FLAC and Ogg files, every one.
+        for since in 1..=3 {
+            assert!(!reader_changed(Path::new("/m/a.mp3"), since));
+            assert!(reader_changed(Path::new("/m/a.flac"), since));
+            assert!(reader_changed(Path::new("/m/a.ogg"), since));
+        }
+        assert!(!reader_changed(Path::new("/m/a.flac"), READER));
+        assert!(!reader_changed(Path::new("/m/a.mp3"), READER));
     }
 
     #[test]
