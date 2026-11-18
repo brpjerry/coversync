@@ -1250,10 +1250,14 @@ fn read_whole(typed: &str, read: &Timestamp) -> bool {
     // A bare T only where an hour could follow (2010-08-25T, or a padded
     // 2024-06-3 T): with 00 after it, lofty reads that hour and nothing
     // more. Not after a month (2024-06-T), nor after an hour (T12T).
+    // (No hour read before it, and no longer than a whole date and its T,
+    // so only that short a string is copied.)
     if body.ends_with('T')
-        && !format!("{body}00")
-            .parse::<Timestamp>()
-            .is_ok_and(|t| t.hour == Some(0) && t.minute.is_none())
+        && !(read.hour.is_none()
+            && body.len() <= "YYYY-MM-DDT".len()
+            && format!("{body}00")
+                .parse::<Timestamp>()
+                .is_ok_and(|t| t.hour == Some(0) && t.minute.is_none()))
     {
         return false;
     }
@@ -3455,6 +3459,7 @@ mod tests {
         "2024-06-03T12:Z",
         "2024-06-T",
         "2024-06-03T12T",
+        "2024-06-03T00T",
     ];
 
     #[test]
