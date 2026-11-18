@@ -700,7 +700,14 @@
 		| { kind: 'notice'; id: string; previous: string | null; version?: string | null }
 		| { kind: 'resync' }
 		| { kind: 'moved'; from: string; to: string }
-		| { kind: 'reload'; sheet: string; opening: number }
+		| {
+				kind: 'reload';
+				sheet: string;
+				opening: number;
+				keepDraft: boolean;
+				/** For a retry: the album the editor that asked showed. */
+				from?: Detail;
+		  }
 		| {
 				kind: 'refused';
 				saved: string;
@@ -792,7 +799,7 @@
 						await goto(page.url.href, { state: { album: job.to }, shallow: true, replace: true });
 					return true;
 				case 'reload':
-					await reload(job.sheet, job.opening);
+					await reload(job.sheet, job.opening, job.keepDraft, job.from);
 					return true;
 				case 'refused':
 					refused(job);
@@ -869,19 +876,32 @@
 		return true;
 	}
 
-	/** Reload, pressed on the sheet opened as `sheet`: drop its edits, and show the album as it is now. */
-	async function reload(sheet: string, opening: number) {
+	/**
+	 * Show the album of the sheet opened as `sheet` as it is now: Reload drops
+	 * its edits; the tag editor's Try again (`keepDraft`) keeps the kept ones,
+	 * if the editor that asked (showing the album `from`) is still the one shown.
+	 */
+	async function reload(sheet: string, opening: number, keepDraft: boolean, from?: Detail) {
 		const h = holding;
 		const before = saves;
-		// The sheet it was asked on, still held, or it's moot: closed (or
-		// reopened) since, or saved over.
+		// A retry from an editor since replaced (a second Try again, queued
+		// behind the first) would put the kept edits back over new ones.
+		if (keepDraft && from !== undefined && (h ? h.detail : detail) !== from) return;
+		// The sheet it was asked on, still held (or, for the editor's Try
+		// again, open), or it's moot: closed (or reopened) since, or saved over.
 		const current = () => openId === sheet && openings === opening && holding === h;
-		if (!h || !current()) return;
-		const to = h.next ?? sheet;
+		if ((!h && !keepDraft) || !current()) return;
+		const to = h?.next ?? sheet;
 		const [fresh] = await Promise.all([fetchAlbum(to), loadAlbums()]);
 		if (!current() || saves !== before) return;
 		if (fresh === undefined) {
 			toast('Couldn’t reload the album. Try again in a moment.', 'error');
+			return;
+		}
+		if (fresh === null && keepDraft) {
+			// The editor's Try again: its edits stay, with the sheet, for when
+			// the album's new id comes (or to be closed).
+			toast('Couldn’t find this album: it may have been renamed or removed elsewhere.', 'error');
 			return;
 		}
 		if (fresh === null) {
@@ -890,12 +910,17 @@
 			held = null;
 			return close();
 		}
-		// A new copy of the album: the editor starts over, without the edits.
+		// A new copy of the album: the editor starts over, without the edits,
+		// or with the kept ones on top.
 		detail = fresh;
-		held =
-			to === sheet
-				? null
-				: { from: sheet, next: to, album: h.album, detail, changed: false, kept: null };
+		const kept = keepDraft ? (h?.kept ?? null) : null;
+		// Still reviewing the kept edits: the notice stays (tracks they lost, Reload).
+		if (kept) held = { from: to, next: null, album: fresh, detail, changed: true, kept };
+		else
+			held =
+				to === sheet || !h
+					? null
+					: { from: sheet, next: to, album: h.album, detail, changed: false, kept: null };
 		if (openId !== to)
 			await goto(page.url.href, { state: { album: to }, shallow: true, replace: true });
 	}
@@ -951,9 +976,13 @@
 		if (holding?.kept) held = { ...holding, kept: null };
 	}
 
-	/** Drop the held sheet's unsaved edits and show its album as it is now. */
-	function reloadHeld() {
-		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings });
+	/**
+	 * Show the open sheet's album as it is now: dropping the held sheet's
+	 * unsaved edits (Reload), or keeping them (`keepDraft`: the tag editor's
+	 * Try again after the album changed while its tags were read).
+	 */
+	function reloadHeld(keepDraft = false, from?: Detail) {
+		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings, keepDraft, from });
 	}
 
 	/** An album was edited, here or elsewhere: show it as it is now. */

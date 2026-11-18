@@ -1092,7 +1092,8 @@ def auth_flow(d, out, tag):
     d.wait("return !!document.querySelector('.tracks li')")
     time.sleep(1.2)
     d.click(".mode button:nth-child(3)")
-    d.wait("return !!document.querySelector('.editor')")
+    # The editor reads the album's tags first.
+    d.wait("return !!document.querySelector('.editor .album-grid')")
     field = ".album-grid .field:nth-child(4) input"
     d.type(field, " (edited)")
     time.sleep(0.5)
@@ -1475,7 +1476,8 @@ def main():
         d.shot(out / f"3-playing-{tag}.png")
 
         d.click(".mode button:nth-child(3)")
-        d.wait("return !!document.querySelector('.editor')")
+        # The editor reads the album's tags first.
+        d.wait("return !!document.querySelector('.editor .album-grid')")
         d.js("const i = document.querySelector('.album-grid .field:nth-child(4) input'); i.focus();")
         d.type(".album-grid .field:nth-child(4) input", " (edited)")
         d.type(".tr:nth-child(2) .col-title", " — remix")

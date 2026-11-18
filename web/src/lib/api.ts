@@ -109,8 +109,10 @@ export type TagField =
 export type TagEdit = Partial<Record<TagField, string>>;
 
 export interface TagWrite {
-	album: TagEdit;
-	tracks: Record<number, TagEdit>;
+	album?: TagEdit;
+	tracks?: Record<number, TagEdit>;
+	/** Tag kinds (catalog ids) to set, by track id; '' removes one. */
+	kinds?: Record<number, Record<string, string>>;
 	/** The album's version the edits were made on: if it has changed since, nothing is saved (see TagConflict). */
 	version?: string;
 	/**
@@ -118,6 +120,20 @@ export interface TagWrite {
 	 * has a new id since (a new title gives it one).
 	 */
 	base_tracks?: Pick<Track, 'id' | 'rel_path'>[];
+}
+
+/** Every track's tags, as the tag editor shows them. */
+export interface AlbumTags {
+	/** The album's version as they were read. */
+	version: string;
+	tracks: {
+		id: number;
+		rel_path: string;
+		/** Each tag kind the track has, by catalog id; several values joined by the separator. */
+		values: Record<string, string>;
+		/** Tags no kind names, as [key, value] in the file's own naming: kept, not editable. */
+		other: [string, string][];
+	}[];
 }
 
 export interface TagWriteResult {
@@ -925,6 +941,7 @@ export const api = {
 	/** `keepalive`: sent even as the page goes away. */
 	cancelUpload: (id: string, keepalive = false) =>
 		request<void>(`/api/uploads/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
+	albumTags: (id: string) => request<AlbumTags>(`/api/albums/${id}/tags`),
 	/** Throws TagConflict when `body.version` is no longer the album's. */
 	writeTags: (id: string, body: TagWrite) =>
 		request<TagWriteResult>(`/api/albums/${id}/tags`, {

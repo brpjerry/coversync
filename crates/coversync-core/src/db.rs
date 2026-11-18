@@ -484,6 +484,21 @@ fn new_prefix() -> i64 {
     1 + (h.finish() % ((1 << 20) - 1)) as i64
 }
 
+/// A Library index started here (new, or in memory) is filled by this
+/// build's tag reader (see [`Library::tag_reader`]); rows carried into a
+/// new one come from an in-memory one, also started here.
+fn start_reader(conn: &Connection, schema: &str) -> Result<()> {
+    put_setting(conn, schema, TAG_READER, &crate::tags::READER)
+}
+
+/// Where `collection`'s tag reader marker is kept.
+fn reader_schema(collection: Collection) -> &'static str {
+    match collection {
+        Collection::Inbox => "main",
+        Collection::Library => "lib",
+    }
+}
+
 /// Index `dir` (or nothing, with no `dir`) in an empty in-memory database.
 /// It gets a Library id of its own, like the track id prefix: its rows and
 /// counter start afresh, so what a client knew from before doesn't apply.
@@ -492,6 +507,7 @@ fn attach_memory(conn: &Connection, dir: Option<&Path>, problem: Option<&str>) -
     conn.execute("ATTACH DATABASE ':memory:' AS lib", [])?;
     conn.execute_batch(&library_schema("lib"))?;
     migrate_library(conn, "lib")?;
+    start_reader(conn, "lib")?;
     conn.execute("DELETE FROM temp.lib_root", [])?;
     if let Some(dir) = dir {
         conn.execute(
@@ -534,6 +550,7 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         }
         let prefix = carry.unwrap_or_else(new_prefix);
         put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
+        start_reader(conn, "lib_new")?;
         if carry.is_some() {
             // The index carries on, as clients may have seen it: the same
             // rows, generations and removals, under the same id and counter,
@@ -856,6 +873,9 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     }
     Ok(())
 }
+
+/// The setting holding [`Library::tag_reader`].
+const TAG_READER: &str = "tag_reader";
 
 /// A setting stored in `schema` ("main" or "lib"). A value this build can't
 /// parse (say, from a newer one) reads as unset.
@@ -1920,6 +1940,16 @@ impl Library {
         if lib_wrote {
             put_setting(&tx, "lib", GENERATION, &lib_next)?;
         }
+        // Rows this reader wrote into an index a newer one filled: its
+        // marker comes down to this reader, so the newer one reads them again.
+        for (wrote, schema) in [(inbox_wrote, "main"), (lib_wrote, "lib")] {
+            if wrote
+                && get_setting::<u32>(&tx, schema, TAG_READER)?
+                    .is_some_and(|r| r > crate::tags::READER)
+            {
+                put_setting(&tx, schema, TAG_READER, &crate::tags::READER)?;
+            }
+        }
         tx.commit()?;
         if lib_wrote {
             remember_library(&conn);
@@ -2310,6 +2340,18 @@ impl Library {
             )
             .optional()?;
         Ok(row.map(|(source, version)| (source.as_deref().and_then(CoverSource::decode), version)))
+    }
+
+    /// The tag reader `collection`'s index was last filled by (see
+    /// [`crate::tags::READER`]); 0 before one was kept. The Inbox's is kept
+    /// in the local database, the Library's in its own (which can be
+    /// another's, a folder switched to; one started here starts current).
+    pub fn tag_reader(&self, collection: Collection) -> Result<u32> {
+        Ok(get_setting(&self.conn(), reader_schema(collection), TAG_READER)?.unwrap_or(0))
+    }
+
+    pub fn set_tag_reader(&self, collection: Collection, reader: u32) -> Result<()> {
+        put_setting(&self.conn(), reader_schema(collection), TAG_READER, &reader)
     }
 
     /// A setting of this installation, kept in the local database.

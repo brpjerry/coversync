@@ -1,6 +1,6 @@
 //! Reading and writing audio file tags through lofty.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -11,7 +11,8 @@ use lofty::picture::{Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
-use lofty::tag::{ItemValue, SplitTag, Tag, TagType};
+use lofty::tag::{ItemValue, SplitTag, Tag, TagItem, TagType};
+use serde::Serialize;
 
 use crate::model::TagEdit;
 use crate::{Error, Result, rules};
@@ -50,6 +51,36 @@ pub struct TrackTags {
     pub tag_keys: Vec<&'static str>,
     /// Text value of each catalog kind the file has.
     pub values: HashMap<&'static str, String>,
+}
+
+/// The tag reader's version, kept with each index: bumped when what reading
+/// a file gives changes, so the next scan reads again the files
+/// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
+/// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
+/// for FLACs with an ID3v2 tag, which 1 left out.
+pub const READER: u32 = 2;
+
+/// Whether what reading `path` gives has changed since reader `since`: for
+/// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
+/// one, or can't be opened to tell; since 2); Ogg files can't.
+pub fn reader_changed(path: &Path, since: u32) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "ogg" | "oga" | "opus" | "spx" => false,
+        "flac" => {
+            use std::io::Read;
+            let mut head = [0u8; 3];
+            since < 2
+                && fs::File::open(path)
+                    .and_then(|mut f| f.read_exact(&mut head))
+                    .map_or(true, |()| &head == b"ID3")
+        }
+        _ => since < 1,
+    }
 }
 
 fn tag_err(e: impl std::fmt::Display) -> Error {
@@ -168,96 +199,45 @@ fn parse_number(field: &str, value: &str) -> Result<Option<u32>> {
 
 /// Check an edit's numeric and date fields without touching any file.
 pub fn validate(edit: &TagEdit) -> Result<()> {
-    if let Some(v) = &edit.track_no {
-        parse_number("track", v)?;
-    }
-    if let Some(v) = &edit.disc_no {
-        parse_number("disc", v)?;
-    }
-    if let Some(v) = edit
-        .year
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        v.parse::<Timestamp>()
-            .map_err(|_| Error::Tags(format!("year: '{v}' is not a date")))?;
+    for (id, value) in edit_values(edit) {
+        validate_kind(id, &value)?;
     }
     Ok(())
 }
 
-fn apply(tag: &mut Tag, edit: &TagEdit) -> Result<()> {
-    fn set_text(
-        value: &Option<String>,
-        tag: &mut Tag,
-        set: fn(&mut Tag, String),
-        remove: fn(&mut Tag),
-    ) {
-        if let Some(v) = value {
-            let v = v.trim();
-            if v.is_empty() {
-                remove(tag)
-            } else {
-                set(tag, v.to_string())
-            }
+/// `edit`'s fields as tag kinds (catalog ids) with their values: written
+/// the way any kind is ([`apply_kinds`]).
+fn edit_values(edit: &TagEdit) -> Vec<(&'static str, String)> {
+    [
+        ("title", &edit.title),
+        ("artist", &edit.artist),
+        ("album", &edit.album),
+        ("album_artist", &edit.album_artist),
+        ("track_number", &edit.track_no),
+        ("disc_number", &edit.disc_no),
+        ("date", &edit.year),
+        ("genre", &edit.genre),
+    ]
+    .into_iter()
+    .filter_map(|(id, value)| value.clone().map(|v| (id, v)))
+    .collect()
+}
+
+/// `edit`'s fields and `kinds` as one edit: a kind given both ways takes
+/// its value from `kinds` (applied after the fields), so only what's
+/// written has to fit the format.
+fn merged<'a>(edit: &TagEdit, kinds: &[(&'a str, String)]) -> Result<Vec<(&'a str, String)>> {
+    let mut all: Vec<(&'a str, String)> = edit_values(edit).into_iter().collect();
+    for (id, value) in kinds {
+        let id = rules::kind(id).map_or(*id, |k| k.id);
+        // A field given another way still had to be one.
+        for (_, displaced) in all.iter().filter(|(x, _)| *x == id) {
+            validate_kind(id, displaced)?;
         }
+        all.retain(|(x, _)| *x != id);
+        all.push((id, value.clone()));
     }
-    set_text(
-        &edit.title,
-        tag,
-        |t, v| t.set_title(v),
-        |t| t.remove_title(),
-    );
-    set_text(
-        &edit.artist,
-        tag,
-        |t, v| t.set_artist(v),
-        |t| t.remove_artist(),
-    );
-    set_text(
-        &edit.album,
-        tag,
-        |t, v| t.set_album(v),
-        |t| t.remove_album(),
-    );
-    set_text(
-        &edit.genre,
-        tag,
-        |t, v| t.set_genre(v),
-        |t| t.remove_genre(),
-    );
-    set_text(
-        &edit.album_artist,
-        tag,
-        |t, v| {
-            t.insert_text(ItemKey::AlbumArtist, v);
-        },
-        |t| t.remove_key(ItemKey::AlbumArtist),
-    );
-    if let Some(v) = &edit.track_no {
-        match parse_number("track", v)? {
-            Some(n) => tag.set_track(n),
-            None => tag.remove_track(),
-        }
-    }
-    if let Some(v) = &edit.disc_no {
-        match parse_number("disc", v)? {
-            Some(n) => tag.set_disk(n),
-            None => tag.remove_disk(),
-        }
-    }
-    if let Some(v) = &edit.year {
-        let v = v.trim();
-        if v.is_empty() {
-            tag.remove_date();
-        } else {
-            let ts: Timestamp = v
-                .parse()
-                .map_err(|_| Error::Tags(format!("year: '{v}' is not a date")))?;
-            tag.set_date(ts);
-        }
-    }
-    Ok(())
+    Ok(all)
 }
 
 /// The Vorbis comments of a FLAC or Ogg file that lofty's generic [`Tag`]
@@ -287,6 +267,12 @@ struct VorbisRest {
 /// whose primary tag isn't Vorbis comments.
 fn vorbis_comments(path: &Path, file_type: FileType) -> Result<Option<(VorbisComments, bool)>> {
     use lofty::file::AudioFile;
+    if !matches!(
+        file_type,
+        FileType::Flac | FileType::Vorbis | FileType::Opus | FileType::Speex
+    ) {
+        return Ok(None);
+    }
     // Without implicit conversions: splitting TRACKNUMBER=1/10 removes a
     // TOTALTRACKS alias in a way that reorders the other comments.
     let options = ParseOptions::new()
@@ -555,14 +541,22 @@ fn unwritable(
     children.iter().find_map(|f| unwritable(f, true, &mut seen))
 }
 
-/// Write `tag`, a primary tag other than Vorbis comments after an edit,
-/// through lofty's owned conversion: unlike its writer for a borrowed
+/// A tag in its own format, ready to write.
+enum Native {
+    Id3v2(lofty::id3::v2::Id3v2Tag),
+    Ilst(lofty::mp4::Ilst),
+    Ape(lofty::ape::ApeTag),
+    Other(Tag),
+}
+
+/// `tag`, a primary tag other than Vorbis comments after an edit, in its
+/// format as it will be written, through lofty's owned conversion
+/// (refused, as the save is, where it can't be): unlike its writer for a borrowed
 /// generic tag, it puts back what the generic tag couldn't hold (custom
 /// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
 /// frames) and joins repeated values as the format wants.
-fn save_owned(path: &Path, tag: Tag) -> Result<()> {
-    let options = WriteOptions::default();
-    match tag.tag_type() {
+fn native(tag: Tag) -> Result<Native> {
+    Ok(match tag.tag_type() {
         TagType::Id3v2 => {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
             // A frame lofty wouldn't write back as it read it: not saved
@@ -589,9 +583,9 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
             // can't write CRC or restrictions back readably, and
             // unsynchronisation would decode its frames twice.
             id3.set_flags(lofty::id3::v2::Id3v2TagFlags::default());
-            id3.save_to_path(path, options)
+            Native::Id3v2(id3)
         }
-        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag).save_to_path(path, options),
+        TagType::Mp4Ilst => Native::Ilst(lofty::mp4::Ilst::from(tag)),
         TagType::Ape => {
             // Number pairs and the compilation flag as written: the
             // conversion would read them as numbers (Track=A1 lost, 01/09
@@ -645,12 +639,323 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
             for value in compilation {
                 ape.push(lofty::ape::ApeItem::new("Compilation".into(), value).map_err(tag_err)?);
             }
-            ape.save_to_path(path, options)
+            Native::Ape(ape)
         }
         // RIFF INFO, AIFF text chunks: as lofty writes them.
-        _ => tag.save_to_path(path, options),
+        _ => Native::Other(tag),
+    })
+}
+
+/// Write `tag`, a primary tag other than Vorbis comments after an edit, as
+/// [`native`] makes it.
+fn save_owned(path: &Path, tag: Tag) -> Result<()> {
+    let options = WriteOptions::default();
+    match native(tag)? {
+        Native::Id3v2(t) => t.save_to_path(path, options),
+        Native::Ilst(t) => t.save_to_path(path, options),
+        Native::Ape(t) => t.save_to_path(path, options),
+        Native::Other(t) => t.save_to_path(path, options),
     }
     .map_err(tag_err)
+}
+
+/// A tag block's items, as (key, value) text in the file's own naming.
+type Block = (TagType, Vec<(String, String)>);
+
+/// What each of the file's tag blocks holds that lofty's generic [`Tag`]
+/// has no key for, as (key, value) text in the file's own naming; binary
+/// ones by their size. For showing: an edit keeps them (see [`save`]).
+/// `comments`: a FLAC or Ogg file's Vorbis comments, as written; `blocks`:
+/// the tag blocks the file has (a FLAC is read again only for an ID3v2 one).
+fn unmapped_items(
+    path: &Path,
+    file_type: FileType,
+    comments: Option<VorbisComments>,
+    blocks: &[TagType],
+) -> Result<Vec<Block>> {
+    use lofty::file::AudioFile;
+    use lofty::id3::v2::{Frame, Id3v2Tag};
+    use lofty::mp4::{AtomData, AtomIdent};
+    // As the writer reads them (ID3v2.3's TYER and TDAT as the date, an MP4
+    // gnre atom as the genre), so what it converts isn't listed again; FLAC
+    // and Ogg comments are read as written.
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    // Opened only for a native read.
+    macro_rules! read {
+        ($file:ty) => {
+            <$file>::read_from(&mut std::io::BufReader::new(fs::File::open(path)?), options)
+                .map_err(tag_err)?
+        };
+    }
+    let bytes = |n: usize| format!("({n} bytes of data)");
+    let id3v2 = |tag: &Id3v2Tag| -> Block {
+        let rest = tag.clone().split_tag().0;
+        let items = (&*rest)
+            .into_iter()
+            .map(|frame| {
+                let id = frame.id_str().to_string();
+                match frame {
+                    Frame::Text(f) => (id, f.value.to_string()),
+                    Frame::UserText(f) => {
+                        (format!("{id}:{}", f.description), f.content.to_string())
+                    }
+                    Frame::Comment(f) => (format!("{id}:{}", f.description), f.content.to_string()),
+                    Frame::UnsynchronizedText(f) => {
+                        (format!("{id}:{}", f.description), f.content.to_string())
+                    }
+                    Frame::Url(f) => (id, f.url().to_string()),
+                    Frame::UserUrl(f) => (format!("{id}:{}", f.description), f.content.to_string()),
+                    Frame::UniqueFileIdentifier(f) => {
+                        (format!("{id}:{}", f.owner), printable(&f.identifier))
+                    }
+                    Frame::Private(f) => (format!("{id}:{}", f.owner), bytes(f.private_data.len())),
+                    // Involved people (TIPL, TMCL) lofty has no role for.
+                    Frame::KeyValue(f) => (
+                        id,
+                        f.key_value_pairs
+                            .iter()
+                            .map(|(role, who)| format!("{role}: {who}"))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                    Frame::Binary(f) => (id, bytes(f.data.len())),
+                    _ => (id, "(data)".to_string()),
+                }
+            })
+            .collect();
+        (TagType::Id3v2, items)
+    };
+    let ape = |tag: &lofty::ape::ApeTag| -> Block {
+        let rest = tag.clone().split_tag().0;
+        let items = (&*rest)
+            .into_iter()
+            .map(|item| (item.key().to_string(), value_text(item.value())))
+            .collect();
+        (TagType::Ape, items)
+    };
+    let vorbis = |tag: VorbisComments| -> Block {
+        // As read: ratings lofty can't read included.
+        let items = VorbisComments::from(tag.split_tag().0)
+            .items()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        (TagType::VorbisComments, items)
+    };
+    let mut out = Vec::new();
+    match file_type {
+        FileType::Flac => {
+            out.extend(comments.map(vorbis));
+            // Only a FLAC with an ID3v2 tag is read again for it.
+            if blocks.contains(&TagType::Id3v2) {
+                out.extend(read!(lofty::flac::FlacFile).id3v2().map(id3v2));
+            }
+        }
+        FileType::Vorbis | FileType::Opus | FileType::Speex => out.extend(comments.map(vorbis)),
+        FileType::Mpeg => {
+            let mpeg = read!(lofty::mpeg::MpegFile);
+            out.extend(mpeg.id3v2().map(id3v2));
+            out.extend(mpeg.ape().map(ape));
+        }
+        FileType::Aac => out.extend(read!(lofty::aac::AacFile).id3v2().map(id3v2)),
+        FileType::Aiff => out.extend(read!(lofty::iff::aiff::AiffFile).id3v2().map(id3v2)),
+        FileType::Wav => {
+            let wav = read!(lofty::iff::wav::WavFile);
+            out.extend(wav.id3v2().map(id3v2));
+            if let Some(info) = wav.riff_info() {
+                let items = info
+                    .into_iter()
+                    .filter(|(k, _)| ItemKey::from_key(TagType::RiffInfo, k).is_none())
+                    .cloned()
+                    .collect();
+                out.push((TagType::RiffInfo, items));
+            }
+        }
+        FileType::Ape => {
+            let file = read!(lofty::ape::ApeFile);
+            out.extend(file.ape().map(ape));
+            out.extend(file.id3v2().map(id3v2));
+        }
+        FileType::WavPack => out.extend(read!(lofty::wavpack::WavPackFile).ape().map(ape)),
+        FileType::Mpc => {
+            let file = read!(lofty::musepack::MpcFile);
+            out.extend(file.ape().map(ape));
+            out.extend(file.id3v2().map(id3v2));
+        }
+        FileType::Mp4 => {
+            if let Some(ilst) = read!(lofty::mp4::Mp4File).ilst() {
+                let rest = ilst.clone().split_tag().0;
+                let items = (&*rest)
+                    .into_iter()
+                    .map(|atom| {
+                        let key = match atom.ident() {
+                            // Byte codes: ©nam's first byte is 0xA9, not UTF-8.
+                            AtomIdent::Fourcc(code) => code.iter().map(|b| *b as char).collect(),
+                            AtomIdent::Freeform { mean, name } => format!("----:{mean}:{name}"),
+                        };
+                        let values: Vec<String> = atom
+                            .data()
+                            .map(|d| match d {
+                                AtomData::UTF8(t) | AtomData::UTF16(t) => t.clone(),
+                                AtomData::SignedInteger(n) => n.to_string(),
+                                AtomData::UnsignedInteger(n) => n.to_string(),
+                                AtomData::Bool(b) => b.to_string(),
+                                AtomData::Picture(p) => bytes(p.data().len()),
+                                AtomData::Unknown { data, .. } => bytes(data.len()),
+                            })
+                            .collect();
+                        (key, values.join("; "))
+                    })
+                    .collect();
+                out.push((TagType::Mp4Ilst, items));
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// Bytes as text if they are printable UTF-8, else as hex.
+fn printable(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.chars().any(char::is_control) => text.to_string(),
+        _ => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
+/// An item's value as text; binary ones by their size.
+fn value_text(value: &ItemValue) -> String {
+    match value {
+        ItemValue::Text(t) | ItemValue::Locator(t) => t.clone(),
+        ItemValue::Binary(b) => format!("({} bytes of data)", b.len()),
+    }
+}
+
+/// A tag block's name, before its items in the read-only list.
+fn block_name(t: TagType) -> &'static str {
+    match t {
+        TagType::Id3v2 => "ID3v2",
+        TagType::Id3v1 => "ID3v1",
+        TagType::Ape => "APE",
+        TagType::VorbisComments => "Vorbis comments",
+        TagType::Mp4Ilst => "MP4",
+        TagType::RiffInfo => "RIFF INFO",
+        TagType::AiffText => "AIFF text",
+        _ => "Other tag",
+    }
+}
+
+/// A file's tags as the tag editor shows them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FileTags {
+    /// Every catalog kind the file has, by id; one held several times has
+    /// its values joined by the Library's separator, as an import writes them.
+    pub values: BTreeMap<&'static str, String>,
+    /// Everything else, as (key, value) in the file's own naming, which an
+    /// edit keeps but can't change: tags no kind names, ones held as data or
+    /// with a description (`COMM:iTunNORM`), and the file's other tag blocks
+    /// (ID3v2 in a FLAC, RIFF INFO beside ID3v2), each key after its
+    /// block's name (`RIFF INFO · IXYZ`).
+    pub other: Vec<(String, String)>,
+}
+
+/// The file's tags for the tag editor (see [`FileTags`]). Pictures and the
+/// audio stream aren't read.
+pub fn file_tags(path: &Path, separator: &str) -> Result<FileTags> {
+    let file = Probe::open(path)
+        .map_err(tag_err)?
+        .options(
+            ParseOptions::new()
+                .read_properties(false)
+                .read_cover_art(false),
+        )
+        .read()
+        .map_err(tag_err)?;
+    let mut out = FileTags::default();
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(out);
+    };
+    let shown = tag.tag_type();
+    let editable = |i: &TagItem| !described(i) && !matches!(i.value(), ItemValue::Binary(_));
+    for kind in rules::CATALOG {
+        let mut values: Vec<&str> = Vec::new();
+        for key in kind.keys {
+            let earlier = values.len();
+            for item in tag.get_items(*key).filter(|i| editable(i)) {
+                let (ItemValue::Text(v) | ItemValue::Locator(v)) = item.value() else {
+                    continue;
+                };
+                let v = v.trim();
+                // Under another of the kind's names too: once.
+                if !v.is_empty() && !values[..earlier].contains(&v) {
+                    values.push(v);
+                }
+            }
+        }
+        if !values.is_empty() {
+            out.values.insert(kind.id, values.join(separator));
+        }
+    }
+    // FLAC and Ogg comments as written, read once.
+    let comments = vorbis_comments(path, file.file_type())?.map(|(raw, _)| raw);
+    // Lofty reads a Vorbis vendor string as the encoder when there's no
+    // ENCODER comment: that isn't a tag the file has (an edit keeps the
+    // vendor string apart).
+    if shown == TagType::VorbisComments
+        && !comments
+            .as_ref()
+            .is_some_and(|raw| raw.get("ENCODER").is_some())
+    {
+        out.values.remove("encoder");
+    }
+    let covered: Vec<ItemKey> = rules::CATALOG
+        .iter()
+        .flat_map(|k| k.keys.iter().copied())
+        .collect();
+    let native = |t: TagType, i: &TagItem| {
+        let key = i
+            .key()
+            .map_key(t)
+            .map_or_else(|| format!("{:?}", i.key()), str::to_string);
+        if described(i) {
+            format!("{key}:{}", i.description())
+        } else {
+            key
+        }
+    };
+    // What lofty knows by a key no kind covers, or holds as data or with a
+    // description…
+    for item in tag
+        .items()
+        .filter(|i| !covered.contains(&i.key()) || !editable(i))
+    {
+        out.other
+            .push((native(shown, item), value_text(item.value())));
+    }
+    // …and what it has no key for.
+    let present: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
+    let mut blocks = unmapped_items(path, file.file_type(), comments, &present)?;
+    if let Some(at) = blocks.iter().position(|(t, _)| *t == shown) {
+        out.other.extend(blocks.remove(at).1);
+    }
+    // The file's other tag blocks, whole.
+    for block in file.tags().iter().filter(|t| t.tag_type() != shown) {
+        let t = block.tag_type();
+        let name = block_name(t);
+        for item in block.items() {
+            out.other.push((
+                format!("{name} · {}", native(t, item)),
+                value_text(item.value()),
+            ));
+        }
+        if let Some(at) = blocks.iter().position(|(b, _)| *b == t) {
+            for (key, value) in blocks.remove(at).1 {
+                out.other.push((format!("{name} · {key}"), value));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Save an edit of `file`, read from `path` (`rest`, for Vorbis comments,
@@ -685,24 +990,18 @@ fn save(
 
 /// The tag kinds (catalog ids) `edit` sets or clears.
 fn edit_kinds(edit: &TagEdit) -> Vec<&'static str> {
-    [
-        ("title", &edit.title),
-        ("artist", &edit.artist),
-        ("album", &edit.album),
-        ("album_artist", &edit.album_artist),
-        ("track_number", &edit.track_no),
-        ("disc_number", &edit.disc_no),
-        ("date", &edit.year),
-        ("genre", &edit.genre),
-    ]
-    .into_iter()
-    .filter_map(|(id, value)| value.is_some().then_some(id))
-    .collect()
+    edit_values(edit).into_iter().map(|(id, _)| id).collect()
 }
 
 /// Apply `edit` to the file's primary tag. The change is written to a copy
 /// beside the file and renamed over it, so a failed write leaves the original.
 pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
+    write_with_kinds(path, edit, &[])
+}
+
+/// As [`write`], then set tag kinds (catalog ids) as an import does; an
+/// empty value removes the kind.
+pub fn write_with_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Result<()> {
     // Keep the real extension last: lofty picks the format from it.
     let name = path.file_name().ok_or(Error::NotFound)?.to_string_lossy();
     let tmp = path.with_file_name(format!(".coversync-tmp-{name}"));
@@ -711,8 +1010,10 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
         let mut file = probe(&tmp, true)?;
         let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
-        apply(tag, edit)?;
-        save(&tmp, file, rest, &[], &edit_kinds(edit))?;
+        apply_kinds(tag, &merged(edit, kinds)?)?;
+        let mut edited = edit_kinds(edit);
+        edited.extend(kinds.iter().map(|(id, _)| *id));
+        save(&tmp, file, rest, &[], &edited)?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -907,14 +1208,99 @@ fn values_of(tag: &Tag) -> HashMap<&'static str, String> {
         if let Some(v) = kind
             .keys
             .iter()
-            .filter_map(|k| tag.get_string(*k))
-            .map(str::trim)
+            .flat_map(|k| tag.get_items(*k))
+            .filter(|i| !described(i))
+            .filter_map(|i| match i.value() {
+                ItemValue::Text(t) | ItemValue::Locator(t) => Some(t.trim()),
+                ItemValue::Binary(_) => None,
+            })
             .find(|v| !v.is_empty())
         {
             out.insert(kind.id, v.to_string());
         }
     }
     out
+}
+
+/// Whether `read` (lofty's reading of the date `typed`) has every part of
+/// it: the numbers typed, the year first and then two digits a part where
+/// they run together (20100825), are the ones read, in order.
+fn read_whole(typed: &str, read: &Timestamp) -> bool {
+    // Each part in its range: ID3v2 writes a month 13 but reads it back as
+    // no date at all.
+    let in_range = [
+        read.month.is_none_or(|m| (1..=12).contains(&m)),
+        read.day.is_none_or(|d| (1..=31).contains(&d)),
+        read.hour.is_none_or(|h| h <= 23),
+        read.minute.is_none_or(|m| m <= 59),
+        read.second.is_none_or(|s| s <= 59),
+    ];
+    if in_range.contains(&false) {
+        return false;
+    }
+    // Nothing left unfinished after the last number (2024-06-, or a time cut
+    // short before its Z): a T or a Z may end it, not a separator.
+    // (A space before a Z can pad the last part, as in 2024-6 Z.)
+    let body = typed.trim().trim_end_matches('Z');
+    if body.ends_with(['-', '.', ':'])
+        || (body.ends_with(' ') && !body.trim_end().ends_with(|c: char| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    // A bare T only where an hour could follow (2010-08-25T, or a padded
+    // 2024-06-3 T): with 00 after it, lofty reads that hour and nothing
+    // more. Not after a month (2024-06-T), nor after an hour (T12T).
+    // (No hour read before it, and no longer than a whole date and its T,
+    // so only that short a string is copied.)
+    if body.ends_with('T')
+        && !(read.hour.is_none()
+            && body.len() <= "YYYY-MM-DDT".len()
+            && format!("{body}00")
+                .parse::<Timestamp>()
+                .is_ok_and(|t| t.hour == Some(0) && t.minute.is_none()))
+    {
+        return false;
+    }
+    // Anything but numbers, separators, T and Z (a PM, say) isn't read.
+    if !typed
+        .trim()
+        .chars()
+        .all(|c| c.is_ascii_digit() || "-.: TZ".contains(c))
+    {
+        return false;
+    }
+    let mut typed_parts: Vec<u32> = Vec::new();
+    let runs = typed
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|r| !r.is_empty());
+    for (n, run) in runs.enumerate() {
+        let mut rest = run;
+        if n == 0 {
+            let (year, after) = run.split_at(run.len().min(4));
+            typed_parts.push(year.parse().unwrap_or(u32::MAX));
+            rest = after;
+        } else if run.len() <= 2 {
+            typed_parts.push(run.parse().unwrap_or(u32::MAX));
+            continue;
+        }
+        while !rest.is_empty() {
+            let (part, after) = rest.split_at(rest.len().min(2));
+            typed_parts.push(part.parse().unwrap_or(u32::MAX));
+            rest = after;
+        }
+    }
+    let read_parts: Vec<u32> = [
+        Some(u32::from(read.year)),
+        read.month.map(u32::from),
+        read.day.map(u32::from),
+        read.hour.map(u32::from),
+        read.minute.map(u32::from),
+        read.second.map(u32::from),
+    ]
+    .into_iter()
+    .map_while(|part| part)
+    .collect();
+    typed_parts == read_parts
 }
 
 /// Check a value typed for a tag kind before anything is written.
@@ -929,11 +1315,17 @@ pub fn validate_kind(id: &str, value: &str) -> Result<()> {
             parse_number(label, v)?;
         }
         "date" => {
-            v.parse::<Timestamp>().map_err(|_| {
+            let wrong = || {
                 Error::Tags(format!(
                     "{label}: '{v}' should be a year like 2003, or a date like 2003-04-01"
                 ))
-            })?;
+            };
+            let read = v.parse::<Timestamp>().map_err(|_| wrong())?;
+            // Lofty stops at what it can't read (a time after a space): a
+            // date it reads only part of would lose the rest when written.
+            if !read_whole(v, &read) {
+                return Err(wrong());
+            }
         }
         _ if rules::NOT_EDITABLE.contains(&id) => {
             return Err(Error::Tags(format!("{label} can't be entered as text")));
@@ -943,22 +1335,62 @@ pub fn validate_kind(id: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `item` is an ID3v2 comment or lyrics with a description
+/// (`iTunNORM`, say): a tag of its own, not the field's.
+fn described(item: &TagItem) -> bool {
+    !item.description().is_empty()
+}
+
 /// Set tag kinds (catalog ids) on `tag`; an empty value removes the kind.
+/// A value goes under the name the file has the kind under, or failing
+/// that the first this format holds; one the format would drop on writing
+/// (an MP4 compilation flag of "yes") is refused.
 fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
+    // The kinds given values, to check they're all still there as written.
+    let mut set: Vec<(&'static rules::TagKind, String)> = Vec::new();
     for (id, value) in values {
         let kind =
             rules::kind(id).ok_or_else(|| Error::Invalid(format!("unknown tag kind '{id}'")))?;
         validate_kind(id, value)?;
         let v = value.trim();
+        // A value held as data (a binary APE item) isn't the field's text,
+        // and isn't typed over.
+        let field = |i: &TagItem| {
+            kind.keys.contains(&i.key())
+                && !described(i)
+                && !matches!(i.value(), ItemValue::Binary(_))
+        };
         if v.is_empty() {
-            for key in kind.keys {
-                tag.remove_key(*key);
-            }
+            tag.retain(|i| !field(i));
             continue;
         }
         // Numbers and dates go through lofty's typed setters so each format
         // stores them natively (MP4 keeps track numbers as integers).
         let number = || parse_number(kind.label, v).map(|n| n.unwrap_or_default());
+        // A value held as data isn't typed over (a binary APE Year).
+        let data = |k: &ItemKey| {
+            tag.items()
+                .any(|i| i.key() == *k && matches!(i.value(), ItemValue::Binary(_)))
+        };
+        let held_as_data = || {
+            Error::Tags(format!(
+                "{}: the file holds it as data, which can't be typed over",
+                kind.label
+            ))
+        };
+        let typed = matches!(
+            *id,
+            "track_number" | "track_total" | "disc_number" | "disc_total" | "date"
+        );
+        if typed && kind.keys.iter().any(data) {
+            return Err(held_as_data());
+        }
+        let unstorable = || {
+            Error::Tags(format!(
+                "{} can't be stored in this file's tag format",
+                kind.label
+            ))
+        };
         match *id {
             "track_number" => tag.set_track(number()?),
             "track_total" => tag.set_track_total(number()?),
@@ -966,14 +1398,325 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
             "disc_total" => tag.set_disk_total(number()?),
             "date" => tag.set_date(v.parse().map_err(|_| Error::Tags(format!("date: '{v}'")))?),
             _ => {
-                if !tag.insert_text(kind.keys[0], v.to_string()) {
+                // Plain ones in several languages (an English and a Japanese
+                // comment) are more than one field can hold.
+                let mut langs: Vec<[u8; 3]> = tag
+                    .items()
+                    .filter(|i| field(i))
+                    .map(|i| *i.lang())
+                    .collect();
+                langs.dedup();
+                if langs.len() > 1 {
                     return Err(Error::Tags(format!(
-                        "{} can't be stored in this file's tag format",
+                        "{}: the file has it in several languages, which one field can't hold, so it wasn't changed",
                         kind.label
                     )));
                 }
+                let old = tag.items().find(|i| field(i)).cloned();
+                // A name the format holds and no data item uses.
+                let taken = |k: ItemKey| {
+                    tag.items()
+                        .any(|i| i.key() == k && matches!(i.value(), ItemValue::Binary(_)))
+                };
+                let key = old
+                    .as_ref()
+                    .map(TagItem::key)
+                    .or_else(|| {
+                        kind.keys
+                            .iter()
+                            .copied()
+                            .find(|k| k.map_key(tag.tag_type()).is_some() && !taken(*k))
+                    })
+                    .ok_or_else(|| {
+                        if kind.keys.iter().any(|k| taken(*k)) {
+                            held_as_data()
+                        } else {
+                            unstorable()
+                        }
+                    })?;
+                tag.retain(|i| !field(i));
+                // A URL stays one (ID3v2's WOAR), a comment keeps its language.
+                let value = match old.as_ref().map(TagItem::value) {
+                    Some(ItemValue::Locator(_)) => ItemValue::Locator(v.to_string()),
+                    _ => ItemValue::Text(v.to_string()),
+                };
+                let mut item = TagItem::new(key, value);
+                if let Some(old) = &old {
+                    item.set_lang(*old.lang());
+                }
+                if !tag.push(item) {
+                    return Err(unstorable());
+                }
             }
         }
+        set.push((kind, v.to_string()));
+    }
+    // Lofty builds ID3v2's MVIN from the movement items in order: the total
+    // goes after the number, however they were set. (Moved by copying and
+    // the order-keeping `remove_key`: `take` reorders the other items.)
+    if tag.tag_type() == TagType::Id3v2 {
+        let totals: Vec<TagItem> = tag.get_items(ItemKey::MovementTotal).cloned().collect();
+        if !totals.is_empty() {
+            tag.remove_key(ItemKey::MovementTotal);
+            for total in totals {
+                tag.push(total);
+            }
+        }
+    }
+    // Together, as they'll be written: two kinds can share one field (Label
+    // and Publisher are both ID3v2's TPUB).
+    if let Some((kind, v)) = lost(tag, &set) {
+        return Err(Error::Tags(format!(
+            "{}: '{v}' can't be stored in this file's tag format{}",
+            kind.label,
+            if set.len() > 1 {
+                " beside the other tags set"
+            } else {
+                ""
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// The number kind a total kind goes with.
+fn number_of(total: &str) -> Option<&'static str> {
+    match total {
+        "track_total" => Some("track_number"),
+        "disc_total" => Some("disc_number"),
+        "movement_total" => Some("movement_number"),
+        _ => None,
+    }
+}
+
+/// Which of `set` (kinds just given values on `tag`) isn't there once the
+/// tag is converted to its format and encoded as it will be written
+/// ([`native`]). Each kind's value is first converted alone: what comes back
+/// is what the format makes of it (`2010.08.25` as `2010-08-25`, ID3v2's
+/// genre `17` as `Rock`, Label as ID3v2's publisher frame), and nothing
+/// back means the format drops it (a compilation flag that isn't 0, 1,
+/// true or false; an MP4 advisory of 3; a track number past MP4's 65535; a
+/// month 13 ID3v2 can't encode). Then all of them together must give each
+/// of those back: two kinds can land on one field (Label and Publisher are
+/// both TPUB). Vorbis comments hold any text as it is.
+fn lost(
+    tag: &Tag,
+    set: &[(&'static rules::TagKind, String)],
+) -> Option<(&'static rules::TagKind, String)> {
+    if tag.tag_type() == TagType::VorbisComments || set.is_empty() {
+        return None;
+    }
+    // A tag of these kinds' items (and `also`, more of the file's keys),
+    // converted and encoded: None if refused.
+    let back =
+        |kinds: &[&'static rules::TagKind], also: &[ItemKey]| -> Option<Vec<(ItemKey, String)>> {
+            let mut only = Tag::new(tag.tag_type());
+            for item in tag.items().filter(|i| {
+                kinds.iter().any(|k| k.keys.contains(&i.key())) || also.contains(&i.key())
+            }) {
+                only.push(item.clone());
+            }
+            let mut sink = std::io::sink();
+            let options = WriteOptions::default();
+            let converted: Tag = match native(only).ok()? {
+                Native::Id3v2(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Ilst(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Ape(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Other(t) => t,
+            };
+            Some(
+                converted
+                    .items()
+                    .filter_map(|i| match i.value() {
+                        ItemValue::Text(t) | ItemValue::Locator(t) => {
+                            Some((i.key(), t.trim().to_string()))
+                        }
+                        ItemValue::Binary(_) => None,
+                    })
+                    .collect(),
+            )
+        };
+    let number = |kind: &rules::TagKind, t: &str| parse_number(kind.label, t).ok().flatten();
+    let id3v2 = tag.tag_type() == TagType::Id3v2;
+    let mut alone = Vec::new();
+    for (kind, value) in set {
+        // ID3v2 reads its date and time frames as timestamps: one it reads
+        // only part of (a time after a space; TBD) loses the rest. Its URL
+        // frames hold Latin-1 only.
+        if id3v2
+            && kind.id != "date"
+            && kind.keys.iter().any(|k| {
+                matches!(
+                    k.map_key(TagType::Id3v2),
+                    Some("TDRC" | "TDRL" | "TDOR" | "TDTG" | "TDEN" | "TDLY")
+                )
+            })
+            && !value
+                .parse::<Timestamp>()
+                .is_ok_and(|read| read_whole(value, &read))
+        {
+            return Some((kind, value.clone()));
+        }
+        if id3v2 && kind.id.ends_with("_url") && value.chars().any(|c| u32::from(c) > 0xFF) {
+            return Some((kind, value.clone()));
+        }
+        // A total goes with its number, as they're written (ID3v2's MVIN,
+        // MP4's trkn): alone, it would land in the number's place.
+        let with: Vec<&'static rules::TagKind> = std::iter::once(*kind)
+            .chain(number_of(kind.id).and_then(rules::kind))
+            .collect();
+        let items = match back(&with, &[]) {
+            Some(items) if !items.is_empty() => items,
+            _ => return Some((kind, value.clone())),
+        };
+        let numeric = matches!(
+            kind.id,
+            "track_number"
+                | "track_total"
+                | "disc_number"
+                | "disc_total"
+                | "movement_number"
+                | "movement_total"
+        );
+        if numeric
+            && !items
+                .iter()
+                .any(|(k, t)| kind.keys.contains(k) && number(kind, t) == number(kind, value))
+        {
+            return Some((kind, value.clone()));
+        }
+        // What it came back as under its own names; under another's only
+        // when the format has it there (Label as Publisher). Not the other
+        // half of a pair it was converted without (a disc total's number).
+        let own: Vec<(ItemKey, String)> = items
+            .iter()
+            .filter(|(k, _)| kind.keys.contains(k))
+            .cloned()
+            .collect();
+        if numeric && own.is_empty() {
+            return Some((kind, value.clone()));
+        }
+        alone.push((*kind, value, if own.is_empty() { items } else { own }));
+    }
+    // The file's other tags that land in the same field (ID3v2's TSSE holds
+    // Encoder and Encoder settings): together, one may push out another.
+    let field = |key: ItemKey| key.map_key(tag.tag_type());
+    let fields: Vec<&str> = set
+        .iter()
+        .flat_map(|(k, _)| k.keys.iter().filter_map(|key| field(*key)))
+        .collect();
+    let mut sharing: Vec<ItemKey> = Vec::new();
+    for item in tag.items() {
+        let key = item.key();
+        if !set.iter().any(|(k, _)| k.keys.contains(&key))
+            && field(key).is_some_and(|f| fields.contains(&f))
+            && !sharing.contains(&key)
+        {
+            sharing.push(key);
+        }
+    }
+    // One kind, alone in its field: converted alone is converted together.
+    if set.len() == 1 && sharing.is_empty() {
+        return None;
+    }
+    // Each total with its number (one the file has, if it isn't set too).
+    let mut kinds: Vec<&'static rules::TagKind> = set.iter().map(|(k, _)| *k).collect();
+    for number in set
+        .iter()
+        .filter_map(|(k, _)| number_of(k.id).and_then(rules::kind))
+    {
+        if !kinds.iter().any(|k| k.id == number.id) {
+            kinds.push(number);
+        }
+    }
+    let Some(together) = back(&kinds, &sharing) else {
+        return set.first().cloned();
+    };
+    if let Some((kind, value, _)) = alone
+        .into_iter()
+        .find(|(_, _, items)| !items.iter().all(|item| together.contains(item)))
+    {
+        return Some((kind, value.clone()));
+    }
+    // The file's own values in a field an edit shares are kept too (adding
+    // Label to an MP3 mustn't overwrite its Publisher: both are TPUB).
+    // Each as it comes back under its own name, a total with its number.
+    let lost_key = sharing.iter().find(|key| {
+        let number = match key {
+            ItemKey::TrackTotal => Some(ItemKey::TrackNumber),
+            ItemKey::DiscTotal => Some(ItemKey::DiscNumber),
+            ItemKey::MovementTotal => Some(ItemKey::MovementNumber),
+            _ => None,
+        };
+        let with: Vec<ItemKey> = std::iter::once(**key).chain(number).collect();
+        !back(&[], &with).is_some_and(|items| {
+            let own: Vec<&(ItemKey, String)> = items.iter().filter(|(k, _)| k == *key).collect();
+            let expected = if own.is_empty() {
+                items.iter().collect()
+            } else {
+                own
+            };
+            // As many times as the file has it (two Publishers of one name):
+            // each needed occurrence consumed from the combined conversion.
+            let mut needed: HashMap<&(ItemKey, String), usize> = HashMap::new();
+            for item in expected {
+                *needed.entry(item).or_default() += 1;
+            }
+            for item in &together {
+                if let Some(n) = needed.get_mut(item) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            needed.values().all(|n| *n == 0)
+        })
+    })?;
+    // Named by the edit that pushes it out: one in the same field.
+    set.iter()
+        .find(|(k, _)| k.keys.iter().any(|key| field(*key) == field(*lost_key)))
+        .or(set.first())
+        .cloned()
+}
+
+/// Check, before anything is written, that `kinds` can be set on the file
+/// at `path` as it is: everything a save would refuse (a kind its format
+/// has no field for, a value it would drop, a field held as data, a frame
+/// that can't be written back) is refused, so an album of mixed formats or
+/// files isn't left half edited. Pictures and the audio stream aren't read.
+pub fn check_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Result<()> {
+    let mut file = Probe::open(path)
+        .map_err(tag_err)?
+        .options(
+            ParseOptions::new()
+                .read_properties(false)
+                .read_cover_art(false),
+        )
+        .read()
+        .map_err(tag_err)?;
+    apply_kinds(primary_tag_mut(&mut file), &merged(edit, kinds)?)?;
+    let primary = file.primary_tag_type();
+    if primary != TagType::VorbisComments
+        && let Some(tag) = file.remove(primary)
+    {
+        // Encoded whole: a frame the file already has that can't be written
+        // (an ID3v2 timestamp of month 13) fails here, not on saving.
+        let mut sink = std::io::sink();
+        let options = WriteOptions::default();
+        match native(tag)? {
+            Native::Id3v2(t) => t.dump_to(&mut sink, options),
+            Native::Ilst(t) => t.dump_to(&mut sink, options),
+            Native::Ape(t) => t.dump_to(&mut sink, options),
+            Native::Other(t) => t.dump_to(&mut sink, options),
+        }
+        .map_err(tag_err)?;
     }
     Ok(())
 }
@@ -1488,6 +2231,7 @@ mod tests {
             &[
                 "ARTIST=A",
                 "ARTIST=B",
+                "TRACKTOTAL=10",
                 "RATING=80",
                 "COMPILATION=YES",
                 "TITLE=Song",
@@ -2328,6 +3072,801 @@ mod tests {
         )));
         assert_eq!(tag.title().as_deref(), Some("Song"));
         assert_eq!(tag.track(), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_sees_every_kind_and_the_tags_no_kind_names() {
+        let dir = std::env::temp_dir().join(format!("coversync-filetags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(
+            &path,
+            &[
+                "TITLE=Song",
+                "ARTISTS=Rin",
+                "ARTISTS=Riho",
+                "LABEL=Lantis",
+                "TRACKTOTAL=13",
+                "ALBUM_JP=アルバム",
+                "CDTOC=1+96",
+                "rating:MusicBee=60",
+            ],
+        );
+        let tags = file_tags(&path, "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song");
+        // Held twice: both, joined as an import writes them.
+        assert_eq!(tags.values["artists"], "Rin; Riho");
+        assert_eq!(tags.values["label"], "Lantis");
+        assert_eq!(tags.values["track_total"], "13");
+        assert!(!tags.values.contains_key("album"));
+        let other: Vec<(&str, &str)> = tags
+            .other
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(other.contains(&("ALBUM_JP", "アルバム")), "{other:?}");
+        assert!(other.contains(&("CDTOC", "1+96")), "{other:?}");
+        // A rating lofty can't read, as written; no blanks.
+        assert!(other.contains(&("rating:MusicBee", "60")), "{other:?}");
+        assert!(other.iter().all(|(_, v)| !v.is_empty()), "{other:?}");
+        // Nothing a kind names is "other".
+        assert!(
+            !other.iter().any(|(k, _)| *k == "LABEL" || *k == "TITLE"),
+            "{other:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_sets_any_kind_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("coversync-kindedit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(
+            &path,
+            &["TITLE=Song", "LABEL=Lantis", "GENRE=Idol", "TITLE_JP=歌"],
+        );
+        let kinds = [
+            ("label", "Lantis Company, Limited".to_string()),
+            ("track_total", "13".to_string()),
+            ("genre", String::new()),
+        ];
+        let edit = TagEdit {
+            title: Some("Song!".into()),
+            ..Default::default()
+        };
+        write_with_kinds(&path, &edit, &kinds).unwrap();
+        let tags = file_tags(&path, "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song!");
+        assert_eq!(tags.values["label"], "Lantis Company, Limited");
+        assert_eq!(tags.values["track_total"], "13");
+        // An empty value removes the kind.
+        assert!(!tags.values.contains_key("genre"));
+        assert!(has(&vorbis(&path).1, "TITLE_JP", "歌"));
+        // A bad value writes nothing.
+        let bad = [("track_total", "thirteen".to_string())];
+        assert!(write_with_kinds(&path, &TagEdit::default(), &bad).is_err());
+        assert_eq!(file_tags(&path, "; ").unwrap().values["track_total"], "13");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_doesnt_take_the_vendor_for_an_encoder() {
+        let dir = std::env::temp_dir().join(format!("coversync-noenc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        // The fixture's vendor string is "coversync".
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let tags = file_tags(&path("plain.flac"), "; ").unwrap();
+        assert!(!tags.values.contains_key("encoder"), "{:?}", tags.values);
+        flac_with_comments(&path("enc.flac"), &["TITLE=Song", "ENCODER=flac 1.4"]);
+        assert_eq!(
+            file_tags(&path("enc.flac"), "; ").unwrap().values["encoder"],
+            "flac 1.4"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An MP3 with an ID3v2 tag holding a title, an artist URL (WOAR), a
+    /// plain comment, an iTunes one with a description, and a TIPL role
+    /// lofty has no key for; and an APE tag of its own.
+    #[cfg(feature = "server")]
+    fn mp3_with_comments(path: &Path) {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{CommentFrame, Frame, FrameId, Id3v2Tag, KeyValueFrame, UrlLinkFrame};
+        fs::write(path, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Url(UrlLinkFrame::new(
+            FrameId::new("WOAR").unwrap(),
+            "https://example.org/rin",
+        )));
+        id3.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            String::new(),
+            "Nice",
+        )));
+        id3.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            "iTunNORM",
+            "0000ABCD",
+        )));
+        let roles: Vec<(std::borrow::Cow<str>, std::borrow::Cow<str>)> =
+            vec![("ukulele".into(), "Rin".into())];
+        id3.insert(Frame::KeyValue(KeyValueFrame::new(
+            FrameId::new("TIPL").unwrap(),
+            TextEncoding::UTF8,
+            roles,
+        )));
+        id3.save_to_path(path, WriteOptions::default()).unwrap();
+        let mut ape = lofty::ape::ApeTag::default();
+        ape.insert(
+            lofty::ape::ApeItem::new("Ripper".into(), ItemValue::Text("kept".into())).unwrap(),
+        );
+        ape.save_to_path(path, WriteOptions::default()).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn the_editor_reads_every_block_and_what_lofty_holds_as_data() {
+        use lofty::TextEncoding;
+        use lofty::ape::{ApeItem, ApeTag};
+        use lofty::id3::v2::{ExtendedTextFrame, Frame, Id3v2Tag};
+        use lofty::mp4::{Atom, AtomData, AtomIdent};
+        let dir = std::env::temp_dir().join(format!("coversync-blocks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let other = |tags: &FileTags| -> Vec<(String, String)> { tags.other.clone() };
+        let has_other = |tags: &FileTags, k: &str, v: &str| {
+            tags.other.iter().any(|(key, value)| key == k && value == v)
+        };
+
+        // MP3: a URL is a value; a described comment, an unknown role and
+        // the APE tag are read-only.
+        mp3_with_comments(&path("a.mp3"));
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert_eq!(tags.values["artist_url"], "https://example.org/rin");
+        assert_eq!(tags.values["comment"], "Nice");
+        assert!(
+            has_other(&tags, "COMM:iTunNORM", "0000ABCD"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "TIPL", "ukulele: Rin"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "APE · Ripper", "kept"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // WAV: RIFF INFO beside the ID3v2 tag the editor shows.
+        wav_with_info(&path("a.wav"));
+        let mut f = fs::File::open(path("a.wav")).unwrap();
+        let mut wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut info = wav.remove_riff_info().unwrap();
+        info.insert("IXYZ".into(), "custom".into());
+        info.save_to_path(path("a.wav"), WriteOptions::default())
+            .unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.save_to_path(path("a.wav"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.wav"), "; ").unwrap();
+        assert!(
+            has_other(&tags, "RIFF INFO · IXYZ", "custom"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "RIFF INFO · INAM", "Song"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // FLAC: an ID3v2 tag in front of the Vorbis comments, read-only.
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let mut id3 = Id3v2Tag::new();
+        id3.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::UTF8,
+            "coversync test",
+            "custom",
+        )));
+        let mut bytes = Vec::new();
+        id3.dump_to(&mut bytes, WriteOptions::default()).unwrap();
+        bytes.extend(fs::read(path("plain.flac")).unwrap());
+        fs::write(path("id3.flac"), bytes).unwrap();
+        let tags = file_tags(&path("id3.flac"), "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song");
+        assert!(
+            has_other(&tags, "ID3v2 · TXXX:coversync test", "custom"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // M4A: a © code read byte for byte.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let mut ilst = lofty::mp4::Ilst::default();
+        ilst.set_title("Song".into());
+        ilst.insert(Atom::new(
+            AtomIdent::Fourcc(*b"\xa9xyz"),
+            AtomData::UTF8("x".into()),
+        ));
+        ilst.save_to_path(path("a.m4a"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.m4a"), "; ").unwrap();
+        assert!(has_other(&tags, "\u{a9}xyz", "x"), "{:?}", other(&tags));
+
+        // WavPack: a binary compilation flag isn't a value to type over.
+        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(ApeItem::new("Title".into(), ItemValue::Text("Song".into())).unwrap());
+        ape.insert(ApeItem::new("Compilation".into(), ItemValue::Binary(vec![1])).unwrap());
+        ape.save_to_path(path("a.wv"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.wv"), "; ").unwrap();
+        assert!(!tags.values.contains_key("compilation"));
+        assert!(
+            tags.other
+                .iter()
+                .any(|(k, v)| k == "Compilation" && v == "(1 bytes of data)"),
+            "{:?}",
+            other(&tags)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn an_edit_writes_a_kind_where_the_file_has_it() {
+        let dir = std::env::temp_dir().join(format!("coversync-kindkey-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+
+        // FLAC: lyrics edited where they are (UNSYNCEDLYRICS), not added
+        // beside them.
+        flac_with_comments(&path("a.flac"), &["TITLE=Song", "UNSYNCEDLYRICS=old"]);
+        write_with_kinds(&path("a.flac"), &none, &[("lyrics", "new".to_string())]).unwrap();
+        let (_, items) = vorbis(&path("a.flac"));
+        let lyrics: Vec<&(String, String)> =
+            items.iter().filter(|(k, _)| k.contains("LYRICS")).collect();
+        assert_eq!(lyrics, [&("UNSYNCEDLYRICS".to_string(), "new".to_string())]);
+
+        // MP3: the plain comment changes, the described one stays; lyrics
+        // go where ID3v2 has them; a URL stays a URL.
+        mp3_with_comments(&path("a.mp3"));
+        let kinds = [
+            ("comment", "Better".to_string()),
+            ("lyrics", "La la".to_string()),
+            ("artist_url", "https://example.org/riho".to_string()),
+        ];
+        write_with_kinds(&path("a.mp3"), &none, &kinds).unwrap();
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert_eq!(tags.values["comment"], "Better");
+        assert_eq!(tags.values["lyrics"], "La la");
+        assert_eq!(tags.values["artist_url"], "https://example.org/riho");
+        assert!(
+            tags.other
+                .contains(&("COMM:iTunNORM".into(), "0000ABCD".into()))
+        );
+        // Clearing the comment leaves the described one too.
+        write_with_kinds(&path("a.mp3"), &none, &[("comment", String::new())]).unwrap();
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert!(!tags.values.contains_key("comment"));
+        assert!(
+            tags.other
+                .contains(&("COMM:iTunNORM".into(), "0000ABCD".into()))
+        );
+
+        // M4A: a compilation flag MP4 can't hold is refused, not dropped.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let yes = [("compilation", "yes".to_string())];
+        let refused = write_with_kinds(&path("a.m4a"), &none, &yes).unwrap_err();
+        assert!(refused.to_string().contains("Compilation"), "{refused}");
+        write_with_kinds(&path("a.m4a"), &none, &[("compilation", "1".to_string())]).unwrap();
+        assert!(
+            file_tags(&path("a.m4a"), "; ")
+                .unwrap()
+                .values
+                .contains_key("compilation")
+        );
+
+        // Checked before writing: a kind the format has no field for.
+        let publisher = [("publisher", "Lantis".to_string())];
+        assert!(check_kinds(&path("a.m4a"), &TagEdit::default(), &publisher).is_err());
+        assert!(check_kinds(&path("a.flac"), &TagEdit::default(), &publisher).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Dates the server reads whole, and ones it doesn't (the form's looser
+    /// check, in tag-form.test.ts, passes every one it reads whole).
+    const DATES_READ_WHOLE: &[&str] = &[
+        "2010",
+        "2010-08",
+        "2010-08-25",
+        "2010.08.25",
+        "2010.8.25",
+        "20100825",
+        "201008",
+        "2010-08-25T12",
+        "2010-08-25T12:30:45",
+        "20100825T1230",
+        "2010.08.25T12:30",
+        "2010-08-25Z",
+        "2010-08-25T",
+        "2024-6-3T14:8:49",
+        "2024- 6-03",
+        "2024-6-03",
+        "2024-06-03T1:02",
+        "2024- 6",
+        "2024-06- 3",
+        "2024.6.03",
+        "2024-06-03T 1:02",
+        "2024-06-03T14:08:49Z",
+        "2024-6-03Z",
+        "202406",
+        "2024-6 -03",
+        "2024-06-03T1 :02",
+        "2024-6 Z",
+        "20240603T 1",
+        "20240603T14 8",
+        "2024 6 3",
+        "2024 6",
+        "20246 03",
+        "999 -06",
+        "2024-06-3 T",
+    ];
+    const DATES_READ_IN_PART: &[&str] = &[
+        "2010-08-25 12:30",
+        "2010-8-5",
+        "2010/08/25",
+        "2010-08-25T1230",
+        "2010-08-25T12.30",
+        "10-08-25",
+        "summer",
+        "2024-6",
+        "2024-6-3",
+        "2024-06-3",
+        "2024-06-03T01:2",
+        "2024-6-03T14:08:4",
+        "2024-06 -03",
+        "2010-08-25T01:30 PM",
+        "2024 6 03",
+        "2024 603",
+        "2024-06-",
+        "2024-06-03T12:",
+        "2024-06-03T12:Z",
+        "2024-06-T",
+        "2024-06-03T12T",
+        "2024-06-03T00T",
+    ];
+
+    #[test]
+    fn dates_are_refused_unless_lofty_reads_every_part() {
+        for date in DATES_READ_WHOLE {
+            assert!(validate_kind("date", date).is_ok(), "{date}");
+        }
+        for date in DATES_READ_IN_PART {
+            assert!(validate_kind("date", date).is_err(), "{date}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn ape_items_held_as_data_are_left_and_literal_values_kept() {
+        use lofty::ape::{ApeItem, ApeTag};
+        let dir = std::env::temp_dir().join(format!("coversync-apedata-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
+        let none = TagEdit::default();
+        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(item("Title", ItemValue::Text("Song".into())));
+        ape.insert(item("UnsyncedLyrics", ItemValue::Binary(vec![1, 2, 3])));
+        ape.insert(item("Track", ItemValue::Binary(vec![4])));
+        ape.save_to_path(path("a.wv"), WriteOptions::default())
+            .unwrap();
+        // Lyrics go under their other name; the data item stays.
+        write_with_kinds(&path("a.wv"), &none, &[("lyrics", "La la".to_string())]).unwrap();
+        // A literal compilation flag, as APE writes it.
+        write_with_kinds(&path("a.wv"), &none, &[("compilation", "yes".to_string())]).unwrap();
+        let mut f = fs::File::open(path("a.wv")).unwrap();
+        let wv = lofty::wavpack::WavPackFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ape = wv.ape().unwrap();
+        assert!(matches!(
+            ape.get("UnsyncedLyrics").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == &[1, 2, 3]
+        ));
+        assert!(matches!(
+            ape.get("Lyrics").map(|i| i.value()),
+            Some(ItemValue::Text(t)) if t == "La la"
+        ));
+        assert!(matches!(
+            ape.get("Compilation").map(|i| i.value()),
+            Some(ItemValue::Text(t)) if t == "yes"
+        ));
+        // A date where a data item holds it: refused, by kind or by field.
+        let mut ape = lofty::wavpack::WavPackFile::read_from(
+            &mut fs::File::open(path("a.wv")).unwrap(),
+            ParseOptions::new(),
+        )
+        .unwrap()
+        .remove_ape()
+        .unwrap();
+        ape.insert(item("Year", ItemValue::Binary(vec![9])));
+        ape.save_to_path(path("a.wv"), WriteOptions::default())
+            .unwrap();
+        let date = [("date", "2010".to_string())];
+        assert!(
+            write_with_kinds(&path("a.wv"), &none, &date)
+                .unwrap_err()
+                .to_string()
+                .contains("as data")
+        );
+        let year = TagEdit {
+            year: Some("2010".into()),
+            ..Default::default()
+        };
+        assert!(write(&path("a.wv"), &year).is_err());
+        // A track number where a data item holds the number: refused before
+        // anything is written.
+        let three = [("track_number", "3".to_string())];
+        assert!(check_kinds(&path("a.wv"), &TagEdit::default(), &three).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn mp3_comments_dates_and_numbers_as_their_formats_hold_them() {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{CommentFrame, Frame, Id3v2Tag, UniqueFileIdentifierFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-mp3fmt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+        let comment = |lang: &[u8; 3], description: &str, text: &str| {
+            Frame::Comment(CommentFrame::new(
+                TextEncoding::UTF8,
+                *lang,
+                description.to_string(),
+                text.to_string(),
+            ))
+        };
+
+        // Only an iTunes comment: no comment, to the index or the rules.
+        fs::write(
+            path("itunes.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(comment(b"eng", "iTunNORM", "0000ABCD"));
+        // A binary file identifier, shown as hex.
+        id3.insert(Frame::UniqueFileIdentifier(UniqueFileIdentifierFrame::new(
+            "x".to_string(),
+            vec![0xFF, 0x00],
+        )));
+        id3.save_to_path(path("itunes.mp3"), WriteOptions::default())
+            .unwrap();
+        assert!(
+            !read_kinds(&path("itunes.mp3"), false)
+                .unwrap()
+                .values
+                .contains_key("comment")
+        );
+        let file = probe(&path("itunes.mp3"), false).unwrap();
+        assert!(!rules::present(file.primary_tag().unwrap()).contains(&"comment"));
+        let tags = file_tags(&path("itunes.mp3"), "; ").unwrap();
+        assert!(
+            tags.other.contains(&("UFID:x".into(), "ff00".into())),
+            "{:?}",
+            tags.other
+        );
+
+        // Plain comments in two languages: more than one field holds.
+        fs::write(
+            path("two.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.insert(comment(b"eng", "", "Nice"));
+        id3.insert(comment(b"jpn", "", "いい"));
+        id3.save_to_path(path("two.mp3"), WriteOptions::default())
+            .unwrap();
+        let refused = write_with_kinds(&path("two.mp3"), &none, &[("comment", "One".to_string())]);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("several languages")
+        );
+
+        // ID3v2.3: TYER and TDAT are the date, not other tags too. (Lofty
+        // doesn't write them, so the tag is built byte by byte.)
+        let mut v23 = b"ID3\x03\x00\x00\x00\x00\x00\x2d".to_vec();
+        for (id, text) in [(b"TIT2", b"Song"), (b"TYER", b"2010"), (b"TDAT", b"2508")] {
+            v23.extend(id);
+            v23.extend(5u32.to_be_bytes());
+            v23.extend([0, 0, 0]);
+            v23.extend(text);
+        }
+        v23.extend(include_bytes!("../tests/fixtures/silence.mp3"));
+        fs::write(path("v23.mp3"), v23).unwrap();
+        let tags = file_tags(&path("v23.mp3"), "; ").unwrap();
+        assert!(tags.values.contains_key("date"), "{:?}", tags.values);
+        assert!(
+            !tags
+                .other
+                .iter()
+                .any(|(k, _)| k == "TYER" || k == "TDAT" || k == "TDRC"),
+            "{:?}",
+            tags.other
+        );
+
+        // Label and Publisher are one frame (TPUB): two values can't both be.
+        let both = [
+            ("label", "Lantis".to_string()),
+            ("publisher", "Bandai".to_string()),
+        ];
+        let refused = write_with_kinds(&path("itunes.mp3"), &none, &both).unwrap_err();
+        assert!(
+            refused.to_string().contains("beside the other tags set"),
+            "{refused}"
+        );
+        // The same value in both is one value.
+        let same = [
+            ("label", "Lantis".to_string()),
+            ("publisher", "Lantis".to_string()),
+        ];
+        write_with_kinds(&path("itunes.mp3"), &none, &same).unwrap();
+        // The album and track fields check dates as the kinds do.
+        let year = TagEdit {
+            year: Some("2010-08-25 12:30".into()),
+            ..Default::default()
+        };
+        assert!(validate(&year).is_err());
+        assert!(write(&path("itunes.mp3"), &year).is_err());
+
+        // MP4 holds a track number up to 65535.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let big = [("track_number", "65536".to_string())];
+        assert!(write_with_kinds(&path("a.m4a"), &none, &big).is_err());
+        write_with_kinds(
+            &path("a.m4a"),
+            &none,
+            &[("track_number", "65535".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            file_tags(&path("a.m4a"), "; ").unwrap().values["track_number"],
+            "65535"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_read_again_for_a_new_reader_are_those_it_reads_differently() {
+        // Since reader 0: MP3s and M4As, not Ogg; a FLAC only with ID3v2
+        // (or if it can't be opened to tell).
+        assert!(reader_changed(Path::new("/m/a.mp3"), 0));
+        assert!(reader_changed(Path::new("/m/a.M4A"), 0));
+        assert!(!reader_changed(Path::new("/m/a.Opus"), 0));
+        // A path under a file can't be opened, wherever this runs.
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml/missing.flac");
+        assert!(reader_changed(&missing, 0));
+        // Since 1: only such FLACs.
+        assert!(!reader_changed(Path::new("/m/a.mp3"), 1));
+        assert!(reader_changed(&missing, 1));
+        assert!(!reader_changed(&missing, READER));
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn values_the_format_writes_its_own_way_are_kept_and_dropped_ones_refused() {
+        let dir = std::env::temp_dir().join(format!("coversync-norm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+        let kinds = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+        };
+
+        // MP3: a dotted original date and a numeric genre, as ID3v2 has them.
+        fs::write(
+            path("a.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("original_date", "2010.08.25"), ("genre", "17")]),
+        )
+        .unwrap();
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert_eq!(tags.values["genre"], "Rock");
+        assert!(
+            tags.values["original_date"].starts_with("2010-08-25"),
+            "{:?}",
+            tags.values
+        );
+        // A month 13 ID3v2 can't encode: refused, nothing written.
+        let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("date", "2024-13-01")]));
+        assert!(refused.is_err());
+
+        // M4A: an explicit advisory of 4 is MP4's 1; 3 is dropped, and a
+        // track number of 3 beside it doesn't hide that.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        write_with_kinds(&path("a.m4a"), &none, &kinds(&[("advisory", "4")])).unwrap();
+        let refused = write_with_kinds(
+            &path("a.m4a"),
+            &none,
+            &kinds(&[("advisory", "3"), ("track_number", "3")]),
+        );
+        assert!(refused.unwrap_err().to_string().contains("'3'"));
+
+        // A field and a kind for the same tag: only the kind's value (applied
+        // after) has to fit.
+        let field = TagEdit {
+            track_no: Some("65536".into()),
+            ..Default::default()
+        };
+        write_with_kinds(&path("a.m4a"), &field, &kinds(&[("track_number", "1")])).unwrap();
+        assert!(check_kinds(&path("a.m4a"), &field, &kinds(&[("track_number", "1")])).is_ok());
+        assert_eq!(
+            file_tags(&path("a.m4a"), "; ").unwrap().values["track_number"],
+            "1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_dates_urls_and_pairs_as_they_are_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-id3pairs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+        let kinds = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+        };
+        fs::write(
+            path("a.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        // An original or release date ID3v2 would read only part of.
+        for kind in ["original_date", "release_date"] {
+            let refused =
+                write_with_kinds(&path("a.mp3"), &none, &kinds(&[(kind, "2010-08-25 12:30")]));
+            assert!(refused.is_err(), "{kind}");
+        }
+        // A URL ID3v2 can't hold (its URL frames are Latin-1).
+        let refused = write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("artist_url", "https://例え.jp")]),
+        );
+        assert!(refused.is_err());
+        // A movement number and total, in either order: both kept (MVIN).
+        for pair in [
+            [("movement_number", "2"), ("movement_total", "4")],
+            [("movement_total", "4"), ("movement_number", "2")],
+        ] {
+            write_with_kinds(&path("a.mp3"), &none, &kinds(&pair)).unwrap();
+            let values = file_tags(&path("a.mp3"), "; ").unwrap().values;
+            assert_eq!(values["movement_number"], "2");
+            assert_eq!(values["movement_total"], "4");
+        }
+        // A total changed beside another field, the number left as it is.
+        write_with_kinds(&path("a.mp3"), &none, &kinds(&[("movement_number", "2")])).unwrap();
+        write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("movement_total", "5"), ("title", "Song")]),
+        )
+        .unwrap();
+        let values = file_tags(&path("a.mp3"), "; ").unwrap().values;
+        assert_eq!(
+            (
+                values["movement_number"].as_str(),
+                values["movement_total"].as_str()
+            ),
+            ("2", "5")
+        );
+        // Encoder beside the file's Encoder settings: one field (TSSE) for two.
+        write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("encoder_settings", "-V0")]),
+        )
+        .unwrap();
+        let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("encoder", "LAME")]));
+        assert!(refused.is_err());
+        // Label beside the file's Publisher: TPUB holds one, so it's refused,
+        // not the Publisher overwritten.
+        write_with_kinds(&path("a.mp3"), &none, &kinds(&[("publisher", "Bandai")])).unwrap();
+        let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("label", "Lantis")]));
+        assert!(refused.is_err());
+        assert_eq!(
+            file_tags(&path("a.mp3"), "; ").unwrap().values["publisher"],
+            "Bandai"
+        );
+        // The file's Publisher given twice: a Label of that name would leave one.
+        fs::write(
+            path("twice.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        let mut id3 = lofty::id3::v2::Id3v2Tag::new();
+        id3.insert(lofty::id3::v2::Frame::Text(
+            lofty::id3::v2::TextInformationFrame::new(
+                lofty::id3::v2::FrameId::new("TPUB").unwrap(),
+                lofty::TextEncoding::UTF8,
+                "Bandai\0Bandai",
+            ),
+        ));
+        id3.save_to_path(path("twice.mp3"), WriteOptions::default())
+            .unwrap();
+        let refused = write_with_kinds(&path("twice.mp3"), &none, &kinds(&[("label", "Bandai")]));
+        assert!(refused.is_err());
+        // Beside another edit, the error names the one that pushes it out.
+        let refused = write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("album", "Record"), ("label", "Lantis")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.starts_with("tags: Label"), "{refused}");
+        // A time with words after it isn't read whole.
+        assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
+        // Parts out of range: not a date (the form leaves these to the server).
+        for date in ["2024-13-01", "2024-06-32", "2024-06-03T24:00"] {
+            assert!(validate_kind("date", date).is_err(), "{date}");
+        }
+        // A field given another way must still have been one.
+        let bad = TagEdit {
+            track_no: Some("invalid".into()),
+            ..Default::default()
+        };
+        assert!(check_kinds(&path("a.mp3"), &bad, &kinds(&[("track_number", "1")])).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

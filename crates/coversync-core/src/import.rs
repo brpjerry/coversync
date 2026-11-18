@@ -302,6 +302,24 @@ fn clash_fix(uses: &[&str], discs_differ: bool) -> &'static str {
     }
 }
 
+/// The tags a track's copy is written with: autofilled ones first, then the
+/// user's edits on top (an emptied value removes the tag from the copy, as
+/// the plan assumed).
+fn written_values(
+    autofilled: &HashMap<&'static str, String>,
+    edits: Option<&HashMap<String, String>>,
+) -> Vec<(&'static str, String)> {
+    let mut values: Vec<(&'static str, String)> =
+        autofilled.iter().map(|(k, v)| (*k, v.clone())).collect();
+    for (k, v) in edits.into_iter().flatten() {
+        if let Some(kind) = rules::kind(k) {
+            values.retain(|(x, _)| *x != kind.id);
+            values.push((kind.id, v.trim().to_string()));
+        }
+    }
+    values
+}
+
 /// What importing `album_id` would do, with `edits` applied and `upload` as
 /// the album art (instead of what the album has).
 pub fn plan(
@@ -371,12 +389,14 @@ pub fn plan(
             .chain(&split)
             .map(|k| (*k, values.get(k).cloned().unwrap_or_default()))
             .collect();
+        let mut typed_ok = true;
         for (kind, value) in edits.get(&track.id).into_iter().flatten() {
             let Some(k) = rules::kind(kind) else {
                 return Err(Error::Invalid(format!("unknown tag kind '{kind}'")));
             };
             if let Err(e) = tags::validate_kind(k.id, value) {
                 problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
+                typed_ok = false;
             }
             let value = value.trim();
             // What the user typed (or cleared) wins over any assumption.
@@ -386,6 +406,16 @@ pub fn plan(
             } else {
                 values.insert(k.id, value.to_string());
             }
+        }
+        // What the copy will be written with, checked against the file as it
+        // is: a value its format can't hold makes the plan unready, rather
+        // than fail the import part way through the copies.
+        let to_write = written_values(&autofilled, edits.get(&track.id));
+        if typed_ok
+            && !to_write.is_empty()
+            && let Err(e) = tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write)
+        {
+            problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
         }
         filled_by.push(
             read.autofilled
@@ -634,19 +664,7 @@ pub fn execute(
                         .as_deref()
                         .expect("ready plans have destinations"),
                 );
-                // Autofilled tags first, then the user's edits on top (an emptied
-                // value removes the tag from the copy, as the plan assumed).
-                let mut values: Vec<(&str, String)> = track
-                    .autofilled
-                    .iter()
-                    .map(|(k, v)| (*k, v.clone()))
-                    .collect();
-                for (k, v) in edits.get(&track.id).into_iter().flatten() {
-                    if let Some(kind) = rules::kind(k) {
-                        values.retain(|(x, _)| *x != kind.id);
-                        values.push((kind.id, v.trim().to_string()));
-                    }
-                }
+                let values = written_values(&track.autofilled, edits.get(&track.id));
                 let (added, hash) =
                     tags::copy_with_tags_hashed(&src, &dest, &values, picture.as_ref(), replace)?;
                 Ok((src, dest, added, hash))

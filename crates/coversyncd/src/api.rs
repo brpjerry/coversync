@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use coversync_core::appearance::{self, AppearanceSetup};
@@ -37,7 +37,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/albums/{id}", get(album))
         .route("/api/albums/{id}/cover", get(cover))
         .route("/api/albums/{id}/cover/full", get(full_cover))
-        .route("/api/albums/{id}/tags", put(write_tags))
+        .route("/api/albums/{id}/tags", get(album_tags).put(write_tags))
         .route("/api/tracks/{id}/stream", get(stream))
         .route(
             "/api/library/setup",
@@ -905,7 +905,69 @@ async fn stream(
     Ok(serve_file(path, req, "private, max-age=3600").await)
 }
 
-#[derive(Deserialize)]
+/// Every track's tags, for the tag editor.
+#[derive(Serialize)]
+struct AlbumTags {
+    /// The album's version as its tags were read (see [`AlbumDetail`]).
+    version: String,
+    tracks: Vec<TrackTags>,
+}
+
+#[derive(Serialize)]
+struct TrackTags {
+    id: i64,
+    rel_path: String,
+    #[serde(flatten)]
+    tags: tags::FileTags,
+}
+
+async fn album_tags(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AlbumTags>> {
+    blocking(&state, move |s| {
+        // No save writes the files while they're read (a save indexes them
+        // before it lets go), and a scan that indexes meanwhile shows in
+        // the version: read again then.
+        let _files = s.tag_files.read().unwrap_or_else(|e| e.into_inner());
+        let separator = s.lib.library_setup()?.rules.separator;
+        for _ in 0..3 {
+            let detail = s.lib.album(&id)?.ok_or(coversync_core::Error::NotFound)?;
+            let tracks = detail
+                .tracks
+                .iter()
+                .map(|t| {
+                    let (path, _) = s
+                        .lib
+                        .track_root(t.id)?
+                        .ok_or(coversync_core::Error::NotFound)?;
+                    Ok(TrackTags {
+                        id: t.id,
+                        rel_path: t.rel_path.clone(),
+                        tags: tags::file_tags(&path, &separator)?,
+                    })
+                })
+                .collect::<coversync_core::Result<_>>()?;
+            let now = s.lib.album(&id)?.map(|d| d.version);
+            if now.as_ref() == Some(&detail.version) {
+                return Ok(AlbumTags {
+                    version: detail.version,
+                    tracks,
+                });
+            }
+        }
+        Err(coversync_core::Error::Invalid(
+            "the album kept changing while its tags were read; try again".into(),
+        ))
+    })
+    .await
+    .map(Json)
+}
+
+/// One track's edit: by field, and by tag kind.
+type TrackEdit<'a> = (i64, TagEdit, Vec<(&'a str, String)>);
+
+#[derive(Deserialize, Default)]
 struct TagWrite {
     /// Applied to every track in the album.
     #[serde(default)]
@@ -930,6 +992,10 @@ struct TagWrite {
     /// without them, the album is the one its id names now.
     #[serde(default)]
     base_tracks: Option<Vec<BaseTrack>>,
+    /// Tag kinds (catalog ids) to set, by track id, after `album` and
+    /// `tracks`; an empty value removes the kind.
+    #[serde(default)]
+    kinds: HashMap<i64, HashMap<String, String>>,
 }
 
 /// A track a tag save's edits were made on.
@@ -1046,31 +1112,68 @@ async fn write_tags(
         let current = current.ok_or(coversync_core::Error::NotFound)?;
         let collection = current.album.collection;
         let ids: Vec<i64> = current.tracks.iter().map(|t| t.id).collect();
-        if let Some(stray) = body.tracks.keys().find(|t| !ids.contains(t)) {
+        if let Some(stray) = body
+            .tracks
+            .keys()
+            .chain(body.kinds.keys())
+            .find(|t| !ids.contains(t))
+        {
             return Err(coversync_core::Error::Tags(format!(
                 "track {stray} is not in this album"
             )));
         }
         // Validate every edit before writing anything, so a bad field can't
         // leave the album half-written.
-        let edits: Vec<(i64, TagEdit)> = ids
+        let kinds_of = |t: &i64| -> Vec<(&str, String)> {
+            let mut kinds: Vec<(&str, String)> = body
+                .kinds
+                .get(t)
+                .map(|k| k.iter().map(|(id, v)| (id.as_str(), v.clone())).collect())
+                .unwrap_or_default();
+            kinds.sort();
+            kinds
+        };
+        let edits: Vec<TrackEdit> = ids
             .iter()
-            .map(|t| (*t, merge(&body.album, body.tracks.get(t))))
-            .filter(|(_, e)| !e.is_empty())
+            .map(|t| (*t, merge(&body.album, body.tracks.get(t)), kinds_of(t)))
+            .filter(|(_, e, k)| !e.is_empty() || !k.is_empty())
             .collect();
-        for (_, edit) in &edits {
+        for (_, edit, kinds) in &edits {
             tags::validate(edit)?;
+            for (id, value) in kinds {
+                if coversync_core::rules::kind(id).is_none() {
+                    return Err(coversync_core::Error::Invalid(format!("unknown tag kind '{id}'")));
+                }
+                tags::validate_kind(id, value)?;
+            }
         }
+        // Every file can take its edits, as it is, before any is written: an
+        // album of mixed formats or files isn't left half edited.
+        for (track, edit, kinds) in &edits {
+            let (path, _) = s
+                .lib
+                .track_root(*track)?
+                .ok_or(coversync_core::Error::NotFound)?;
+            tags::check_kinds(&path, edit, kinds).map_err(|e| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                coversync_core::Error::Invalid(format!("{name}: {e}"))
+            })?;
+        }
+        // The files are written and indexed before the tag editor can read
+        // them again (see `tag_files`).
+        let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
         // Files written before one fails are indexed all the same, so their
         // tracks (and the album's version) say they changed.
         let mut written = Vec::new();
         let mut failed = None;
-        for (track, edit) in &edits {
+        for (track, edit, kinds) in &edits {
             let file = s
                 .lib
                 .track_root(*track)
                 .and_then(|found| found.ok_or(coversync_core::Error::NotFound))
-                .and_then(|(path, root)| tags::write(&path, edit).map(|()| (path, root)));
+                .and_then(|(path, root)| {
+                    tags::write_with_kinds(&path, edit, kinds).map(|()| (path, root))
+                });
             match file {
                 Ok(file) => written.push(file),
                 Err(e) => {
@@ -1089,6 +1192,7 @@ async fn write_tags(
         // worker queued by exclusively() rehashes after the save can return.
         scan::index_files(&s.lib, stats, &s.progress)?;
         s.lib.remove_paths(&[])?;
+        drop(files);
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
         let new_id = match first {
             Some((p, root)) => album_id_in(
@@ -1129,14 +1233,36 @@ mod tests {
     use std::path::Path as FsPath;
     use std::sync::Arc;
 
-    /// A FLAC file with no audio, only these Vorbis comments.
+    /// A FLAC file with these Vorbis comments and a few bytes standing for its audio.
     fn flac(path: &FsPath, comments: &[&str]) {
+        flac_with_icons(path, comments, 0);
+    }
+
+    /// As `flac`, with `icons` 32x32 file icons (PICTURE blocks of type 1),
+    /// which FLAC allows one of: a save refuses a file with two, as only its
+    /// write finds out (the check before reads no pictures).
+    fn flac_with_icons(path: &FsPath, comments: &[&str], icons: usize) {
         let mut b = b"fLaC".to_vec();
         // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
         b.extend([0, 0, 0, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
         let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
         b.extend(packed.to_be_bytes());
         b.extend([0u8; 16]);
+        for _ in 0..icons {
+            let mut picture = Vec::new();
+            picture.extend(1u32.to_be_bytes());
+            picture.extend(9u32.to_be_bytes());
+            picture.extend(b"image/png");
+            picture.extend(0u32.to_be_bytes());
+            for v in [32u32, 32, 24, 0] {
+                picture.extend(v.to_be_bytes());
+            }
+            picture.extend(4u32.to_be_bytes());
+            picture.extend([1, 2, 3, 4]);
+            b.push(6);
+            b.extend(&(picture.len() as u32).to_be_bytes()[1..]);
+            b.extend(picture);
+        }
         let mut block = Vec::new();
         block.extend(9u32.to_le_bytes());
         block.extend(b"coversync");
@@ -1149,6 +1275,8 @@ mod tests {
         b.push(0x80 | 4);
         b.extend(&(block.len() as u32).to_be_bytes()[1..]);
         b.extend(block);
+        // A frame header's sync code and some bytes: lofty's writer expects audio after the metadata.
+        b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b).unwrap();
     }
@@ -1176,6 +1304,7 @@ mod tests {
                 "ALBUMARTIST=Artist",
                 "ALBUM=Record",
                 "TRACKNUMBER=1",
+                "CDTOC=1+96",
             ],
         );
         std::fs::create_dir_all(dir.join("library")).unwrap();
@@ -1217,7 +1346,181 @@ mod tests {
             tracks: HashMap::new(),
             version: None,
             base_tracks: None,
+            kinds: HashMap::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn the_editor_reads_and_writes_every_kind() {
+        let (state, inbox_id, _dir) = daemon("kinds");
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let id = imported.album_id;
+        let read = |id: &str| album_tags(State(state.clone()), Path(id.to_string()));
+        let Json(tags) = read(&id).await.unwrap();
+        assert_eq!(tags.tracks.len(), 1);
+        let track = &tags.tracks[0];
+        assert_eq!(track.tags.values["title"], "Song");
+        assert_eq!(track.tags.values["album"], "Record");
+        assert!(
+            track.tags.other.contains(&("CDTOC".into(), "1+96".into())),
+            "{:?}",
+            track.tags.other
+        );
+        let detail = state.lib.album(&id).unwrap().unwrap();
+        assert_eq!(tags.version, detail.version);
+
+        // Any kind, on its track; an empty value removes one.
+        let kinds = |pairs: &[(&str, &str)]| {
+            HashMap::from([(
+                track.id,
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )])
+        };
+        let body = TagWrite {
+            kinds: kinds(&[("label", "Lantis"), ("track_total", "1"), ("artist", "")]),
+            ..Default::default()
+        };
+        let Json(saved) = write_tags(State(state.clone()), Path(id.clone()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(saved.files_written, 1);
+        let Json(after) = read(&saved.album_id).await.unwrap();
+        let values = &after.tracks[0].tags.values;
+        assert_eq!(values["label"], "Lantis");
+        assert_eq!(values["track_total"], "1");
+        assert!(!values.contains_key("artist"));
+        // Tags no kind names survive the edit.
+        assert!(
+            after.tracks[0]
+                .tags
+                .other
+                .contains(&("CDTOC".into(), "1+96".into()))
+        );
+
+        // A kind that doesn't exist, one that can't be typed, or a bad
+        // value: refused, and nothing written.
+        for bad in [("nope", "x"), ("rating", "5"), ("track_total", "many")] {
+            let body = TagWrite {
+                kinds: kinds(&[bad, ("label", "Other")]),
+                ..Default::default()
+            };
+            let result = write_tags(
+                State(state.clone()),
+                Path(saved.album_id.clone()),
+                Json(body),
+            )
+            .await;
+            assert!(result.is_err(), "{bad:?}");
+        }
+        let Json(unchanged) = read(&saved.album_id).await.unwrap();
+        assert_eq!(unchanged.tracks[0].tags.values["label"], "Lantis");
+    }
+
+    #[tokio::test]
+    async fn a_kind_one_format_cant_hold_writes_no_track() {
+        let (state, _, dir) = daemon("mixed");
+        // An M4A beside the FLAC, in the same album: MP4 has no publisher field.
+        let m4a = dir.0.join("inbox/Artist/Record/02.m4a");
+        std::fs::write(
+            &m4a,
+            include_bytes!("../../coversync-core/tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let tags_of = TagEdit {
+            title: Some("Other".into()),
+            artist: Some("Artist".into()),
+            album: Some("Record".into()),
+            album_artist: Some("Artist".into()),
+            track_no: Some("2".into()),
+            ..Default::default()
+        };
+        tags::write(&m4a, &tags_of).unwrap();
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        // The index was filled by this tag reader.
+        assert_eq!(
+            state.lib.tag_reader(Collection::Inbox).unwrap(),
+            tags::READER
+        );
+        let albums = state
+            .lib
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        // The import's plan: a track number the M4A can't hold isn't ready,
+        // and says which track.
+        let inbox = state.lib.album(&albums[0].id).unwrap().unwrap();
+        let m4a_track = inbox
+            .tracks
+            .iter()
+            .find(|t| t.rel_path.ends_with(".m4a"))
+            .unwrap()
+            .id;
+        let request = serde_json::from_value(serde_json::json!({
+            "album_id": albums[0].id,
+            "edits": { m4a_track.to_string(): { "track_number": "65536" } }
+        }))
+        .unwrap();
+        let Json(plan) = import_plan(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        assert!(!plan.ready());
+        assert!(
+            plan.problems.iter().any(|p| p.starts_with("Track 2:")),
+            "{:?}",
+            plan.problems
+        );
+        // In the Library, where the editor writes.
+        let request =
+            serde_json::from_value(serde_json::json!({ "album_id": albums[0].id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let id = imported.album_id;
+        let detail = state.lib.album(&id).unwrap().unwrap();
+        assert_eq!(detail.tracks.len(), 2);
+        assert!(detail.tracks[0].rel_path.ends_with(".flac"));
+        let (flac, _) = state.lib.track_root(detail.tracks[0].id).unwrap().unwrap();
+        let before = std::fs::read(&flac).unwrap();
+        // Publisher on every track: the FLAC (first) could take it, the M4A can't.
+        let kinds = detail
+            .tracks
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    HashMap::from([("publisher".to_string(), "Lantis".to_string())]),
+                )
+            })
+            .collect();
+        let body = TagWrite {
+            kinds,
+            ..Default::default()
+        };
+        let refused = write_tags(State(state.clone()), Path(id.clone()), Json(body)).await;
+        // The FLAC is as it was.
+        assert_eq!(std::fs::read(&flac).unwrap(), before);
+        let Err(TagWriteError::Api(e)) = refused else {
+            panic!("not refused");
+        };
+        // Named by the file that can't take it.
+        let said = format!("{e:?}");
+        assert!(
+            said.contains(".m4a: ") && said.contains("Publisher"),
+            "{said}"
+        );
     }
 
     #[tokio::test]
@@ -1469,6 +1772,7 @@ mod tests {
             tracks: HashMap::new(),
             version: Some(base.version.clone()),
             base_tracks: Some(base_tracks(base)),
+            kinds: HashMap::new(),
         })
     }
 
@@ -1960,9 +2264,19 @@ mod tests {
     async fn a_partly_failed_save_still_changes_the_albums_version() {
         let (state, inbox) = editing_daemon("conflict-partial");
         let base = detail(&state, "Record");
-        // The second file is gone (no scan has noticed): the save writes the
-        // first, then fails.
-        std::fs::remove_file(inbox.join(&base.tracks[1].rel_path)).unwrap();
+        // The second file has two icons, which only writing it finds: the
+        // save writes the first, then fails.
+        flac_with_icons(
+            &inbox.join(&base.tracks[1].rel_path),
+            &[
+                "TITLE=Song 2",
+                "ARTIST=Artist",
+                "ALBUMARTIST=Artist",
+                "ALBUM=Record",
+                "TRACKNUMBER=2",
+            ],
+            2,
+        );
         let failed = put(&state, &base.album.id, save_on(&base, genre("Rock"))).await;
         assert!(matches!(failed, Err(TagWriteError::Api(_))));
         let first = state.lib.track_path(base.tracks[0].id).unwrap().unwrap();
@@ -1979,10 +2293,20 @@ mod tests {
             tracks: HashMap::from([(base.tracks[0].id, mine)]),
             version: Some(base.version.clone()),
             base_tracks: Some(base_tracks(&base)),
+            kinds: HashMap::new(),
         });
         let now = conflict(put(&state, &base.album.id, stale).await).unwrap();
         assert_eq!(now.album.genre.as_deref(), Some("Rock"));
         assert_eq!(tags::read(&first).unwrap().title.as_deref(), Some("Song 1"));
+
+        // A file gone (no scan has noticed) is found before anything is
+        // written: the album stays as it was.
+        let now = detail(&state, "Record");
+        std::fs::remove_file(inbox.join(&now.tracks[2].rel_path)).unwrap();
+        let failed = put(&state, &now.album.id, save_on(&now, genre("Jazz"))).await;
+        assert!(matches!(failed, Err(TagWriteError::Api(_))));
+        assert_eq!(tags::read(&first).unwrap().genre.as_deref(), Some("Rock"));
+        assert_eq!(detail(&state, "Record").version, now.version);
     }
 
     #[tokio::test]
@@ -2210,6 +2534,7 @@ mod tests {
             tracks: HashMap::new(),
             version: None,
             base_tracks: None,
+            kinds: HashMap::new(),
         });
         let saved = put(&state, &base.album.id, old).await.unwrap();
         assert_eq!(
@@ -2228,6 +2553,7 @@ mod tests {
                 tracks: HashMap::new(),
                 version: Some(base.version.clone()),
                 base_tracks: None,
+                kinds: HashMap::new(),
             })
         };
         put(&state, &base.album.id, by_id(genre("Rock")))

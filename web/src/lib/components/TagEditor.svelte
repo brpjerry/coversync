@@ -1,36 +1,15 @@
 <script lang="ts" module>
 	import type { AlbumDetail } from '#lib/api.ts';
+	import type { TagDraft as Kept } from '#lib/tag-form.ts';
 
 	/** Edits in the editor: none, some not sent yet, or some being saved. */
 	export type Draft = 'none' | 'draft' | 'saving';
 
-	export type AlbumField = 'album' | 'album_artist' | 'year' | 'genre';
-	export type TrackField = 'track_no' | 'disc_no' | 'title' | 'artist';
-
-	/** The editor's values for an album, as its details give them. */
-	export interface TagValues {
-		/** Album fields, empty where the tracks differ (mixed). */
-		album: Record<AlbumField, string>;
-		/** Each track's fields, by id. */
-		tracks: Record<number, Record<TrackField, string>>;
-		/** Each track's album fields as they are, mixed or not. */
-		albumTracks: Record<number, Record<AlbumField, string>>;
-	}
-
 	/**
 	 * Edits whose save was refused because the album had changed elsewhere,
-	 * kept to put on top of the album as it is now.
+	 * kept to put on top of the album as it is now (see tag-form).
 	 */
-	export interface TagDraft {
-		/** The values the edits were made on. */
-		base: TagValues;
-		/** The album fields edited, with their values; '' clears one. */
-		album: Partial<Record<AlbumField, string>>;
-		/** Each track's edited fields, by id. */
-		tracks: Record<number, Partial<Record<TrackField, string>>>;
-		/** Where each track's file was. */
-		paths: Record<number, string>;
-	}
+	export type TagDraft = Kept;
 
 	/**
 	 * Whether `detail` still has the draft's track `id`: under that id and at
@@ -42,7 +21,7 @@
 
 	/** How many tracks a draft edited that `detail` no longer has: those edits can't be put back. */
 	export function lostTracks(draft: TagDraft, detail: AlbumDetail): number {
-		return Object.keys(draft.tracks).filter((id) => !stillHere(draft, detail, +id)).length;
+		return Object.keys(draft.edits).filter((id) => !stillHere(draft, detail, +id)).length;
 	}
 </script>
 
@@ -50,21 +29,41 @@
 	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import Check from '@lucide/svelte/icons/check';
+	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import { onDestroy } from 'svelte';
-	import { fly } from 'svelte/transition';
+	import { fly, slide } from 'svelte/transition';
+	import { SvelteSet } from 'svelte/reactivity';
 	import {
 		api,
 		ApiError,
 		TagConflict,
+		type AlbumTags,
 		type ImportEdits,
-		type TagEdit,
-		type TagField,
-		type TagWriteResult,
-		type Track
+		type TagWriteResult
 	} from '#lib/api.ts';
 	import { drafts } from '#lib/drafts.svelte.ts';
+	import { setup } from '#lib/setup.svelte.ts';
 	import { toast } from '#lib/toast.svelte.ts';
+	import {
+		ALBUM_CORE,
+		CORE,
+		MULTILINE,
+		TRACK_CORE,
+		changeCount,
+		changed,
+		changedElsewhere,
+		edits,
+		invalid,
+		kindsIn,
+		otherTags,
+		setAll,
+		shared,
+		valueOf,
+		withKept,
+		type Values
+	} from '#lib/tag-form.ts';
+	import ShowAll from './ShowAll.svelte';
 
 	interface Props {
 		detail: AlbumDetail;
@@ -91,6 +90,11 @@
 		onrefused?: (current: AlbumDetail | null, draft: () => TagDraft | null, id: string) => void;
 		/** Revert was pressed: the edits, kept ones included, are dropped. */
 		onrevert?: () => void;
+		/**
+		 * The album changed while its tags were read: load it as it is now,
+		 * kept edits and all (Try again, then).
+		 */
+		onretry?: () => void;
 	}
 	let {
 		detail,
@@ -101,180 +105,154 @@
 		ondraft,
 		kept = null,
 		onrefused,
-		onrevert
+		onrevert,
+		onretry
 	}: Props = $props();
 
-	const albumFields: { key: AlbumField; label: string; wide?: boolean }[] = [
-		{ key: 'album', label: 'Album', wide: true },
-		{ key: 'album_artist', label: 'Album artist', wide: true },
-		{ key: 'year', label: 'Year' },
-		{ key: 'genre', label: 'Genre' }
-	];
-	const trackFields: { key: TrackField; label: string }[] = [
-		{ key: 'track_no', label: '#' },
-		{ key: 'disc_no', label: 'Disc' },
-		{ key: 'title', label: 'Title' },
-		{ key: 'artist', label: 'Artist' }
-	];
-
-	function value(t: Track, key: TagField): string {
-		const v = t[key as keyof Track];
-		return v == null ? '' : String(v);
-	}
-
-	/** The shared value of a field across all tracks, or null when they differ. */
-	function shared(key: TagField): string | null {
-		const values = new Set(detail.tracks.map((t) => value(t, key)));
-		return values.size === 1 ? [...values][0] : null;
-	}
-
-	function initialAlbum() {
-		return Object.fromEntries(albumFields.map((f) => [f.key, shared(f.key) ?? ''])) as Record<
-			AlbumField,
-			string
-		>;
-	}
-	function initialTracks() {
-		return Object.fromEntries(
-			detail.tracks.map((t) => [
-				t.id,
-				Object.fromEntries(trackFields.map((f) => [f.key, value(t, f.key)]))
-			])
-		) as Record<number, Record<TrackField, string>>;
-	}
-
-	/** The album's values as `detail` has them. */
-	function initial(): TagValues {
-		return {
-			album: initialAlbum(),
-			tracks: initialTracks(),
-			albumTracks: Object.fromEntries(
-				detail.tracks.map((t) => [
-					t.id,
-					Object.fromEntries(albumFields.map((f) => [f.key, value(t, f.key)]))
-				])
-			) as TagValues['albumTracks']
-		};
-	}
-
-	/** `values` with the kept edits on top: every field edited, on tracks still here. */
-	function withKept(values: TagValues): TagValues {
-		if (!kept) return values;
-		for (const f of albumFields) {
-			const edit = kept.album[f.key];
-			if (edit !== undefined) values.album[f.key] = edit;
-		}
-		for (const [id, edited] of Object.entries(kept.tracks)) {
-			if (!stillHere(kept, detail, +id)) continue;
-			for (const f of trackFields) {
-				const edit = edited[f.key];
-				if (edit !== undefined) values.tracks[+id][f.key] = edit;
-			}
-		}
-		return values;
-	}
-
-	/**
-	 * What changed elsewhere since the kept edits were made, with what it was.
-	 * An album field's tracks had these values (one, or several when mixed); a
-	 * track field had this value, or null on a track that has joined since.
-	 */
-	function changedElsewhere(now: TagValues) {
-		const album: Partial<Record<AlbumField, string[]>> = {};
-		const tracks: Record<number, Partial<Record<TrackField, string | null>>> = {};
-		if (!kept) return { album, tracks };
-		const was = kept.base;
-		const here = (id: number) => stillHere(kept, detail, id);
-		for (const f of albumFields) {
-			const values = (all: TagValues['albumTracks']) =>
-				[...new Set(Object.values(all).map((t) => t[f.key]))].sort();
-			const before = values(was.albumTracks);
-			// The tracks' values, not the field as shown: a mixed field shows empty
-			// however its tracks differ.
-			const changed =
-				before.join('\0') !== values(now.albumTracks).join('\0') ||
-				Object.entries(now.albumTracks).some(
-					([id, v]) => here(+id) && was.albumTracks[+id]?.[f.key] !== v[f.key]
-				);
-			if (changed) album[f.key] = before;
-		}
-		for (const [id, values] of Object.entries(now.tracks)) {
-			const old = here(+id) ? was.tracks[+id] : undefined;
-			const fields: Partial<Record<TrackField, string | null>> = {};
-			for (const f of trackFields)
-				if (old?.[f.key] !== values[f.key]) fields[f.key] = old?.[f.key] ?? null;
-			if (Object.keys(fields).length) tracks[+id] = fields;
-		}
-		return { album, tracks };
-	}
-
-	/** Values as a field's note gives them: one, or several when mixed. */
-	function described(values: string[]): string {
-		if (values.length > 1) return `mixed values (${values.map((v) => v || 'empty').join(', ')})`;
-		return values[0] ? `“${values[0]}”` : 'empty';
-	}
-	/**
-	 * What a field changed elsewhere says about it: what it was, and what it is
-	 * now (`base`, the album as it is now, under any edits made here).
-	 */
-	function albumNote(k: AlbumField): string | undefined {
-		const was = elsewhere.album[k];
-		if (!was) return undefined;
-		const now = [...new Set(Object.values(base.albumTracks).map((t) => t[k]))].sort();
-		return `Changed elsewhere, from ${described(was)} to ${described(now)}`;
-	}
-	function trackNote(id: number, k: TrackField): string | undefined {
-		const was = elsewhere.tracks[id]?.[k];
-		if (was === undefined) return undefined;
-		const now = described([base.tracks[id][k]]);
-		if (was === null) return `Added elsewhere: ${now}`;
-		return `Changed elsewhere, from ${described([was])} to ${now}`;
-	}
-
-	const mixed = Object.fromEntries(
-		albumFields.map((f) => [f.key, shared(f.key) === null])
-	) as Record<AlbumField, boolean>;
-	let base = $state(initial());
-	let form = $state(withKept(initial()));
-	let saving = $state(false);
-	const elsewhere = changedElsewhere(initial());
-	/**
-	 * Album fields a kept edit clears where the tracks now differ: empty there
-	 * would otherwise mean "keep each track's", as for a mixed field left be.
-	 */
-	const clearing = (): Set<AlbumField> =>
-		new Set(albumFields.filter((f) => kept?.album[f.key] === '' && mixed[f.key]).map((f) => f.key));
-	let clears = $state(clearing());
-
-	const albumChanged = (k: AlbumField) =>
-		form.album[k] !== base.album[k] || (clears.has(k) && form.album[k] === '');
-	const trackChanged = (id: number, k: TrackField) => form.tracks[id][k] !== base.tracks[id][k];
-
-	const invalid = (k: TagField, v: string) => {
-		if (!v.trim()) return false;
-		if (k === 'track_no' || k === 'disc_no') return !/^\d+(\/\d+)?$/.test(v.trim());
-		if (k === 'year') return !/^\d{4}(-\d{2}(-\d{2})?)?$/.test(v.trim());
-		return false;
+	/** The editor's own names for the fields up front. */
+	const LABEL: Record<string, string> = {
+		album: 'Album',
+		album_artist: 'Album artist',
+		date: 'Date',
+		genre: 'Genre',
+		track_number: '#',
+		disc_number: 'Disc',
+		title: 'Title',
+		artist: 'Artist'
 	};
+	const label = (kind: string) => LABEL[kind] ?? setup.label(kind);
+	const WIDE = new Set(['album', 'album_artist']);
+	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
 
-	let changes = $derived(
-		albumFields.filter((f) => albumChanged(f.key)).length +
-			detail.tracks.reduce(
-				(n, t) => n + trackFields.filter((f) => trackChanged(t.id, f.key)).length,
-				0
-			)
+	// The editor is made anew for each album version (see AlbumDetail).
+	// svelte-ignore state_referenced_locally
+	const tracks = detail.tracks;
+	const ids = tracks.map((t) => t.id);
+	const here = (id: number) => (kept ? stillHere(kept, detail, id) : true);
+
+	let loading = $state(true);
+	let failed = $state<string | null>(null);
+	/** The failure was the album changing while its tags were read. */
+	let stale = $state(false);
+	let base = $state<Values>({});
+	let form = $state<Values>({});
+	let other = $state<AlbumTags['tracks']>([]);
+	/** Per (track, kind) changed elsewhere since the kept edits: what it was then. */
+	let elsewhere = $state<Record<number, Record<string, string | null>>>({});
+	/** Kinds added with "Add a tag", shown though no track has them yet. */
+	const added = new SvelteSet<string>();
+	/** Album-wide fields opened to edit each track's value. */
+	const perTrack = new SvelteSet<string>();
+	let saving = $state(false);
+
+	async function load() {
+		loading = true;
+		failed = null;
+		stale = false;
+		try {
+			const [tags] = await Promise.all([api.albumTags(detail.id), setup.load()]);
+			// The tag list always has kinds once it's loaded.
+			if (!setup.kinds.length) {
+				failed = 'The list of tags could not be read.';
+				return;
+			}
+			// Read from the album as it is now: tracks and values from another
+			// version than the one shown (and saved against) can't be paired.
+			if (tags.version !== detail.version) {
+				failed = 'This album changed while its tags were read. Try again to load it as it is now.';
+				stale = true;
+				return;
+			}
+			const values: Values = {};
+			for (const id of ids) {
+				const read = tags.tracks.find((t) => t.id === id)?.values ?? {};
+				// Every field up front exists on every track, so inputs can bind to it.
+				values[id] = { ...Object.fromEntries(CORE.map((k) => [k, ''])), ...read };
+			}
+			base = structuredClone(values);
+			if (kept) {
+				elsewhere = changedElsewhere(kept, values, here);
+				form = withKept(structuredClone(values), kept, here);
+				for (const kind of kindsIn(kept.edits)) if (!CORE.includes(kind)) added.add(kind);
+				// A field kept edits made differ per track opens per track.
+				for (const kind of ALBUM_CORE) if (shared(form, ids, kind) === null) perTrack.add(kind);
+			} else form = structuredClone(values);
+			other = tags.tracks;
+		} catch (e) {
+			failed = e instanceof ApiError ? e.message : 'The tags could not be read.';
+			// Gone under this id: renamed (or removed) since; the sheet may
+			// know it by its new one.
+			if (e instanceof ApiError && e.status === 404) {
+				failed =
+					'This album was renamed or removed while its tags were read. Try again to load it as it is now.';
+				stale = true;
+			}
+		} finally {
+			loading = false;
+		}
+	}
+	load();
+
+	const anyChanged = (kind: string) => ids.some((id) => changed(form, base, id, kind));
+	const anyElsewhere = (kind: string) => ids.some((id) => elsewhere[id]?.[kind] !== undefined);
+	const wrong = (id: number, kind: string) =>
+		changed(form, base, id, kind) && invalid(kind, valueOf(form, id, kind));
+
+	let changes = $derived(loading ? 0 : changeCount(form, base, ids));
+	let errors = $derived(ids.some((id) => Object.keys(form[id] ?? {}).some((k) => wrong(id, k))));
+
+	/** The other kinds the album has, or was given, in catalog order. */
+	let extra = $derived.by(() => {
+		const present = kindsIn(base, form);
+		// One changed elsewhere stays to show that, though it's empty now.
+		const marked = new Set(Object.values(elsewhere).flatMap((kinds) => Object.keys(kinds)));
+		const all = setup.kinds.length ? setup.kinds.map((k) => k.id) : [...present].sort();
+		return all.filter(
+			(k) => !CORE.includes(k) && (present.has(k) || added.has(k) || marked.has(k))
+		);
+	});
+	let extraGroups = $derived(
+		setup.groups
+			.map((g) => ({
+				...g,
+				kinds: extra.filter((k) => setup.kinds.find((x) => x.id === k)?.group === g.id)
+			}))
+			.filter((g) => g.kinds.length)
 	);
+	let extraChanged = $derived(extra.filter(anyChanged).length);
+	/** Kinds "Add a tag" offers: those not shown, that can be typed. */
+	let addable = $derived(
+		setup.groups
+			.map((g) => ({
+				...g,
+				kinds: setup.kinds.filter(
+					(k) =>
+						k.group === g.id &&
+						!CORE.includes(k.id) &&
+						!extra.includes(k.id) &&
+						!setup.notEditable.includes(k.id)
+				)
+			}))
+			.filter((g) => g.kinds.length)
+	);
+	let others = $derived(otherTags(other));
+
+	function addKind(kind: string) {
+		if (!kind) return;
+		added.add(kind);
+		requestAnimationFrame(() =>
+			document.querySelector<HTMLElement>(`[data-kind="${kind}"] .all`)?.focus()
+		);
+	}
+
+	/** Kept edits not yet put back (still loading, or the load failed): still a draft. */
+	let pending = $derived(kept !== null && (loading || failed !== null));
 	// So that signing out asks before dropping them.
 	$effect(() => {
-		drafts.tags = changes > 0;
+		drafts.tags = changes > 0 || pending;
 		return () => (drafts.tags = false);
 	});
-	let errors = $derived(
-		albumFields.some((f) => invalid(f.key, form.album[f.key])) ||
-			detail.tracks.some((t) => trackFields.some((f) => invalid(f.key, form.tracks[t.id][f.key])))
-	);
-
-	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 ? 'draft' : 'none'));
+	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 || pending ? 'draft' : 'none'));
 	/** Whether this editor is still open: a refused save's edits are read from it, if so. */
 	let open = true;
 	onDestroy(() => {
@@ -282,61 +260,52 @@
 		ondraft?.('none');
 	});
 
+	/** Values as a field's note gives them: one, or several when mixed. */
+	function described(values: string[]): string {
+		if (values.length > 1) return `mixed values (${values.map((v) => v || 'empty').join(', ')})`;
+		return values[0] ? `“${values[0]}”` : 'empty';
+	}
+	/** What a field changed elsewhere says: what its tracks had, and have now. */
+	function albumNote(kind: string): string | undefined {
+		if (!kept || !anyElsewhere(kind)) return undefined;
+		const was = [...new Set(ids.filter(here).map((id) => kept!.base[id]?.[kind] ?? ''))].sort();
+		const now = [...new Set(ids.map((id) => valueOf(base, id, kind)))].sort();
+		return `Changed elsewhere, from ${described(was)} to ${described(now)}`;
+	}
+	function trackNote(id: number, kind: string): string | undefined {
+		const was = elsewhere[id]?.[kind];
+		if (was === undefined) return undefined;
+		const now = described([valueOf(base, id, kind)]);
+		if (was === null) return `Added elsewhere: ${now}`;
+		return `Changed elsewhere, from ${described([was])} to ${now}`;
+	}
+
+	/** What an album-wide field says when it shows no single value. */
+	function placeholder(kind: string): string {
+		const now = shared(form, ids, kind);
+		if (now === '' && ids.some((id) => valueOf(base, id, kind) !== '') && anyChanged(kind))
+			return 'Cleared on every track';
+		if (now !== null) return '';
+		return ids.some((id) => changed(form, base, id, kind))
+			? 'Differs per track'
+			: 'Mixed — leave empty to keep';
+	}
+
 	function revert() {
 		form = structuredClone($state.snapshot(base));
-		clears = new Set();
+		added.clear();
+		// The kept edits go, and with them what changed since they were made.
+		elsewhere = {};
 		onrevert?.();
 	}
 
 	/** The edits, kept to put back on the album as it is now. `sent`: the album they were made on. */
 	function keep(sent: AlbumDetail): TagDraft {
-		const album: TagDraft['album'] = {};
-		for (const f of albumFields) if (albumChanged(f.key)) album[f.key] = form.album[f.key];
-		const tracks: TagDraft['tracks'] = {};
-		for (const t of sent.tracks) {
-			const edit: Partial<Record<TrackField, string>> = {};
-			for (const f of trackFields)
-				if (trackChanged(t.id, f.key)) edit[f.key] = form.tracks[t.id][f.key];
-			if (Object.keys(edit).length) tracks[t.id] = edit;
-		}
 		const paths = Object.fromEntries(sent.tracks.map((t) => [t.id, t.rel_path]));
-		return { base: $state.snapshot(base), album, tracks, paths };
-	}
-
-	/** Editor fields as library rule tag kinds, for the import. */
-	const KIND: Record<TagField, string> = {
-		album: 'album',
-		album_artist: 'album_artist',
-		year: 'date',
-		genre: 'genre',
-		track_no: 'track_number',
-		disc_no: 'disc_number',
-		title: 'title',
-		artist: 'artist'
-	};
-
-	function importEdits(): ImportEdits {
-		const out: ImportEdits = {};
-		for (const t of detail.tracks) {
-			const edit: Record<string, string> = {};
-			for (const f of albumFields) if (albumChanged(f.key)) edit[KIND[f.key]] = form.album[f.key];
-			for (const f of trackFields)
-				if (trackChanged(t.id, f.key)) edit[KIND[f.key]] = form.tracks[t.id][f.key];
-			if (Object.keys(edit).length) out[t.id] = edit;
-		}
-		return out;
+		return { base: $state.snapshot(base), edits: edits(form, base, ids), paths };
 	}
 
 	async function save() {
-		const album: TagEdit = {};
-		for (const f of albumFields) if (albumChanged(f.key)) album[f.key] = form.album[f.key];
-		const tracks: Record<number, TagEdit> = {};
-		for (const t of detail.tracks) {
-			const edit: TagEdit = {};
-			for (const f of trackFields)
-				if (trackChanged(t.id, f.key)) edit[f.key] = form.tracks[t.id][f.key];
-			if (Object.keys(edit).length) tracks[t.id] = edit;
-		}
 		saving = true;
 		// The album as saved: once answered, `detail` may be another's (the sheet
 		// closed, and another album opened).
@@ -344,8 +313,7 @@
 		const id = sent.id;
 		try {
 			const result = await api.writeTags(id, {
-				album,
-				tracks,
+				kinds: edits(form, base, ids),
 				version: sent.version,
 				base_tracks: sent.tracks.map(({ id, rel_path }) => ({ id, rel_path }))
 			});
@@ -355,7 +323,6 @@
 			);
 			// Saved: no longer a draft, while the album is reloaded with them.
 			base = structuredClone($state.snapshot(form));
-			clears = new Set();
 			onsaved(result, id);
 		} catch (e) {
 			if (e instanceof TagConflict) {
@@ -378,64 +345,237 @@
 	}
 </script>
 
-<div class="editor">
-	<section>
-		<h3>Album</h3>
-		<div class="album-grid">
-			{#each albumFields as f (f.key)}
-				<label
-					class="field"
-					class:wide={f.wide}
-					class:changed={albumChanged(f.key)}
-					class:elsewhere={f.key in elsewhere.album}
-					class:invalid={invalid(f.key, form.album[f.key])}
-				>
-					<span class="label"
-						>{f.label}{#if albumChanged(f.key)}<i class="dot" in:fly={{ y: -4 }}
-							></i>{/if}{#if f.key in elsewhere.album}<i class="dot warn"></i>{/if}</span
-					>
-					<input
-						title={albumNote(f.key)}
-						bind:value={form.album[f.key]}
-						placeholder={mixed[f.key]
-							? clears.has(f.key)
-								? 'Cleared on every track'
-								: 'Mixed — leave empty to keep'
-							: ''}
-						spellcheck="false"
-					/>
-				</label>
-			{/each}
-		</div>
-	</section>
+{#snippet input(id: number | null, kind: string, aria: string)}
+	{@const readonly = setup.notEditable.includes(kind)}
+	{#if id === null}
+		{@const value = shared(form, ids, kind) ?? ''}
+		{#if MULTILINE.has(kind)}
+			<textarea
+				class="all"
+				rows="3"
+				{value}
+				{readonly}
+				title={albumNote(kind)}
+				placeholder={placeholder(kind)}
+				aria-label={aria}
+				spellcheck="false"
+				oninput={(e) => setAll(form, base, ids, kind, e.currentTarget.value)}></textarea>
+		{:else}
+			<input
+				class="all"
+				{value}
+				{readonly}
+				title={albumNote(kind)}
+				placeholder={placeholder(kind)}
+				aria-label={aria}
+				inputmode={NUMERIC.has(kind) ? 'numeric' : undefined}
+				spellcheck="false"
+				oninput={(e) => setAll(form, base, ids, kind, e.currentTarget.value)}
+			/>
+		{/if}
+	{:else if MULTILINE.has(kind)}
+		<textarea
+			class:changed={changed(form, base, id, kind)}
+			class:elsewhere={elsewhere[id]?.[kind] !== undefined}
+			class:invalid={wrong(id, kind)}
+			title={trackNote(id, kind)}
+			rows="3"
+			{readonly}
+			bind:value={form[id][kind]}
+			aria-label={aria}
+			spellcheck="false"></textarea>
+	{:else}
+		<input
+			class:changed={changed(form, base, id, kind)}
+			class:elsewhere={elsewhere[id]?.[kind] !== undefined}
+			class:invalid={wrong(id, kind)}
+			title={trackNote(id, kind)}
+			{readonly}
+			bind:value={form[id][kind]}
+			aria-label={aria}
+			inputmode={NUMERIC.has(kind) ? 'numeric' : undefined}
+			spellcheck="false"
+		/>
+	{/if}
+{/snippet}
 
-	<section>
-		<h3>Tracks</h3>
-		<div class="table" role="table" aria-label="Track tags">
-			<div class="thead" role="row">
-				{#each trackFields as f (f.key)}<span role="columnheader" class="col-{f.key}"
-						>{f.label}</span
-					>{/each}
+{#snippet toggle(kind: string)}
+	<button
+		type="button"
+		class="per-track"
+		class:open={perTrack.has(kind)}
+		aria-expanded={perTrack.has(kind)}
+		title="Edit each track's value"
+		onclick={() => (perTrack.has(kind) ? perTrack.delete(kind) : perTrack.add(kind))}
+	>
+		<ChevronRight size={13} /> Per track
+	</button>
+{/snippet}
+
+{#snippet tracksOf(kind: string)}
+	<div class="track-values" transition:slide={{ duration: 200 }}>
+		{#each tracks as t, i (t.id)}
+			<label class="track-value">
+				<span class="which tabular" title={t.title}
+					><b>{t.track_no ?? i + 1}</b> {t.title || t.rel_path}</span
+				>
+				{@render input(t.id, kind, `${label(kind)}, track ${i + 1}`)}
+			</label>
+		{/each}
+	</div>
+{/snippet}
+
+<div class="editor">
+	{#if loading}
+		<p class="status"><span class="spin"><LoaderCircle size={15} /></span> Reading the tags…</p>
+	{:else if failed}
+		<p class="status failed">
+			{failed}
+			<button class="link" onclick={stale && onretry ? onretry : load}>Try again</button>
+		</p>
+	{:else}
+		<section>
+			<h3>Album</h3>
+			<div class="album-grid">
+				{#each ALBUM_CORE as kind (kind)}
+					<div
+						class="field"
+						class:wide={WIDE.has(kind)}
+						class:changed={anyChanged(kind)}
+						class:elsewhere={anyElsewhere(kind)}
+						class:invalid={ids.some((id) => wrong(id, kind))}
+					>
+						<span class="label"
+							>{label(kind)}{#if anyChanged(kind)}<i class="dot" in:fly={{ y: -4 }}
+								></i>{/if}{#if anyElsewhere(kind)}<i class="dot warn"></i>{/if}
+							{@render toggle(kind)}</span
+						>
+						{@render input(null, kind, label(kind))}
+					</div>
+				{/each}
 			</div>
-			{#each detail.tracks as t, i (t.id)}
-				<div class="tr" role="row" style:--i={Math.min(i, 24)}>
-					{#each trackFields as f (f.key)}
-						<input
-							class="cell col-{f.key}"
-							class:changed={trackChanged(t.id, f.key)}
-							class:elsewhere={f.key in (elsewhere.tracks[t.id] ?? {})}
-							title={trackNote(t.id, f.key)}
-							class:invalid={invalid(f.key, form.tracks[t.id][f.key])}
-							bind:value={form.tracks[t.id][f.key]}
-							aria-label="{f.label}, track {i + 1}"
-							inputmode={f.key === 'track_no' || f.key === 'disc_no' ? 'numeric' : undefined}
-							spellcheck="false"
-						/>
-					{/each}
+			{#each ALBUM_CORE.filter((k) => perTrack.has(k)) as kind (kind)}
+				<div class="per-track-block" transition:slide={{ duration: 200 }}>
+					<h4>{label(kind)}, per track</h4>
+					{@render tracksOf(kind)}
 				</div>
 			{/each}
-		</div>
-	</section>
+		</section>
+
+		<section>
+			<h3>Tracks</h3>
+			<div class="table" role="table" aria-label="Track tags">
+				<div class="thead" role="row">
+					{#each TRACK_CORE as kind (kind)}<span role="columnheader" class="col-{kind}"
+							>{label(kind)}</span
+						>{/each}
+				</div>
+				{#each tracks as t, i (t.id)}
+					<div class="tr" role="row" style:--i={Math.min(i, 24)}>
+						{#each TRACK_CORE as kind (kind)}
+							<input
+								class="cell col-{kind}"
+								class:changed={changed(form, base, t.id, kind)}
+								class:elsewhere={elsewhere[t.id]?.[kind] !== undefined}
+								title={trackNote(t.id, kind)}
+								class:invalid={wrong(t.id, kind)}
+								bind:value={form[t.id][kind]}
+								aria-label="{label(kind)}, track {i + 1}"
+								inputmode={NUMERIC.has(kind) ? 'numeric' : undefined}
+								spellcheck="false"
+							/>
+						{/each}
+					</div>
+				{/each}
+			</div>
+		</section>
+
+		<ShowAll
+			label="Show all tags"
+			count={extra.length + others.length}
+			badge={extraChanged ? `${extraChanged} changed` : undefined}
+			initiallyOpen={extraChanged > 0}
+		>
+			<div class="all-tags">
+				{#each extraGroups as g (g.id)}
+					<div class="group">
+						<h4>{g.label}</h4>
+						{#each g.kinds as kind (kind)}
+							<div
+								class="row"
+								data-kind={kind}
+								class:changed={anyChanged(kind)}
+								class:elsewhere={anyElsewhere(kind)}
+								class:invalid={ids.some((id) => wrong(id, kind))}
+							>
+								<span class="label"
+									>{label(kind)}{#if anyChanged(kind)}<i class="dot" in:fly={{ y: -4 }}
+										></i>{/if}{#if anyElsewhere(kind)}<i class="dot warn"></i>{/if}</span
+								>
+								{@render input(null, kind, label(kind))}
+								{#if tracks.length > 1}{@render toggle(kind)}{/if}
+							</div>
+							{#if perTrack.has(kind)}{@render tracksOf(kind)}{/if}
+						{/each}
+					</div>
+				{/each}
+				{#if addable.length}
+					<label class="add">
+						<span>Add a tag</span>
+						<select
+							onchange={(e) => {
+								addKind(e.currentTarget.value);
+								e.currentTarget.value = '';
+							}}
+						>
+							<option value="">Choose a tag…</option>
+							{#each addable as g (g.id)}
+								<optgroup label={g.label}>
+									{#each g.kinds as k (k.id)}<option value={k.id}>{k.label}</option>{/each}
+								</optgroup>
+							{/each}
+						</select>
+					</label>
+				{/if}
+				{#if others.length}
+					<div class="group other">
+						<h4>Other tags in the files</h4>
+						<p class="note">
+							Kept as they are when you save, but not editable here: tags coversync has no name for,
+							ones held as data or with a description, and the files' other tag blocks. TRACKNUM, an
+							old name for the track number, is dropped when a file with a track number is saved.
+						</p>
+						<dl>
+							{#each others as o (o.key)}
+								<dt>{o.key}</dt>
+								<dd>
+									{#if o.values !== null}
+										{#each o.values as v, n (n)}<span class="value">{v}</span>{/each}
+									{:else}
+										<details>
+											<summary>Differs per track</summary>
+											<ul>
+												{#each o.tracks as t (t.id)}
+													{@const track = tracks.find((x) => x.id === t.id)}
+													<li>
+														<span class="which tabular"
+															><b>{track?.track_no ?? '–'}</b>
+															{track?.title ?? ''}</span
+														>
+														{#each t.values as v, n (n)}<span class="value">{v}</span>{/each}
+													</li>
+												{/each}
+											</ul>
+										</details>
+									{/if}
+								</dd>
+							{/each}
+						</dl>
+					</div>
+				{/if}
+			</div>
+		</ShowAll>
+	{/if}
 
 	<div class="savebar" class:dirty={changes > 0}>
 		<span class="summary tabular">
@@ -458,7 +598,7 @@
 					class="btn"
 					class:primary={!onimport}
 					onclick={save}
-					disabled={changes === 0 || errors || saving}
+					disabled={changes === 0 || errors || saving || loading}
 				>
 					{#if saving}<span class="spin"><LoaderCircle size={15} /></span>{:else}<Check
 							size={15}
@@ -469,8 +609,8 @@
 			{#if onimport}
 				<button
 					class="btn primary"
-					onclick={() => onimport(importEdits())}
-					disabled={errors || saving}
+					onclick={() => onimport(edits(form, base, ids))}
+					disabled={errors || saving || loading || failed !== null}
 				>
 					<FolderInput size={15} /> Import
 				</button>
@@ -598,8 +738,8 @@
 		height: 36px;
 		font-size: 14px;
 	}
-	.col-track_no,
-	.col-disc_no {
+	.col-track_number,
+	.col-disc_number {
 		text-align: center;
 	}
 
@@ -651,6 +791,180 @@
 		}
 	}
 
+	/* Each track's value of a field. */
+	.per-track {
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
+		margin-left: auto;
+		padding: 1px 6px 1px 2px;
+		border-radius: 6px;
+		font-size: 11.5px;
+		font-weight: 550;
+		color: var(--text-3);
+		transition: color 140ms;
+	}
+	.per-track:hover {
+		color: var(--text);
+	}
+	.per-track :global(svg) {
+		transition: rotate 180ms var(--ease-out);
+	}
+	.per-track.open :global(svg) {
+		rotate: 90deg;
+	}
+	.per-track-block {
+		margin-top: 16px;
+	}
+	h4 {
+		margin: 0 0 8px;
+		font-size: 12.5px;
+		font-weight: 600;
+		color: var(--text-2);
+	}
+	.track-values {
+		display: grid;
+		gap: 6px;
+		margin: 4px 0 12px;
+	}
+	.track-value {
+		display: grid;
+		grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+		gap: 10px;
+		align-items: center;
+	}
+	.which {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.which b {
+		display: inline-block;
+		min-width: 1.6em;
+		color: var(--text-3);
+		font-weight: 500;
+	}
+	textarea {
+		width: 100%;
+		padding: 8px 12px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: var(--surface);
+		outline: none;
+		font: inherit;
+		resize: vertical;
+	}
+	textarea:focus {
+		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
+		background: var(--bg-raised);
+		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+	}
+	.changed textarea,
+	textarea.changed {
+		border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+		background: color-mix(in oklab, var(--accent) 8%, var(--surface));
+	}
+	.invalid textarea,
+	textarea.invalid {
+		border-color: var(--danger);
+	}
+	input[readonly],
+	textarea[readonly] {
+		color: var(--text-3);
+	}
+
+	/* Show all tags. */
+	.all-tags {
+		display: grid;
+		gap: 22px;
+	}
+	.group {
+		display: grid;
+		gap: 8px;
+	}
+	.row {
+		display: grid;
+		grid-template-columns: minmax(0, 200px) minmax(0, 1fr) auto;
+		gap: 10px;
+		align-items: center;
+	}
+	.row .label {
+		min-width: 0;
+	}
+	.add {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.add select {
+		height: 36px;
+		padding: 0 10px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: var(--surface);
+		color: var(--text);
+		font: inherit;
+	}
+	.other .note {
+		margin: 0;
+		font-size: 12.5px;
+		color: var(--text-3);
+	}
+	.other dl {
+		display: grid;
+		grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+		gap: 6px 12px;
+		margin: 4px 0 0;
+		font-size: 13px;
+	}
+	.other dt {
+		font-family: var(--mono, ui-monospace, monospace);
+		font-size: 12px;
+		color: var(--text-2);
+		overflow-wrap: anywhere;
+	}
+	.other dd {
+		margin: 0;
+		color: var(--text-2);
+		overflow-wrap: anywhere;
+		white-space: pre-wrap;
+	}
+	.other summary {
+		cursor: pointer;
+		color: var(--text-3);
+	}
+	/* A key held several times: each value on its own line. */
+	.other .value {
+		display: block;
+	}
+	.other ul {
+		margin: 6px 0 0;
+		padding: 0;
+		list-style: none;
+		display: grid;
+		gap: 4px;
+	}
+	.status {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 8px 0;
+		color: var(--text-2);
+		font-size: 13.5px;
+	}
+	.status.failed {
+		color: var(--warn-text);
+	}
+	.link {
+		color: var(--accent);
+		font-weight: 600;
+	}
+
 	@media (max-width: 760px) {
 		.album-grid {
 			grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -661,6 +975,11 @@
 		}
 		.col-artist {
 			display: none;
+		}
+		.row,
+		.track-value,
+		.other dl {
+			grid-template-columns: minmax(0, 1fr);
 		}
 	}
 	/* Phones: a sheet along the bottom edge, summary and buttons on their own rows. */

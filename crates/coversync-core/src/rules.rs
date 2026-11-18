@@ -206,6 +206,8 @@ pub fn present(tag: &Tag) -> Vec<&'static str> {
     let keys: HashSet<ItemKey> = tag
         .items()
         .filter(|i| i.value().text().is_none_or(|t| !t.trim().is_empty()))
+        // An ID3v2 comment with a description (iTunNORM) isn't the comment.
+        .filter(|i| i.description().is_empty())
         .map(|i| i.key())
         .collect();
     CATALOG
