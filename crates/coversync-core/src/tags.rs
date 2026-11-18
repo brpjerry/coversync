@@ -261,15 +261,22 @@ fn apply(tag: &mut Tag, edit: &TagEdit) -> Result<()> {
 }
 
 /// The Vorbis comments of a FLAC or Ogg file that lofty's generic [`Tag`]
-/// has no key for (`ALBUM_JP`, `CDTOC`, a ripper's own), read aside before an
-/// edit: lofty keeps such items of other tag types for its own writer to
-/// put back, but its Vorbis writer leaves them out (see [`save_vorbis`]).
+/// leaves out, read aside before an edit. Lofty's owned conversions put back
+/// what a generic tag couldn't hold for other tag types, but its Vorbis
+/// conversion rewrites values its generic items don't round-trip (see
+/// [`save_vorbis`]), so Vorbis comments are written here.
 struct VorbisRest {
-    items: Vec<(String, String)>,
-    /// The vendor string, which lofty also writes as an ENCODER comment.
+    /// The comments lofty has no key for, as read (nothing renamed or
+    /// rejected), with the file's vendor string.
+    rest: VorbisComments,
+    /// The vendor string, which lofty also reads as an ENCODER comment.
     vendor: String,
     /// Whether the file had ENCODER comments of its own.
     had_encoder: bool,
+    /// The file's RATING comments, provider-qualified ones (`RATING:MusicBee`)
+    /// included, as written: coversync never edits a rating, and lofty can't
+    /// write a provider's back the way it read it.
+    ratings: Vec<(String, String)>,
 }
 
 /// The file's [`VorbisRest`]; None for a file whose primary tag isn't
@@ -299,23 +306,31 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
     };
     let vendor = tag.vendor().to_string();
     let had_encoder = tag.get("ENCODER").is_some();
-    let rest = tag.split_tag().0;
-    let items = rest
+    let is_rating = |k: &str| {
+        let k = k.to_ascii_uppercase();
+        k == "RATING" || k.starts_with("RATING:")
+    };
+    let mut ratings: Vec<(String, String)> = tag
         .items()
+        .filter(|(k, _)| is_rating(k))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    let rest = VorbisComments::from(tag.split_tag().0);
+    // Ratings lofty couldn't read stay with the rest, once.
+    ratings.retain(|(k, v)| !rest.items().any(|(rk, rv)| rk == k && rv == v));
     Ok(Some(VorbisRest {
-        items,
+        rest,
         vendor,
         had_encoder,
+        ratings,
     }))
 }
 
 /// Write `tag`, a FLAC or Ogg file's primary tag after an edit, as lofty's
-/// own writer does (each item under its usual key, its text as it is), with
-/// `rest` put back. The vendor string stays as it was; ENCODER comments are
-/// the file's own, or one the edit set (`encoder_edited`), never the vendor
-/// string lofty reads as one.
+/// own writer does (each item under its usual key, its text as it is) over
+/// `rest`. The vendor string stays as it was; ENCODER comments are the
+/// file's own, or one the edit set (`encoder_edited`), never the vendor
+/// string lofty reads as one; ratings are the file's own.
 fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool) -> Result<()> {
     use lofty::ogg::OggPictureStorage;
     use lofty::picture::PictureInformation;
@@ -324,10 +339,12 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
         .map(str::to_string)
         .collect();
     let vendor_only = !rest.had_encoder && !encoder_edited && encoders == [rest.vendor.as_str()];
-    let mut out = VorbisComments::default();
+    let mut out = rest.rest;
     out.set_vendor(rest.vendor);
     for item in tag.items() {
-        if item.key() == ItemKey::EncoderSoftware {
+        if item.key() == ItemKey::EncoderSoftware
+            || (item.key() == ItemKey::Popularimeter && !rest.ratings.is_empty())
+        {
             continue;
         }
         let (ItemValue::Text(value) | ItemValue::Locator(value)) = item.value() else {
@@ -342,11 +359,17 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
             out.push("ENCODER".into(), encoder);
         }
     }
-    for (key, value) in rest.items {
-        out.push(key, value);
+    if tag.get(ItemKey::Popularimeter).is_some() {
+        for (key, value) in rest.ratings {
+            out.push(key, value);
+        }
     }
+    // From the end, so each move is cheap; then in their order.
+    let mut pictures = Vec::with_capacity(tag.pictures().len());
     while !tag.pictures().is_empty() {
-        let picture = tag.remove_picture(0);
+        pictures.push(tag.remove_picture(tag.pictures().len() - 1));
+    }
+    for picture in pictures.into_iter().rev() {
         let info = PictureInformation::from_picture(&picture).unwrap_or_default();
         out.insert_picture(picture, Some(info)).map_err(tag_err)?;
     }
@@ -354,10 +377,93 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
         .map_err(tag_err)
 }
 
-/// Save an edit of `file`, read from `path`, with `rest` read before the
-/// edit. A FLAC or Ogg file gets its primary tag written by [`save_vorbis`],
-/// and of its other tags those in `changed` that the format can write; any
-/// other file is saved as lofty saves it.
+/// The ID3v2 tag's header flags as the file has them (CRC, restrictions…),
+/// which a tag converted from lofty's generic one would lose.
+fn id3v2_flags(path: &Path, file_type: FileType) -> Result<Option<lofty::id3::v2::Id3v2TagFlags>> {
+    use lofty::file::AudioFile;
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false);
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let tag = match file_type {
+        FileType::Mpeg => lofty::mpeg::MpegFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_id3v2(),
+        FileType::Aac => lofty::aac::AacFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_id3v2(),
+        FileType::Aiff => lofty::iff::aiff::AiffFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_id3v2(),
+        FileType::Wav => lofty::iff::wav::WavFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_id3v2(),
+        _ => None,
+    };
+    Ok(tag.map(|t| *t.flags()))
+}
+
+/// Write `tag`, a primary tag other than Vorbis comments after an edit,
+/// through lofty's owned conversion: unlike its writer for a borrowed
+/// generic tag, it puts back what the generic tag couldn't hold (custom
+/// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
+/// frames) and joins repeated values as the format wants.
+fn save_owned(path: &Path, file_type: FileType, tag: Tag) -> Result<()> {
+    let options = WriteOptions::default();
+    match tag.tag_type() {
+        TagType::Id3v2 => {
+            let flags = id3v2_flags(path, file_type)?;
+            let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
+            if let Some(flags) = flags {
+                id3.set_flags(flags);
+            }
+            id3.save_to_path(path, options)
+        }
+        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag).save_to_path(path, options),
+        TagType::Ape => {
+            // Number pairs and the compilation flag as written: the
+            // conversion would read them as numbers (Track=A1 lost, 01/09
+            // made 1/9).
+            let mut tag = tag;
+            let mut literal = Vec::new();
+            for (name, number, total) in [
+                ("Track", ItemKey::TrackNumber, ItemKey::TrackTotal),
+                ("Disc", ItemKey::DiscNumber, ItemKey::DiscTotal),
+            ] {
+                let value = match (tag.get_string(number), tag.get_string(total)) {
+                    (Some(n), None) => Some(n.to_string()),
+                    (n, Some(t)) => Some(format!("{}/{t}", n.unwrap_or("0"))),
+                    (None, None) => None,
+                };
+                if let Some(value) = value {
+                    literal.push((name, value));
+                }
+                tag.remove_key(number);
+                tag.remove_key(total);
+            }
+            for value in tag.get_strings(ItemKey::FlagCompilation) {
+                literal.push(("Compilation", value.to_string()));
+            }
+            tag.remove_key(ItemKey::FlagCompilation);
+            let mut ape = lofty::ape::ApeTag::from(tag);
+            for (name, value) in literal {
+                let item = lofty::ape::ApeItem::new(name.into(), ItemValue::Text(value))
+                    .map_err(tag_err)?;
+                ape.insert(item);
+            }
+            ape.save_to_path(path, options)
+        }
+        // RIFF INFO, AIFF text chunks: as lofty writes them.
+        _ => tag.save_to_path(path, options),
+    }
+    .map_err(tag_err)
+}
+
+/// Save an edit of `file`, read from `path` (`rest`, for Vorbis comments,
+/// read before the edit): its primary tag, keeping what lofty's generic tag
+/// couldn't hold, and of its other tags only those in `changed` (pictures
+/// replaced) that the format can write. Untouched tags stay as they are on
+/// disk.
 fn save(
     path: &Path,
     mut file: TaggedFile,
@@ -365,12 +471,8 @@ fn save(
     changed: &[TagType],
     encoder_edited: bool,
 ) -> Result<()> {
+    let file_type = file.file_type();
     let primary = file.primary_tag_type();
-    let (Some(rest), true) = (rest, file.primary_tag().is_some()) else {
-        return file
-            .save_to_path(path, WriteOptions::default())
-            .map_err(tag_err);
-    };
     for t in changed.iter().filter(|t| **t != primary) {
         if file.tag_support(*t).is_writable()
             && let Some(tag) = file.tag(*t)
@@ -379,8 +481,13 @@ fn save(
                 .map_err(tag_err)?;
         }
     }
-    let tag = file.remove(primary).expect("checked above");
-    save_vorbis(path, tag, rest, encoder_edited)
+    let Some(tag) = file.remove(primary) else {
+        return Ok(());
+    };
+    match rest {
+        Some(rest) => save_vorbis(path, tag, rest, encoder_edited),
+        None => save_owned(path, file_type, tag),
+    }
 }
 
 /// Apply `edit` to the file's primary tag. The change is written to a copy
@@ -1205,6 +1312,152 @@ mod tests {
                 if private.owner == "coversync" && private.private_data.as_ref() == [1, 2, 3]
         )));
         assert_eq!(kept.title().as_deref(), Some("Song"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ratings_and_comments_lofty_cant_name_stay_as_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-ratings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "RATING:MusicBee=80", "RATING=60", "=legacy"],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        // A provider's rating under its own key and scale, and a bare one.
+        assert!(has(&items, "RATING:MusicBee", "80"), "{items:?}");
+        assert!(has(&items, "RATING", "60"), "{items:?}");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|(k, _)| k.starts_with("RATING"))
+                .count(),
+            2
+        );
+        assert!(has(&items, "GENRE", "Anime"));
+        // A comment with no name, as read.
+        assert!(has(&items, "", "legacy"), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_urls_header_flags_and_untouched_tags_are_kept() {
+        use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, Id3v2TagFlags, UrlLinkFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-id3url-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        wav_with_info(&src);
+        // A RIFF INFO item lofty has no key for, beside the ID3v2 tag.
+        let mut f = fs::File::open(&src).unwrap();
+        let mut wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut info = wav.remove_riff_info().unwrap();
+        info.insert("IXYZ".into(), "kept".into());
+        info.save_to_path(&src, WriteOptions::default()).unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Url(UrlLinkFrame::new(
+            FrameId::new("WOAR").unwrap(),
+            "https://example.com/artist",
+        )));
+        id3.set_flags(Id3v2TagFlags {
+            experimental: true,
+            ..Default::default()
+        });
+        id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let tag = wav.id3v2().unwrap();
+        assert!(tag.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Url(url) if url.url() == "https://example.com/artist"
+        )));
+        assert!(tag.flags().experimental);
+        assert_eq!(tag.track(), Some(1));
+        // The RIFF INFO tag wasn't touched.
+        assert_eq!(wav.riff_info().unwrap().get("IXYZ"), Some("kept"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mp4_atoms_lofty_has_no_key_for_are_kept() {
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
+        let dir = std::env::temp_dir().join(format!("coversync-mp4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.m4a"), dir.join("out.m4a"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.m4a")).unwrap();
+        let mut ilst = lofty::mp4::Ilst::default();
+        ilst.set_title("Song".into());
+        ilst.insert(Atom::new(
+            AtomIdent::Freeform {
+                mean: "com.apple.iTunes".into(),
+                name: "CUSTOM".into(),
+            },
+            AtomData::UTF8("kept".into()),
+        ));
+        ilst.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let mp4 = Mp4File::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ilst = mp4.ilst().unwrap();
+        let custom = AtomIdent::Freeform {
+            mean: "com.apple.iTunes".into(),
+            name: "CUSTOM".into(),
+        };
+        let kept: Vec<&AtomData> = ilst.get(&custom).unwrap().data().collect();
+        assert!(
+            matches!(kept[..], [AtomData::UTF8(v)] if v == "kept"),
+            "{kept:?}"
+        );
+        assert_eq!(ilst.title().as_deref(), Some("Song"));
+        assert_eq!(ilst.track(), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ape_items_covers_and_numbers_are_kept_as_written() {
+        use lofty::ape::{ApeItem, ApeTag};
+        let dir = std::env::temp_dir().join(format!("coversync-ape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wv"), dir.join("out.wv"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(item("Title", ItemValue::Text("Song".into())));
+        ape.insert(item("Track", ItemValue::Text("A1".into())));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.insert(item(
+            "Cover Art (Front)",
+            ItemValue::Binary(b"front.jpg\0data".to_vec()),
+        ));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("title", "New".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wv = lofty::wavpack::WavPackFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ape = wv.ape().unwrap();
+        let text = |k: &str| match ape.get(k).map(|i| i.value()) {
+            Some(ItemValue::Text(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        assert_eq!(text("Title"), Some("New"));
+        assert_eq!(text("Track"), Some("A1"));
+        assert_eq!(text("Ripper"), Some("kept"));
+        assert!(matches!(
+            ape.get("Cover Art (Front)").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == b"front.jpg\0data"
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
