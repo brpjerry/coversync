@@ -228,11 +228,14 @@ pub fn scan(
         .cloned()
         .collect();
     let total = files.len() as u64;
+    // Files the tag reader now reads differently are read again, once.
+    let reread = lib.tag_reader()? != crate::tags::READER;
     let changed: Vec<FileStat> = files
         .into_iter()
         .filter(|f| {
             known.get(&f.path) != Some(&(f.mtime, f.size, f.collection))
                 || times.get(&f.path) != Some(&f.mtime_ns)
+                || (reread && crate::tags::reader_changed(&f.path))
         })
         .collect();
     tracing::info!(
@@ -248,6 +251,9 @@ pub fn scan(
     });
     index_files(lib, changed, progress)?;
     lib.remove_paths(&removed)?;
+    if reread {
+        lib.set_tag_reader(crate::tags::READER)?;
+    }
     update(progress, |p| p.phase = "covers".into());
     refresh_covers(lib, covers, progress)?;
     let albums = lib

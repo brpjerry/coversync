@@ -700,7 +700,14 @@
 		| { kind: 'notice'; id: string; previous: string | null; version?: string | null }
 		| { kind: 'resync' }
 		| { kind: 'moved'; from: string; to: string }
-		| { kind: 'reload'; sheet: string; opening: number; keepDraft: boolean }
+		| {
+				kind: 'reload';
+				sheet: string;
+				opening: number;
+				keepDraft: boolean;
+				/** For a retry: the album version the editor that asked showed. */
+				from?: string;
+		  }
 		| {
 				kind: 'refused';
 				saved: string;
@@ -792,7 +799,7 @@
 						await goto(page.url.href, { state: { album: job.to }, shallow: true, replace: true });
 					return true;
 				case 'reload':
-					await reload(job.sheet, job.opening, job.keepDraft);
+					await reload(job.sheet, job.opening, job.keepDraft, job.from);
 					return true;
 				case 'refused':
 					refused(job);
@@ -869,10 +876,17 @@
 		return true;
 	}
 
-	/** Reload, pressed on the sheet opened as `sheet`: drop its edits, and show the album as it is now. */
-	async function reload(sheet: string, opening: number, keepDraft: boolean) {
+	/**
+	 * Show the album of the sheet opened as `sheet` as it is now: Reload drops
+	 * its edits; the tag editor's Try again (`keepDraft`) keeps the kept ones,
+	 * if the editor that asked (showing version `from`) is still the one shown.
+	 */
+	async function reload(sheet: string, opening: number, keepDraft: boolean, from?: string) {
 		const h = holding;
 		const before = saves;
+		// A retry from an editor since replaced (a second Try again, queued
+		// behind the first) would put the kept edits back over new ones.
+		if (keepDraft && from !== undefined && (h ? h.detail : detail)?.version !== from) return;
 		// The sheet it was asked on, still held (or, for the editor's Try
 		// again, open), or it's moot: closed (or reopened) since, or saved over.
 		const current = () => openId === sheet && openings === opening && holding === h;
@@ -894,7 +908,8 @@
 		// or with the kept ones on top.
 		detail = fresh;
 		const kept = keepDraft ? (h?.kept ?? null) : null;
-		if (kept) held = { from: to, next: null, album: fresh, detail, changed: false, kept };
+		// Still reviewing the kept edits: the notice stays (tracks they lost, Reload).
+		if (kept) held = { from: to, next: null, album: fresh, detail, changed: true, kept };
 		else
 			held =
 				to === sheet || !h
@@ -960,8 +975,8 @@
 	 * unsaved edits (Reload), or keeping them (`keepDraft`: the tag editor's
 	 * Try again after the album changed while its tags were read).
 	 */
-	function reloadHeld(keepDraft = false) {
-		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings, keepDraft });
+	function reloadHeld(keepDraft = false, from?: string) {
+		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings, keepDraft, from });
 	}
 
 	/** An album was edited, here or elsewhere: show it as it is now. */

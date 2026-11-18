@@ -74,16 +74,22 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
 	return n;
 }
 
-const SEPARATED = /^\d{4}(?:[-.]\d{1,2}(?:[-.]\d{2}(?:T(?:\d{2}(?::\d{2}(?::\d{2})?)?)?)?)?)?Z?$/;
+// A part lofty reads whole: two characters (06, or a space and 6), or one
+// digit with a separator after it; the last part must be two.
+const PART = '(?:\\d{1,2}| \\d)';
+const LAST = '(?:\\d{2}| \\d)';
+const SEPARATED = new RegExp(
+	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
+);
 const COMPACT = /^\d{4}(?:\d{2}(?:\d{2}(?:T\d{2}(?:\d{2}(?:\d{2})?)?)?)?)?Z?$/;
 
 /**
  * Numbers and dates the server would refuse; other kinds take any text. A
- * date is one lofty reads whole: a year, then a month, a two-digit day and
- * a time after a T, the parts after dashes or dots and the time's after
- * colons (2010.08.25, 2010-08-25T12:30), or the digits run together
- * (20100825T1230); a Z may end it. A time after a space, say, would be
- * dropped on writing.
+ * date is one lofty reads whole: a year, then a month, a day and a time
+ * after a T, the parts after dashes or dots and the time's after colons
+ * (2010.08.25, 2024-6-03T14:8:49), or the digits run together
+ * (20100825T1230); a Z may end it. A time after a space, or a last part of
+ * one digit (2024-6), would be dropped on writing.
  */
 export function invalid(kind: string, value: string): boolean {
 	const v = value.trim();

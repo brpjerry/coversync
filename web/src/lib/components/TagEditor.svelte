@@ -180,6 +180,13 @@
 			other = tags.tracks;
 		} catch (e) {
 			failed = e instanceof ApiError ? e.message : 'The tags could not be read.';
+			// Gone under this id: renamed (or removed) since; the sheet may
+			// know it by its new one.
+			if (e instanceof ApiError && e.status === 404) {
+				failed =
+					'This album was renamed or removed while its tags were read. Try again to load it as it is now.';
+				stale = true;
+			}
 		} finally {
 			loading = false;
 		}

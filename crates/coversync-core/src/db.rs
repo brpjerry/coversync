@@ -859,6 +859,9 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
 
 /// A setting stored in `schema` ("main" or "lib"). A value this build can't
 /// parse (say, from a newer one) reads as unset.
+/// The setting holding [`Library::tag_reader`].
+const TAG_READER: &str = "tag_reader";
+
 fn get_setting<T: serde::de::DeserializeOwned>(
     conn: &Connection,
     schema: &str,
@@ -2310,6 +2313,16 @@ impl Library {
             )
             .optional()?;
         Ok(row.map(|(source, version)| (source.as_deref().and_then(CoverSource::decode), version)))
+    }
+
+    /// The tag reader the index was last filled by (see
+    /// [`crate::tags::READER`]); 0 before one was kept.
+    pub fn tag_reader(&self) -> Result<u32> {
+        Ok(self.setting(TAG_READER)?.unwrap_or(0))
+    }
+
+    pub fn set_tag_reader(&self, reader: u32) -> Result<()> {
+        self.put_setting(TAG_READER, &reader)
     }
 
     /// A setting of this installation, kept in the local database.
