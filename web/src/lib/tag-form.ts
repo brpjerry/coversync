@@ -76,9 +76,9 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
 
 // A part lofty reads whole: two characters (06, or 6 with a space before or
 // after it), or one digit with a separator after it; the last part must be
-// two, and can't end in a space (the value is trimmed).
+// two, and ends in a space only before a Z (the value is trimmed).
 const PART = '(?:\\d{1,2}| \\d|\\d )';
-const LAST = '(?:\\d{2}| \\d)';
+const LAST = '(?:\\d{2}| \\d|\\d (?=Z$))';
 const SEPARATED = new RegExp(
 	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
 );

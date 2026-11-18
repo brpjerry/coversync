@@ -53,17 +53,17 @@ pub struct TrackTags {
     pub values: HashMap<&'static str, String>,
 }
 
-/// The tag reader's version, kept with the index: bumped when what reading
+/// The tag reader's version, kept with each index: bumped when what reading
 /// a file gives changes, so the next scan reads again the files
-/// [`reader_changed`] names. 1, 2: ID3v2 comments and lyrics with a
-/// description (`iTunNORM`) aren't the comment, or the lyrics (2 adds FLACs
-/// with an ID3v2 tag).
+/// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
+/// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
+/// for FLACs with an ID3v2 tag, which 1 left out.
 pub const READER: u32 = 2;
 
-/// Whether the last change of [`READER`] can change what reading `path`
-/// gives: files that can hold ID3v2 tags (a FLAC only if it starts with
-/// one; Ogg files can't).
-pub fn reader_changed(path: &Path) -> bool {
+/// Whether what reading `path` gives has changed since reader `since`: for
+/// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
+/// one, or can't be opened to tell; since 2); Ogg files can't.
+pub fn reader_changed(path: &Path, since: u32) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -74,12 +74,12 @@ pub fn reader_changed(path: &Path) -> bool {
         "flac" => {
             use std::io::Read;
             let mut head = [0u8; 3];
-            fs::File::open(path)
-                .and_then(|mut f| f.read_exact(&mut head))
-                .is_ok()
-                && &head == b"ID3"
+            since < 2
+                && fs::File::open(path)
+                    .and_then(|mut f| f.read_exact(&mut head))
+                    .map_or(true, |()| &head == b"ID3")
         }
-        _ => true,
+        _ => since < 1,
     }
 }
 
@@ -226,14 +226,18 @@ fn edit_values(edit: &TagEdit) -> Vec<(&'static str, String)> {
 /// `edit`'s fields and `kinds` as one edit: a kind given both ways takes
 /// its value from `kinds` (applied after the fields), so only what's
 /// written has to fit the format.
-fn merged<'a>(edit: &TagEdit, kinds: &[(&'a str, String)]) -> Vec<(&'a str, String)> {
+fn merged<'a>(edit: &TagEdit, kinds: &[(&'a str, String)]) -> Result<Vec<(&'a str, String)>> {
     let mut all: Vec<(&'a str, String)> = edit_values(edit).into_iter().collect();
     for (id, value) in kinds {
         let id = rules::kind(id).map_or(*id, |k| k.id);
+        // A field given another way still had to be one.
+        for (_, displaced) in all.iter().filter(|(x, _)| *x == id) {
+            validate_kind(id, displaced)?;
+        }
         all.retain(|(x, _)| *x != id);
         all.push((id, value.clone()));
     }
-    all
+    Ok(all)
 }
 
 /// The Vorbis comments of a FLAC or Ogg file that lofty's generic [`Tag`]
@@ -1006,7 +1010,7 @@ pub fn write_with_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -
         let mut file = probe(&tmp, true)?;
         let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
-        apply_kinds(tag, &merged(edit, kinds))?;
+        apply_kinds(tag, &merged(edit, kinds)?)?;
         let mut edited = edit_kinds(edit);
         edited.extend(kinds.iter().map(|(id, _)| *id));
         save(&tmp, file, rest, &[], &edited)?;
@@ -1301,6 +1305,9 @@ fn described(item: &TagItem) -> bool {
 fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
     // The kinds given values, to check they're all still there as written.
     let mut set: Vec<(&'static rules::TagKind, String)> = Vec::new();
+    // Numbers before their totals (a pair is written number first).
+    let mut values: Vec<&(&str, String)> = values.iter().collect();
+    values.sort_by_key(|(id, _)| number_of(id).is_some());
     for (id, value) in values {
         let kind =
             rules::kind(id).ok_or_else(|| Error::Invalid(format!("unknown tag kind '{id}'")))?;
@@ -1420,6 +1427,16 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
     Ok(())
 }
 
+/// The number kind a total kind goes with.
+fn number_of(total: &str) -> Option<&'static str> {
+    match total {
+        "track_total" => Some("track_number"),
+        "disc_total" => Some("disc_number"),
+        "movement_total" => Some("movement_number"),
+        _ => None,
+    }
+}
+
 /// Which of `set` (kinds just given values on `tag`) isn't there once the
 /// tag is converted to its format and encoded as it will be written
 /// ([`native`]). Each kind's value is first converted alone: what comes back
@@ -1438,7 +1455,7 @@ fn lost(
         return None;
     }
     // A tag of these kinds' items, converted and encoded: None if refused.
-    let back = |kinds: &[&rules::TagKind]| -> Option<Vec<(ItemKey, String)>> {
+    let back = |kinds: &[&'static rules::TagKind]| -> Option<Vec<(ItemKey, String)>> {
         let mut only = Tag::new(tag.tag_type());
         for item in tag
             .items()
@@ -1446,7 +1463,7 @@ fn lost(
         {
             only.push(item.clone());
         }
-        let mut sink = Vec::new();
+        let mut sink = std::io::sink();
         let options = WriteOptions::default();
         let converted: Tag = match native(only).ok()? {
             Native::Id3v2(t) => {
@@ -1476,15 +1493,40 @@ fn lost(
         )
     };
     let number = |kind: &rules::TagKind, t: &str| parse_number(kind.label, t).ok().flatten();
+    let id3v2 = tag.tag_type() == TagType::Id3v2;
     let mut alone = Vec::new();
     for (kind, value) in set {
-        let items = match back(&[*kind]) {
+        // ID3v2 reads dates as timestamps: a date it reads only part of
+        // (a time after a space) loses the rest. Its URL frames hold
+        // Latin-1 only.
+        if id3v2
+            && matches!(kind.id, "release_date" | "original_date")
+            && !value
+                .parse::<Timestamp>()
+                .is_ok_and(|read| read_whole(value, &read))
+        {
+            return Some((kind, value.clone()));
+        }
+        if id3v2 && kind.id.ends_with("_url") && value.chars().any(|c| u32::from(c) > 0xFF) {
+            return Some((kind, value.clone()));
+        }
+        // A total goes with its number, as they're written (ID3v2's MVIN,
+        // MP4's trkn): alone, it would land in the number's place.
+        let with: Vec<&'static rules::TagKind> = std::iter::once(*kind)
+            .chain(number_of(kind.id).and_then(rules::kind))
+            .collect();
+        let items = match back(&with) {
             Some(items) if !items.is_empty() => items,
             _ => return Some((kind, value.clone())),
         };
         let numeric = matches!(
             kind.id,
-            "track_number" | "track_total" | "disc_number" | "disc_total"
+            "track_number"
+                | "track_total"
+                | "disc_number"
+                | "disc_total"
+                | "movement_number"
+                | "movement_total"
         );
         if numeric
             && !items
@@ -1501,9 +1543,16 @@ fn lost(
             .filter(|(k, _)| kind.keys.contains(k))
             .cloned()
             .collect();
+        if numeric && own.is_empty() {
+            return Some((kind, value.clone()));
+        }
         alone.push((*kind, value, if own.is_empty() { items } else { own }));
     }
-    let kinds: Vec<&rules::TagKind> = set.iter().map(|(k, _)| *k).collect();
+    // One kind: converted alone is converted together.
+    if set.len() == 1 {
+        return None;
+    }
+    let kinds: Vec<&'static rules::TagKind> = set.iter().map(|(k, _)| *k).collect();
     let Some(together) = back(&kinds) else {
         return set.first().cloned();
     };
@@ -1528,12 +1577,22 @@ pub fn check_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Res
         )
         .read()
         .map_err(tag_err)?;
-    apply_kinds(primary_tag_mut(&mut file), &merged(edit, kinds))?;
+    apply_kinds(primary_tag_mut(&mut file), &merged(edit, kinds)?)?;
     let primary = file.primary_tag_type();
     if primary != TagType::VorbisComments
         && let Some(tag) = file.remove(primary)
     {
-        native(tag)?;
+        // Encoded whole: a frame the file already has that can't be written
+        // (an ID3v2 timestamp of month 13) fails here, not on saving.
+        let mut sink = std::io::sink();
+        let options = WriteOptions::default();
+        match native(tag)? {
+            Native::Id3v2(t) => t.dump_to(&mut sink, options),
+            Native::Ilst(t) => t.dump_to(&mut sink, options),
+            Native::Ape(t) => t.dump_to(&mut sink, options),
+            Native::Other(t) => t.dump_to(&mut sink, options),
+        }
+        .map_err(tag_err)?;
     }
     Ok(())
 }
@@ -3243,6 +3302,7 @@ mod tests {
         "202406",
         "2024-6 -03",
         "2024-06-03T1 :02",
+        "2024-6 Z",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3474,10 +3534,16 @@ mod tests {
 
     #[test]
     fn files_read_again_for_a_new_reader_are_those_it_reads_differently() {
-        assert!(reader_changed(Path::new("/m/a.mp3")));
-        assert!(reader_changed(Path::new("/m/a.M4A")));
-        assert!(!reader_changed(Path::new("/m/a.flac")));
-        assert!(!reader_changed(Path::new("/m/a.Opus")));
+        // Since reader 0: MP3s and M4As, not Ogg; a FLAC only with ID3v2
+        // (or if it can't be opened to tell).
+        assert!(reader_changed(Path::new("/m/a.mp3"), 0));
+        assert!(reader_changed(Path::new("/m/a.M4A"), 0));
+        assert!(!reader_changed(Path::new("/m/a.Opus"), 0));
+        assert!(reader_changed(Path::new("/m/missing.flac"), 0));
+        // Since 1: only such FLACs.
+        assert!(!reader_changed(Path::new("/m/a.mp3"), 1));
+        assert!(reader_changed(Path::new("/m/missing.flac"), 1));
+        assert!(!reader_changed(Path::new("/m/missing.flac"), READER));
     }
 
     #[test]
@@ -3542,6 +3608,54 @@ mod tests {
             file_tags(&path("a.m4a"), "; ").unwrap().values["track_number"],
             "1"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_dates_urls_and_pairs_as_they_are_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-id3pairs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+        let kinds = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+        };
+        fs::write(
+            path("a.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        // An original or release date ID3v2 would read only part of.
+        for kind in ["original_date", "release_date"] {
+            let refused =
+                write_with_kinds(&path("a.mp3"), &none, &kinds(&[(kind, "2010-08-25 12:30")]));
+            assert!(refused.is_err(), "{kind}");
+        }
+        // A URL ID3v2 can't hold (its URL frames are Latin-1).
+        let refused = write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("artist_url", "https://例え.jp")]),
+        );
+        assert!(refused.is_err());
+        // A movement number and total, in either order: both kept (MVIN).
+        for pair in [
+            [("movement_number", "2"), ("movement_total", "4")],
+            [("movement_total", "4"), ("movement_number", "2")],
+        ] {
+            write_with_kinds(&path("a.mp3"), &none, &kinds(&pair)).unwrap();
+            let values = file_tags(&path("a.mp3"), "; ").unwrap().values;
+            assert_eq!(values["movement_number"], "2");
+            assert_eq!(values["movement_total"], "4");
+        }
+        // A field given another way must still have been one.
+        let bad = TagEdit {
+            track_no: Some("invalid".into()),
+            ..Default::default()
+        };
+        assert!(check_kinds(&path("a.mp3"), &bad, &kinds(&[("track_number", "1")])).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

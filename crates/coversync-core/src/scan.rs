@@ -228,14 +228,20 @@ pub fn scan(
         .cloned()
         .collect();
     let total = files.len() as u64;
-    // Files the tag reader now reads differently are read again, once,
-    // keeping their audio digests: the files themselves haven't changed.
-    let reread = lib.tag_reader()? != crate::tags::READER;
-    let digests = if reread {
+    // Files the tag reader now reads differently (since each collection's
+    // index was filled) are read again, once, keeping their audio digests:
+    // the files themselves haven't changed.
+    let readers = [
+        (Collection::Inbox, lib.tag_reader(Collection::Inbox)?),
+        (Collection::Library, lib.tag_reader(Collection::Library)?),
+    ];
+    let since = |c: Collection| readers.iter().find(|(x, _)| *x == c).map_or(0, |(_, r)| *r);
+    let digests = if since(Collection::Library) < crate::tags::READER {
         lib.library_hashes()?
     } else {
         HashMap::new()
     };
+    let mut reread = Vec::new();
     let changed: Vec<FileStat> = files
         .into_iter()
         .filter_map(|mut f| {
@@ -244,11 +250,12 @@ pub fn scan(
             if !unchanged {
                 return Some(f);
             }
-            if reread && crate::tags::reader_changed(&f.path) {
+            let read_by = since(f.collection);
+            if read_by < crate::tags::READER && crate::tags::reader_changed(&f.path, read_by) {
                 // Kept by path in the Library folder.
                 let rel = f.path.strip_prefix(&f.root).unwrap_or(&f.path);
                 f.hash = digests.get(rel).cloned();
-                return Some(f);
+                reread.push(f);
             }
             None
         })
@@ -261,17 +268,29 @@ pub fn scan(
     );
     update(progress, |p| {
         p.files_seen = total;
-        p.files_read = total - changed.len() as u64;
+        p.files_read = total - changed.len() as u64 - reread.len() as u64;
         p.phase = "reading".into();
     });
-    let errors = progress.read().map_or(0, |p| p.errors);
     index_files(lib, changed, progress)?;
-    lib.remove_paths(&removed)?;
-    // Only once every file it chose was read (an unreadable one is tried
-    // again next time).
-    if reread && progress.read().map_or(0, |p| p.errors) == errors {
-        lib.set_tag_reader(crate::tags::READER)?;
+    // A collection's marker moves on once every file read again for it
+    // was read (an unreadable one is tried again next time; a new file
+    // that can't be read is tried again anyway, and doesn't hold it back).
+    for (collection, read_by) in readers {
+        if read_by >= crate::tags::READER {
+            continue;
+        }
+        let errors = progress.read().map_or(0, |p| p.errors);
+        let again: Vec<FileStat> = reread
+            .iter()
+            .filter(|f| f.collection == collection)
+            .cloned()
+            .collect();
+        index_files(lib, again, progress)?;
+        if progress.read().map_or(0, |p| p.errors) == errors {
+            lib.set_tag_reader(collection, crate::tags::READER)?;
+        }
     }
+    lib.remove_paths(&removed)?;
     update(progress, |p| p.phase = "covers".into());
     refresh_covers(lib, covers, progress)?;
     let albums = lib

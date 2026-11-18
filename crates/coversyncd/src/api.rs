@@ -1443,7 +1443,10 @@ mod tests {
         tags::write(&m4a, &tags_of).unwrap();
         scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
         // The index was filled by this tag reader.
-        assert_eq!(state.lib.tag_reader().unwrap(), tags::READER);
+        assert_eq!(
+            state.lib.tag_reader(Collection::Inbox).unwrap(),
+            tags::READER
+        );
         let albums = state
             .lib
             .albums(

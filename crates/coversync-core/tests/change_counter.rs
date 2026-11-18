@@ -990,17 +990,37 @@ fn a_new_tag_reader_reads_files_again_and_keeps_their_digests() {
     s.import(&s.inbox_album());
     let before = s.lib.library_hashes().unwrap();
     assert_eq!(before.len(), 2);
-    assert_eq!(s.lib.tag_reader().unwrap(), coversync_core::tags::READER);
-    // As if the index had been filled by an older reader: the next scan
-    // reads the files again (the change counter says so), digests kept.
-    s.lib.set_tag_reader(0).unwrap();
+    assert_eq!(
+        s.lib.tag_reader(Collection::Library).unwrap(),
+        coversync_core::tags::READER
+    );
+    // As if the Library's index had been filled by an older reader: the
+    // next scan reads its files again (the change counter says so), digests
+    // kept.
+    s.lib.set_tag_reader(Collection::Library, 0).unwrap();
     let generation = s.library().generation;
     s.scan();
     assert!(s.library().generation > generation);
     assert_eq!(s.lib.library_hashes().unwrap(), before);
-    assert_eq!(s.lib.tag_reader().unwrap(), coversync_core::tags::READER);
+    assert_eq!(
+        s.lib.tag_reader(Collection::Library).unwrap(),
+        coversync_core::tags::READER
+    );
     // And once read, not again.
     let generation = s.library().generation;
     s.scan();
+    assert_eq!(s.library().generation, generation);
+
+    // The Inbox's own marker: a new file that can't be read doesn't hold it
+    // back (it's tried again anyway), and the Library isn't read again.
+    fs::create_dir_all(s.inbox.join("Other")).unwrap();
+    fs::write(s.inbox.join("Other/bad.mp3"), b"not audio").unwrap();
+    s.lib.set_tag_reader(Collection::Inbox, 0).unwrap();
+    let generation = s.library().generation;
+    s.scan();
+    assert_eq!(
+        s.lib.tag_reader(Collection::Inbox).unwrap(),
+        coversync_core::tags::READER
+    );
     assert_eq!(s.library().generation, generation);
 }

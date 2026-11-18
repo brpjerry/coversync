@@ -484,14 +484,19 @@ fn new_prefix() -> i64 {
     1 + (h.finish() % ((1 << 20) - 1)) as i64
 }
 
-/// A Library index started here (new, or in memory) holds only what this
-/// installation's index read: it takes its tag reader marker too (see
-/// [`Library::tag_reader`]).
+/// A Library index started here (new, or in memory) is filled by this
+/// build's tag reader (see [`Library::tag_reader`]); rows carried into a
+/// new one come from an in-memory one, also started here.
 fn start_reader(conn: &Connection, schema: &str) -> Result<()> {
-    if let Some(reader) = get_setting::<u32>(conn, "main", TAG_READER)? {
-        put_setting(conn, schema, TAG_READER, &reader)?;
+    put_setting(conn, schema, TAG_READER, &crate::tags::READER)
+}
+
+/// Where `collection`'s tag reader marker is kept.
+fn reader_schema(collection: Collection) -> &'static str {
+    match collection {
+        Collection::Inbox => "main",
+        Collection::Library => "lib",
     }
-    Ok(())
 }
 
 /// Index `dir` (or nothing, with no `dir`) in an empty in-memory database.
@@ -2327,25 +2332,16 @@ impl Library {
         Ok(row.map(|(source, version)| (source.as_deref().and_then(CoverSource::decode), version)))
     }
 
-    /// The tag reader the index was last filled by (see
-    /// [`crate::tags::READER`]); 0 before one was kept. Kept in the local
-    /// database and in the Library's own, when one is attached (it can be
-    /// another's, a folder switched to): the older of the two.
-    pub fn tag_reader(&self) -> Result<u32> {
-        let conn = self.conn();
-        let local = get_setting::<u32>(&conn, "main", TAG_READER)?.unwrap_or(0);
-        let library = get_setting::<u32>(&conn, "lib", TAG_READER)
-            .ok()
-            .map(|v| v.unwrap_or(0));
-        Ok(library.map_or(local, |l| local.min(l)))
+    /// The tag reader `collection`'s index was last filled by (see
+    /// [`crate::tags::READER`]); 0 before one was kept. The Inbox's is kept
+    /// in the local database, the Library's in its own (which can be
+    /// another's, a folder switched to; one started here starts current).
+    pub fn tag_reader(&self, collection: Collection) -> Result<u32> {
+        Ok(get_setting(&self.conn(), reader_schema(collection), TAG_READER)?.unwrap_or(0))
     }
 
-    pub fn set_tag_reader(&self, reader: u32) -> Result<()> {
-        let conn = self.conn();
-        put_setting(&conn, "main", TAG_READER, &reader)?;
-        // No Library attached: nothing to keep it in.
-        let _ = put_setting(&conn, "lib", TAG_READER, &reader);
-        Ok(())
+    pub fn set_tag_reader(&self, collection: Collection, reader: u32) -> Result<()> {
+        put_setting(&self.conn(), reader_schema(collection), TAG_READER, &reader)
     }
 
     /// A setting of this installation, kept in the local database.
