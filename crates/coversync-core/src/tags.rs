@@ -423,8 +423,9 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
             // Frames lofty kept aside come flagged as unsynchronised but
             // already decoded: written as they are, unflagged, so they aren't
-            // decoded twice. Compressed, encrypted or nested ones, which it
-            // can't write back plainly, refuse the save instead.
+            // decoded twice. A tag that also has frames lofty can't write
+            // back as they are (compressed, encrypted, length-prefixed,
+            // chapters) refuses the save instead.
             if (&id3).into_iter().any(|f| f.flags().unsynchronisation) {
                 use lofty::id3::v2::Frame;
                 let encoded = (&id3).into_iter().any(|frame| {
@@ -436,7 +437,7 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
                 });
                 if encoded {
                     return Err(Error::Tags(
-                        "the file's ID3v2 tag has unsynchronised frames that are compressed, encrypted or nested, which can't be rewritten safely yet, so it wasn't changed".into(),
+                        "the file's ID3v2 tag has unsynchronised frames alongside frames lofty can't write back as they are (compressed, encrypted, length-prefixed, or chapters), so it wasn't changed".into(),
                     ));
                 }
                 id3.retain_mut(|frame| {
@@ -1548,19 +1549,16 @@ mod tests {
             .filter(|(k, _)| k.starts_with("RATING"))
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        // MusicBee's four stars on its Vorbis scale, under its key.
+        // MusicBee's four stars on its Vorbis scale, under its key; Windows
+        // Media Player's on its own.
         assert!(ratings.contains(&("RATING:MusicBee", "80")), "{ratings:?}");
         assert!(
-            ratings
-                .iter()
-                .any(|(k, _)| *k == "RATING:Windows Media Player 9 Series"),
+            ratings.contains(&("RATING:Windows Media Player 9 Series", "255")),
             "{ratings:?}"
         );
-        // The third, as lofty read it, under RATING.
+        // The third, as lofty read it (owner, stars, play count), under RATING.
         assert!(
-            ratings
-                .iter()
-                .any(|(k, v)| *k == "RATING" && v.contains("a=b@example.org")),
+            ratings.contains(&("RATING", "a=b@example.org|3|0")),
             "{ratings:?}"
         );
         assert_eq!(ratings.len(), 3, "{ratings:?}");
@@ -1602,25 +1600,23 @@ mod tests {
     #[test]
     #[cfg(feature = "server")]
     fn unsynchronised_id3v2_frames_are_written_back_plainly() {
-        use lofty::id3::v2::{Frame, Id3v2Tag, Id3v2TagFlags, PrivateFrame};
+        use lofty::id3::v2::Frame;
         let dir = std::env::temp_dir().join(format!("coversync-unsync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
         wav_with_info(&src);
-        let mut id3 = Id3v2Tag::new();
-        id3.set_title("Song".into());
-        // A frame lofty keeps aside, with its flags, as read; its data has
-        // bytes unsynchronisation encodes.
-        id3.insert(Frame::Private(PrivateFrame::new(
-            "coversync",
-            vec![1, 0xFF, 0x00, 0xFF, 0xE0, 2],
-        )));
-        id3.set_flags(Id3v2TagFlags {
-            unsynchronisation: true,
-            ..Default::default()
-        });
-        id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        // Both the tag and its PRIV frame are unsynchronised: FF 00 00 and
+        // FF 00 E0 on disk decode to FF 00 and FF E0.
+        let tag = b"ID3\x04\x00\x80\x00\x00\x00\x1c\
+                    PRIV\x00\x00\x00\x12\x00\x02coversync\x00\x01\xff\x00\x00\xff\x00\xe0\x02";
+        let mut wav = fs::read(&src).unwrap();
+        wav.extend_from_slice(b"ID3 ");
+        wav.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+        wav.extend_from_slice(tag);
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        fs::write(&src, wav).unwrap();
         let private = |path: &Path| {
             let mut f = fs::File::open(path).unwrap();
             let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
@@ -1633,6 +1629,8 @@ mod tests {
         };
         let (read, was) = private(&src);
         assert!(was, "the fixture is unsynchronised");
+        let expected: &[u8] = &[1, 0xFF, 0x00, 0xFF, 0xE0, 2];
+        assert_eq!(read.as_deref(), Some(expected));
         let values = [("track_number", "1".to_string())];
         copy_with_tags(&src, &dest, &values, None, false).unwrap();
         // The data as lofty read it, in a tag no longer unsynchronised.
