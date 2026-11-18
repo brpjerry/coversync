@@ -82,8 +82,9 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
  * so nothing it would lose is written.
  */
 export function invalid(kind: string, value: string): boolean {
-	// Trimmed as the server trims (Rust's whitespace includes U+0085).
-	const v = value.replace(/^[\s\u0085]+|[\s\u0085]+$/g, '');
+	// Trimmed as the server trims (Rust's whitespace includes U+0085, which
+	// JavaScript's trim doesn't: as a tab, it's trimmed too).
+	const v = value.replace(/\u0085/g, '\t').trim();
 	if (!v) return false;
 	if (['track_number', 'track_total', 'disc_number', 'disc_total'].includes(kind))
 		return !/^\d+(\/\d+)?$/.test(v);

@@ -1247,6 +1247,12 @@ fn read_whole(typed: &str, read: &Timestamp) -> bool {
     {
         return false;
     }
+    // A bare T only right after a whole date (2010-08-25T), not a month.
+    if let Some(date) = body.strip_suffix('T')
+        && (read.day.is_none() || !date.ends_with(|c: char| c.is_ascii_digit()))
+    {
+        return false;
+    }
     // Anything but numbers, separators, T and Z (a PM, say) isn't read.
     if !typed
         .trim()
@@ -1651,14 +1657,18 @@ fn lost(
             } else {
                 own
             };
-            // As many times as the file has it (two Publishers of one name).
-            let count = |list: &[&(ItemKey, String)], item: &(ItemKey, String)| {
-                list.iter().filter(|x| **x == item).count()
-            };
-            let together: Vec<&(ItemKey, String)> = together.iter().collect();
-            expected
-                .iter()
-                .all(|item| count(&expected, item) <= count(&together, item))
+            // As many times as the file has it (two Publishers of one name):
+            // each needed occurrence consumed from the combined conversion.
+            let mut needed: HashMap<&(ItemKey, String), usize> = HashMap::new();
+            for item in expected {
+                *needed.entry(item).or_default() += 1;
+            }
+            for item in &together {
+                if let Some(n) = needed.get_mut(item) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+            needed.values().all(|n| *n == 0)
         })
     })?;
     // Named by the edit that pushes it out: one in the same field.
@@ -3438,6 +3448,7 @@ mod tests {
         "2024-06-",
         "2024-06-03T12:",
         "2024-06-03T12:Z",
+        "2024-06-T",
     ];
 
     #[test]
