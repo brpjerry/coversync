@@ -643,6 +643,18 @@ pub struct Medium {
     pub tracks: Vec<Track>,
 }
 
+impl Medium {
+    /// How many tracks it holds: those listed, or its count when none are
+    /// (a DVD whose tracks MusicBrainz doesn't list, say).
+    pub fn size(&self) -> u32 {
+        if self.tracks.is_empty() {
+            self.track_count.unwrap_or(0)
+        } else {
+            self.tracks.len() as u32
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
     pub id: String,

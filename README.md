@@ -20,9 +20,11 @@ used on a home server.
   the Inbox's order. "Needs attention" lists albums missing tags or art the
   rules require, and albums **Incomplete** by their own numbering: track
   numbers below the last one (or up to the track total) that no track has,
-  and discs between the first and the last there. Discs past the last one
-  aren't counted missing, since a disc total often counts a DVD or Blu-ray;
-  nor is an album with an unnumbered track (it could be any of the gaps).
+  and discs below the last one there that no track is on. Discs past the
+  last one aren't counted missing, since a disc total often counts a DVD or
+  Blu-ray, and an album with an unnumbered track isn't judged (it could be
+  any of the gaps). A total for the whole album on every disc counts the
+  tracks it lacks even when the tags don't say which disc they're on.
   The album's page shows the missing numbers in its tracklist. This needs no
   MusicBrainz; Smart suggestions (below) list what a release has that the
   album doesn't. The sidebar filters albums by tag:

@@ -289,7 +289,7 @@ impl Evidence {
         cache: Option<&LookupCache>,
         release: &Release,
     ) -> Option<mb::Answer<Arc<Release>>> {
-        let total: u32 = release.media.iter().map(|m| m.tracks.len() as u32).sum();
+        let total: u32 = release.media.iter().map(Medium::size).sum();
         let linked = romanize::linked_tracklists(release);
         let others = self
             .candidates
@@ -1120,10 +1120,14 @@ pub fn suggest(
     if let Some(c) = candidates.iter_mut().find(|c| c.id == release.id) {
         c.artist = Some(mb::credit_name(&release.artist_credit));
     }
-    let (missing, missing_discs) = match &shown {
-        Some(romanized) => unpaired(&evidence.tracks, romanized, Some(&release)),
-        None => unpaired(&evidence.tracks, &release, None),
+    // Suggestions come from the romanized release when there is one, its
+    // titles matched against the original's too.
+    let (displayed, original): (&Release, Option<&Release>) = match &shown {
+        Some(romanized) => (romanized, Some(&release)),
+        None => (&release, None),
     };
+    let mapped = map_tracks(&evidence.tracks, displayed, original);
+    let (missing, missing_discs) = unpaired(displayed, &mapped);
     Ok(Identification {
         method: if chosen {
             Method::Chosen
@@ -1134,10 +1138,7 @@ pub fn suggest(
         candidates,
         fingerprinted: evidence.fingerprinted,
         recognized: evidence.recognized,
-        tracks: match &shown {
-            Some(romanized) => suggestions(&evidence.tracks, romanized, Some(&release), split),
-            None => suggestions(&evidence.tracks, &release, None, split),
-        },
+        tracks: track_suggestions(&evidence.tracks, displayed, original, &mapped, split),
         missing,
         missing_discs,
         notes: evidence.notes.clone(),
@@ -1154,7 +1155,7 @@ fn summary(r: &Release) -> ReleaseSummary {
         date: r.date.clone().filter(|d| !d.is_empty()),
         country: r.country.clone(),
         format: format_summary(r.media.iter().map(|m| m.format.as_deref())),
-        track_count: r.media.iter().map(|m| m.tracks.len() as u32).sum(),
+        track_count: r.media.iter().map(Medium::size).sum(),
         disambiguation: r.disambiguation.clone().filter(|d| !d.is_empty()),
         front_art: r.cover_art.as_ref().is_some_and(|c| c.front),
         release_group: r.release_group.as_ref().map(|g| g.id.clone()),
@@ -1251,7 +1252,11 @@ fn map_tracks(
     }
     // Numbers only mean the same thing when the release is laid out like the
     // album; on a bigger or smaller one, track 3 is some other song.
-    let same_shape = positions.len() == tracks.len();
+    let same_shape = positions.len() == tracks.len()
+        && release
+            .media
+            .iter()
+            .all(|m| m.size() as usize == m.tracks.len());
     for (i, local) in tracks.iter().enumerate() {
         let Some(pos) = local.track.filter(|_| same_shape && out[i].is_none()) else {
             continue;
@@ -1277,10 +1282,22 @@ fn map_tracks(
         let same = |r: &Release, m: usize, t: usize| {
             fold(&r.media[m].tracks[t].title).to_lowercase() == title
         };
-        if let Some(&(m, t, _, _)) = positions.iter().find(|(m, t, _, _)| {
-            !taken.contains(&(*m, *t))
-                && (same(release, *m, *t) || original.is_some_and(|o| same(o, *m, *t)))
-        }) {
+        // A title on the release twice ("Intro" on each disc): the one at the
+        // track's own disc and number, if it says.
+        let elsewhere = |disc: u32, pos: u32| {
+            (
+                !single && local.disc.is_some_and(|d| d != disc),
+                local.track.is_some_and(|n| n != pos),
+            )
+        };
+        let hit = positions
+            .iter()
+            .filter(|(m, t, _, _)| {
+                !taken.contains(&(*m, *t))
+                    && (same(release, *m, *t) || original.is_some_and(|o| same(o, *m, *t)))
+            })
+            .min_by_key(|(_, _, disc, pos)| elsewhere(*disc, *pos));
+        if let Some(&(m, t, _, _)) = hit {
             taken.insert((m, t));
             out[i] = Some((m, t, Via::Title));
         }
@@ -1298,19 +1315,14 @@ fn position(multi_disc: bool, disc: u32, track: u32) -> String {
     }
 }
 
-/// The release's tracks none of `tracks` was paired with (as `suggestions`
+/// The release's tracks no track was paired with (`mapped`, as `map_tracks`
 /// pairs them), and its discs with none paired, apart. Nothing when no track
 /// was paired: then the release's tracklist says nothing about the album's.
 fn unpaired(
-    tracks: &[Local],
     release: &Release,
-    original: Option<&Release>,
+    mapped: &[Option<(usize, usize, Via)>],
 ) -> (Vec<ReleaseTrack>, Vec<ReleaseDisc>) {
-    let taken: HashSet<(usize, usize)> = map_tracks(tracks, release, original)
-        .into_iter()
-        .flatten()
-        .map(|(m, t, _)| (m, t))
-        .collect();
+    let taken: HashSet<(usize, usize)> = mapped.iter().flatten().map(|&(m, t, _)| (m, t)).collect();
     let mut missing = Vec::new();
     let mut discs = Vec::new();
     if taken.is_empty() {
@@ -1320,12 +1332,12 @@ fn unpaired(
     for (m, medium) in release.media.iter().enumerate() {
         let disc = medium.position.unwrap_or(m as u32 + 1);
         let none_paired = (0..medium.tracks.len()).all(|t| !taken.contains(&(m, t)));
-        if multi_disc && none_paired && !medium.tracks.is_empty() {
+        if multi_disc && none_paired && medium.size() > 0 {
             discs.push(ReleaseDisc {
                 position: disc,
                 format: medium.format.clone(),
                 title: medium.title.clone().filter(|t| !t.is_empty()),
-                tracks: medium.tracks.len() as u32,
+                tracks: medium.size(),
             });
             continue;
         }
@@ -1531,13 +1543,27 @@ fn track_values(
     out
 }
 
-/// Suggestions from `release`. When it's a romanization of `original`,
-/// suggestions say what they romanize, and never trade a tag that sorts
-/// A–Z for one that doesn't.
+/// Suggestions from `release`, its tracks paired with `tracks` as `map_tracks`
+/// pairs them.
+#[cfg(test)]
 fn suggestions(
     tracks: &[Local],
     release: &Release,
     original: Option<&Release>,
+    split: &Splitter,
+) -> Vec<TrackSuggestions> {
+    let mapped = map_tracks(tracks, release, original);
+    track_suggestions(tracks, release, original, &mapped, split)
+}
+
+/// Suggestions from `release`, its tracks paired with `tracks` as `mapped`
+/// says. When it's a romanization of `original`, suggestions say what they
+/// romanize, and never trade a tag that sorts A–Z for one that doesn't.
+fn track_suggestions(
+    tracks: &[Local],
+    release: &Release,
+    original: Option<&Release>,
+    mapped: &[Option<(usize, usize, Via)>],
     split: &Splitter,
 ) -> Vec<TrackSuggestions> {
     let separator = split.separator();
@@ -1545,11 +1571,10 @@ fn suggestions(
     let shared_original = original
         .map(|o| release_values(o, separator))
         .unwrap_or_default();
-    let mapped = map_tracks(tracks, release, original);
     let multi_disc = release.media.len() > 1;
     tracks
         .iter()
-        .zip(mapped)
+        .zip(mapped.iter().copied())
         .map(|(local, mapped)| {
             let mut values = shared.clone();
             let mut originals = shared_original.clone();
@@ -2434,10 +2459,19 @@ mod tests {
         );
     }
 
+    /// The release's tracks and discs `tracks` lack, paired as identify pairs them.
+    fn lacking(
+        tracks: &[Local],
+        release: &Release,
+        original: Option<&Release>,
+    ) -> (Vec<ReleaseTrack>, Vec<ReleaseDisc>) {
+        unpaired(release, &map_tracks(tracks, release, original))
+    }
+
     #[test]
     fn the_releases_tracks_the_album_lacks_are_listed() {
         let tracks = [local(1, &[("title", "Thaw"), ("track_number", "1")])];
-        let (missing, discs) = unpaired(&tracks, &release(), None);
+        let (missing, discs) = lacking(&tracks, &release(), None);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].position, "2");
         assert_eq!(missing[0].title, "Don’t Look Back");
@@ -2448,14 +2482,14 @@ mod tests {
             local(1, &[("title", "Thaw"), ("track_number", "1")]),
             local(2, &[("title", "Don't Look Back"), ("track_number", "2")]),
         ];
-        let (missing, discs) = unpaired(&tracks, &release(), None);
+        let (missing, discs) = lacking(&tracks, &release(), None);
         assert!(missing.is_empty() && discs.is_empty());
     }
 
     #[test]
     fn nothing_paired_says_nothing_about_what_the_album_lacks() {
         let tracks = [local(1, &[("title", "Something else")])];
-        let (missing, discs) = unpaired(&tracks, &release(), None);
+        let (missing, discs) = lacking(&tracks, &release(), None);
         assert!(missing.is_empty() && discs.is_empty());
     }
 
@@ -2495,7 +2529,7 @@ mod tests {
                 ],
             ),
         ];
-        let (missing, discs) = unpaired(&tracks, &r, None);
+        let (missing, discs) = lacking(&tracks, &r, None);
         let positions: Vec<&str> = missing.iter().map(|m| m.position.as_str()).collect();
         assert_eq!(positions, ["1-2"]);
         assert_eq!(discs.len(), 1);
@@ -2511,11 +2545,80 @@ mod tests {
         romanized.media[0].tracks[1].title = "Romanized".into();
         // Paired by the original's title.
         let tracks = [local(1, &[("title", "Don’t Look Back")])];
-        let (missing, _) = unpaired(&tracks, &romanized, Some(&original));
+        let (missing, _) = lacking(&tracks, &romanized, Some(&original));
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].title, "Thaw");
         let tracks = [local(1, &[("title", "Thaw")])];
-        let (missing, _) = unpaired(&tracks, &romanized, Some(&original));
+        let (missing, _) = lacking(&tracks, &romanized, Some(&original));
         assert_eq!(missing[0].title, "Romanized");
+    }
+
+    /// `release()` with a second disc copying the first, titled the same.
+    fn two_discs_same_titles() -> Release {
+        let mut r = release();
+        let mut second = r.media[0].clone();
+        second.position = Some(2);
+        for t in &mut second.tracks {
+            t.id = format!("{}-2", t.id);
+            t.recording = None;
+        }
+        r.media.push(second);
+        r
+    }
+
+    #[test]
+    fn a_title_on_two_discs_pairs_at_the_tracks_own_disc() {
+        let r = two_discs_same_titles();
+        let tracks = [local(
+            1,
+            &[
+                ("title", "Thaw"),
+                ("track_number", "1"),
+                ("disc_number", "2"),
+            ],
+        )];
+        let mapped = map_tracks(&tracks, &r, None);
+        assert_eq!(mapped[0], Some((1, 0, Via::Title)));
+        let (missing, discs) = unpaired(&r, &mapped);
+        let positions: Vec<&str> = missing.iter().map(|m| m.position.as_str()).collect();
+        assert_eq!(positions, ["2-2"]);
+        assert_eq!(discs.len(), 1);
+        assert_eq!(discs[0].position, 1);
+        // Without a disc number, the first.
+        let tracks = [local(1, &[("title", "Thaw")])];
+        assert_eq!(map_tracks(&tracks, &r, None)[0], Some((0, 0, Via::Title)));
+    }
+
+    #[test]
+    fn a_disc_with_a_count_and_no_tracklist_is_counted() {
+        let mut r = release();
+        r.media.push(
+            serde_json::from_str(r#"{"position": 2, "format": "DVD-Video", "track-count": 5}"#)
+                .unwrap(),
+        );
+        assert_eq!(summary(&r).track_count, 7);
+        let tracks = [
+            local(1, &[("title", "Thaw"), ("track_number", "1")]),
+            local(2, &[("title", "Don't Look Back"), ("track_number", "2")]),
+        ];
+        let (missing, discs) = lacking(&tracks, &r, None);
+        assert!(missing.is_empty());
+        assert_eq!(discs.len(), 1);
+        assert_eq!((discs[0].position, discs[0].tracks), (2, 5));
+        // A disc it doesn't list makes the release bigger than the tracks it
+        // lists, so numbers alone don't pair; with an empty disc they do.
+        let numbered = [
+            local(1, &[("track_number", "1"), ("disc_number", "1")]),
+            local(2, &[("track_number", "2"), ("disc_number", "1")]),
+        ];
+        let with_disc = |json: &str| {
+            let mut r = release();
+            r.media.push(serde_json::from_str(json).unwrap());
+            map_tracks(&numbered, &r, None)
+        };
+        let unlisted = with_disc(r#"{"position": 2, "track-count": 1}"#);
+        assert!(unlisted.iter().all(|m| m.is_none()));
+        let empty = with_disc(r#"{"position": 2, "track-count": 0}"#);
+        assert!(empty.iter().all(|m| m.is_some()));
     }
 }

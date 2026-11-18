@@ -24,6 +24,15 @@ describe('describeIncomplete', () => {
 			'Missing tracks 11–20 and disc 2'
 		);
 	});
+
+	it('counts tracks an album-wide total asks for on no disc in particular', () => {
+		expect(describeIncomplete({ tracks: [], discs: [], unplaced: 1 })).toBe(
+			"Missing 1 track whose disc the tags don't say"
+		);
+		expect(describeIncomplete({ tracks: [gap(2, 2, 1)], discs: [], unplaced: 2 })).toBe(
+			"Missing disc 1 track 2 and 2 more tracks whose disc the tags don't say"
+		);
+	});
 });
 
 describe('withGaps', () => {
@@ -41,7 +50,7 @@ describe('withGaps', () => {
 		]);
 	});
 
-	it('finds the disc of a gap numbered straight through, and adds missing discs', () => {
+	it('puts a gap numbered straight through on the missing disc between', () => {
 		const rows = withGaps(
 			[
 				[1, [t(1), t(2)]],
@@ -50,9 +59,50 @@ describe('withGaps', () => {
 			{ tracks: [gap(3, 4)], discs: [2] }
 		);
 		expect(rows).toEqual([
-			[1, [{ track: t(1) }, { track: t(2) }, { from: 3, to: 4 }]],
-			[2, null],
+			[1, [{ track: t(1) }, { track: t(2) }]],
+			[2, [{ from: 3, to: 4 }]],
 			[3, [{ track: t(5) }, { track: t(6) }]]
+		]);
+		// Disc 1 missing, before the first there.
+		expect(
+			withGaps(
+				[
+					[2, [t(3)]],
+					[3, [t(4)]]
+				],
+				{ tracks: [gap(1, 2)], discs: [1] }
+			)
+		).toEqual([
+			[1, [{ from: 1, to: 2 }]],
+			[2, [{ track: t(3) }]],
+			[3, [{ track: t(4) }]]
+		]);
+	});
+
+	it('puts a gap inside a disc on it, and one between two discs there on the one before', () => {
+		const discs: [number, { track_no: number }[]][] = [
+			[1, [t(1), t(3)]],
+			[2, [t(5), t(6)]]
+		];
+		expect(withGaps(discs, { tracks: [gap(2, 2), gap(4, 4)], discs: [] })).toEqual([
+			[1, [{ track: t(1) }, { from: 2, to: 2 }, { track: t(3) }, { from: 4, to: 4 }]],
+			[2, [{ track: t(5) }, { track: t(6) }]]
+		]);
+	});
+
+	it('adds a missing disc with no gap on it as a disc of its own', () => {
+		expect(
+			withGaps(
+				[
+					[1, [t(1)]],
+					[3, [t(1)]]
+				],
+				{ tracks: [], discs: [2] }
+			)
+		).toEqual([
+			[1, [{ track: t(1) }]],
+			[2, null],
+			[3, [{ track: t(1) }]]
 		]);
 	});
 

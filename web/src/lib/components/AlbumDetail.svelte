@@ -18,7 +18,7 @@
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { duration, longDuration, quality } from '#lib/format.ts';
-	import { describeIncomplete, withGaps } from '#lib/incomplete.ts';
+	import { describeIncomplete, unplacedText, withGaps } from '#lib/incomplete.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
@@ -80,7 +80,8 @@
 	let discs = $derived.by(() => {
 		const groups = new Map<number, AlbumDetail['tracks']>();
 		for (const t of detail?.tracks ?? []) {
-			const d = t.disc_no ?? 1;
+			// Disc 0 is no disc, as the server sorts it.
+			const d = t.disc_no || 1;
 			if (!groups.has(d)) groups.set(d, []);
 			groups.get(d)!.push(t);
 		}
@@ -292,6 +293,24 @@
 							{/if}
 						</ol>
 					{/each}
+					{#if incomplete?.unplaced}
+						<!-- More missing than the gaps hold, by an album-wide total: on no disc in particular. -->
+						<ol class="tracks">
+							<li class="missing" style:--i={0}>
+								<span class="row">
+									<span class="no tabular">–</span>
+									<span class="title">
+										<span class="name"
+											>{unplacedText(
+												incomplete.unplaced,
+												incomplete.tracks.length > 0 || incomplete.discs.length > 0
+											)}</span
+										>
+									</span>
+								</span>
+							</li>
+						</ol>
+					{/if}
 					<p class="path" title={detail.dir}>{`\u200e${detail.dir}\u200e`}</p>
 				</div>
 			{:else}

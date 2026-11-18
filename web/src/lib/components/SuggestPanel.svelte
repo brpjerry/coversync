@@ -526,6 +526,7 @@
 		const rows = [
 			...result.missing.map((m) => ({
 				key: m.position,
+				tracks: 1,
 				at: order(m.position),
 				position: m.position,
 				title: m.title,
@@ -533,6 +534,7 @@
 			})),
 			...result.missing_discs.map((d) => ({
 				key: `disc ${d.position}`,
+				tracks: d.tracks,
 				at: [d.position, 0],
 				position: `Disc ${d.position}`,
 				title: [d.format, d.title].filter(Boolean).join(' · ') || 'Disc',
@@ -551,6 +553,10 @@
 	);
 	/** Missing rows shown before "Show all". */
 	const MISSING_SHOWN = 5;
+	/** Tracks behind "Show all": a whole disc's row counts its tracks. */
+	let missingHidden = $derived(
+		missingRows.slice(MISSING_SHOWN).reduce((n, row) => n + row.tracks, 0)
+	);
 
 	/** Identifiers read better in a fixed-width face. */
 	const ID_KINDS = /^(mb_|acoustid|isrc|barcode)/;
@@ -944,7 +950,7 @@
 			<p class="note">
 				<Info size={14} />
 				<span
-					>Not on this release, so only album-wide tags are suggested for {unpaired
+					>Not matched on this release, so only album-wide tags are suggested for {unpaired
 						.map((t) => t.title || t.file_name)
 						.join(', ')}.</span
 				>
@@ -968,7 +974,7 @@
 					{/each}
 				</ol>
 				{#if missingRows.length > MISSING_SHOWN}
-					<ShowAll label="Show all missing tracks" count={missingRows.length - MISSING_SHOWN}>
+					<ShowAll label="Show all missing tracks" count={missingHidden}>
 						<ol class="missing-list">
 							{#each missingRows.slice(MISSING_SHOWN) as m (m.key)}
 								{@render missingRow(m)}
@@ -1246,9 +1252,7 @@
 	}
 	.missing-title {
 		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		overflow-wrap: anywhere;
 	}
 	.missing :global(.show-all) {
 		padding-left: 16px;

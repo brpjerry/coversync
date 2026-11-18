@@ -39,6 +39,8 @@ export interface Incomplete {
 	tracks: { disc: number | null; from: number; to: number }[];
 	/** Discs missing below the album's last one. */
 	discs: number[];
+	/** More tracks missing than the gaps hold, by an album-wide total: on no disc in particular. */
+	unplaced?: number;
 }
 
 export type Collection = 'inbox' | 'library';

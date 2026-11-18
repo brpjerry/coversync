@@ -1,8 +1,11 @@
 //! Whether an album is missing tracks, by its own numbering: no MusicBrainz,
 //! just its tracks' numbers and totals. Track numbers below the last one (or
 //! up to the track total) that no track has are missing, and so are discs
-//! between the first and the last it has. Discs past the last one aren't:
-//! a disc total often counts a DVD or Blu-ray that holds no audio.
+//! numbered below the last one it has that no track is on. Discs past the
+//! last one aren't: a disc total often counts a DVD or Blu-ray that holds no
+//! audio. A total for the whole album on every disc says how many tracks
+//! there should be but not where the missing ones go: those are counted,
+//! unplaced.
 //!
 //! It says nothing when it can't tell: an album with a track that has no
 //! number (it could be any of the missing ones), or with some tracks on a
@@ -110,9 +113,17 @@ pub fn incomplete(tracks: &[&Track]) -> Option<Incomplete> {
             .map(|(d, ts)| (several.then_some(d), ts))
             .collect()
     };
+    // A total below the numbers there are (or past any album's) is wrong, not
+    // a limit: left out before the vote, so it can't outvote a usable one.
     let totals: Vec<Option<u32>> = runs
         .iter()
-        .map(|(_, ts)| usual(ts.iter().map(|t| t.track_total)).filter(|n| *n <= MAX_NUMBER))
+        .map(|(_, ts)| {
+            let possible = span(ts).1..=MAX_NUMBER;
+            usual(
+                ts.iter()
+                    .map(|t| t.track_total.filter(|n| possible.contains(n))),
+            )
+        })
         .collect();
     // Every disc tagged with the album's total rather than its own: the same
     // total on each, enough for all of them together.
@@ -120,17 +131,33 @@ pub fn incomplete(tracks: &[&Track]) -> Option<Incomplete> {
     let album_wide = runs.len() > 1
         && totals.iter().all(|t| *t == totals[0])
         && totals[0].is_some_and(|t| t >= tops);
+    // Beyond the gaps, what the album's total asks for: unless a disc it may
+    // count isn't there (one in between, or one past the last, a DVD maybe).
+    let declared = usual(
+        tracks
+            .iter()
+            .map(|t| t.disc_total.filter(|n| *n <= MAX_NUMBER)),
+    );
+    let unplaced = match totals[0] {
+        Some(total)
+            if album_wide
+                && missing_discs.is_empty()
+                && declared.is_none_or(|n| n as usize == runs.len()) =>
+        {
+            total - tops
+        }
+        _ => 0,
+    };
     let mut missing = Vec::new();
     for ((disc, ts), total) in runs.iter().zip(totals) {
         let present: BTreeSet<u32> = ts.iter().filter_map(|t| number(t)).collect();
-        let last = span(ts).1;
-        // A total below the numbers there are is wrong, not a limit.
-        let total = total.filter(|t| *t >= last && !album_wide);
-        gaps(&present, total.unwrap_or(last), *disc, &mut missing);
+        let total = total.filter(|_| !album_wide);
+        gaps(&present, total.unwrap_or(span(ts).1), *disc, &mut missing);
     }
-    (!missing.is_empty() || !missing_discs.is_empty()).then_some(Incomplete {
+    (!missing.is_empty() || !missing_discs.is_empty() || unplaced > 0).then_some(Incomplete {
         tracks: missing,
         discs: missing_discs,
+        unplaced,
     })
 }
 
@@ -212,6 +239,17 @@ mod tests {
     #[test]
     fn a_total_below_the_numbers_is_ignored() {
         assert_eq!(check(&one_disc(&[1, 2, 3, 4], Some(2))), None);
+    }
+
+    #[test]
+    fn impossible_totals_dont_outvote_a_possible_one() {
+        // 2 is below track 3, 1000 past any album's: 5 is the total.
+        let mut tracks = one_disc(&[1, 2, 3], Some(2));
+        tracks[2].track_total = Some(5);
+        assert_eq!(check(&tracks).unwrap().tracks, [gap(None, 4, 5)]);
+        let mut tracks = one_disc(&[1, 2, 3], Some(1000));
+        tracks[2].track_total = Some(5);
+        assert_eq!(check(&tracks).unwrap().tracks, [gap(None, 4, 5)]);
     }
 
     #[test]
@@ -349,6 +387,37 @@ mod tests {
             t(Some(2), Some(2), Some(4), Some(2)),
         ];
         assert_eq!(check(&tracks).unwrap().tracks, [gap(Some(2), 3, 4)]);
+    }
+
+    #[test]
+    fn an_album_wide_total_counts_what_it_cant_place() {
+        // Tracks 1-2 on each of 2 discs, each "of 5": one more, on either.
+        let tracks = [
+            t(Some(1), Some(1), Some(5), Some(2)),
+            t(Some(1), Some(2), Some(5), Some(2)),
+            t(Some(2), Some(1), Some(5), Some(2)),
+            t(Some(2), Some(2), Some(5), Some(2)),
+        ];
+        let found = check(&tracks).unwrap();
+        assert!(found.tracks.is_empty() && found.discs.is_empty());
+        assert_eq!(found.unplaced, 1);
+        // A gap too: 1, 3 and 1 of 6 lack disc 1's track 2, and 2 more on either.
+        let tracks = [
+            t(Some(1), Some(1), Some(6), None),
+            t(Some(1), Some(3), Some(6), None),
+            t(Some(2), Some(1), Some(6), None),
+        ];
+        let found = check(&tracks).unwrap();
+        assert_eq!(found.tracks, [gap(Some(1), 2, 2)]);
+        assert_eq!(found.unplaced, 2);
+        // A third disc the tags count (a DVD, maybe) could hold the rest.
+        let tracks = [
+            t(Some(1), Some(1), Some(5), Some(3)),
+            t(Some(1), Some(2), Some(5), Some(3)),
+            t(Some(2), Some(1), Some(5), Some(3)),
+            t(Some(2), Some(2), Some(5), Some(3)),
+        ];
+        assert_eq!(check(&tracks), None);
     }
 
     #[test]

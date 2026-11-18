@@ -33,16 +33,46 @@ export function describeIncomplete(inc: Incomplete): string {
 	for (const d of inc.discs) parts.push({ disc: d, text: `disc ${d}` });
 	// In disc order (gaps on no disc first, as 0).
 	parts.sort((a, b) => a.disc - b.disc);
-	return `Missing ${listed(parts.map((p) => p.text))}`;
+	const texts = parts.map((p) => p.text);
+	if (inc.unplaced) texts.push(unplacedText(inc.unplaced, texts.length > 0));
+	return `Missing ${listed(texts)}`;
+}
+
+/** Tracks an album-wide total asks for beyond the gaps: "2 more tracks whose disc the tags don't say". */
+export function unplacedText(n: number, more: boolean) {
+	return `${more ? `${n} more` : n} ${n === 1 ? 'track' : 'tracks'} whose disc the tags don't say`;
 }
 
 /** A row of an album's tracklist: one of its tracks, or a run of missing ones. */
 export type Row<T> = { track: T } | { from: number; to: number };
 
 /**
+ * Which disc a gap with none of its own (numbered straight through the
+ * discs) is on: the one whose tracks surround it, else the one missing disc
+ * between those before and after it, else the one before it.
+ */
+function discOf<T extends { track_no: number | null }>(
+	g: { from: number; to: number },
+	discs: [number, T[]][],
+	missing: number[]
+): number {
+	if (discs.length < 2) return discs[0]?.[0] ?? 1;
+	const numbers = (ts: T[]) => ts.map((t) => t.track_no ?? 0);
+	const around = discs.find(
+		([, ts]) => numbers(ts).some((n) => n < g.from) && numbers(ts).some((n) => n > g.to)
+	);
+	if (around) return around[0];
+	const before = discs.findLast(([, ts]) => numbers(ts).every((n) => n < g.from));
+	const after = discs.find(([, ts]) => numbers(ts).every((n) => n > g.to));
+	const between = missing.filter((d) => d > (before?.[0] ?? 0) && d < (after?.[0] ?? Infinity));
+	if (between.length === 1) return between[0];
+	return (before ?? after ?? discs[0])[0];
+}
+
+/**
  * The album's tracks, disc by disc as `discs` has them, with rows for the
  * runs of numbers it lacks where they belong, and missing discs as discs
- * whose only row is `null`.
+ * whose only row is `null` (or the gap that's on them).
  */
 export function withGaps<T extends { track_no: number | null }>(
 	discs: [number, T[]][],
@@ -53,13 +83,7 @@ export function withGaps<T extends { track_no: number | null }>(
 	);
 	if (!inc) return [...out.entries()];
 	for (const g of inc.tracks) {
-		// No disc: the album's only one, or (numbered straight through) the one
-		// whose numbers it follows.
-		const disc =
-			g.disc ??
-			[...discs].reverse().find(([, ts]) => ts.some((t) => (t.track_no ?? 0) < g.from))?.[0] ??
-			discs[0]?.[0] ??
-			1;
+		const disc = g.disc ?? discOf(g, discs, inc.discs);
 		const rows = out.get(disc) ?? [];
 		// Before the first track numbered after it.
 		const at = rows.findIndex((r) => 'track' in r && (r.track.track_no ?? 0) > g.to);
