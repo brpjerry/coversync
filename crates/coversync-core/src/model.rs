@@ -125,6 +125,11 @@ pub struct Track {
     /// Path relative to the library root it was found under.
     pub rel_path: String,
     pub collection: Collection,
+    /// Paths (like `rel_path`) a tag save moved this Library track from,
+    /// under the same id: a client that knew it at one of them still has it.
+    /// Only an album's details list them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub moved_from: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,7 +202,9 @@ pub struct RemovedTrack {
 
 /// What changed in the Library after a generation, each list earliest
 /// change first. Apply them in generation order, and within a generation,
-/// the removals before the tracks. A track listed is one still in the
+/// the removals before the tracks. A track a tag save moved keeps its id and
+/// is listed at its new path, with no removal for its old one: a client
+/// moves its copy (tracks can trade paths in one generation). A track listed is one still in the
 /// Library, written after any removal of its id or path, and a removal and
 /// a track can share a generation: an older coversyncd stamps all its
 /// changes one above the counter, so its deleting a track and writing one

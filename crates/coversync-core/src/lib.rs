@@ -18,7 +18,7 @@ pub mod lookups;
 pub mod model;
 #[cfg(feature = "server")]
 pub mod musicbrainz;
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", unix))]
 pub mod relocate;
 #[cfg(feature = "server")]
 pub mod romanize;

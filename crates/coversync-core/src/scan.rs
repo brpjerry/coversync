@@ -149,6 +149,32 @@ fn walk(roots: &[(PathBuf, Collection)], progress: &Progress) -> Vec<FileStat> {
     files
 }
 
+/// Index what a tag save wrote and moved, all in one transaction with the
+/// moves (see [`Library::upsert_moving`]), after reading every file: one
+/// that can't be read leaves the index as it was. `moved` pairs Library
+/// tracks' old paths with their new, and `batch` names the record of those
+/// moves, which goes with them.
+pub fn index_moved(
+    lib: &Library,
+    files: Vec<FileStat>,
+    moved: &[(PathBuf, PathBuf)],
+    batch: Option<&str>,
+    progress: &Progress,
+) -> Result<()> {
+    let read = files
+        .par_iter()
+        .map(|stat| {
+            let t = tags::read(&stat.path)?;
+            let dir = album_dir_in(stat.collection, &stat.root, &stat.path);
+            let id = album_id_in(stat.collection, &stat.root, &dir, t.album.as_deref());
+            Ok((stat.clone(), id, dir, t))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    lib.upsert_moving(&read, moved, batch)?;
+    update(progress, |p| p.files_read += read.len() as u64);
+    Ok(())
+}
+
 /// Read tags for the given files and store them, in batches.
 pub fn index_files(lib: &Library, files: Vec<FileStat>, progress: &Progress) -> Result<()> {
     for chunk in files.chunks(BATCH) {

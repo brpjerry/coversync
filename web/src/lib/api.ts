@@ -65,6 +65,8 @@ export interface Track {
 	bitrate: number | null;
 	format: string;
 	rel_path: string;
+	/** Paths a tag save moved this Library track from (album details only). */
+	moved_from?: string[];
 }
 
 export interface AlbumDetail extends Album {

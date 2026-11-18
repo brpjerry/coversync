@@ -4,9 +4,11 @@ import {
 	changedElsewhere,
 	edits,
 	invalid,
+	lostTracks,
 	otherTags,
 	setAll,
 	shared,
+	stillHere,
 	withKept,
 	type Values
 } from './tag-form';
@@ -196,5 +198,32 @@ describe('otherTags', () => {
 		expect(differ[0].values).toBeNull();
 		expect(differ[0].tracks.map((t) => t.id)).toEqual([1, 2]);
 		expect(differ[0].tracks[0].values).toEqual(['A', 'B']);
+	});
+});
+
+describe('a kept draft’s tracks', () => {
+	const draft = {
+		base: {},
+		edits: { 1: { genre: 'Rock' }, 2: { genre: 'Jazz' } },
+		paths: { 1: 'A/Record/01.flac', 2: 'A/Record/02.flac' }
+	};
+
+	it('are the same id at the same path, or one a save moved it from', () => {
+		const tracks = [
+			{ id: 1, rel_path: 'A/Record 2/01.flac', moved_from: ['A/Record/01.flac'] },
+			{ id: 2, rel_path: 'A/Record/02.flac' }
+		];
+		expect(stillHere(draft, tracks, 1)).toBe(true);
+		expect(stillHere(draft, tracks, 2)).toBe(true);
+		expect(lostTracks(draft, tracks)).toBe(0);
+	});
+
+	it('aren’t an id at a path it never had, as a restored database can give', () => {
+		const tracks = [
+			{ id: 1, rel_path: 'B/Other/01.flac' },
+			{ id: 2, rel_path: 'A/Record 2/02.flac', moved_from: ['A/Elsewhere/02.flac'] }
+		];
+		expect(stillHere(draft, tracks, 1)).toBe(false);
+		expect(lostTracks(draft, tracks)).toBe(2);
 	});
 });

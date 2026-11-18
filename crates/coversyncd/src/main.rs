@@ -84,6 +84,12 @@ pub struct AppState {
     /// has written before their album's version says so. Not `jobs`: a scan
     /// holds that for long, and only indexes.
     pub tag_files: RwLock<()>,
+    /// Held while a save moves Library files and indexes them where they
+    /// went (or files are put back): a stream finds its track's file and
+    /// opens it under a read, so it never opens a path another track's
+    /// file has taken, or one emptied for a moment. Not `tag_files`, so
+    /// playback goes on while a save writes tags.
+    pub moving: tokio::sync::RwLock<()>,
     /// A scan is waiting for `jobs`; scans asked for meanwhile join it.
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
@@ -189,6 +195,15 @@ pub fn spawn_scan(state: Shared) {
         let result = tokio::task::spawn_blocking(move || {
             // The Library folder may have appeared (or gone) since the last scan.
             s.lib.refresh_library()?;
+            // Files a save moved and never indexed (coversyncd stopped
+            // meanwhile, say) go back to where the index has them, before
+            // the scan would miss them under the names they waited under.
+            let moving = s.moving.blocking_write();
+            let recovered = coversync_core::relocate::recover(&s.lib);
+            drop(moving);
+            if let Err(e) = recovered {
+                tracing::error!("putting back unindexed moves failed: {e}");
+            }
             scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress)
         })
         .await;
@@ -322,6 +337,7 @@ async fn run() -> anyhow::Result<()> {
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
+        moving: tokio::sync::RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
@@ -385,6 +401,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         allow_writes: false,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
+        moving: tokio::sync::RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),

@@ -22,12 +22,8 @@
 	import { describeIncomplete, unplacedText, withGaps } from '#lib/incomplete.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor, {
-		lostTracks,
-		type Draft,
-		type TagDraft,
-		type TagView
-	} from './TagEditor.svelte';
+	import { lostTracks } from '#lib/tag-form.ts';
+	import TagEditor, { type Draft, type TagDraft, type TagView } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -74,8 +70,9 @@
 	}: Props = $props();
 
 	/**
-	 * What the tag editor has open, kept while it's shown: a new one (made for
-	 * each album version, so after a save) opens the same way.
+	 * What the tag editor has open, kept while it's shown: a new one (made
+	 * when the album changes elsewhere, or a save is refused; one that saved
+	 * reads the album in place) opens the same way.
 	 */
 	let editorView = $state<TagView | null>(null);
 	/**
@@ -103,7 +100,12 @@
 		const next = detail;
 		untrack(() => {
 			if (next === editorDetail) return;
-			if (!ownSave || !next || !editorDetail) editorKey++;
+			// One album's version for another's: a new editor. Across no album
+			// at all, the sheet makes the editor anew itself.
+			if (next && editorDetail && !ownSave) editorKey++;
+			// Another album comes (from the player bar, say): its editor opens
+			// afresh, not as this one's was.
+			if (!next) editorView = null;
 			ownSave = false;
 			editorDetail = next;
 		});
@@ -127,7 +129,7 @@
 	/** The tag editor's edits, for the notice. */
 	let editing = $state<Draft>('none');
 	/** Kept edits for tracks no longer in the album, which couldn't be put back. */
-	let dropped = $derived(kept && detail ? lostTracks(kept, detail) : 0);
+	let dropped = $derived(kept && detail ? lostTracks(kept, detail.tracks) : 0);
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -368,7 +370,10 @@
 					<p class="path" title={detail.dir}>{`\u200e${detail.dir}\u200e`}</p>
 				</div>
 			{:else}
-				<div in:fade={{ duration: 200 }} style:min-height={heldHeight ? `${heldHeight}px` : null}>
+				<div
+					in:fade={{ duration: 200 }}
+					style:min-height={heldHeight && editorView ? `${heldHeight}px` : null}
+				>
 					{#key editorKey}
 						<div bind:offsetHeight={editorHeight}>
 							<TagEditor

@@ -105,6 +105,31 @@ export interface TagDraft {
 	paths: Record<number, string>;
 }
 
+/** A track as an album's details list it: where its file is, and was. */
+export interface PlacedTrack {
+	id: number;
+	rel_path: string;
+	/** Paths a tag save moved it from. */
+	moved_from?: string[];
+}
+
+/**
+ * Whether `tracks` still have the draft's track `id`: under that id and at
+ * the same path, or one a save moved it from, as an id freed by a track
+ * removed can name a new one.
+ */
+export function stillHere(draft: TagDraft, tracks: PlacedTrack[], id: number): boolean {
+	const was = draft.paths[id];
+	return tracks.some(
+		(t) => t.id === id && (t.rel_path === was || (t.moved_from ?? []).includes(was))
+	);
+}
+
+/** How many tracks a draft edited that `tracks` no longer have: those edits can't be put back. */
+export function lostTracks(draft: TagDraft, tracks: PlacedTrack[]): number {
+	return Object.keys(draft.edits).filter((id) => !stillHere(draft, tracks, +id)).length;
+}
+
 /** `values` with a kept draft's edits on top, on the tracks `here` says are still the same. */
 export function withKept(values: Values, kept: TagDraft, here: (id: number) => boolean): Values {
 	for (const [id, edited] of Object.entries(kept.edits)) {

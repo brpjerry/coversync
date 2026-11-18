@@ -470,8 +470,12 @@
 		const vt = document.startViewTransition(async () => {
 			await back();
 			// History can go back to another album, whose sheet stays: then its
-			// cover is the end.
-			if (sheetAlbum) return;
+			// cover (the same element) is the end, named again now that the
+			// old one's snapshot is taken.
+			if (sheetAlbum) {
+				if (hidden) hidden.style.viewTransitionName = 'album-cover';
+				return;
+			}
 			// Back at the grid, the cover lands on its card, and the sheet fading
 			// out leaves its own cover to the moving snapshot (see AlbumDetail).
 			// Now, not on the fade's outrostart, which Svelte sends a frame later.

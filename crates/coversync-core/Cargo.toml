@@ -13,7 +13,7 @@ publish = false
 # for Android, ARM Linux and Windows.
 [features]
 default = ["server"]
-server = ["dep:flate2", "dep:getrandom", "dep:image", "dep:ureq", "dep:walkdir"]
+server = ["dep:flate2", "dep:getrandom", "dep:image", "dep:rustix", "dep:ureq", "dep:walkdir"]
 
 # It imports albums and runs the cover pass.
 [[test]]
@@ -42,6 +42,8 @@ ureq = { version = "3.5.0", optional = true, features = ["json"] }
 walkdir = { version = "2.5.0", optional = true }
 blake3 = "1.8.7"
 
-# Linux file clones and I/O priority, access(2) and the uploads' disk calls.
+# Linux file clones and I/O priority, access(2) and the uploads' disk calls;
+# moving Library files one name at a time, never following a link.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
+rustix = { version = "1.1.6", features = ["fs"], optional = true }

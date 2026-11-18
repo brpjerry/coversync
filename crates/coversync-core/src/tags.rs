@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFile};
@@ -93,6 +93,38 @@ fn probe(path: &Path, cover_art: bool) -> Result<TaggedFile> {
         .options(ParseOptions::new().read_cover_art(cover_art))
         .read()
         .map_err(tag_err)
+}
+
+/// As [`probe`], without the audio stream's properties: for what only needs
+/// tags (some readers, raw AAC's say, walk the audio for them).
+fn probe_tags(path: &Path, cover_art: bool) -> Result<TaggedFile> {
+    Probe::open(path)
+        .map_err(tag_err)?
+        .options(
+            ParseOptions::new()
+                .read_cover_art(cover_art)
+                .read_properties(false),
+        )
+        .read()
+        .map_err(tag_err)
+}
+
+/// Lofty reads a FLAC or Ogg file's vendor string as its encoder when it
+/// has no ENCODER comment: not a tag the file has (an edit keeps the vendor
+/// string apart), so not a value.
+fn drop_vendor_encoder(
+    path: &Path,
+    file: &TaggedFile,
+    values: &mut HashMap<&'static str, String>,
+) -> Result<()> {
+    if values.contains_key("encoder")
+        && file.primary_tag_type() == TagType::VorbisComments
+        && !vorbis_comments(path, file.file_type())?
+            .is_some_and(|(raw, _)| raw.get("ENCODER").is_some())
+    {
+        values.remove("encoder");
+    }
+    Ok(())
 }
 
 fn text(s: Option<std::borrow::Cow<'_, str>>) -> Option<String> {
@@ -1002,26 +1034,64 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
 /// As [`write`], then set tag kinds (catalog ids) as an import does; an
 /// empty value removes the kind.
 pub fn write_with_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Result<()> {
+    prepare_with_kinds(path, edit, kinds)?.commit()
+}
+
+/// An edited copy of a file, written beside it and not yet in its place:
+/// read it (its tags as saved) before [`Prepared::commit`] puts it there.
+/// Dropped uncommitted, the copy goes and the file stays as it was.
+#[derive(Debug)]
+pub struct Prepared {
+    /// The file the edit is for.
+    pub path: PathBuf,
+    /// The edited copy.
+    pub copy: PathBuf,
+    done: bool,
+}
+
+impl Prepared {
+    /// Put the edited copy in the file's place (one rename).
+    pub fn commit(mut self) -> Result<()> {
+        fs::rename(&self.copy, &self.path)?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = fs::remove_file(&self.copy);
+        }
+    }
+}
+
+/// [`write_with_kinds`]'s edit, written to a copy beside the file (see
+/// [`Prepared`]): everything that can refuse it does so here.
+pub fn prepare_with_kinds(
+    path: &Path,
+    edit: &TagEdit,
+    kinds: &[(&str, String)],
+) -> Result<Prepared> {
     // Keep the real extension last: lofty picks the format from it.
     let name = path.file_name().ok_or(Error::NotFound)?.to_string_lossy();
     let tmp = path.with_file_name(format!(".coversync-tmp-{name}"));
     fs::copy(path, &tmp)?;
-    let result = (|| {
-        let mut file = probe(&tmp, true)?;
-        let rest = vorbis_rest(&tmp, file.file_type())?;
-        let tag = primary_tag_mut(&mut file);
-        apply_kinds(tag, &merged(edit, kinds)?)?;
-        let mut edited = edit_kinds(edit);
-        edited.extend(kinds.iter().map(|(id, _)| *id));
-        save(&tmp, file, rest, &[], &edited)?;
-        fs::File::open(&tmp)?.sync_all()?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    let prepared = Prepared {
+        path: path.to_path_buf(),
+        copy: tmp,
+        done: false,
+    };
+    let tmp = &prepared.copy;
+    let mut file = probe_tags(tmp, true)?;
+    let rest = vorbis_rest(tmp, file.file_type())?;
+    let tag = primary_tag_mut(&mut file);
+    apply_kinds(tag, &merged(edit, kinds)?)?;
+    let mut edited = edit_kinds(edit);
+    edited.extend(kinds.iter().map(|(id, _)| *id));
+    save(tmp, file, rest, &[], &edited)?;
+    fs::File::open(tmp)?.sync_all()?;
+    Ok(prepared)
 }
 
 /// The text value of every rule tag kind the file has, keyed by catalog id.
@@ -1039,12 +1109,13 @@ pub struct KindValues {
 }
 
 pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
-    let file = probe(path, pictures)?;
-    let values = file
+    let file = probe_tags(path, pictures)?;
+    let mut values = file
         .primary_tag()
         .or_else(|| file.first_tag())
         .map(values_of)
         .unwrap_or_default();
+    drop_vendor_encoder(path, &file, &mut values)?;
     Ok(KindValues {
         values,
         has_art: pictures && has_pictures(&file),
@@ -1061,9 +1132,10 @@ pub fn read_kinds_split(
     pictures: bool,
     split: &crate::split::Splitter,
 ) -> Result<KindValues> {
-    let file = probe(path, pictures)?;
+    let file = probe_tags(path, pictures)?;
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let mut values = tag.map(values_of).unwrap_or_default();
+    drop_vendor_encoder(path, &file, &mut values)?;
     if let Some(tag) = tag {
         for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
             let all: Vec<&str> = kind
