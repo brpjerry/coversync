@@ -366,12 +366,21 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
     // had only ID3v2) through lofty's conversion, under its provider's key.
     if tag.get(ItemKey::Popularimeter).is_some() {
         if rest.ratings.is_empty() {
-            let mut ratings = Tag::new(TagType::VorbisComments);
+            // One at a time: lofty skips one whose provider can't name a
+            // Vorbis field (an owner with "="), which then stays as lofty
+            // read it, under RATING.
             for item in tag.items().filter(|i| i.key() == ItemKey::Popularimeter) {
-                ratings.push(item.clone());
-            }
-            for (key, value) in VorbisComments::from(ratings).items() {
-                out.push(key.to_string(), value.to_string());
+                let mut one = Tag::new(TagType::VorbisComments);
+                one.push(item.clone());
+                let converted = VorbisComments::from(one);
+                if converted.items().len() == 0
+                    && let ItemValue::Text(value) = item.value()
+                {
+                    out.push("RATING".into(), value.clone());
+                }
+                for (key, value) in converted.items() {
+                    out.push(key.to_string(), value.to_string());
+                }
             }
         } else {
             for (key, value) in rest.ratings {
@@ -412,12 +421,30 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
     match tag.tag_type() {
         TagType::Id3v2 => {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
-            // Lofty reads unsynchronised frames decoded and would write them
-            // back flagged, to be decoded twice: not saved rather than corrupted.
+            // Frames lofty kept aside come flagged as unsynchronised but
+            // already decoded: written as they are, unflagged, so they aren't
+            // decoded twice. Compressed, encrypted or nested ones, which it
+            // can't write back plainly, refuse the save instead.
             if (&id3).into_iter().any(|f| f.flags().unsynchronisation) {
-                return Err(Error::Tags(
-                    "the file's ID3v2 tag uses unsynchronisation, which can't be rewritten safely yet, so it wasn't changed".into(),
-                ));
+                use lofty::id3::v2::Frame;
+                let encoded = (&id3).into_iter().any(|frame| {
+                    let flags = frame.flags();
+                    flags.compression
+                        || flags.encryption.is_some()
+                        || flags.data_length_indicator.is_some()
+                        || matches!(frame, Frame::Chapter(_) | Frame::TableOfContents(_))
+                });
+                if encoded {
+                    return Err(Error::Tags(
+                        "the file's ID3v2 tag has unsynchronised frames that are compressed, encrypted or nested, which can't be rewritten safely yet, so it wasn't changed".into(),
+                    ));
+                }
+                id3.retain_mut(|frame| {
+                    let mut flags = frame.flags();
+                    flags.unsynchronisation = false;
+                    frame.set_flags(flags);
+                    true
+                });
             }
             // Header flags as lofty writes them by default, as before: it
             // can't write CRC or restrictions back readably, and
@@ -653,8 +680,9 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
     if file.primary_tag().is_none() {
         let mut tag = Tag::new(file.primary_tag_type());
         if let Some(existing) = file.first_tag() {
+            // Every value, not the last of each key (two ratings, say).
             for item in existing.items() {
-                tag.insert(item.clone());
+                tag.push(item.clone());
             }
             for picture in existing.pictures() {
                 tag.push_picture(picture.clone());
@@ -1497,20 +1525,45 @@ mod tests {
         let path = |name: &str| dir.join(name);
         let mut id3 = Id3v2Tag::new();
         id3.set_title("Song".into());
+        // Two providers, and one whose name can't be a Vorbis field's.
         id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
             "MusicBee", 196, 0,
+        )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "Windows Media Player 9 Series",
+            255,
+            0,
+        )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "a=b@example.org",
+            128,
+            0,
         )));
         flac_with_only_id3v2(&path("in.flac"), &id3);
         let genre = [("genre", "Anime".to_string())];
         copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
         let (_, items) = vorbis(&path("out.flac"));
-        let ratings: Vec<&(String, String)> = items
+        let ratings: Vec<(&str, &str)> = items
             .iter()
             .filter(|(k, _)| k.starts_with("RATING"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        assert_eq!(ratings.len(), 1, "{items:?}");
-        assert_eq!(ratings[0].0, "RATING:MusicBee");
-        assert!(!ratings[0].1.contains('|'), "{items:?}");
+        // MusicBee's four stars on its Vorbis scale, under its key.
+        assert!(ratings.contains(&("RATING:MusicBee", "80")), "{ratings:?}");
+        assert!(
+            ratings
+                .iter()
+                .any(|(k, _)| *k == "RATING:Windows Media Player 9 Series"),
+            "{ratings:?}"
+        );
+        // The third, as lofty read it, under RATING.
+        assert!(
+            ratings
+                .iter()
+                .any(|(k, v)| *k == "RATING" && v.contains("a=b@example.org")),
+            "{ratings:?}"
+        );
+        assert_eq!(ratings.len(), 3, "{ratings:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1548,7 +1601,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "server")]
-    fn unsynchronised_id3v2_frames_leave_the_file_unchanged() {
+    fn unsynchronised_id3v2_frames_are_written_back_plainly() {
         use lofty::id3::v2::{Frame, Id3v2Tag, Id3v2TagFlags, PrivateFrame};
         let dir = std::env::temp_dir().join(format!("coversync-unsync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1557,26 +1610,40 @@ mod tests {
         wav_with_info(&src);
         let mut id3 = Id3v2Tag::new();
         id3.set_title("Song".into());
-        // A frame lofty keeps aside, with its flags, as read.
+        // A frame lofty keeps aside, with its flags, as read; its data has
+        // bytes unsynchronisation encodes.
         id3.insert(Frame::Private(PrivateFrame::new(
             "coversync",
-            vec![0xFF, 0xE0, 1],
+            vec![1, 0xFF, 0x00, 0xFF, 0xE0, 2],
         )));
         id3.set_flags(Id3v2TagFlags {
             unsynchronisation: true,
             ..Default::default()
         });
         id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        let private = |path: &Path| {
+            let mut f = fs::File::open(path).unwrap();
+            let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+            let id3 = wav.id3v2().unwrap();
+            let data = id3.into_iter().find_map(|frame| match frame {
+                Frame::Private(p) => Some(p.private_data.to_vec()),
+                _ => None,
+            });
+            (data, id3.flags().unsynchronisation)
+        };
+        let (read, was) = private(&src);
+        assert!(was, "the fixture is unsynchronised");
         let values = [("track_number", "1".to_string())];
-        let result = copy_with_tags(&src, &dest, &values, None, false);
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unsynchronisation"),
-            "refused"
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        // The data as lofty read it, in a tag no longer unsynchronised.
+        let (written, unsync) = private(&dest);
+        assert_eq!(written, read);
+        assert!(written.is_some());
+        assert!(!unsync);
+        assert_eq!(
+            read_kinds(&dest, false).unwrap().values["track_number"],
+            "1"
         );
-        assert!(!dest.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
