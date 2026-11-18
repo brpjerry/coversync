@@ -274,8 +274,9 @@ struct VorbisRest {
     /// Whether the file had ENCODER comments of its own.
     had_encoder: bool,
     /// The file's RATING comments, provider-qualified ones (`RATING:MusicBee`)
-    /// included, as written: coversync never edits a rating, and lofty can't
-    /// write a provider's back the way it read it.
+    /// included, as written and in their order (taken out of `rest`):
+    /// coversync never edits a rating, and lofty can't write a provider's
+    /// back the way it read it.
     ratings: Vec<(String, String)>,
 }
 
@@ -310,16 +311,17 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
         let k = k.to_ascii_uppercase();
         k == "RATING" || k.starts_with("RATING:")
     };
-    let mut ratings: Vec<(String, String)> = tag
+    let ratings: Vec<(String, String)> = tag
         .items()
         .filter(|(k, _)| is_rating(k))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let rest = VorbisComments::from(tag.split_tag().0);
-    // Ratings lofty couldn't read stay with the rest, once.
-    let retained: std::collections::HashSet<(&str, &str)> =
-        rest.items().filter(|(k, _)| is_rating(k)).collect();
-    ratings.retain(|(k, v)| !retained.contains(&(k.as_str(), v.as_str())));
+    let mut rest = VorbisComments::from(tag.split_tag().0);
+    // Those lofty couldn't read too, so all go back in their order.
+    let keys: std::collections::HashSet<&str> = ratings.iter().map(|(k, _)| k.as_str()).collect();
+    for key in keys {
+        rest.remove(key).for_each(drop);
+    }
     Ok(Some(VorbisRest {
         rest,
         vendor,
@@ -364,8 +366,8 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
     }
     // Ratings: the file's own as written; one from another tag (a FLAC that
     // had only ID3v2) through lofty's conversion, under its provider's key.
-    if tag.get(ItemKey::Popularimeter).is_some() {
-        if rest.ratings.is_empty() {
+    if rest.ratings.is_empty() {
+        {
             // One at a time, each as lofty converts it. Lofty reads a rating
             // as "owner|stars|count" text, so it can't convert one whose
             // owner has a "|": that one goes through it under a stand-in
@@ -411,10 +413,10 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
                     out.push("RATING".into(), text.clone());
                 }
             }
-        } else {
-            for (key, value) in rest.ratings {
-                out.push(key, value);
-            }
+        }
+    } else {
+        for (key, value) in rest.ratings {
+            out.push(key, value);
         }
     }
     // From the end, so each move is cheap; then in their order.
@@ -440,6 +442,29 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
         .map_err(tag_err)
 }
 
+/// Whether lofty writes the ID3v2 `frame` back as it read it: not
+/// compressed, encrypted or length-prefixed (it consumes the prefix on
+/// reading but keeps the flag), and for a chapter or table of contents, no
+/// frame inside that isn't, or that's flagged as unsynchronised (decoded on
+/// reading, written as it is).
+fn written_as_read(frame: &lofty::id3::v2::Frame<'_>) -> bool {
+    use lofty::id3::v2::Frame;
+    let flags = frame.flags();
+    if flags.compression || flags.encryption.is_some() || flags.data_length_indicator.is_some() {
+        return false;
+    }
+    let children = match frame {
+        Frame::Chapter(c) => Some(&c.children),
+        Frame::TableOfContents(t) => Some(&t.children),
+        _ => None,
+    };
+    children.is_none_or(|frames| {
+        frames
+            .iter()
+            .all(|f| !f.flags().unsynchronisation && written_as_read(f))
+    })
+}
+
 /// Write `tag`, a primary tag other than Vorbis comments after an edit,
 /// through lofty's owned conversion: unlike its writer for a borrowed
 /// generic tag, it puts back what the generic tag couldn't hold (custom
@@ -450,32 +475,29 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
     match tag.tag_type() {
         TagType::Id3v2 => {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
+            // What lofty can't write back: an ID3v2.2 frame with no v2.4 name
+            // (it drops it), or one it doesn't write as it read it. Not
+            // saved rather than lost or corrupted.
+            if let Some(frame) = (&id3).into_iter().find(|f| f.id().is_outdated()) {
+                return Err(Error::Tags(format!(
+                    "the file's ID3v2 tag has a {} frame, which has no ID3v2.4 name, so it wasn't changed",
+                    frame.id_str()
+                )));
+            }
+            if !(&id3).into_iter().all(written_as_read) {
+                return Err(Error::Tags(
+                    "the file's ID3v2 tag has frames lofty can't write back as they are (compressed, encrypted, length-prefixed, or in chapters holding such or unsynchronised frames), so it wasn't changed".into(),
+                ));
+            }
             // Frames lofty kept aside come flagged as unsynchronised but
             // already decoded: written as they are, unflagged, so they aren't
-            // decoded twice. A tag that also has frames lofty can't write
-            // back as they are (compressed, encrypted, length-prefixed,
-            // chapters) refuses the save instead.
-            if (&id3).into_iter().any(|f| f.flags().unsynchronisation) {
-                use lofty::id3::v2::Frame;
-                let encoded = (&id3).into_iter().any(|frame| {
-                    let flags = frame.flags();
-                    flags.compression
-                        || flags.encryption.is_some()
-                        || flags.data_length_indicator.is_some()
-                        || matches!(frame, Frame::Chapter(_) | Frame::TableOfContents(_))
-                });
-                if encoded {
-                    return Err(Error::Tags(
-                        "the file's ID3v2 tag is unsynchronised and has frames lofty can't write back as they are (compressed, encrypted, length-prefixed, or chapters), so it wasn't changed".into(),
-                    ));
-                }
-                id3.retain_mut(|frame| {
-                    let mut flags = frame.flags();
-                    flags.unsynchronisation = false;
-                    frame.set_flags(flags);
-                    true
-                });
-            }
+            // decoded twice.
+            id3.retain_mut(|frame| {
+                let mut flags = frame.flags();
+                flags.unsynchronisation = false;
+                frame.set_flags(flags);
+                true
+            });
             // Header flags as lofty writes them by default, as before: it
             // can't write CRC or restrictions back readably, and
             // unsynchronisation would decode its frames twice.
@@ -489,17 +511,30 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
             // made 1/9).
             let mut tag = tag;
             let mut literal = Vec::new();
+            let mut typed = Vec::new();
             for (name, number, total) in [
                 ("Track", ItemKey::TrackNumber, ItemKey::TrackTotal),
                 ("Disc", ItemKey::DiscNumber, ItemKey::DiscTotal),
             ] {
-                let value = match (tag.get_string(number), tag.get_string(total)) {
-                    (Some(n), None) => Some(n.to_string()),
-                    (n, Some(t)) => Some(format!("{}/{t}", n.unwrap_or("0"))),
-                    (None, None) => None,
-                };
-                if let Some(value) = value {
-                    literal.push((name, value));
+                let value = |key| tag.get(key).map(|i| i.value().clone());
+                match (value(number), value(total)) {
+                    (None, None) => {}
+                    (Some(ItemValue::Text(n)), None) => literal.push((name, n)),
+                    (n @ (None | Some(ItemValue::Text(_))), Some(ItemValue::Text(t))) => {
+                        let n = match n {
+                            Some(ItemValue::Text(n)) => n,
+                            _ => "0".into(),
+                        };
+                        literal.push((name, format!("{n}/{t}")));
+                    }
+                    // A binary or locator item, as it was (lofty files it
+                    // under either key).
+                    (Some(v), None) | (None, Some(v)) => typed.push((name, v)),
+                    _ => {
+                        return Err(Error::Tags(format!(
+                            "the file's APE {name} item can't hold both its number and total as they are, so it wasn't changed"
+                        )));
+                    }
                 }
                 tag.remove_key(number);
                 tag.remove_key(total);
@@ -516,6 +551,9 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
                 let item = lofty::ape::ApeItem::new(name.into(), ItemValue::Text(value))
                     .map_err(tag_err)?;
                 ape.insert(item);
+            }
+            for (name, value) in typed {
+                ape.insert(lofty::ape::ApeItem::new(name.into(), value).map_err(tag_err)?);
             }
             for value in compilation {
                 ape.push(lofty::ape::ApeItem::new("Compilation".into(), value).map_err(tag_err)?);
@@ -1506,6 +1544,7 @@ mod tests {
             ItemValue::Binary(b"front.jpg\0data".to_vec()),
         ));
         ape.insert(item("Compilation", ItemValue::Binary(vec![1])));
+        ape.insert(item("Disc", ItemValue::Binary(vec![2])));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
         let values = [("title", "New".to_string())];
         copy_with_tags(&src, &dest, &values, None, false).unwrap();
@@ -1519,6 +1558,10 @@ mod tests {
         assert_eq!(text("Title"), Some("New"));
         assert_eq!(text("Track"), Some("A1"));
         assert_eq!(text("Ripper"), Some("kept"));
+        assert!(matches!(
+            ape.get("Disc").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == &[2]
+        ));
         assert!(matches!(
             ape.get("Compilation").map(|i| i.value()),
             Some(ItemValue::Binary(b)) if b == &[1]
@@ -1681,6 +1724,74 @@ mod tests {
             read_kinds(&dest, false).unwrap().values["track_number"],
             "1"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ratings_keep_their_order_whatever_the_case_of_their_names() {
+        let dir = std::env::temp_dir().join(format!("coversync-rorder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "RATING:MusicBee=80", "rating:MusicBee=60"],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let ratings: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|(k, _)| k.to_ascii_uppercase().starts_with("RATING"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            ratings,
+            [("RATING:MusicBee", "80"), ("rating:MusicBee", "60")]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `wav_with_info`'s WAV with `id3` as its ID3 chunk.
+    #[cfg(feature = "server")]
+    fn wav_with_id3_chunk(path: &Path, id3: &[u8]) {
+        wav_with_info(path);
+        let mut wav = fs::read(path).unwrap();
+        wav.extend_from_slice(b"ID3 ");
+        wav.extend_from_slice(&(id3.len() as u32).to_le_bytes());
+        wav.extend_from_slice(id3);
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        fs::write(path, wav).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_frames_lofty_cant_write_back_leave_the_file_unchanged() {
+        let dir = std::env::temp_dir().join(format!("coversync-id3refuse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let values = [("track_number", "1".to_string())];
+        // ID3v2.4: a PRIV frame with a data length indicator (flags 00 01),
+        // its payload led by the four-byte length.
+        let src = dir.join("dli.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x1e\
+              PRIV\x00\x00\x00\x14\x00\x01\x00\x00\x00\x10coversync\x00\x01\x02\x03\x04\x05\x06",
+        );
+        let refused = copy_with_tags(&src, &dir.join("dli-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("length-prefixed"));
+        assert!(!dir.join("dli-out.wav").exists());
+        // ID3v2.2: a title, and an XYZ frame with no ID3v2.4 name.
+        let src = dir.join("v22.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x02\x00\x00\x00\x00\x00\x14TT2\x00\x00\x05\x00SongXYZ\x00\x00\x03abc",
+        );
+        let refused = copy_with_tags(&src, &dir.join("v22-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("XYZ"));
+        assert!(!dir.join("v22-out.wav").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
