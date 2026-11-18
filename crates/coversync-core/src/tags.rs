@@ -1483,44 +1483,45 @@ fn lost(
     if tag.tag_type() == TagType::VorbisComments || set.is_empty() {
         return None;
     }
-    // A tag of these kinds' items, converted and encoded: None if refused.
-    let back = |kinds: &[&'static rules::TagKind]| -> Option<Vec<(ItemKey, String)>> {
-        let mut only = Tag::new(tag.tag_type());
-        for item in tag
-            .items()
-            .filter(|i| kinds.iter().any(|k| k.keys.contains(&i.key())))
-        {
-            only.push(item.clone());
-        }
-        let mut sink = std::io::sink();
-        let options = WriteOptions::default();
-        let converted: Tag = match native(only).ok()? {
-            Native::Id3v2(t) => {
-                t.dump_to(&mut sink, options).ok()?;
-                t.into()
+    // A tag of these kinds' items (and `also`, more of the file's keys),
+    // converted and encoded: None if refused.
+    let back =
+        |kinds: &[&'static rules::TagKind], also: &[ItemKey]| -> Option<Vec<(ItemKey, String)>> {
+            let mut only = Tag::new(tag.tag_type());
+            for item in tag.items().filter(|i| {
+                kinds.iter().any(|k| k.keys.contains(&i.key())) || also.contains(&i.key())
+            }) {
+                only.push(item.clone());
             }
-            Native::Ilst(t) => {
-                t.dump_to(&mut sink, options).ok()?;
-                t.into()
-            }
-            Native::Ape(t) => {
-                t.dump_to(&mut sink, options).ok()?;
-                t.into()
-            }
-            Native::Other(t) => t,
+            let mut sink = std::io::sink();
+            let options = WriteOptions::default();
+            let converted: Tag = match native(only).ok()? {
+                Native::Id3v2(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Ilst(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Ape(t) => {
+                    t.dump_to(&mut sink, options).ok()?;
+                    t.into()
+                }
+                Native::Other(t) => t,
+            };
+            Some(
+                converted
+                    .items()
+                    .filter_map(|i| match i.value() {
+                        ItemValue::Text(t) | ItemValue::Locator(t) => {
+                            Some((i.key(), t.trim().to_string()))
+                        }
+                        ItemValue::Binary(_) => None,
+                    })
+                    .collect(),
+            )
         };
-        Some(
-            converted
-                .items()
-                .filter_map(|i| match i.value() {
-                    ItemValue::Text(t) | ItemValue::Locator(t) => {
-                        Some((i.key(), t.trim().to_string()))
-                    }
-                    ItemValue::Binary(_) => None,
-                })
-                .collect(),
-        )
-    };
     let number = |kind: &rules::TagKind, t: &str| parse_number(kind.label, t).ok().flatten();
     let id3v2 = tag.tag_type() == TagType::Id3v2;
     let mut alone = Vec::new();
@@ -1550,7 +1551,7 @@ fn lost(
         let with: Vec<&'static rules::TagKind> = std::iter::once(*kind)
             .chain(number_of(kind.id).and_then(rules::kind))
             .collect();
-        let items = match back(&with) {
+        let items = match back(&with, &[]) {
             Some(items) if !items.is_empty() => items,
             _ => return Some((kind, value.clone())),
         };
@@ -1583,8 +1584,25 @@ fn lost(
         }
         alone.push((*kind, value, if own.is_empty() { items } else { own }));
     }
-    // One kind: converted alone is converted together.
-    if set.len() == 1 {
+    // The file's other tags that land in the same field (ID3v2's TSSE holds
+    // Encoder and Encoder settings): together, one may push out another.
+    let field = |key: ItemKey| key.map_key(tag.tag_type());
+    let fields: Vec<&str> = set
+        .iter()
+        .flat_map(|(k, _)| k.keys.iter().filter_map(|key| field(*key)))
+        .collect();
+    let mut sharing: Vec<ItemKey> = Vec::new();
+    for item in tag.items() {
+        let key = item.key();
+        if !set.iter().any(|(k, _)| k.keys.contains(&key))
+            && field(key).is_some_and(|f| fields.contains(&f))
+            && !sharing.contains(&key)
+        {
+            sharing.push(key);
+        }
+    }
+    // One kind, alone in its field: converted alone is converted together.
+    if set.len() == 1 && sharing.is_empty() {
         return None;
     }
     // Each total with its number (one the file has, if it isn't set too).
@@ -1597,7 +1615,7 @@ fn lost(
             kinds.push(number);
         }
     }
-    let Some(together) = back(&kinds) else {
+    let Some(together) = back(&kinds, &sharing) else {
         return set.first().cloned();
     };
     alone
@@ -3350,6 +3368,8 @@ mod tests {
         "2024-6 Z",
         "20240603T 1",
         "20240603T14 8",
+        "2024 6 3",
+        "2024 6",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3366,6 +3386,7 @@ mod tests {
         "2024-6-03T14:08:4",
         "2024-06 -03",
         "2010-08-25T01:30 PM",
+        "2024 6 03",
     ];
 
     #[test]
@@ -3716,6 +3737,15 @@ mod tests {
             ),
             ("2", "5")
         );
+        // Encoder beside the file's Encoder settings: one field (TSSE) for two.
+        write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("encoder_settings", "-V0")]),
+        )
+        .unwrap();
+        let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("encoder", "LAME")]));
+        assert!(refused.is_err());
         // A time with words after it isn't read whole.
         assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
         // Parts out of range: not a date (the form leaves these to the server).

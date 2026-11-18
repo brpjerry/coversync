@@ -82,8 +82,11 @@ const LAST = '(?:\\d{2}| \\d|\\d (?=Z$))';
 const SEPARATED = new RegExp(
 	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
 );
+// Run together, a month or day can be a space and a digit (2024 6 3 is
+// June 3: lofty reads the spaces as padding, not separators).
+const PADDED = '(?:\\d{2}| \\d)';
 const COMPACT = new RegExp(
-	`^\\d{4}(?:\\d{2}(?:\\d{2}(?:T(?:${LAST}|\\d{2}(?:${LAST}|\\d{2}(?:${LAST})?)?))?)?)?Z?$`
+	`^\\d{4}(?:${PADDED}(?:${PADDED}(?:T(?:${LAST}|\\d{2}(?:${LAST}|\\d{2}(?:${LAST})?)?))?)?)?Z?$`
 );
 
 /**
