@@ -23,9 +23,11 @@ used on a home server.
   and discs below the last one there that no track is on. Discs past the
   last one aren't counted missing, since a disc total often counts a DVD or
   Blu-ray, and an album with an unnumbered track isn't judged (it could be
-  any of the gaps). A total for the whole album on every disc counts the
-  tracks it lacks even when the tags don't say which disc they're on.
-  The album's page shows the missing numbers in its tracklist. This needs no
+  any of the gaps). A total for the whole album on every disc counts at
+  least the tracks it lacks even when the tags don't say which disc they're
+  on. The album's page shows the missing numbers in its tracklist (between
+  discs, when the numbering runs straight through them and the tags don't
+  say which disc a gap is on). This needs no
   MusicBrainz; Smart suggestions (below) list what a release has that the
   album doesn't. The sidebar filters albums by tag:
   pick a tag such as Genre from its dropdown, search its values, and tick the

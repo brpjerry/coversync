@@ -131,18 +131,17 @@ pub fn incomplete(tracks: &[&Track]) -> Option<Incomplete> {
     let album_wide = runs.len() > 1
         && totals.iter().all(|t| *t == totals[0])
         && totals[0].is_some_and(|t| t >= tops);
-    // Beyond the gaps, what the album's total asks for: unless a disc it may
-    // count isn't there (one in between, or one past the last, a DVD maybe).
-    let declared = usual(
-        tracks
-            .iter()
-            .map(|t| t.disc_total.filter(|n| *n <= MAX_NUMBER)),
-    );
+    // Beyond the gaps, at least what the album's total asks for: unless a
+    // disc it may count isn't there (one in between, or one any file says
+    // comes after the last, a DVD maybe).
+    let last_declared = tracks
+        .iter()
+        .filter_map(|t| t.disc_total.filter(|n| *n <= MAX_NUMBER))
+        .max()
+        .unwrap_or(0);
     let unplaced = match totals[0] {
         Some(total)
-            if album_wide
-                && missing_discs.is_empty()
-                && declared.is_none_or(|n| n as usize == runs.len()) =>
+            if album_wide && missing_discs.is_empty() && last_declared as usize <= runs.len() =>
         {
             total - tops
         }
@@ -410,14 +409,23 @@ mod tests {
         let found = check(&tracks).unwrap();
         assert_eq!(found.tracks, [gap(Some(1), 2, 2)]);
         assert_eq!(found.unplaced, 2);
-        // A third disc the tags count (a DVD, maybe) could hold the rest.
+        // A third disc the tags count (a DVD, maybe) could hold the rest,
+        // even if only some files say so.
         let tracks = [
             t(Some(1), Some(1), Some(5), Some(3)),
             t(Some(1), Some(2), Some(5), Some(3)),
-            t(Some(2), Some(1), Some(5), Some(3)),
-            t(Some(2), Some(2), Some(5), Some(3)),
+            t(Some(2), Some(1), Some(5), Some(2)),
+            t(Some(2), Some(2), Some(5), Some(2)),
         ];
         assert_eq!(check(&tracks), None);
+        // A stale disc total below the discs there says nothing.
+        let tracks = [
+            t(Some(1), Some(1), Some(5), Some(1)),
+            t(Some(1), Some(2), Some(5), Some(1)),
+            t(Some(2), Some(1), Some(5), Some(2)),
+            t(Some(2), Some(2), Some(5), Some(2)),
+        ];
+        assert_eq!(check(&tracks).unwrap().unplaced, 1);
     }
 
     #[test]

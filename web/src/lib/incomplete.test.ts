@@ -27,41 +27,64 @@ describe('describeIncomplete', () => {
 
 	it('counts tracks an album-wide total asks for on no disc in particular', () => {
 		expect(describeIncomplete({ tracks: [], discs: [], unplaced: 1 })).toBe(
-			"Missing 1 track whose disc the tags don't say"
+			"Missing at least 1 track whose disc the tags don't say"
 		);
 		expect(describeIncomplete({ tracks: [gap(2, 2, 1)], discs: [], unplaced: 2 })).toBe(
-			"Missing disc 1 track 2 and 2 more tracks whose disc the tags don't say"
+			"Missing disc 1 track 2 and at least 2 more tracks whose disc the tags don't say"
 		);
 	});
 });
 
 describe('withGaps', () => {
+	const disc = (key: number, rows: unknown[] | null, label = `Disc ${key}`) => ({
+		key,
+		label,
+		rows
+	});
+
 	it('puts each run of missing numbers where it belongs', () => {
 		const rows = withGaps([[1, [t(1), t(2), t(5)]]], { tracks: [gap(3, 4), gap(6, 8)], discs: [] });
 		expect(rows).toEqual([
-			[
-				1,
-				[{ track: t(1) }, { track: t(2) }, { from: 3, to: 4 }, { track: t(5) }, { from: 6, to: 8 }]
-			]
+			disc(1, [
+				{ track: t(1) },
+				{ track: t(2) },
+				{ from: 3, to: 4 },
+				{ track: t(5) },
+				{ from: 6, to: 8 }
+			])
 		]);
-		expect(withGaps([[1, [t(2)]]], { tracks: [gap(1, 1)], discs: [] })[0][1]).toEqual([
+		expect(withGaps([[1, [t(2)]]], { tracks: [gap(1, 1)], discs: [] })[0].rows).toEqual([
 			{ from: 1, to: 1 },
 			{ track: t(2) }
 		]);
 	});
 
-	it('puts a gap numbered straight through on the missing disc between', () => {
+	it('puts a gap numbered straight through on the disc around it', () => {
+		const discs: [number, { track_no: number }[]][] = [
+			[1, [t(1), t(3)]],
+			[2, [t(5), t(7)]]
+		];
+		expect(withGaps(discs, { tracks: [gap(2, 2), gap(6, 6)], discs: [] })).toEqual([
+			disc(1, [{ track: t(1) }, { from: 2, to: 2 }, { track: t(3) }]),
+			disc(2, [{ track: t(5) }, { from: 6, to: 6 }, { track: t(7) }])
+		]);
+	});
+
+	it('puts a gap at a disc boundary between the discs, the tags not saying which', () => {
+		// Tracks 3-4 could end disc 1, start disc 3, or be disc 2.
 		const rows = withGaps(
 			[
 				[1, [t(1), t(2)]],
 				[3, [t(5), t(6)]]
 			],
-			{ tracks: [gap(3, 4)], discs: [2] }
+			{ tracks: [gap(3, 4), gap(7, 8)], discs: [2] }
 		);
 		expect(rows).toEqual([
-			[1, [{ track: t(1) }, { track: t(2) }]],
-			[2, [{ from: 3, to: 4 }]],
-			[3, [{ track: t(5) }, { track: t(6) }]]
+			disc(1, [{ track: t(1) }, { track: t(2) }]),
+			disc(1.5, [{ from: 3, to: 4 }], 'Between discs 1 and 3'),
+			disc(2, null),
+			disc(3, [{ track: t(5) }, { track: t(6) }]),
+			disc(3.5, [{ from: 7, to: 8 }], 'After disc 3')
 		]);
 		// Disc 1 missing, before the first there.
 		expect(
@@ -73,40 +96,14 @@ describe('withGaps', () => {
 				{ tracks: [gap(1, 2)], discs: [1] }
 			)
 		).toEqual([
-			[1, [{ from: 1, to: 2 }]],
-			[2, [{ track: t(3) }]],
-			[3, [{ track: t(4) }]]
-		]);
-	});
-
-	it('puts a gap inside a disc on it, and one between two discs there on the one before', () => {
-		const discs: [number, { track_no: number }[]][] = [
-			[1, [t(1), t(3)]],
-			[2, [t(5), t(6)]]
-		];
-		expect(withGaps(discs, { tracks: [gap(2, 2), gap(4, 4)], discs: [] })).toEqual([
-			[1, [{ track: t(1) }, { from: 2, to: 2 }, { track: t(3) }, { from: 4, to: 4 }]],
-			[2, [{ track: t(5) }, { track: t(6) }]]
-		]);
-	});
-
-	it('adds a missing disc with no gap on it as a disc of its own', () => {
-		expect(
-			withGaps(
-				[
-					[1, [t(1)]],
-					[3, [t(1)]]
-				],
-				{ tracks: [], discs: [2] }
-			)
-		).toEqual([
-			[1, [{ track: t(1) }]],
-			[2, null],
-			[3, [{ track: t(1) }]]
+			disc(1, null),
+			disc(1.5, [{ from: 1, to: 2 }], 'Before disc 2'),
+			disc(2, [{ track: t(3) }]),
+			disc(3, [{ track: t(4) }])
 		]);
 	});
 
 	it('leaves a complete album as it is', () => {
-		expect(withGaps([[1, [t(1)]]], undefined)).toEqual([[1, [{ track: t(1) }]]]);
+		expect(withGaps([[1, [t(1)]]], undefined)).toEqual([disc(1, [{ track: t(1) }])]);
 	});
 });

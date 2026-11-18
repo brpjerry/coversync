@@ -72,8 +72,8 @@ pub struct Incomplete {
     pub tracks: Vec<Gap>,
     /// Discs missing below the album's last one.
     pub discs: Vec<u32>,
-    /// More tracks missing than the gaps hold, by a total for the whole album
-    /// that every disc has, on no disc in particular.
+    /// At least this many more tracks missing than the gaps hold, by a total
+    /// for the whole album that every disc has, on no disc in particular.
     #[serde(skip_serializing_if = "is_zero")]
     pub unplaced: u32,
 }

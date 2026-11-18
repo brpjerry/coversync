@@ -2028,10 +2028,12 @@ impl Library {
             .into_iter()
             .map(|(id, idx)| {
                 let mut ts: Vec<&Track> = idx.iter().map(|i| &rows[*i].track).collect();
+                // As `sort_tracks` sorts them, so the album's summary is the same.
                 ts.sort_by_key(|t| {
                     (
                         t.disc_no.unwrap_or(1).max(1),
                         t.track_no.unwrap_or(u32::MAX),
+                        t.rel_path.as_str(),
                     )
                 });
                 let added = album_added(collection, idx.iter().map(|i| rows[*i].added));

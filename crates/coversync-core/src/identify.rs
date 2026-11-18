@@ -289,12 +289,19 @@ impl Evidence {
         cache: Option<&LookupCache>,
         release: &Release,
     ) -> Option<mb::Answer<Arc<Release>>> {
+        // With a disc it doesn't list (a DVD), an edition without it can still
+        // hold every listed track: either count will do.
         let total: u32 = release.media.iter().map(Medium::size).sum();
+        let listed: u32 = release.media.iter().map(|m| m.tracks.len() as u32).sum();
         let linked = romanize::linked_tracklists(release);
         let others = self
             .candidates
             .iter()
-            .filter(|c| c.id != release.id && sorts_az(&c.title) && c.track_count == Some(total))
+            .filter(|c| {
+                c.id != release.id
+                    && sorts_az(&c.title)
+                    && c.track_count.is_some_and(|n| n == total || n == listed)
+            })
             .map(|c| c.id.clone())
             .take(2);
         let ids: Vec<String> = if linked.is_empty() {
@@ -1273,31 +1280,47 @@ fn map_tracks(
             out[i] = Some((m, t, Via::Position));
         }
     }
+    if out.iter().all(Option::is_some) {
+        return out;
+    }
+    // The release's titles as compared, each folded once; romanized or not,
+    // the album's title may be either.
+    let keys = |r: &Release| -> Vec<String> {
+        positions
+            .iter()
+            .map(|(m, t, _, _)| fold(&r.media[*m].tracks[*t].title).to_lowercase())
+            .collect()
+    };
+    let titles = keys(release);
+    let originals = original.map(keys);
     for (i, local) in tracks.iter().enumerate() {
         let Some(title) = local.values.get("title").filter(|_| out[i].is_none()) else {
             continue;
         };
         let title = fold(title).to_lowercase();
-        // Romanized or not, the album's title may be either.
-        let same = |r: &Release, m: usize, t: usize| {
-            fold(&r.media[m].tracks[t].title).to_lowercase() == title
-        };
         // A title on the release twice ("Intro" on each disc): the one at the
-        // track's own disc and number, if it says.
+        // track's own disc and number, if it says; else the first.
         let elsewhere = |disc: u32, pos: u32| {
             (
                 !single && local.disc.is_some_and(|d| d != disc),
                 local.track.is_some_and(|n| n != pos),
             )
         };
-        let hit = positions
-            .iter()
-            .filter(|(m, t, _, _)| {
-                !taken.contains(&(*m, *t))
-                    && (same(release, *m, *t) || original.is_some_and(|o| same(o, *m, *t)))
-            })
-            .min_by_key(|(_, _, disc, pos)| elsewhere(*disc, *pos));
-        if let Some(&(m, t, _, _)) = hit {
+        let mut hit: Option<((bool, bool), usize)> = None;
+        for (j, &(m, t, disc, pos)) in positions.iter().enumerate() {
+            let rank = elsewhere(disc, pos);
+            if taken.contains(&(m, t)) || hit.is_some_and(|(best, _)| best <= rank) {
+                continue;
+            }
+            if titles[j] == title || originals.as_ref().is_some_and(|o| o[j] == title) {
+                hit = Some((rank, j));
+                if rank == (false, false) {
+                    break;
+                }
+            }
+        }
+        if let Some((_, j)) = hit {
+            let (m, t, _, _) = positions[j];
             taken.insert((m, t));
             out[i] = Some((m, t, Via::Title));
         }

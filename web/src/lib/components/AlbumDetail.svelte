@@ -237,8 +237,8 @@
 				</div>
 			{:else if mode === 'tracks'}
 				<div in:fade={{ duration: 200 }}>
-					{#each rows as [disc, items] (disc)}
-						{#if rows.length > 1}<h3 class="disc">Disc {disc}</h3>{/if}
+					{#each rows as { key, label, rows: items } (key)}
+						{#if rows.length > 1}<h3 class="disc">{label}</h3>{/if}
 						<ol class="tracks">
 							{#if !items}
 								<li class="missing" style:--i={0}>
@@ -301,7 +301,7 @@
 									<span class="no tabular">–</span>
 									<span class="title">
 										<span class="name"
-											>{unplacedText(
+											>Missing {unplacedText(
 												incomplete.unplaced,
 												incomplete.tracks.length > 0 || incomplete.discs.length > 0
 											)}</span
@@ -671,6 +671,7 @@
 		font-size: 12.5px;
 	}
 	.missing .name {
+		white-space: normal;
 		font-weight: 450;
 		font-style: italic;
 		color: var(--text-3);

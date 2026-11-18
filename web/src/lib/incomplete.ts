@@ -38,58 +38,77 @@ export function describeIncomplete(inc: Incomplete): string {
 	return `Missing ${listed(texts)}`;
 }
 
-/** Tracks an album-wide total asks for beyond the gaps: "2 more tracks whose disc the tags don't say". */
+/**
+ * Tracks an album-wide total asks for beyond the gaps, a minimum (the total
+ * might be each disc's): "at least 2 more tracks whose disc the tags don't say".
+ */
 export function unplacedText(n: number, more: boolean) {
-	return `${more ? `${n} more` : n} ${n === 1 ? 'track' : 'tracks'} whose disc the tags don't say`;
+	return `at least ${n}${more ? ' more' : ''} ${n === 1 ? 'track' : 'tracks'} whose disc the tags don't say`;
 }
 
 /** A row of an album's tracklist: one of its tracks, or a run of missing ones. */
 export type Row<T> = { track: T } | { from: number; to: number };
 
+/** A disc of an album's tracklist, or a place between discs; `rows` null for a missing disc. */
+export interface Group<T> {
+	/** Orders the groups: the disc's number, or halfway past the disc before. */
+	key: number;
+	label: string;
+	rows: Row<T>[] | null;
+}
+
 /**
- * Which disc a gap with none of its own (numbered straight through the
- * discs) is on: the one whose tracks surround it, else the one missing disc
- * between those before and after it, else the one before it.
+ * Where a gap with no disc of its own (numbered straight through the discs)
+ * goes: on the disc whose tracks surround it; otherwise the tags don't say
+ * whether it ends one disc, starts the next or fills one between, so it
+ * goes between them.
  */
-function discOf<T extends { track_no: number | null }>(
+function placeOf<T extends { track_no: number | null }>(
 	g: { from: number; to: number },
-	discs: [number, T[]][],
-	missing: number[]
-): number {
-	if (discs.length < 2) return discs[0]?.[0] ?? 1;
+	discs: [number, T[]][]
+): { key: number; label: string } {
+	const disc = (d: number) => ({ key: d, label: `Disc ${d}` });
+	if (discs.length < 2) return disc(discs[0]?.[0] ?? 1);
 	const numbers = (ts: T[]) => ts.map((t) => t.track_no ?? 0);
 	const around = discs.find(
 		([, ts]) => numbers(ts).some((n) => n < g.from) && numbers(ts).some((n) => n > g.to)
 	);
-	if (around) return around[0];
-	const before = discs.findLast(([, ts]) => numbers(ts).every((n) => n < g.from));
-	const after = discs.find(([, ts]) => numbers(ts).every((n) => n > g.to));
-	const between = missing.filter((d) => d > (before?.[0] ?? 0) && d < (after?.[0] ?? Infinity));
-	if (between.length === 1) return between[0];
-	return (before ?? after ?? discs[0])[0];
+	if (around) return disc(around[0]);
+	const before = discs.findLast(([, ts]) => numbers(ts).every((n) => n < g.from))?.[0];
+	const after = discs.find(([, ts]) => numbers(ts).every((n) => n > g.to))?.[0];
+	if (before !== undefined && after !== undefined)
+		return { key: before + 0.5, label: `Between discs ${before} and ${after}` };
+	if (before !== undefined) return { key: before + 0.5, label: `After disc ${before}` };
+	const next = after ?? discs[0][0];
+	return { key: next - 0.5, label: `Before disc ${next}` };
 }
 
 /**
  * The album's tracks, disc by disc as `discs` has them, with rows for the
- * runs of numbers it lacks where they belong, and missing discs as discs
- * whose only row is `null` (or the gap that's on them).
+ * runs of numbers it lacks where they belong (or between discs, where the
+ * tags don't say which), and missing discs with no rows.
  */
 export function withGaps<T extends { track_no: number | null }>(
 	discs: [number, T[]][],
 	inc: Incomplete | undefined
-): [number, Row<T>[] | null][] {
-	const out = new Map<number, Row<T>[] | null>(
-		discs.map(([d, tracks]) => [d, tracks.map((track) => ({ track }))])
+): Group<T>[] {
+	const groups = new Map<number, Group<T>>(
+		discs.map(([d, tracks]) => [
+			d,
+			{ key: d, label: `Disc ${d}`, rows: tracks.map((track) => ({ track })) }
+		])
 	);
-	if (!inc) return [...out.entries()];
-	for (const g of inc.tracks) {
-		const disc = g.disc ?? discOf(g, discs, inc.discs);
-		const rows = out.get(disc) ?? [];
+	for (const g of inc?.tracks ?? []) {
+		const place = g.disc === null ? placeOf(g, discs) : { key: g.disc, label: `Disc ${g.disc}` };
+		const group = groups.get(place.key) ?? { ...place, rows: [] };
+		const rows = (group.rows ??= []);
 		// Before the first track numbered after it.
 		const at = rows.findIndex((r) => 'track' in r && (r.track.track_no ?? 0) > g.to);
 		rows.splice(at === -1 ? rows.length : at, 0, { from: g.from, to: g.to });
-		out.set(disc, rows);
+		groups.set(place.key, group);
 	}
-	for (const d of inc.discs) if (!out.has(d)) out.set(d, null);
-	return [...out.entries()].sort(([a], [b]) => a - b);
+	for (const d of inc?.discs ?? []) {
+		if (!groups.has(d)) groups.set(d, { key: d, label: `Disc ${d}`, rows: null });
+	}
+	return [...groups.values()].sort((a, b) => a.key - b.key);
 }
