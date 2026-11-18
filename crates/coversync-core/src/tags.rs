@@ -1238,9 +1238,13 @@ fn read_whole(typed: &str, read: &Timestamp) -> bool {
     if in_range.contains(&false) {
         return false;
     }
-    // Nothing left unfinished after the last number (2024-06-): a T or a Z
-    // may end it, not a separator.
-    if typed.trim().ends_with(['-', '.', ':', ' ']) {
+    // Nothing left unfinished after the last number (2024-06-, or a time cut
+    // short before its Z): a T or a Z may end it, not a separator.
+    // (A space before a Z can pad the last part, as in 2024-6 Z.)
+    let body = typed.trim().trim_end_matches('Z');
+    if body.ends_with(['-', '.', ':'])
+        || (body.ends_with(' ') && !body.trim_end().ends_with(|c: char| c.is_ascii_digit()))
+    {
         return false;
     }
     // Anything but numbers, separators, T and Z (a PM, say) isn't read.
@@ -1647,7 +1651,14 @@ fn lost(
             } else {
                 own
             };
-            expected.iter().all(|item| together.contains(item))
+            // As many times as the file has it (two Publishers of one name).
+            let count = |list: &[&(ItemKey, String)], item: &(ItemKey, String)| {
+                list.iter().filter(|x| **x == item).count()
+            };
+            let together: Vec<&(ItemKey, String)> = together.iter().collect();
+            expected
+                .iter()
+                .all(|item| count(&expected, item) <= count(&together, item))
         })
     })?;
     // Named by the edit that pushes it out: one in the same field.
@@ -3426,6 +3437,7 @@ mod tests {
         "2024 603",
         "2024-06-",
         "2024-06-03T12:",
+        "2024-06-03T12:Z",
     ];
 
     #[test]
@@ -3794,6 +3806,24 @@ mod tests {
             file_tags(&path("a.mp3"), "; ").unwrap().values["publisher"],
             "Bandai"
         );
+        // The file's Publisher given twice: a Label of that name would leave one.
+        fs::write(
+            path("twice.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        let mut id3 = lofty::id3::v2::Id3v2Tag::new();
+        id3.insert(lofty::id3::v2::Frame::Text(
+            lofty::id3::v2::TextInformationFrame::new(
+                lofty::id3::v2::FrameId::new("TPUB").unwrap(),
+                lofty::TextEncoding::UTF8,
+                "Bandai\0Bandai",
+            ),
+        ));
+        id3.save_to_path(path("twice.mp3"), WriteOptions::default())
+            .unwrap();
+        let refused = write_with_kinds(&path("twice.mp3"), &none, &kinds(&[("label", "Bandai")]));
+        assert!(refused.is_err());
         // Beside another edit, the error names the one that pushes it out.
         let refused = write_with_kinds(
             &path("a.mp3"),
