@@ -83,7 +83,7 @@ const SEPARATED = new RegExp(
 	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
 );
 const COMPACT = new RegExp(
-	`^\\d{4}(?:\\d{2}(?:\\d{2}(?:T(?:${LAST}|\\d{2}(?:\\d{2}(?:\\d{2})?)?))?)?)?Z?$`
+	`^\\d{4}(?:\\d{2}(?:\\d{2}(?:T(?:${LAST}|\\d{2}(?:${LAST}|\\d{2}(?:${LAST})?)?))?)?)?Z?$`
 );
 
 /**

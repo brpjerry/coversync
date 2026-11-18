@@ -1226,6 +1226,18 @@ fn values_of(tag: &Tag) -> HashMap<&'static str, String> {
 /// it: the numbers typed, the year first and then two digits a part where
 /// they run together (20100825), are the ones read, in order.
 fn read_whole(typed: &str, read: &Timestamp) -> bool {
+    // Each part in its range: ID3v2 writes a month 13 but reads it back as
+    // no date at all.
+    let in_range = [
+        read.month.is_none_or(|m| (1..=12).contains(&m)),
+        read.day.is_none_or(|d| (1..=31).contains(&d)),
+        read.hour.is_none_or(|h| h <= 23),
+        read.minute.is_none_or(|m| m <= 59),
+        read.second.is_none_or(|s| s <= 59),
+    ];
+    if in_range.contains(&false) {
+        return false;
+    }
     // Anything but numbers, separators, T and Z (a PM, say) isn't read.
     if !typed
         .trim()
@@ -1416,17 +1428,16 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
         }
         set.push((kind, v.to_string()));
     }
-    // A pair is written number first (lofty builds ID3v2's MVIN from the
-    // items in order): each total goes after its number, however they were
-    // set.
-    for key in [
-        ItemKey::TrackTotal,
-        ItemKey::DiscTotal,
-        ItemKey::MovementTotal,
-    ] {
-        let totals: Vec<TagItem> = tag.take(key).collect();
-        for total in totals {
-            tag.push(total);
+    // Lofty builds ID3v2's MVIN from the movement items in order: the total
+    // goes after the number, however they were set. (Moved by copying and
+    // the order-keeping `remove_key`: `take` reorders the other items.)
+    if tag.tag_type() == TagType::Id3v2 {
+        let totals: Vec<TagItem> = tag.get_items(ItemKey::MovementTotal).cloned().collect();
+        if !totals.is_empty() {
+            tag.remove_key(ItemKey::MovementTotal);
+            for total in totals {
+                tag.push(total);
+            }
         }
     }
     // Together, as they'll be written: two kinds can share one field (Label
@@ -2140,6 +2151,7 @@ mod tests {
             &[
                 "ARTIST=A",
                 "ARTIST=B",
+                "TRACKTOTAL=10",
                 "RATING=80",
                 "COMPILATION=YES",
                 "TITLE=Song",
@@ -3337,6 +3349,7 @@ mod tests {
         "2024-06-03T1 :02",
         "2024-6 Z",
         "20240603T 1",
+        "20240603T14 8",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3705,6 +3718,10 @@ mod tests {
         );
         // A time with words after it isn't read whole.
         assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
+        // Parts out of range: not a date (the form leaves these to the server).
+        for date in ["2024-13-01", "2024-06-32", "2024-06-03T24:00"] {
+            assert!(validate_kind("date", date).is_err(), "{date}");
+        }
         // A field given another way must still have been one.
         let bad = TagEdit {
             track_no: Some("invalid".into()),
