@@ -1247,9 +1247,13 @@ fn read_whole(typed: &str, read: &Timestamp) -> bool {
     {
         return false;
     }
-    // A bare T only right after a whole date (2010-08-25T), not a month.
-    if let Some(date) = body.strip_suffix('T')
-        && (read.day.is_none() || !date.ends_with(|c: char| c.is_ascii_digit()))
+    // A bare T only where an hour could follow (2010-08-25T, or a padded
+    // 2024-06-3 T): with 00 after it, lofty reads that hour and nothing
+    // more. Not after a month (2024-06-T), nor after an hour (T12T).
+    if body.ends_with('T')
+        && !format!("{body}00")
+            .parse::<Timestamp>()
+            .is_ok_and(|t| t.hour == Some(0) && t.minute.is_none())
     {
         return false;
     }
@@ -3427,6 +3431,7 @@ mod tests {
         "2024 6",
         "20246 03",
         "999 -06",
+        "2024-06-3 T",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3449,6 +3454,7 @@ mod tests {
         "2024-06-03T12:",
         "2024-06-03T12:Z",
         "2024-06-T",
+        "2024-06-03T12T",
     ];
 
     #[test]
