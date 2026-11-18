@@ -5,6 +5,14 @@
 	/** Edits in the editor: none, some not sent yet, or some being saved. */
 	export type Draft = 'none' | 'draft' | 'saving';
 
+	/** What the editor shows open, kept by the sheet across a new editor (see `restore`). */
+	export interface TagView {
+		/** Show all tags is open. */
+		allTags: boolean;
+		/** Fields open per track. */
+		perTrack: string[];
+	}
+
 	/**
 	 * Edits whose save was refused because the album had changed elsewhere,
 	 * kept to put on top of the album as it is now (see tag-form).
@@ -71,6 +79,16 @@
 		allowWrites: boolean;
 		/** A save, answered; `id` is the album's id as it was. */
 		onsaved: (result: TagWriteResult, id: string) => void;
+		/**
+		 * Open as this view once the tags are read: what the editor before
+		 * this one had open (one is made anew for each album version, so
+		 * after a save, say).
+		 */
+		restore?: TagView | null;
+		/** Hears what's open, as it changes. */
+		onview?: (view: TagView) => void;
+		/** Hears whether the tags are being read (the editor is short then). */
+		onloading?: (loading: boolean) => void;
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
@@ -106,7 +124,10 @@
 		kept = null,
 		onrefused,
 		onrevert,
-		onretry
+		onretry,
+		restore = null,
+		onview,
+		onloading
 	}: Props = $props();
 
 	/** The editor's own names for the fields up front. */
@@ -143,6 +164,8 @@
 	const added = new SvelteSet<string>();
 	/** Album-wide fields opened to edit each track's value. */
 	const perTrack = new SvelteSet<string>();
+	/** Show all tags is open. */
+	let allTags = $state(false);
 	let saving = $state(false);
 
 	async function load() {
@@ -178,6 +201,12 @@
 				for (const kind of ALBUM_CORE) if (shared(form, ids, kind) === null) perTrack.add(kind);
 			} else form = structuredClone(values);
 			other = tags.tracks;
+			// As the editor before this one had it (after a save, say); else
+			// open where kept edits (or changes elsewhere) need looking at.
+			if (restore) {
+				allTags = restore.allTags;
+				for (const kind of restore.perTrack) perTrack.add(kind);
+			} else allTags = extraChanged > 0;
 		} catch (e) {
 			failed = e instanceof ApiError ? e.message : 'The tags could not be read.';
 			// Gone under this id: renamed (or removed) since; the sheet may
@@ -192,6 +221,12 @@
 		}
 	}
 	load();
+
+	$effect(() => onloading?.(loading));
+	$effect(() => {
+		if (loading || failed) return;
+		onview?.({ allTags, perTrack: [...perTrack] });
+	});
 
 	const anyChanged = (kind: string) => ids.some((id) => changed(form, base, id, kind));
 	const anyElsewhere = (kind: string) => ids.some((id) => elsewhere[id]?.[kind] !== undefined);
@@ -499,7 +534,7 @@
 			label="Show all tags"
 			count={extra.length + others.length}
 			badge={extraChanged ? `${extraChanged} changed` : undefined}
-			initiallyOpen={extraChanged > 0}
+			bind:open={allTags}
 		>
 			<div class="all-tags">
 				{#each extraGroups as g (g.id)}

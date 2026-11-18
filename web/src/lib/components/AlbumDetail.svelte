@@ -21,7 +21,12 @@
 	import { describeIncomplete, unplacedText, withGaps } from '#lib/incomplete.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
+	import TagEditor, {
+		lostTracks,
+		type Draft,
+		type TagDraft,
+		type TagView
+	} from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -67,9 +72,28 @@
 		ondiscard
 	}: Props = $props();
 
+	/**
+	 * What the tag editor has open, kept while it's shown: a new one (made for
+	 * each album version, so after a save) opens the same way.
+	 */
+	let editorView = $state<TagView | null>(null);
+	/**
+	 * While a new editor reads the tags it's short: its box keeps the height
+	 * the editor had, so the page doesn't jump (and the scroll stays put).
+	 * The height is held all along, following the editor's own except while
+	 * one loads, so it's already there the moment an editor is replaced.
+	 */
+	let editorLoading = $state(false);
+	let editorHeight = $state(0);
+	let heldHeight = $state(0);
+	$effect(() => {
+		if (!editorLoading && editorHeight > 0) heldHeight = editorHeight;
+	});
+
 	/** Leave the tag editor: its edits go, kept ones included. */
 	function showTracks() {
 		if (mode === 'edit') ondiscard?.();
+		editorView = null;
 		mode = 'tracks';
 	}
 
@@ -318,23 +342,28 @@
 					<p class="path" title={detail.dir}>{`\u200e${detail.dir}\u200e`}</p>
 				</div>
 			{:else}
-				<div in:fade={{ duration: 200 }}>
+				<div in:fade={{ duration: 200 }} style:min-height={heldHeight ? `${heldHeight}px` : null}>
 					{#key detail}
-						<TagEditor
-							{detail}
-							{allowWrites}
-							{onsaved}
-							{onimport}
-							ondraft={(d) => {
-								editing = d;
-								ondraft?.(d);
-							}}
-							{kept}
-							{onrefused}
-							onrevert={() => ondiscard?.()}
-							onretry={onreload && (() => onreload?.(true, detail ?? undefined))}
-							oncancel={showTracks}
-						/>
+						<div bind:offsetHeight={editorHeight}>
+							<TagEditor
+								{detail}
+								{allowWrites}
+								{onsaved}
+								restore={editorView}
+								onview={(v) => (editorView = v)}
+								onloading={(l) => (editorLoading = l)}
+								{onimport}
+								ondraft={(d) => {
+									editing = d;
+									ondraft?.(d);
+								}}
+								{kept}
+								{onrefused}
+								onrevert={() => ondiscard?.()}
+								onretry={onreload && (() => onreload?.(true, detail ?? undefined))}
+								oncancel={showTracks}
+							/>
+						</div>
 					{/key}
 				</div>
 			{/if}
