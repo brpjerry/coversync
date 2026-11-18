@@ -64,8 +64,10 @@ used on a home server.
   Moved tracks keep their ids and import dates, and a client that knew a
   track at its old path still finds it. A save the structure couldn't
   place (a title cleared, two tracks on one path, a file already there or
-  in the way of a folder, a name starting with a dot, which scans skip, a
-  linked folder, another file system) is refused before anything is
+  in the way of a folder, a file name starting with a dot, which scans
+  skip, a folder name starting with `.coversync` in any case, a linked
+  folder, another file system, or moves before the Library's database
+  exists, which its first import makes) is refused before anything is
   written; one whose files can't all be moved after the tags are written
   (a file appearing meanwhile) puts them all back and says so. Moves are
   recorded in the Library's database before they're made, and ones not

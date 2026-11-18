@@ -203,8 +203,11 @@ fn kind(st: &Stat) -> FileType {
 
 /// Rename, never replacing anything: `AlreadyExists` when `to` is taken.
 /// File systems without `RENAME_NOREPLACE` (some network ones) make a second
-/// name, which can't replace anything either, then drop the first; folders
-/// there, or where hard links aren't, are checked first and then renamed.
+/// name, which can't replace anything either, then drop the first. Folders
+/// there are checked first and then renamed, as a rename can't put a folder
+/// in place of a file or of a folder with anything in it. A file where hard
+/// links aren't either could replace one that came meanwhile, so it doesn't
+/// move.
 fn rename_new(
     from_dir: BorrowedFd<'_>,
     from: &OsStr,
@@ -229,6 +232,12 @@ fn rename_new(
     if entry(to_dir, to)?.is_some() {
         return Err(Errno::EXIST.into());
     }
+    if !entry(from_dir, from)?.is_some_and(|st| kind(&st) == FileType::Directory) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the Library's file system can't move a file without the risk of replacing another",
+        ));
+    }
     Ok(renameat(from_dir, from, to_dir, to)?)
 }
 
@@ -243,10 +252,25 @@ fn list(dir: BorrowedFd<'_>) -> io::Result<Vec<(OsString, FileType)>> {
             continue;
         }
         let name = OsStr::from_bytes(name).to_owned();
-        let Some(st) = entry(dir, &name)? else {
-            continue;
+        // The folder says, unless its file system doesn't.
+        let what = match e.file_type() {
+            FileType::Unknown => match entry(dir, &name)? {
+                Some(st) => kind(&st),
+                None => continue,
+            },
+            what => what,
         };
-        out.push((name, kind(&st)));
+        out.push((name, what));
+    }
+    Ok(out)
+}
+
+/// A folder's names, as they're spelt.
+fn spellings(dir: BorrowedFd<'_>) -> io::Result<HashSet<OsString>> {
+    let mut out = HashSet::new();
+    let mut entries = Dir::read_from(dir)?;
+    while let Some(e) = entries.read() {
+        out.insert(OsStr::from_bytes(e?.file_name().to_bytes()).to_owned());
     }
     Ok(out)
 }
@@ -316,7 +340,10 @@ pub fn plan(
             .unwrap_or_default();
         match template.render(values, &extension) {
             Ok(to) => {
-                if let Some(why) = unscanned(&to) {
+                // A file that stays is where a scan found it.
+                if to.as_path() != from
+                    && let Some(why) = unscanned(&to)
+                {
                     return Err(Error::Invalid(format!(
                         "The folder structure would put {file} at {}, where a scan wouldn't find it ({why}).",
                         to.display()
@@ -351,37 +378,11 @@ pub fn plan(
     let root_fd = root_fd.as_fd();
     let folded = case_insensitive(root_fd);
 
-    // Where every file ends up: none twice, and none where another needs a folder.
-    let mut finals: HashMap<String, &Path> = HashMap::new();
-    for (from, to) in &placed {
-        let at: &Path = if from == to { from } else { to };
-        if finals.insert(key(at, folded), at).is_some() {
-            return Err(Error::Invalid(format!(
-                "Two files would both be {}.",
-                at.display()
-            )));
-        }
-    }
-    let mut folders: HashSet<String> = HashSet::new();
-    for at in finals.values() {
-        for dir in at.ancestors().skip(1) {
-            if dir.as_os_str().is_empty() {
-                break;
-            }
-            let k = key(dir, folded);
-            if finals.contains_key(&k) {
-                return Err(Error::Invalid(format!(
-                    "{} would be both a file and a folder.",
-                    dir.display()
-                )));
-            }
-            folders.insert(k);
-        }
-    }
+    let (finals, folders) = places(&placed, folded)?;
 
-    // The files that move, as they are: each by its folder and itself, so
-    // another name for it elsewhere (a hard link) isn't taken for it.
-    let mut leaving: HashSet<Entry> = HashSet::new();
+    // The files that move, as they are: each by its folder, its name and
+    // itself, so another name for it (a hard link) isn't taken for it.
+    let mut leaving: HashSet<Leaving> = HashSet::new();
     let mut devices = Vec::new();
     for (from, _) in &moving {
         let (dir, name) = split(from)?;
@@ -398,32 +399,22 @@ pub fn plan(
                 from.display()
             ))
         })?;
-        match kind(&st) {
-            FileType::RegularFile => {}
-            // A link to a path from its own folder may lead elsewhere once
-            // it, or what it leads to, has moved.
-            FileType::Symlink
-                if !io(readlinkat(&fd, name, Vec::new()))?
-                    .as_bytes()
-                    .starts_with(b"/") =>
-            {
-                return Err(Error::Invalid(format!(
-                    "{} is a link to a path from its own folder, which a save doesn't move.",
-                    from.display()
-                )));
-            }
-            FileType::Symlink => {}
-            _ => {
-                return Err(Error::Invalid(format!("{} isn't a file.", from.display())));
-            }
+        if let Some(why) = unmovable(fd.as_fd(), name, &st)? {
+            return Err(Error::Invalid(format!("{} {why}.", from.display())));
         }
         let parent = io(fstat(&fd))?;
-        leaving.insert((parent.st_dev, parent.st_ino, st.st_ino));
+        leaving.insert((
+            parent.st_dev,
+            parent.st_ino,
+            st.st_ino,
+            key(Path::new(name), folded),
+        ));
         devices.push(parent.st_dev);
     }
 
-    // Where they go: folders, or room for them, on the way, and room at the end.
-    let mut spelled: HashMap<PathBuf, Option<OsString>> = HashMap::new();
+    // Where they go: folders, or room for them, on the way, and room at the
+    // end (a file that leaves makes room for one, not for a folder).
+    let mut spelled: HashMap<PathBuf, HashSet<OsString>> = HashMap::new();
     for ((from, to), device) in moving.iter().zip(&devices) {
         let (dir, name) = split(to)?;
         let mut fd = io(openat(root_fd, ".", DIR, Mode::empty()))?;
@@ -435,31 +426,26 @@ pub fn plan(
                 whole = false;
                 break;
             };
-            let here = io(fstat(&fd))?;
             match kind(&st) {
                 FileType::Directory => {
                     // Where names fold, the folder found can be spelt
                     // otherwise; the index would have it as the structure
                     // spells it, and a scan as it is.
                     if folded {
-                        let other = match spelled.get(&at) {
-                            Some(other) => other.clone(),
-                            None => {
-                                let found = list(fd.as_fd())?
-                                    .into_iter()
-                                    .map(|(name, _)| name)
-                                    .filter(|name| {
-                                        key(Path::new(name), true) == key(Path::new(n), true)
-                                    });
-                                let other = match found.clone().any(|name| name == n) {
-                                    true => None,
-                                    false => found.into_iter().next(),
-                                };
-                                spelled.insert(at.clone(), other.clone());
-                                other
-                            }
+                        // Its folder's names, read once (names only: what
+                        // each is would be a request each on a share).
+                        let parent = at.parent().unwrap_or(Path::new(""));
+                        let names = match spelled.get(parent) {
+                            Some(names) => names,
+                            None => spelled
+                                .entry(parent.to_path_buf())
+                                .or_insert(spellings(fd.as_fd())?),
                         };
-                        if let Some(other) = other {
+                        if !names.contains(n) {
+                            let other = names
+                                .iter()
+                                .find(|m| key(Path::new(m), true) == key(Path::new(n), true))
+                                .map_or(n, OsString::as_os_str);
                             return Err(Error::Invalid(format!(
                                 "The folder structure says {}, but the folder there is {}: a save doesn't change a folder name's case.",
                                 at.display(),
@@ -474,11 +460,6 @@ pub fn plan(
                         "{} is a link, which a save doesn't put files in.",
                         at.display()
                     )));
-                }
-                // A file that moves away first leaves room for the folder.
-                _ if leaving.contains(&(here.st_dev, here.st_ino, st.st_ino)) => {
-                    whole = false;
-                    break;
                 }
                 _ => {
                     return Err(Error::Invalid(format!(
@@ -498,7 +479,12 @@ pub fn plan(
         }
         if whole
             && let Some(st) = entry(fd.as_fd(), name)?
-            && !leaving.contains(&(here.st_dev, here.st_ino, st.st_ino))
+            && !leaving.contains(&(
+                here.st_dev,
+                here.st_ino,
+                st.st_ino,
+                key(Path::new(name), folded),
+            ))
         {
             return Err(Error::Invalid(format!("{} already exists.", to.display())));
         }
@@ -522,14 +508,75 @@ pub fn plan(
     Ok(plan)
 }
 
-/// A name in a folder: the folder's device and inode, and the file's inode.
-type Entry = (u64, u64, u64);
+/// Where every file ends up (`placed`, the paths each has and will have),
+/// and the folders on the way, as names compare where they are (see
+/// [`key`]). Refused when two files would be one, one would be where
+/// another needs a folder, or a folder would be spelt two ways (where names
+/// fold, one folder, which the index would have under both).
+fn places(placed: &[(PathBuf, PathBuf)], folded: bool) -> Result<(Keyed<'_>, Keyed<'_>)> {
+    let mut finals: Keyed<'_> = HashMap::new();
+    for (from, to) in placed {
+        let at: &Path = if from == to { from } else { to };
+        if finals.insert(key(at, folded), at).is_some() {
+            return Err(Error::Invalid(format!(
+                "Two files would both be {}.",
+                at.display()
+            )));
+        }
+    }
+    let mut folders: Keyed<'_> = HashMap::new();
+    for at in finals.values() {
+        for dir in at.ancestors().skip(1) {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            let k = key(dir, folded);
+            if finals.contains_key(&k) {
+                return Err(Error::Invalid(format!(
+                    "{} would be both a file and a folder.",
+                    dir.display()
+                )));
+            }
+            if let Some(other) = folders.insert(k, dir)
+                && other != dir
+            {
+                return Err(Error::Invalid(format!(
+                    "{} and {} would be one folder: the folder structure gives these files names that differ only in case.",
+                    other.display(),
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok((finals, folders))
+}
+
+/// Paths by how names compare where they are (see [`key`]).
+type Keyed<'a> = HashMap<String, &'a Path>;
+
+/// A file that leaves its folder: the folder's device and inode, the
+/// file's inode, and its name as names compare there (see [`key`]).
+type Leaving = (u64, u64, u64, String);
+
+/// Why the file `name` in `dir` (`st`) can't move, if it can't: it isn't a
+/// file, or it's a link to a path from its own folder, which may lead
+/// elsewhere once it, or what it leads to, has moved.
+fn unmovable(dir: BorrowedFd<'_>, name: &OsStr, st: &Stat) -> io::Result<Option<&'static str>> {
+    Ok(match kind(st) {
+        FileType::RegularFile => None,
+        FileType::Symlink => (!io(readlinkat(dir, name, Vec::new()))?
+            .as_bytes()
+            .starts_with(b"/"))
+        .then_some("is a link to a path from its own folder, which a save doesn't move"),
+        _ => Some("isn't a file"),
+    })
+}
 
 /// The names the album's tracks will have, which its other files can't take.
 struct Taken<'a> {
-    finals: &'a HashMap<String, &'a Path>,
+    finals: &'a Keyed<'a>,
     /// The folders on the way to them.
-    folders: &'a HashSet<String>,
+    folders: &'a Keyed<'a>,
     folded: bool,
 }
 
@@ -616,7 +663,10 @@ fn companions(
         for (name, files) in names {
             let dest = to.join(&name);
             let k = key(&dest, taken.folded);
-            if taken.finals.contains_key(&k) || taken.folders.contains(&k) || claimed.contains(&k) {
+            if taken.finals.contains_key(&k)
+                || taken.folders.contains_key(&k)
+                || claimed.contains(&k)
+            {
                 continue;
             }
             if whole && !matches!(entry(at.as_fd(), &name), Ok(None)) {
@@ -634,8 +684,8 @@ fn companions(
 /// with no audio at all. None when it all stays: there's audio there that
 /// isn't the album's moving away, a link or something stranger, or what
 /// can't be listed. coversync's own names, names the move record can't hold
-/// (not UTF-8), and the way down to `to` (an album moving into a folder of
-/// its own inside this one), stay.
+/// (not UTF-8: a folder's is still looked in for audio), and the way down
+/// to `to` (an album moving into a folder of its own inside this one), stay.
 fn movable(
     dir: BorrowedFd<'_>,
     rel: &Path,
@@ -654,13 +704,16 @@ fn movable(
                     return None;
                 }
             }
-            _ if name.to_str().is_none() => {}
-            FileType::RegularFile => names.push((name, 1)),
+            FileType::RegularFile => {
+                if name.to_str().is_some() {
+                    names.push((name, 1));
+                }
+            }
             FileType::Directory => {
                 let sub = openat(dir, &name, DIR, Mode::empty()).ok()?;
                 // A folder of tracks that move (a disc's) has its own way.
                 let (audio, files) = departing_audio(sub.as_fd(), &path, departing)?;
-                if !audio {
+                if !audio && name.to_str().is_some() {
                     names.push((name, files));
                 }
             }
@@ -672,7 +725,8 @@ fn movable(
 
 /// Whether the album's moving tracks are under `dir` (`rel`), and how many
 /// other files are; None when something there keeps it all in place (see
-/// [`movable`]).
+/// [`movable`]), coversync's own folders among it (uploads being staged,
+/// say), which never move.
 fn departing_audio(
     dir: BorrowedFd<'_>,
     rel: &Path,
@@ -681,7 +735,12 @@ fn departing_audio(
     let (mut found, mut files) = (false, 0);
     for (name, kind) in list(dir).ok()? {
         let path = rel.join(&name);
+        // Its own files (a copy a save is making) go with the folder.
         if own(&name) {
+            match kind {
+                FileType::Directory => return None,
+                _ => files += 1,
+            }
             continue;
         }
         match kind {
@@ -719,6 +778,21 @@ fn prune(root: BorrowedFd<'_>, dirs: &[PathBuf]) {
                 break;
             }
             d = parent;
+        }
+    }
+}
+
+/// Remove those of `made` (folders a save made, relative to the Library
+/// folder) that are empty, and no other.
+fn unmake(root: BorrowedFd<'_>, made: &[PathBuf]) {
+    let mut dirs: Vec<&Path> = made.iter().map(PathBuf::as_path).collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    dirs.dedup();
+    for dir in dirs {
+        if let Ok((parent, name)) = split(dir)
+            && let Ok(fd) = open_dir(root, parent)
+        {
+            let _ = unlinkat(&fd, name, AtFlags::REMOVEDIR);
         }
     }
 }
@@ -805,31 +879,48 @@ pub fn apply(lib: &Library, plan: &Plan) -> Result<Applied> {
     let mut records = Vec::new();
     for m in &plan.tracks {
         let (from, to) = (rel(&m.from)?, rel(&m.to)?);
-        let st = found(&from)?.ok_or_else(|| {
+        let (dir, name) = split(&from)?;
+        let fd = open_dir(root_fd, dir)?;
+        let st = entry(fd.as_fd(), name)?.ok_or_else(|| {
             Error::Invalid(format!(
                 "{} isn't in the Library folder now.",
                 from.display()
             ))
         })?;
+        // As it was planned: something else put there meanwhile may not be.
+        if let Some(why) = unmovable(fd.as_fd(), name, &st)? {
+            return Err(Error::Invalid(format!("{} {why}", from.display())));
+        }
         records.push(record(records.len(), &from, &to, &st, true));
     }
-    // The album's other files that are still there (and still audio-free).
+    // The album's other files that can still follow it: its folders still
+    // with no other audio, and no more files than planned (one taken out
+    // meanwhile leaves the rest to go).
+    let departing: HashSet<PathBuf> = records.iter().map(|r| PathBuf::from(&r.from)).collect();
+    let departing: HashSet<&Path> = departing.iter().map(PathBuf::as_path).collect();
+    let mut now: HashMap<PathBuf, Option<HashMap<OsString, usize>>> = HashMap::new();
     let mut following = Vec::new();
     for (m, files) in plan.companions.iter().zip(&plan.companion_files) {
         let (Ok(from), Ok(to)) = (rel(&m.from), rel(&m.to)) else {
             continue;
         };
-        let Ok(Some(st)) = found(&from) else { continue };
-        if kind(&st) == FileType::Directory {
-            let still = open_dir(root_fd, &from)
-                .ok()
-                .and_then(|fd| departing_audio(fd.as_fd(), &from, &HashSet::new()));
-            if still != Some((false, *files)) {
-                continue;
-            }
+        let (Ok((dir, name)), Ok((to_dir, _))) = (split(&from), split(&to)) else {
+            continue;
+        };
+        let can = now.entry(dir.to_path_buf()).or_insert_with(|| {
+            let fd = open_dir(root_fd, dir).ok()?;
+            let names = movable(fd.as_fd(), dir, &departing, to_dir)?;
+            Some(names.into_iter().collect())
+        });
+        let Some(&count) = can.as_ref().and_then(|names| names.get(name)) else {
+            continue;
+        };
+        if count > *files {
+            continue;
         }
+        let Ok(Some(st)) = found(&from) else { continue };
         records.push(record(records.len(), &from, &to, &st, false));
-        following.push((m, *files));
+        following.push((m, count));
     }
     lib.record_moves(&batch, &records)?;
     let (tracks, companions) = records.split_at(plan.tracks.len());
@@ -944,7 +1035,7 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> V
             }
         }
     }
-    prune(root, made);
+    unmake(root, made);
     let mut touched = parents(records, |r| &r.from);
     touched.extend(parents(records, |r| &r.to));
     sync_dirs(root, touched);
@@ -1274,8 +1365,62 @@ mod tests {
         // And where a folder would have to be.
         fs::hard_link(&from, s.root.join("A/Deep")).unwrap();
         let t = Template::parse("{album_artist}/Deep/{title}").unwrap();
-        let err = refused(&t, &s.root, &[(from, track("A", "x", "1", "X"))]);
+        let err = refused(&t, &s.root, &[(from.clone(), track("A", "x", "1", "X"))]);
         assert!(err.contains("needs a folder"), "{err}");
+        // Nor one beside it, in its own folder.
+        fs::remove_file(s.root.join("A/New/01 - X.flac")).unwrap();
+        fs::hard_link(&from, s.root.join("A/Old/02 - X.flac")).unwrap();
+        let err = refused(
+            &structure(),
+            &s.root,
+            &[(from.clone(), track("A", "Old", "2", "X"))],
+        );
+        assert!(err.contains("already exists"), "{err}");
+        // Under its own name it's the file itself, which can take a new one.
+        let p = plan(
+            &structure(),
+            &s.root,
+            &[(from, track("A", "Old", "3", "X"))],
+        )
+        .unwrap();
+        assert_eq!(p.tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_folder_doesnt_take_the_place_of_a_file_that_leaves() {
+        // Undoing that would find the folder in the file's way.
+        let s = scratch("file-to-folder");
+        let from = s.root.join("A/Old.flac");
+        touch(&from, "x");
+        let t = Template::parse("{album_artist}/{album}/{title}").unwrap();
+        let err = refused(
+            &t,
+            &s.root,
+            &[(from.clone(), track("A", "Old.flac", "1", "X"))],
+        );
+        assert!(err.contains("needs a folder"), "{err}");
+        assert_eq!(read(&from), "x");
+    }
+
+    #[test]
+    fn a_folder_spelt_two_ways_is_refused_where_names_fold() {
+        let placed = |a: &str, b: &str| {
+            vec![
+                (PathBuf::from("x/1.flac"), PathBuf::from(a)),
+                (PathBuf::from("x/2.flac"), PathBuf::from(b)),
+            ]
+        };
+        let two = placed("ABBA/Gold/1.flac", "Abba/Gold/2.flac");
+        let err = places(&two, true).unwrap_err().to_string();
+        assert!(err.contains("differ only in case"), "{err}");
+        // Two folders where names don't fold, and one spelt one way.
+        assert!(places(&two, false).is_ok());
+        assert!(places(&placed("ABBA/Gold/1.flac", "ABBA/Gold/2.flac"), true).is_ok());
+        // Files, as before.
+        let err = places(&placed("A/1.flac", "a/1.FLAC"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both be"), "{err}");
     }
 
     #[test]
@@ -1340,6 +1485,125 @@ mod tests {
         assert!(apply(&s.lib, &p).is_err());
         assert_eq!(read(&from), "x");
         assert!(s.root.join("A/New/Empty").is_dir(), "not made by the save");
+
+        // One it made inside one that was there, empty: that one stays.
+        fs::create_dir_all(s.root.join("A/Pre")).unwrap();
+        let t = Template::parse("{album_artist}/Pre/{album}/{track_number} - {title}").unwrap();
+        let files = vec![
+            (from.clone(), track("A", "New", "1", "X")),
+            (
+                s.root.join("A/Old/02 - Y.flac"),
+                track("B", "Newer", "2", "Y"),
+            ),
+        ];
+        let p = plan(&t, &s.root, &files).unwrap();
+        touch(&s.root.join("B/Pre/Newer/02 - Y.flac"), "taken");
+        assert!(apply(&s.lib, &p).is_err());
+        assert_eq!(read(&from), "x");
+        assert!(!s.root.join("A/Pre/New").exists(), "made by the save");
+        assert!(s.root.join("A/Pre").is_dir(), "there before");
+    }
+
+    #[test]
+    fn a_file_turned_into_a_link_after_planning_doesnt_move() {
+        let s = scratch("late-link");
+        let from = s.root.join("A/Old/01 - X.flac");
+        touch(&from, "x");
+        touch(&s.root.join("A/Old/real.flac"), "real");
+        let p = plan(
+            &structure(),
+            &s.root,
+            &[(from.clone(), track("A", "New", "1", "X"))],
+        )
+        .unwrap();
+        fs::remove_file(&from).unwrap();
+        std::os::unix::fs::symlink("real.flac", &from).unwrap();
+        let err = apply(&s.lib, &p).unwrap_err().to_string();
+        assert!(err.contains("link to a path from its own folder"), "{err}");
+        assert!(fs::symlink_metadata(&from).unwrap().is_symlink());
+        assert!(!s.root.join("A/New").exists());
+        assert!(s.lib.recorded_moves().unwrap().is_empty());
+    }
+
+    #[test]
+    fn other_files_follow_as_they_are_when_the_moves_are_made() {
+        let s = scratch("late-companions");
+        let old = s.root.join("A/Old");
+        touch(&old.join("01 - X.flac"), "x");
+        touch(&old.join("cover.jpg"), "art");
+        touch(&old.join("Scans/front.jpg"), "front");
+        touch(&old.join("Scans/back.jpg"), "back");
+        let files = [(old.join("01 - X.flac"), track("A", "New", "1", "X"))];
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        assert_eq!(p.companions.len(), 2);
+        // A scan taken out meanwhile: the rest still go, counted as they are.
+        fs::remove_file(old.join("Scans/back.jpg")).unwrap();
+        let done = apply(&s.lib, &p).unwrap();
+        let new = s.root.join("A/New");
+        assert_eq!(read(&new.join("Scans/front.jpg")), "front");
+        assert_eq!(read(&new.join("cover.jpg")), "art");
+        assert_eq!(done.files, 3);
+
+        // Audio that came meanwhile, beside a loose cover: everything stays.
+        let back = s.root.join("A/Back");
+        let files = [(new.join("01 - X.flac"), track("A", "Back", "1", "X"))];
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        assert_eq!(p.companions.len(), 2);
+        touch(&new.join("02 - Other.flac"), "other");
+        let done = apply(&s.lib, &p).unwrap();
+        assert_eq!(read(&back.join("01 - X.flac")), "x");
+        assert!(done.companions.is_empty(), "{done:?}");
+        assert_eq!(read(&new.join("cover.jpg")), "art");
+        assert_eq!(read(&new.join("Scans/front.jpg")), "front");
+    }
+
+    #[test]
+    fn audio_in_a_folder_named_otherwise_than_utf_8_keeps_the_cover() {
+        use std::os::unix::ffi::OsStrExt;
+        let s = scratch("non-utf8");
+        let old = s.root.join("A/Old");
+        touch(&old.join("01 - X.flac"), "x");
+        touch(&old.join("cover.jpg"), "art");
+        let odd = old.join(OsStr::from_bytes(b"Bonus \xff"));
+        touch(&odd.join("01 - Bonus.flac"), "bonus");
+        let files = [(old.join("01 - X.flac"), track("A", "New", "1", "X"))];
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        assert!(p.companions.is_empty(), "{p:?}");
+        // With none there, the folder stays (its name can't be recorded)
+        // and the cover goes.
+        fs::remove_file(odd.join("01 - Bonus.flac")).unwrap();
+        touch(&odd.join("notes.txt"), "notes");
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        assert_eq!(p.companions.len(), 1, "{p:?}");
+    }
+
+    #[test]
+    fn a_folder_holding_one_of_coversyncs_own_keeps_the_albums_files() {
+        let s = scratch("own-inside");
+        let old = s.root.join("A/Old");
+        touch(&old.join("01 - X.flac"), "x");
+        touch(&old.join("Extras/.coversync-uploads/1/part"), "uploading");
+        touch(&old.join("Extras/notes.txt"), "notes");
+        touch(&old.join("cover.jpg"), "art");
+        let files = [(old.join("01 - X.flac"), track("A", "New", "1", "X"))];
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        // As with a link there: the album's other files all stay.
+        assert!(p.companions.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn a_track_that_stays_in_a_folder_named_like_coversyncs_isnt_refused() {
+        let s = scratch("own-stays");
+        let at = s.root.join("A/.coversync-music/01 - X.flac");
+        touch(&at, "x");
+        let t = Template::parse("{album_artist}/{album}/{track_number} - {title}").unwrap();
+        let p = plan(
+            &t,
+            &s.root,
+            &[(at, track("A", ".coversync-music", "1", "X"))],
+        )
+        .unwrap();
+        assert!(p.is_empty());
     }
 
     #[test]

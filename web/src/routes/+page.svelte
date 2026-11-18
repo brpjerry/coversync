@@ -601,6 +601,12 @@
 		devices.readSyncAll();
 		return loadAlbums();
 	}
+	/** A scan ended, or stopped short: then uploads done before it haven't been scanned. */
+	function scanEnded(scan: Status['scan']) {
+		if (scan.phase !== 'failed') return scanFinished();
+		toast('The scan didn’t finish: see coversyncd’s log.', 'error');
+		return loadAlbums();
+	}
 
 	/** While a scan runs, the grids reload about this often, so albums appear as it reads them. */
 	const SCAN_RELOAD_MS = 4000;
@@ -626,7 +632,8 @@
 			const fresh = await api.status();
 			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
 			// A scan_finished that came meanwhile has seen to the end itself.
-			if (wasRunning && !status.scan.running && finishes === scanFinishes) await scanFinished();
+			if (wasRunning && !status.scan.running && finishes === scanFinishes)
+				await scanEnded(status.scan);
 			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
 		} catch {}
 		// Only one poll waits at a time, even when two ran at once.
@@ -1036,7 +1043,8 @@
 			pushedScan = scan;
 			scanFinishes++;
 			if (status) status = { ...status, scan };
-			scanFinished();
+			scanEnded(scan);
+			if (scan.phase === 'failed') return;
 			// The scan's count is of the Inbox's albums.
 			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'} in the Inbox`;
 			const unread = scan.errors

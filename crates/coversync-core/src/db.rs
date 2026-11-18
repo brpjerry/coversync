@@ -2464,6 +2464,16 @@ impl Library {
         Ok(batches)
     }
 
+    /// Forget the covers of albums with no track left (a tag save's new
+    /// title is a new id), as [`Self::upsert_moving`] does with its rows.
+    pub fn forget_orphan_covers(&self) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM temp.indexed_tracks)",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Forget recorded moves: `seqs` of `batch`, or all of it.
     pub fn forget_moves(&self, batch: &str, seqs: Option<&[i64]>) -> Result<()> {
         let conn = self.conn();

@@ -1,5 +1,9 @@
 //! coversyncd: indexes a music library and serves the coversync web UI.
 
+// A save moves Library files with Linux's own calls (see `relocate`).
+#[cfg(not(target_os = "linux"))]
+compile_error!("coversyncd runs on Linux");
+
 mod api;
 mod auth;
 mod events;
@@ -212,6 +216,7 @@ pub fn spawn_scan(state: Shared) {
             scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress)
         })
         .await;
+        let finished = matches!(result, Ok(Ok(())));
         match result {
             Ok(Ok(())) => tracing::info!("scan finished"),
             Ok(Err(e)) => tracing::error!("scan failed: {e}"),
@@ -223,6 +228,11 @@ pub fn spawn_scan(state: Shared) {
         let progress = {
             let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
             p.running = false;
+            // One that didn't finish (or start: see recovery above) has no
+            // count of its own to give.
+            if !finished {
+                p.phase = "failed".into();
+            }
             p.clone()
         };
         state.events.publish(events::Notice::ScanFinished(progress));

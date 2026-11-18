@@ -1227,6 +1227,13 @@ async fn write_tags(
                     }
                     e => e,
                 })?;
+                // Moves are recorded in the Library folder's own database
+                // (see `relocate::apply`), which its first import makes.
+                if !plan.is_empty() && !s.lib.library_stored()? {
+                    return Err(coversync_core::Error::Invalid(
+                        "These files would move to where the folder structure puts them, which waits for the Library folder's database (its first import makes it). Nothing was saved.".into(),
+                    ));
+                }
                 Some(plan)
             }
             None => None,
@@ -1334,7 +1341,10 @@ async fn write_tags(
                 ),
             });
             moved = relocate::Applied::default();
+            // Only files found are indexed; a track not back stays as the
+            // index has it. A new title's album leaves its old cover behind.
             scan::index_files(&s.lib, stat_all(at_first), &s.progress)?;
+            s.lib.forget_orphan_covers()?;
         }
         drop(moving);
         drop(files);
@@ -1746,6 +1756,95 @@ mod tests {
         assert!(said.ends_with("Nothing was saved."), "{said}");
         let after = tags::read(&moved.join("Song.flac")).unwrap();
         assert_eq!(after.title.as_deref(), Some("Song"));
+    }
+
+    #[tokio::test]
+    async fn a_scan_moves_left_stuck_keep_from_starting_is_announced_as_failed() {
+        let (state, _root, _) =
+            library_record("relocate-scan", coversync_core::template::DEFAULT).await;
+        // A record recovery won't act on (not one it made): stuck.
+        let stuck = coversync_core::db::MoveRecord {
+            seq: 0,
+            from: "A/x.flac".into(),
+            staged: Some("not-ours".into()),
+            to: "B/x.flac".into(),
+            dev: 0,
+            ino: 0,
+        };
+        state
+            .lib
+            .record_moves("00000000000000cc", &[stuck])
+            .unwrap();
+        let scanned = |state: &Shared| {
+            let mut heard = state.events.subscribe();
+            crate::spawn_scan(state.clone());
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if let Ok(Notice::ScanFinished(p)) = heard.recv().await {
+                            return p;
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let p = scanned(&state).await;
+        assert_eq!(p.phase, "failed");
+        assert!(!p.running);
+        // Once the record's gone, scans finish again.
+        state.lib.forget_moves("00000000000000cc", None).unwrap();
+        let p = scanned(&state).await;
+        assert_eq!(p.phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_save_that_would_move_files_waits_for_the_librarys_database() {
+        // A Library folder scanned, never imported into: indexed for now only.
+        let (state, inbox) = editing_daemon("relocate-unstored");
+        with_library(&state, &inbox);
+        let root = state.lib.library_folder().unwrap().unwrap();
+        std::fs::create_dir_all(root.join("Artist/Record")).unwrap();
+        std::fs::copy(
+            inbox.join("Record/01.flac"),
+            root.join("Artist/Record/01 - Song 1.flac"),
+        )
+        .unwrap();
+        state.lib.refresh_library().unwrap();
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        assert!(!state.lib.library_stored().unwrap());
+        let albums = state
+            .lib
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap();
+        let album = state.lib.album(&albums[0].id).unwrap().unwrap();
+        let body = TagWrite {
+            kinds: HashMap::from([(
+                album.tracks[0].id,
+                HashMap::from([("album".to_string(), "Renamed".to_string())]),
+            )]),
+            ..Default::default()
+        };
+        let refused = write_tags(
+            State(state.clone()),
+            Path(album.album.id.clone()),
+            Json(body),
+        )
+        .await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("database"), "{said}");
+        let file = root.join("Artist/Record/01 - Song 1.flac");
+        assert_eq!(tags::read(&file).unwrap().album.as_deref(), Some("Record"));
     }
 
     /// The "Record" album (three tracks) imported from `editing_daemon`'s

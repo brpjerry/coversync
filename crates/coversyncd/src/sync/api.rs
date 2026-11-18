@@ -396,6 +396,8 @@ async fn reconcile(
             .unwrap_or_default()
     })?;
     let s = state.clone();
+    // Read while no save moves files (see `AppState::moving`).
+    let moving = state.moving.read().await;
     let (target, wanted) = blocking(move || {
         let target = target(&s, device)?;
         // A file that might be content being hashed or made right now is
@@ -416,6 +418,7 @@ async fn reconcile(
         Ok((target.clone(), to_sample(&target, &listing)))
     })
     .await?;
+    drop(moving);
     let mut body = String::new();
     for (path, w) in &wanted {
         body.push_str(
