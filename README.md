@@ -41,11 +41,17 @@ used on a home server.
   field shows the value every track shares; where they differ it says so,
   typing there sets every track, and **Per track** edits each track's own.
   Date shows the tag as written (`2010.08.25` stays as it is unless edited).
-  Several values of one tag show joined by Library setup's separator. Tags
-  coversync has no name for (`TITLE_JP`, `CDTOC`…) are listed read-only:
-  saves keep them. `GET /api/albums/{id}/tags` gives each track's values by
-  tag kind and those other tags; a save can send any tag kind per track
-  (`kinds`).
+  Several values of one tag show joined by Library setup's separator. Listed
+  read-only, and kept as they are by saves: tags coversync has no name for
+  (`TITLE_JP`, `CDTOC`…), ones held as data or with a description (an
+  iTunes `COMM:iTunNORM`), and the file's other tag blocks (ID3v2 in a FLAC,
+  `RIFF INFO · IXYZ` beside a WAV's ID3v2). `TRACKNUM`, an old name for the
+  track number, is dropped on saving a file that has a track number. An edit
+  goes under the name the file has the tag under; one the format would drop
+  (an MP4 compilation flag of "yes"), or a tag one file of the album can't
+  hold, refuses the save before anything is written.
+  `GET /api/albums/{id}/tags` gives each track's values by tag kind and
+  those other tags; a save can send any tag kind per track (`kinds`).
   A save is refused, and nothing written, if the album changed after the
   editor loaded it: saved from another browser or app, or changed on disk
   and found by a scan, tracks added or removed included. The album then

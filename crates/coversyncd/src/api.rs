@@ -926,27 +926,38 @@ async fn album_tags(
     Path(id): Path<String>,
 ) -> ApiResult<Json<AlbumTags>> {
     blocking(&state, move |s| {
-        let detail = s.lib.album(&id)?.ok_or(coversync_core::Error::NotFound)?;
         let separator = s.lib.library_setup()?.rules.separator;
-        let tracks = detail
-            .tracks
-            .iter()
-            .map(|t| {
-                let (path, _) = s
-                    .lib
-                    .track_root(t.id)?
-                    .ok_or(coversync_core::Error::NotFound)?;
-                Ok(TrackTags {
-                    id: t.id,
-                    rel_path: t.rel_path.clone(),
-                    tags: tags::file_tags(&path, &separator)?,
+        // The files as the album version says: read again if a save or scan
+        // changed the album while they were read (writers index after
+        // writing, so the version moves once they're done).
+        for _ in 0..3 {
+            let detail = s.lib.album(&id)?.ok_or(coversync_core::Error::NotFound)?;
+            let tracks = detail
+                .tracks
+                .iter()
+                .map(|t| {
+                    let (path, _) = s
+                        .lib
+                        .track_root(t.id)?
+                        .ok_or(coversync_core::Error::NotFound)?;
+                    Ok(TrackTags {
+                        id: t.id,
+                        rel_path: t.rel_path.clone(),
+                        tags: tags::file_tags(&path, &separator)?,
+                    })
                 })
-            })
-            .collect::<coversync_core::Result<_>>()?;
-        Ok(AlbumTags {
-            version: detail.version,
-            tracks,
-        })
+                .collect::<coversync_core::Result<_>>()?;
+            let now = s.lib.album(&id)?.map(|d| d.version);
+            if now.as_ref() == Some(&detail.version) {
+                return Ok(AlbumTags {
+                    version: detail.version,
+                    tracks,
+                });
+            }
+        }
+        Err(coversync_core::Error::Invalid(
+            "the album kept changing while its tags were read; try again".into(),
+        ))
     })
     .await
     .map(Json)
@@ -1134,6 +1145,21 @@ async fn write_tags(
                 }
                 tags::validate_kind(id, value)?;
             }
+        }
+        // Every file can take its kinds, in its format, before any is
+        // written: an album of mixed formats isn't left half edited.
+        for (track, _, kinds) in &edits {
+            if kinds.is_empty() {
+                continue;
+            }
+            let (path, _) = s
+                .lib
+                .track_root(*track)?
+                .ok_or(coversync_core::Error::NotFound)?;
+            tags::check_kinds(&path, kinds).map_err(|e| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                coversync_core::Error::Invalid(format!("{name}: {e}"))
+            })?;
         }
         // Files written before one fails are indexed all the same, so their
         // tracks (and the album's version) say they changed.
@@ -1370,6 +1396,79 @@ mod tests {
         }
         let Json(unchanged) = read(&saved.album_id).await.unwrap();
         assert_eq!(unchanged.tracks[0].tags.values["label"], "Lantis");
+    }
+
+    #[tokio::test]
+    async fn a_kind_one_format_cant_hold_writes_no_track() {
+        let (state, _, dir) = daemon("mixed");
+        // An M4A beside the FLAC, in the same album: MP4 has no publisher field.
+        let m4a = dir.0.join("inbox/Artist/Record/02.m4a");
+        std::fs::write(
+            &m4a,
+            include_bytes!("../../coversync-core/tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let tags_of = TagEdit {
+            title: Some("Other".into()),
+            artist: Some("Artist".into()),
+            album: Some("Record".into()),
+            album_artist: Some("Artist".into()),
+            track_no: Some("2".into()),
+            ..Default::default()
+        };
+        tags::write(&m4a, &tags_of).unwrap();
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        let albums = state
+            .lib
+            .albums(
+                Collection::Inbox,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        // In the Library, where the editor writes.
+        let request =
+            serde_json::from_value(serde_json::json!({ "album_id": albums[0].id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let id = imported.album_id;
+        let detail = state.lib.album(&id).unwrap().unwrap();
+        assert_eq!(detail.tracks.len(), 2);
+        assert!(detail.tracks[0].rel_path.ends_with(".flac"));
+        let (flac, _) = state.lib.track_root(detail.tracks[0].id).unwrap().unwrap();
+        let before = std::fs::read(&flac).unwrap();
+        // Publisher on every track: the FLAC (first) could take it, the M4A can't.
+        let kinds = detail
+            .tracks
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    HashMap::from([("publisher".to_string(), "Lantis".to_string())]),
+                )
+            })
+            .collect();
+        let body = TagWrite {
+            kinds,
+            ..Default::default()
+        };
+        let refused = write_tags(State(state.clone()), Path(id.clone()), Json(body)).await;
+        // The FLAC is as it was.
+        assert_eq!(std::fs::read(&flac).unwrap(), before);
+        let Err(TagWriteError::Api(e)) = refused else {
+            panic!("not refused");
+        };
+        // Named by the file that can't take it.
+        let said = format!("{e:?}");
+        assert!(
+            said.contains(".m4a: ") && said.contains("Publisher"),
+            "{said}"
+        );
     }
 
     #[tokio::test]

@@ -142,6 +142,17 @@
 		failed = null;
 		try {
 			const [tags] = await Promise.all([api.albumTags(detail.id), setup.load()]);
+			// The tag list always has kinds once it's loaded.
+			if (!setup.kinds.length) {
+				failed = 'The list of tags could not be read.';
+				return;
+			}
+			// Read from the album as it is now: tracks and values from another
+			// version than the one shown (and saved against) can't be paired.
+			if (tags.version !== detail.version) {
+				failed = 'This album changed while its tags were read. Close the editor and open it again.';
+				return;
+			}
 			const values: Values = {};
 			for (const id of ids) {
 				const read = tags.tracks.find((t) => t.id === id)?.values ?? {};
@@ -176,8 +187,12 @@
 	/** The other kinds the album has, or was given, in catalog order. */
 	let extra = $derived.by(() => {
 		const present = kindsIn(base, form);
+		// One changed elsewhere stays to show that, though it's empty now.
+		const marked = new Set(Object.values(elsewhere).flatMap((kinds) => Object.keys(kinds)));
 		const all = setup.kinds.length ? setup.kinds.map((k) => k.id) : [...present].sort();
-		return all.filter((k) => !CORE.includes(k) && (present.has(k) || added.has(k)));
+		return all.filter(
+			(k) => !CORE.includes(k) && (present.has(k) || added.has(k) || marked.has(k))
+		);
 	});
 	let extraGroups = $derived(
 		setup.groups
@@ -213,12 +228,14 @@
 		);
 	}
 
+	/** Kept edits not yet put back (still loading, or the load failed): still a draft. */
+	let pending = $derived(kept !== null && (loading || failed !== null));
 	// So that signing out asks before dropping them.
 	$effect(() => {
-		drafts.tags = changes > 0;
+		drafts.tags = changes > 0 || pending;
 		return () => (drafts.tags = false);
 	});
-	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 ? 'draft' : 'none'));
+	$effect(() => ondraft?.(saving ? 'saving' : changes > 0 || pending ? 'draft' : 'none'));
 	/** Whether this editor is still open: a refused save's edits are read from it, if so. */
 	let open = true;
 	onDestroy(() => {
@@ -456,7 +473,7 @@
 
 		<ShowAll
 			label="Show all tags"
-			count={extra.length}
+			count={extra.length + others.length}
 			badge={extraChanged ? `${extraChanged} changed` : undefined}
 			initiallyOpen={extraChanged > 0}
 		>
@@ -505,14 +522,16 @@
 					<div class="group other">
 						<h4>Other tags in the files</h4>
 						<p class="note">
-							coversync has no name for these: they're kept as they are, but can't be edited here.
+							Kept as they are when you save, but not editable here: tags coversync has no name for,
+							ones held as data or with a description, and the files' other tag blocks. TRACKNUM, an
+							old name for the track number, is dropped on saving a track number.
 						</p>
 						<dl>
 							{#each others as o (o.key)}
 								<dt>{o.key}</dt>
 								<dd>
-									{#if o.value !== null}
-										{o.value}
+									{#if o.values !== null}
+										{#each o.values as v, n (n)}<span class="value">{v}</span>{/each}
 									{:else}
 										<details>
 											<summary>Differs per track</summary>
@@ -524,7 +543,7 @@
 															><b>{track?.track_no ?? '–'}</b>
 															{track?.title ?? ''}</span
 														>
-														{t.value}
+														{#each t.values as v, n (n)}<span class="value">{v}</span>{/each}
 													</li>
 												{/each}
 											</ul>
@@ -572,7 +591,7 @@
 				<button
 					class="btn primary"
 					onclick={() => onimport(edits(form, base, ids))}
-					disabled={errors || saving || loading}
+					disabled={errors || saving || loading || failed !== null}
 				>
 					<FolderInput size={15} /> Import
 				</button>
@@ -700,8 +719,8 @@
 		height: 36px;
 		font-size: 14px;
 	}
-	.col-track_no,
-	.col-disc_no {
+	.col-track_number,
+	.col-disc_number {
 		text-align: center;
 	}
 
@@ -899,6 +918,10 @@
 	.other summary {
 		cursor: pointer;
 		color: var(--text-3);
+	}
+	/* A key held several times: each value on its own line. */
+	.other .value {
+		display: block;
 	}
 	.other ul {
 		margin: 6px 0 0;

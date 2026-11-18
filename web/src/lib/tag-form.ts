@@ -74,13 +74,18 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
 	return n;
 }
 
-/** Numbers and dates the server would refuse; other kinds take any text. */
+/**
+ * Numbers and dates the server would refuse; other kinds take any text. A
+ * date is as lofty reads one: a four-digit year, then any of month, day and
+ * time, with dashes, dots, colons, spaces, T or Z between (2010.08.25,
+ * 2010-08-25T12:30).
+ */
 export function invalid(kind: string, value: string): boolean {
 	const v = value.trim();
 	if (!v) return false;
 	if (['track_number', 'track_total', 'disc_number', 'disc_total'].includes(kind))
 		return !/^\d+(\/\d+)?$/.test(v);
-	if (kind === 'date') return !/^\d{4}(-\d{2}(-\d{2})?)?$/.test(v);
+	if (kind === 'date') return !/^\d{4}[\d\-.: TZ]*$/.test(v);
 	return false;
 }
 
@@ -132,29 +137,35 @@ export function changedElsewhere(
 	return out;
 }
 
-/** How the read-only tags look across the album: one value, or each track's. */
+/**
+ * How the read-only tags look across the album: each key once, with its
+ * values (a key can be there several times on one track), shared when every
+ * track has the same ones, or else each track's.
+ */
 export function otherTags(
 	tracks: { id: number; other: [string, string][] }[]
-): { key: string; value: string | null; tracks: { id: number; value: string }[] }[] {
+): { key: string; values: string[] | null; tracks: { id: number; values: string[] }[] }[] {
 	const keys: string[] = [];
-	const byKey = new Map<string, { id: number; value: string }[]>();
+	const byKey = new Map<string, Map<number, string[]>>();
 	for (const t of tracks) {
 		for (const [key, value] of t.other) {
 			if (!byKey.has(key)) {
-				byKey.set(key, []);
+				byKey.set(key, new Map());
 				keys.push(key);
 			}
-			byKey.get(key)!.push({ id: t.id, value });
+			const per = byKey.get(key)!;
+			if (!per.has(t.id)) per.set(t.id, []);
+			per.get(t.id)!.push(value);
 		}
 	}
 	return keys.map((key) => {
-		const all = byKey.get(key)!;
-		const values = new Set(all.map((t) => t.value));
-		const everywhere = new Set(all.map((t) => t.id)).size === tracks.length;
+		const per = byKey.get(key)!;
+		const rows = [...per].map(([id, values]) => ({ id, values }));
+		const same = new Set(rows.map((r) => JSON.stringify(r.values))).size === 1;
 		return {
 			key,
-			value: everywhere && values.size === 1 ? all[0].value : null,
-			tracks: all
+			values: per.size === tracks.length && same ? rows[0].values : null,
+			tracks: rows
 		};
 	});
 }

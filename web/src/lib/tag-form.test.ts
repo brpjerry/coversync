@@ -73,7 +73,13 @@ describe('invalid', () => {
 		expect(invalid('track_number', '3/12')).toBe(false);
 		expect(invalid('disc_total', 'two')).toBe(true);
 		expect(invalid('date', '2010-08-25')).toBe(false);
-		expect(invalid('date', '2010.08.25')).toBe(true);
+		// Dates as lofty reads them: dotted, and with a time.
+		expect(invalid('date', '2010.08.25')).toBe(false);
+		expect(invalid('date', '2010-08-25T12:30:45')).toBe(false);
+		expect(invalid('date', '20100825')).toBe(false);
+		expect(invalid('date', '2010/08/25')).toBe(true);
+		expect(invalid('date', '10-08-25')).toBe(true);
+		expect(invalid('date', 'summer')).toBe(true);
 		expect(invalid('label', 'anything at all')).toBe(false);
 		expect(invalid('date', '')).toBe(false);
 	});
@@ -124,18 +130,18 @@ describe('otherTags', () => {
 		expect(rows).toEqual([
 			{
 				key: 'TITLE_JP',
-				value: null,
+				values: null,
 				tracks: [
-					{ id: 1, value: '僕ら' },
-					{ id: 2, value: '友情' }
+					{ id: 1, values: ['僕ら'] },
+					{ id: 2, values: ['友情'] }
 				]
 			},
 			{
 				key: 'CDTOC',
-				value: '1+96',
+				values: ['1+96'],
 				tracks: [
-					{ id: 1, value: '1+96' },
-					{ id: 2, value: '1+96' }
+					{ id: 1, values: ['1+96'] },
+					{ id: 2, values: ['1+96'] }
 				]
 			}
 		]);
@@ -144,7 +150,39 @@ describe('otherTags', () => {
 			otherTags([
 				{ id: 1, other: [['X', 'y']] },
 				{ id: 2, other: [] }
-			])[0].value
+			])[0].values
 		).toBeNull();
+	});
+
+	it('keep a key held twice on one track as one row with both values', () => {
+		const twice: [string, string][] = [
+			['TITLE_JP', 'A'],
+			['TITLE_JP', 'B']
+		];
+		// The same two, in the same order, on every track: shared.
+		const same = otherTags([
+			{ id: 1, other: twice },
+			{ id: 2, other: twice }
+		]);
+		expect(same).toEqual([
+			{
+				key: 'TITLE_JP',
+				values: ['A', 'B'],
+				tracks: [
+					{ id: 1, values: ['A', 'B'] },
+					{ id: 2, values: ['A', 'B'] }
+				]
+			}
+		]);
+		// One row per track (unique ids for the list), however many values.
+		const differ = otherTags([
+			{ id: 1, other: twice },
+			{ id: 2, other: [['TITLE_JP', 'A']] },
+			{ id: 3, other: [] }
+		]);
+		expect(differ).toHaveLength(1);
+		expect(differ[0].values).toBeNull();
+		expect(differ[0].tracks.map((t) => t.id)).toEqual([1, 2]);
+		expect(differ[0].tracks[0].values).toEqual(['A', 'B']);
 	});
 });

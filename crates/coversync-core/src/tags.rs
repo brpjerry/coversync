@@ -11,7 +11,7 @@ use lofty::picture::{Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
-use lofty::tag::{ItemValue, SplitTag, Tag, TagType};
+use lofty::tag::{ItemValue, SplitTag, Tag, TagItem, TagType};
 use serde::Serialize;
 
 use crate::model::TagEdit;
@@ -654,16 +654,20 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
     .map_err(tag_err)
 }
 
-/// The items of the file's primary tag that lofty's generic [`Tag`] has no
-/// key for, as (key, value) text in the file's own naming; binary ones by
-/// their size. For showing: an edit keeps them (see [`save`]).
-fn unmapped_items(path: &Path, file_type: FileType) -> Result<Vec<(String, String)>> {
+/// A tag block's items, as (key, value) text in the file's own naming.
+type Block = (TagType, Vec<(String, String)>);
+
+/// What each of the file's tag blocks holds that lofty's generic [`Tag`]
+/// has no key for, as (key, value) text in the file's own naming; binary
+/// ones by their size. For showing: an edit keeps them (see [`save`]).
+fn unmapped_items(path: &Path, file_type: FileType) -> Result<Vec<Block>> {
     use lofty::file::AudioFile;
     use lofty::id3::v2::{Frame, Id3v2Tag};
     use lofty::mp4::{AtomData, AtomIdent};
     let options = ParseOptions::new()
         .read_properties(false)
-        .read_cover_art(false);
+        .read_cover_art(false)
+        .implicit_conversions(false);
     let mut f = std::io::BufReader::new(fs::File::open(path)?);
     macro_rules! read {
         ($file:ty) => {
@@ -671,9 +675,9 @@ fn unmapped_items(path: &Path, file_type: FileType) -> Result<Vec<(String, Strin
         };
     }
     let bytes = |n: usize| format!("({n} bytes of data)");
-    let id3v2 = |tag: Option<Id3v2Tag>| -> Vec<(String, String)> {
-        let rest = tag.unwrap_or_default().split_tag().0;
-        (&*rest)
+    let id3v2 = |tag: &Id3v2Tag| -> Block {
+        let rest = tag.clone().split_tag().0;
+        let items = (&*rest)
             .into_iter()
             .map(|frame| {
                 let id = frame.id_str().to_string();
@@ -693,67 +697,101 @@ fn unmapped_items(path: &Path, file_type: FileType) -> Result<Vec<(String, Strin
                         String::from_utf8_lossy(&f.identifier).into_owned(),
                     ),
                     Frame::Private(f) => (format!("{id}:{}", f.owner), bytes(f.private_data.len())),
+                    // Involved people (TIPL, TMCL) lofty has no role for.
+                    Frame::KeyValue(f) => (
+                        id,
+                        f.key_value_pairs
+                            .iter()
+                            .map(|(role, who)| format!("{role}: {who}"))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                    Frame::Binary(f) => (id, bytes(f.data.len())),
                     _ => (id, "(data)".to_string()),
                 }
             })
-            .collect()
+            .collect();
+        (TagType::Id3v2, items)
     };
-    let ape = |tag: Option<lofty::ape::ApeTag>| -> Vec<(String, String)> {
-        let rest = tag.unwrap_or_default().split_tag().0;
-        (&*rest)
+    let ape = |tag: &lofty::ape::ApeTag| -> Block {
+        let rest = tag.clone().split_tag().0;
+        let items = (&*rest)
             .into_iter()
             .map(|item| (item.key().to_string(), value_text(item.value())))
-            .collect()
+            .collect();
+        (TagType::Ape, items)
     };
-    Ok(match file_type {
-        FileType::Flac | FileType::Vorbis | FileType::Opus | FileType::Speex => {
-            // As read: what lofty has no key for, ratings it can't read
-            // included.
-            vorbis_comments(path, file_type)?
-                .map(|(tag, _)| {
-                    VorbisComments::from(tag.split_tag().0)
-                        .items()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()
+    let vorbis = |tag: VorbisComments| -> Block {
+        // As read: ratings lofty can't read included.
+        let items = VorbisComments::from(tag.split_tag().0)
+            .items()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        (TagType::VorbisComments, items)
+    };
+    let mut out = Vec::new();
+    match file_type {
+        FileType::Flac => {
+            let flac = read!(lofty::flac::FlacFile);
+            out.extend(flac.vorbis_comments().cloned().map(vorbis));
+            out.extend(flac.id3v2().map(id3v2));
         }
-        FileType::Mpeg => id3v2(read!(lofty::mpeg::MpegFile).remove_id3v2()),
-        FileType::Aac => id3v2(read!(lofty::aac::AacFile).remove_id3v2()),
-        FileType::Aiff => id3v2(read!(lofty::iff::aiff::AiffFile).remove_id3v2()),
-        FileType::Wav => id3v2(read!(lofty::iff::wav::WavFile).remove_id3v2()),
-        FileType::Ape => ape(read!(lofty::ape::ApeFile).remove_ape()),
-        FileType::WavPack => ape(read!(lofty::wavpack::WavPackFile).remove_ape()),
-        FileType::Mpc => ape(read!(lofty::musepack::MpcFile).remove_ape()),
+        FileType::Vorbis | FileType::Opus | FileType::Speex => {
+            out.extend(vorbis_comments(path, file_type)?.map(|(tag, _)| vorbis(tag)));
+        }
+        FileType::Mpeg => {
+            let mpeg = read!(lofty::mpeg::MpegFile);
+            out.extend(mpeg.id3v2().map(id3v2));
+            out.extend(mpeg.ape().map(ape));
+        }
+        FileType::Aac => out.extend(read!(lofty::aac::AacFile).id3v2().map(id3v2)),
+        FileType::Aiff => out.extend(read!(lofty::iff::aiff::AiffFile).id3v2().map(id3v2)),
+        FileType::Wav => {
+            let wav = read!(lofty::iff::wav::WavFile);
+            out.extend(wav.id3v2().map(id3v2));
+            if let Some(info) = wav.riff_info() {
+                let items = info
+                    .into_iter()
+                    .filter(|(k, _)| ItemKey::from_key(TagType::RiffInfo, k).is_none())
+                    .cloned()
+                    .collect();
+                out.push((TagType::RiffInfo, items));
+            }
+        }
+        FileType::Ape => out.extend(read!(lofty::ape::ApeFile).ape().map(ape)),
+        FileType::WavPack => out.extend(read!(lofty::wavpack::WavPackFile).ape().map(ape)),
+        FileType::Mpc => out.extend(read!(lofty::musepack::MpcFile).ape().map(ape)),
         FileType::Mp4 => {
-            let rest = read!(lofty::mp4::Mp4File)
-                .remove_ilst()
-                .unwrap_or_default()
-                .split_tag()
-                .0;
-            (&*rest)
-                .into_iter()
-                .map(|atom| {
-                    let key = match atom.ident() {
-                        AtomIdent::Fourcc(code) => String::from_utf8_lossy(code).into_owned(),
-                        AtomIdent::Freeform { mean, name } => format!("----:{mean}:{name}"),
-                    };
-                    let values: Vec<String> = atom
-                        .data()
-                        .map(|d| match d {
-                            AtomData::UTF8(t) | AtomData::UTF16(t) => t.clone(),
-                            AtomData::SignedInteger(n) => n.to_string(),
-                            AtomData::UnsignedInteger(n) => n.to_string(),
-                            AtomData::Bool(b) => b.to_string(),
-                            _ => "(data)".to_string(),
-                        })
-                        .collect();
-                    (key, values.join("; "))
-                })
-                .collect()
+            if let Some(ilst) = read!(lofty::mp4::Mp4File).ilst() {
+                let rest = ilst.clone().split_tag().0;
+                let items = (&*rest)
+                    .into_iter()
+                    .map(|atom| {
+                        let key = match atom.ident() {
+                            // Byte codes: ©nam's first byte is 0xA9, not UTF-8.
+                            AtomIdent::Fourcc(code) => code.iter().map(|b| *b as char).collect(),
+                            AtomIdent::Freeform { mean, name } => format!("----:{mean}:{name}"),
+                        };
+                        let values: Vec<String> = atom
+                            .data()
+                            .map(|d| match d {
+                                AtomData::UTF8(t) | AtomData::UTF16(t) => t.clone(),
+                                AtomData::SignedInteger(n) => n.to_string(),
+                                AtomData::UnsignedInteger(n) => n.to_string(),
+                                AtomData::Bool(b) => b.to_string(),
+                                AtomData::Picture(p) => bytes(p.data().len()),
+                                AtomData::Unknown { data, .. } => bytes(data.len()),
+                            })
+                            .collect();
+                        (key, values.join("; "))
+                    })
+                    .collect();
+                out.push((TagType::Mp4Ilst, items));
+            }
         }
-        _ => Vec::new(),
-    })
+        _ => {}
+    }
+    Ok(out)
 }
 
 /// An item's value as text; binary ones by their size.
@@ -764,56 +802,124 @@ fn value_text(value: &ItemValue) -> String {
     }
 }
 
+/// A tag block's name, before its items in the read-only list.
+fn block_name(t: TagType) -> &'static str {
+    match t {
+        TagType::Id3v2 => "ID3v2",
+        TagType::Id3v1 => "ID3v1",
+        TagType::Ape => "APE",
+        TagType::VorbisComments => "Vorbis comments",
+        TagType::Mp4Ilst => "MP4",
+        TagType::RiffInfo => "RIFF INFO",
+        TagType::AiffText => "AIFF text",
+        _ => "Other tag",
+    }
+}
+
 /// A file's tags as the tag editor shows them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FileTags {
     /// Every catalog kind the file has, by id; one held several times has
     /// its values joined by the Library's separator, as an import writes them.
     pub values: BTreeMap<&'static str, String>,
-    /// The rest of the primary tag, as (key, value) in the file's own naming:
-    /// tags no kind names, which an edit keeps but can't change.
+    /// Everything else, as (key, value) in the file's own naming, which an
+    /// edit keeps but can't change: tags no kind names, ones held as data or
+    /// with a description (`COMM:iTunNORM`), and the file's other tag blocks
+    /// (ID3v2 in a FLAC, RIFF INFO beside ID3v2), each key after its
+    /// block's name (`RIFF INFO · IXYZ`).
     pub other: Vec<(String, String)>,
 }
 
-/// The file's tags for the tag editor (see [`FileTags`]). Pictures aren't read.
+/// The file's tags for the tag editor (see [`FileTags`]). Pictures and the
+/// audio stream aren't read.
 pub fn file_tags(path: &Path, separator: &str) -> Result<FileTags> {
-    let file = probe(path, false)?;
+    let file = Probe::open(path)
+        .map_err(tag_err)?
+        .options(
+            ParseOptions::new()
+                .read_properties(false)
+                .read_cover_art(false),
+        )
+        .read()
+        .map_err(tag_err)?;
     let mut out = FileTags::default();
     let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
         return Ok(out);
     };
+    let shown = tag.tag_type();
+    let editable = |i: &TagItem| !described(i) && !matches!(i.value(), ItemValue::Binary(_));
     for kind in rules::CATALOG {
         let mut values: Vec<&str> = Vec::new();
-        for v in kind
-            .keys
-            .iter()
-            .flat_map(|k| tag.get_strings(*k))
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            if !values.contains(&v) {
-                values.push(v);
+        for key in kind.keys {
+            let earlier = values.len();
+            for item in tag.get_items(*key).filter(|i| editable(i)) {
+                let (ItemValue::Text(v) | ItemValue::Locator(v)) = item.value() else {
+                    continue;
+                };
+                let v = v.trim();
+                // Under another of the kind's names too: once.
+                if !v.is_empty() && !values[..earlier].contains(&v) {
+                    values.push(v);
+                }
             }
         }
         if !values.is_empty() {
             out.values.insert(kind.id, values.join(separator));
         }
     }
-    // What lofty knows by a key no kind covers…
+    // Lofty reads a Vorbis vendor string as the encoder when there's no
+    // ENCODER comment: that isn't a tag the file has (an edit keeps the
+    // vendor string apart).
+    if shown == TagType::VorbisComments
+        && !vorbis_comments(path, file.file_type())?
+            .is_some_and(|(raw, _)| raw.get("ENCODER").is_some())
+    {
+        out.values.remove("encoder");
+    }
     let covered: Vec<ItemKey> = rules::CATALOG
         .iter()
         .flat_map(|k| k.keys.iter().copied())
         .collect();
-    for item in tag.items().filter(|i| !covered.contains(&i.key())) {
-        let key = item
+    let native = |t: TagType, i: &TagItem| {
+        let key = i
             .key()
-            .map_key(tag.tag_type())
-            .map_or_else(|| format!("{:?}", item.key()), str::to_string);
-        out.other.push((key, value_text(item.value())));
+            .map_key(t)
+            .map_or_else(|| format!("{:?}", i.key()), str::to_string);
+        if described(i) {
+            format!("{key}:{}", i.description())
+        } else {
+            key
+        }
+    };
+    // What lofty knows by a key no kind covers, or holds as data or with a
+    // description…
+    for item in tag
+        .items()
+        .filter(|i| !covered.contains(&i.key()) || !editable(i))
+    {
+        out.other
+            .push((native(shown, item), value_text(item.value())));
     }
     // …and what it has no key for.
-    if file.primary_tag().is_some() {
-        out.other.extend(unmapped_items(path, file.file_type())?);
+    let mut blocks = unmapped_items(path, file.file_type())?;
+    if let Some(at) = blocks.iter().position(|(t, _)| *t == shown) {
+        out.other.extend(blocks.remove(at).1);
+    }
+    // The file's other tag blocks, whole.
+    for block in file.tags().iter().filter(|t| t.tag_type() != shown) {
+        let t = block.tag_type();
+        let name = block_name(t);
+        for item in block.items() {
+            out.other.push((
+                format!("{name} · {}", native(t, item)),
+                value_text(item.value()),
+            ));
+        }
+        if let Some(at) = blocks.iter().position(|(b, _)| *b == t) {
+            for (key, value) in blocks.remove(at).1 {
+                out.other.push((format!("{name} · {key}"), value));
+            }
+        }
     }
     Ok(out)
 }
@@ -1117,22 +1223,36 @@ pub fn validate_kind(id: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `item` is an ID3v2 comment or lyrics with a description
+/// (`iTunNORM`, say): a tag of its own, not the field's.
+fn described(item: &TagItem) -> bool {
+    !item.description().is_empty()
+}
+
 /// Set tag kinds (catalog ids) on `tag`; an empty value removes the kind.
+/// A value goes under the name the file has the kind under, or failing
+/// that the first this format holds; one the format would drop on writing
+/// (an MP4 compilation flag of "yes") is refused.
 fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
     for (id, value) in values {
         let kind =
             rules::kind(id).ok_or_else(|| Error::Invalid(format!("unknown tag kind '{id}'")))?;
         validate_kind(id, value)?;
         let v = value.trim();
+        let field = |i: &TagItem| kind.keys.contains(&i.key()) && !described(i);
         if v.is_empty() {
-            for key in kind.keys {
-                tag.remove_key(*key);
-            }
+            tag.retain(|i| !field(i));
             continue;
         }
         // Numbers and dates go through lofty's typed setters so each format
         // stores them natively (MP4 keeps track numbers as integers).
         let number = || parse_number(kind.label, v).map(|n| n.unwrap_or_default());
+        let unstorable = || {
+            Error::Tags(format!(
+                "{} can't be stored in this file's tag format",
+                kind.label
+            ))
+        };
         match *id {
             "track_number" => tag.set_track(number()?),
             "track_total" => tag.set_track_total(number()?),
@@ -1140,9 +1260,33 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
             "disc_total" => tag.set_disk_total(number()?),
             "date" => tag.set_date(v.parse().map_err(|_| Error::Tags(format!("date: '{v}'")))?),
             _ => {
-                if !tag.insert_text(kind.keys[0], v.to_string()) {
+                let old = tag.items().find(|i| field(i)).cloned();
+                let key = old
+                    .as_ref()
+                    .map(TagItem::key)
+                    .or_else(|| {
+                        kind.keys
+                            .iter()
+                            .copied()
+                            .find(|k| k.map_key(tag.tag_type()).is_some())
+                    })
+                    .ok_or_else(unstorable)?;
+                tag.retain(|i| !field(i));
+                // A URL stays one (ID3v2's WOAR), a comment keeps its language.
+                let value = match old.as_ref().map(TagItem::value) {
+                    Some(ItemValue::Locator(_)) => ItemValue::Locator(v.to_string()),
+                    _ => ItemValue::Text(v.to_string()),
+                };
+                let mut item = TagItem::new(key, value);
+                if let Some(old) = &old {
+                    item.set_lang(*old.lang());
+                }
+                if !tag.push(item) {
+                    return Err(unstorable());
+                }
+                if !survives(tag, kind, v) {
                     return Err(Error::Tags(format!(
-                        "{} can't be stored in this file's tag format",
+                        "{}: '{v}' can't be stored in this file's tag format",
                         kind.label
                     )));
                 }
@@ -1150,6 +1294,42 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `value`, just set for `kind` on `tag`, is still there once the
+/// tag is converted to its format to be written: lofty's ID3v2, MP4 and APE
+/// conversions drop some values (a compilation flag that isn't 0, 1, true
+/// or false). Under another kind is fine (ID3v2 has Label as its publisher
+/// frame, TPUB).
+fn survives(tag: &Tag, kind: &rules::TagKind, value: &str) -> bool {
+    let mut only = Tag::new(tag.tag_type());
+    for item in tag.items().filter(|i| kind.keys.contains(&i.key())) {
+        only.push(item.clone());
+    }
+    let back: Tag = match tag.tag_type() {
+        TagType::Id3v2 => lofty::id3::v2::Id3v2Tag::from(only).into(),
+        TagType::Mp4Ilst => lofty::mp4::Ilst::from(only).into(),
+        TagType::Ape => lofty::ape::ApeTag::from(only).into(),
+        _ => return true,
+    };
+    back.items().any(|i| {
+        kind.keys.contains(&i.key())
+            || matches!(i.value(), ItemValue::Text(t) | ItemValue::Locator(t) if t.trim() == value)
+    })
+}
+
+/// Check, before anything is written, that `kinds` can be set on the file
+/// at `path` in its format: a kind it has no field for, or a value it would
+/// drop, is refused (so an album of mixed formats isn't left half edited).
+pub fn check_kinds(path: &Path, kinds: &[(&str, String)]) -> Result<()> {
+    let file_type = Probe::open(path)
+        .map_err(tag_err)?
+        .guess_file_type()
+        .map_err(tag_err)?
+        .file_type()
+        .ok_or_else(|| Error::Tags("unknown file format".into()))?;
+    let mut tag = Tag::new(file_type.primary_tag_type());
+    apply_kinds(&mut tag, kinds)
 }
 
 /// Copy `src` to `dest` (which must not exist), setting `values` on the copy
@@ -2580,6 +2760,252 @@ mod tests {
         let bad = [("track_total", "thirteen".to_string())];
         assert!(write_with_kinds(&path, &TagEdit::default(), &bad).is_err());
         assert_eq!(file_tags(&path, "; ").unwrap().values["track_total"], "13");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_doesnt_take_the_vendor_for_an_encoder() {
+        let dir = std::env::temp_dir().join(format!("coversync-noenc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        // The fixture's vendor string is "coversync".
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let tags = file_tags(&path("plain.flac"), "; ").unwrap();
+        assert!(!tags.values.contains_key("encoder"), "{:?}", tags.values);
+        flac_with_comments(&path("enc.flac"), &["TITLE=Song", "ENCODER=flac 1.4"]);
+        assert_eq!(
+            file_tags(&path("enc.flac"), "; ").unwrap().values["encoder"],
+            "flac 1.4"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An MP3 with an ID3v2 tag holding a title, an artist URL (WOAR), a
+    /// plain comment, an iTunes one with a description, and a TIPL role
+    /// lofty has no key for; and an APE tag of its own.
+    #[cfg(feature = "server")]
+    fn mp3_with_comments(path: &Path) {
+        use lofty::TextEncoding;
+        use lofty::id3::v2::{CommentFrame, Frame, FrameId, Id3v2Tag, KeyValueFrame, UrlLinkFrame};
+        fs::write(path, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Url(UrlLinkFrame::new(
+            FrameId::new("WOAR").unwrap(),
+            "https://example.org/rin",
+        )));
+        id3.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            String::new(),
+            "Nice",
+        )));
+        id3.insert(Frame::Comment(CommentFrame::new(
+            TextEncoding::UTF8,
+            *b"eng",
+            "iTunNORM",
+            "0000ABCD",
+        )));
+        let roles: Vec<(std::borrow::Cow<str>, std::borrow::Cow<str>)> =
+            vec![("ukulele".into(), "Rin".into())];
+        id3.insert(Frame::KeyValue(KeyValueFrame::new(
+            FrameId::new("TIPL").unwrap(),
+            TextEncoding::UTF8,
+            roles,
+        )));
+        id3.save_to_path(path, WriteOptions::default()).unwrap();
+        let mut ape = lofty::ape::ApeTag::default();
+        ape.insert(
+            lofty::ape::ApeItem::new("Ripper".into(), ItemValue::Text("kept".into())).unwrap(),
+        );
+        ape.save_to_path(path, WriteOptions::default()).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn the_editor_reads_every_block_and_what_lofty_holds_as_data() {
+        use lofty::TextEncoding;
+        use lofty::ape::{ApeItem, ApeTag};
+        use lofty::id3::v2::{ExtendedTextFrame, Frame, Id3v2Tag};
+        use lofty::mp4::{Atom, AtomData, AtomIdent};
+        let dir = std::env::temp_dir().join(format!("coversync-blocks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let other = |tags: &FileTags| -> Vec<(String, String)> { tags.other.clone() };
+        let has_other = |tags: &FileTags, k: &str, v: &str| {
+            tags.other.iter().any(|(key, value)| key == k && value == v)
+        };
+
+        // MP3: a URL is a value; a described comment, an unknown role and
+        // the APE tag are read-only.
+        mp3_with_comments(&path("a.mp3"));
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert_eq!(tags.values["artist_url"], "https://example.org/rin");
+        assert_eq!(tags.values["comment"], "Nice");
+        assert!(
+            has_other(&tags, "COMM:iTunNORM", "0000ABCD"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "TIPL", "ukulele: Rin"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "APE · Ripper", "kept"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // WAV: RIFF INFO beside the ID3v2 tag the editor shows.
+        wav_with_info(&path("a.wav"));
+        let mut f = fs::File::open(path("a.wav")).unwrap();
+        let mut wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut info = wav.remove_riff_info().unwrap();
+        info.insert("IXYZ".into(), "custom".into());
+        info.save_to_path(path("a.wav"), WriteOptions::default())
+            .unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.save_to_path(path("a.wav"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.wav"), "; ").unwrap();
+        assert!(
+            has_other(&tags, "RIFF INFO · IXYZ", "custom"),
+            "{:?}",
+            other(&tags)
+        );
+        assert!(
+            has_other(&tags, "RIFF INFO · INAM", "Song"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // FLAC: an ID3v2 tag in front of the Vorbis comments, read-only.
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let mut id3 = Id3v2Tag::new();
+        id3.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::UTF8,
+            "coversync test",
+            "custom",
+        )));
+        let mut bytes = Vec::new();
+        id3.dump_to(&mut bytes, WriteOptions::default()).unwrap();
+        bytes.extend(fs::read(path("plain.flac")).unwrap());
+        fs::write(path("id3.flac"), bytes).unwrap();
+        let tags = file_tags(&path("id3.flac"), "; ").unwrap();
+        assert_eq!(tags.values["title"], "Song");
+        assert!(
+            has_other(&tags, "ID3v2 · TXXX:coversync test", "custom"),
+            "{:?}",
+            other(&tags)
+        );
+
+        // M4A: a © code read byte for byte.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let mut ilst = lofty::mp4::Ilst::default();
+        ilst.set_title("Song".into());
+        ilst.insert(Atom::new(
+            AtomIdent::Fourcc(*b"\xa9xyz"),
+            AtomData::UTF8("x".into()),
+        ));
+        ilst.save_to_path(path("a.m4a"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.m4a"), "; ").unwrap();
+        assert!(has_other(&tags, "\u{a9}xyz", "x"), "{:?}", other(&tags));
+
+        // WavPack: a binary compilation flag isn't a value to type over.
+        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(ApeItem::new("Title".into(), ItemValue::Text("Song".into())).unwrap());
+        ape.insert(ApeItem::new("Compilation".into(), ItemValue::Binary(vec![1])).unwrap());
+        ape.save_to_path(path("a.wv"), WriteOptions::default())
+            .unwrap();
+        let tags = file_tags(&path("a.wv"), "; ").unwrap();
+        assert!(!tags.values.contains_key("compilation"));
+        assert!(
+            tags.other
+                .iter()
+                .any(|(k, v)| k == "Compilation" && v == "(1 bytes of data)"),
+            "{:?}",
+            other(&tags)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn an_edit_writes_a_kind_where_the_file_has_it() {
+        let dir = std::env::temp_dir().join(format!("coversync-kindkey-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let none = TagEdit::default();
+
+        // FLAC: lyrics edited where they are (UNSYNCEDLYRICS), not added
+        // beside them.
+        flac_with_comments(&path("a.flac"), &["TITLE=Song", "UNSYNCEDLYRICS=old"]);
+        write_with_kinds(&path("a.flac"), &none, &[("lyrics", "new".to_string())]).unwrap();
+        let (_, items) = vorbis(&path("a.flac"));
+        let lyrics: Vec<&(String, String)> =
+            items.iter().filter(|(k, _)| k.contains("LYRICS")).collect();
+        assert_eq!(lyrics, [&("UNSYNCEDLYRICS".to_string(), "new".to_string())]);
+
+        // MP3: the plain comment changes, the described one stays; lyrics
+        // go where ID3v2 has them; a URL stays a URL.
+        mp3_with_comments(&path("a.mp3"));
+        let kinds = [
+            ("comment", "Better".to_string()),
+            ("lyrics", "La la".to_string()),
+            ("artist_url", "https://example.org/riho".to_string()),
+        ];
+        write_with_kinds(&path("a.mp3"), &none, &kinds).unwrap();
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert_eq!(tags.values["comment"], "Better");
+        assert_eq!(tags.values["lyrics"], "La la");
+        assert_eq!(tags.values["artist_url"], "https://example.org/riho");
+        assert!(
+            tags.other
+                .contains(&("COMM:iTunNORM".into(), "0000ABCD".into()))
+        );
+        // Clearing the comment leaves the described one too.
+        write_with_kinds(&path("a.mp3"), &none, &[("comment", String::new())]).unwrap();
+        let tags = file_tags(&path("a.mp3"), "; ").unwrap();
+        assert!(!tags.values.contains_key("comment"));
+        assert!(
+            tags.other
+                .contains(&("COMM:iTunNORM".into(), "0000ABCD".into()))
+        );
+
+        // M4A: a compilation flag MP4 can't hold is refused, not dropped.
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        let yes = [("compilation", "yes".to_string())];
+        let refused = write_with_kinds(&path("a.m4a"), &none, &yes).unwrap_err();
+        assert!(refused.to_string().contains("Compilation"), "{refused}");
+        write_with_kinds(&path("a.m4a"), &none, &[("compilation", "1".to_string())]).unwrap();
+        assert!(
+            file_tags(&path("a.m4a"), "; ")
+                .unwrap()
+                .values
+                .contains_key("compilation")
+        );
+
+        // Checked before writing: a kind the format has no field for.
+        let publisher = [("publisher", "Lantis".to_string())];
+        assert!(check_kinds(&path("a.m4a"), &publisher).is_err());
+        assert!(check_kinds(&path("a.flac"), &publisher).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 
