@@ -73,60 +73,23 @@ describe('invalid', () => {
 		expect(invalid('track_number', '3/12')).toBe(false);
 		expect(invalid('disc_total', 'two')).toBe(true);
 		expect(invalid('date', '2010-08-25')).toBe(false);
-		// Dates lofty reads whole, as the server's validate_kind (the same
-		// table as tags.rs's DATES_READ_WHOLE and DATES_READ_IN_PART).
+		// Every date the server reads whole passes here (tags.rs's
+		// DATES_READ_WHOLE); the form lets through some the server refuses
+		// with a message (a time after a space), and blocks what isn't a date.
 		const whole = [
 			'2010',
-			'2010-08',
-			'2010-08-25',
 			'2010.08.25',
-			'2010.8.25',
-			'20100825',
-			'201008',
-			'2010-08-25T12',
-			'2010-08-25T12:30:45',
-			'20100825T1230',
-			'2010.08.25T12:30',
-			'2010-08-25Z',
-			'2010-08-25T',
 			'2024-6-3T14:8:49',
 			'2024- 6-03',
-			'2024-6-03',
-			'2024-06-03T1:02',
-			'2024- 6',
-			'2024-06- 3',
-			'2024.6.03',
-			'2024-06-03T 1:02',
-			'2024-06-03T14:08:49Z',
-			'2024-6-03Z',
-			'202406',
-			'2024-6 -03',
-			'2024-06-03T1 :02',
-			'2024-6 Z',
-			'20240603T 1',
-			'20240603T14 8',
+			'20100825T1230',
 			'2024 6 3',
-			'2024 6'
-		];
-		const inPart = [
-			'2010-08-25 12:30',
-			'2010-8-5',
-			'2010/08/25',
-			'2010-08-25T1230',
-			'2010-08-25T12.30',
-			'10-08-25',
-			'summer',
-			'2024-6',
-			'2024-6-3',
-			'2024-06-3',
-			'2024-06-03T01:2',
-			'2024-6-03T14:08:4',
-			'2024-06 -03',
-			'2010-08-25T01:30 PM',
-			'2024 6 03'
+			'20246 03',
+			'2024-6 Z',
+			'2010-08-25T'
 		];
 		for (const date of whole) expect(invalid('date', date), date).toBe(false);
-		for (const date of inPart) expect(invalid('date', date), date).toBe(true);
+		for (const date of ['2010/08/25', '10-08-25', 'summer', '2010-08-25T01:30 PM'])
+			expect(invalid('date', date), date).toBe(true);
 		expect(invalid('label', 'anything at all')).toBe(false);
 		expect(invalid('date', '')).toBe(false);
 	});

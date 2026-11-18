@@ -1618,10 +1618,34 @@ fn lost(
     let Some(together) = back(&kinds, &sharing) else {
         return set.first().cloned();
     };
-    alone
+    if let Some((kind, value, _)) = alone
         .into_iter()
         .find(|(_, _, items)| !items.iter().all(|item| together.contains(item)))
-        .map(|(kind, value, _)| (kind, value.clone()))
+    {
+        return Some((kind, value.clone()));
+    }
+    // The file's own values in a field an edit shares are kept too (adding
+    // Label to an MP3 mustn't overwrite its Publisher: both are TPUB).
+    // Each as it comes back under its own name, a total with its number.
+    let kept = sharing.iter().all(|key| {
+        let number = match key {
+            ItemKey::TrackTotal => Some(ItemKey::TrackNumber),
+            ItemKey::DiscTotal => Some(ItemKey::DiscNumber),
+            ItemKey::MovementTotal => Some(ItemKey::MovementNumber),
+            _ => None,
+        };
+        let with: Vec<ItemKey> = std::iter::once(*key).chain(number).collect();
+        back(&[], &with).is_some_and(|items| {
+            let own: Vec<&(ItemKey, String)> = items.iter().filter(|(k, _)| k == key).collect();
+            let expected = if own.is_empty() {
+                items.iter().collect()
+            } else {
+                own
+            };
+            expected.iter().all(|item| together.contains(item))
+        })
+    });
+    if kept { None } else { set.first().cloned() }
 }
 
 /// Check, before anything is written, that `kinds` can be set on the file
@@ -3337,7 +3361,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Dates the editor's form and the server agree on (see tag-form.test.ts).
+    /// Dates the server reads whole, and ones it doesn't (the form's looser
+    /// check, in tag-form.test.ts, passes every one it reads whole).
     const DATES_READ_WHOLE: &[&str] = &[
         "2010",
         "2010-08",
@@ -3370,6 +3395,7 @@ mod tests {
         "20240603T14 8",
         "2024 6 3",
         "2024 6",
+        "20246 03",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3387,6 +3413,7 @@ mod tests {
         "2024-06 -03",
         "2010-08-25T01:30 PM",
         "2024 6 03",
+        "2024 603",
     ];
 
     #[test]
@@ -3746,6 +3773,15 @@ mod tests {
         .unwrap();
         let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("encoder", "LAME")]));
         assert!(refused.is_err());
+        // Label beside the file's Publisher: TPUB holds one, so it's refused,
+        // not the Publisher overwritten.
+        write_with_kinds(&path("a.mp3"), &none, &kinds(&[("publisher", "Bandai")])).unwrap();
+        let refused = write_with_kinds(&path("a.mp3"), &none, &kinds(&[("label", "Lantis")]));
+        assert!(refused.is_err());
+        assert_eq!(
+            file_tags(&path("a.mp3"), "; ").unwrap().values["publisher"],
+            "Bandai"
+        );
         // A time with words after it isn't read whole.
         assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
         // Parts out of range: not a date (the form leaves these to the server).

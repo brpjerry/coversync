@@ -74,35 +74,19 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
 	return n;
 }
 
-// A part lofty reads whole: two characters (06, or 6 with a space before or
-// after it), or one digit with a separator after it; the last part must be
-// two, and ends in a space only before a Z (the value is trimmed).
-const PART = '(?:\\d{1,2}| \\d|\\d )';
-const LAST = '(?:\\d{2}| \\d|\\d (?=Z$))';
-const SEPARATED = new RegExp(
-	`^\\d{4}(?:[-.](?:${LAST}|${PART}[-.](?:${LAST}|${PART}T(?:${LAST}|${PART}:(?:${LAST}|${PART}:${LAST}))?)))?Z?$`
-);
-// Run together, a month or day can be a space and a digit (2024 6 3 is
-// June 3: lofty reads the spaces as padding, not separators).
-const PADDED = '(?:\\d{2}| \\d)';
-const COMPACT = new RegExp(
-	`^\\d{4}(?:${PADDED}(?:${PADDED}(?:T(?:${LAST}|\\d{2}(?:${LAST}|\\d{2}(?:${LAST})?)?))?)?)?Z?$`
-);
-
 /**
  * Numbers and dates the server would refuse; other kinds take any text. A
- * date is one lofty reads whole: a year, then a month, a day and a time
- * after a T, the parts after dashes or dots and the time's after colons
- * (2010.08.25, 2024-6-03T14:8:49), or the digits run together
- * (20100825T1230); a Z may end it. A time after a space, or a last part of
- * one digit (2024-6), would be dropped on writing.
+ * date only has to look like one here (a four-digit year, then digits,
+ * dashes, dots, colons, spaces, T or Z): the server refuses, with a
+ * message, one lofty wouldn't read whole (a time after a space, a month 13),
+ * so nothing it would lose is written.
  */
 export function invalid(kind: string, value: string): boolean {
 	const v = value.trim();
 	if (!v) return false;
 	if (['track_number', 'track_total', 'disc_number', 'disc_total'].includes(kind))
 		return !/^\d+(\/\d+)?$/.test(v);
-	if (kind === 'date') return !(SEPARATED.test(v) || COMPACT.test(v));
+	if (kind === 'date') return !/^\d{4}[\d\-.: TZ]*$/.test(v);
 	return false;
 }
 
