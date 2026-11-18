@@ -1073,6 +1073,7 @@ fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) 
         sort_values: HashMap::new(),
         filter_values: HashMap::new(),
         attention: None,
+        incomplete: crate::incomplete::incomplete(tracks),
     }
 }
 

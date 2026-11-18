@@ -46,6 +46,7 @@
 	import { matcher, picked, type Filters } from '#lib/filters.ts';
 	import { listen, type Listening, type NoticeHandlers, type Notices } from '#lib/events.ts';
 	import { count, fold } from '#lib/format.ts';
+	import { describeIncomplete } from '#lib/incomplete.ts';
 	import { GRID_MAX_WIDTH, gridLayout } from '#lib/grid.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
@@ -215,7 +216,9 @@
 	}
 	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
 	let attentionView = $derived(activeSort === 'attention');
-	let flagged = $derived(source.filter((a) => a.attention));
+	/** Flagged: missing tags the rules need, or tracks by its own numbering. */
+	const needsAttention = (a: Album) => !!(a.attention || a.incomplete);
+	let flagged = $derived(source.filter(needsAttention));
 	/** The sort in use before Needs attention, to go back to. */
 	let lastPlain = $state<Sort>();
 	$effect(() => {
@@ -233,7 +236,7 @@
 	/** Albums the sort and search leave, in order; the sidebar's tag filters narrow them. */
 	let searched = $derived.by(() => {
 		const list = attentionView
-			? sorted(source, 'album_artist').filter((a) => a.attention)
+			? sorted(source, 'album_artist').filter(needsAttention)
 			: sorted(source, activeSort);
 		// Setup screens use the search field for their own lists.
 		const terms = isSetup(view) ? [] : fold(query).split(/\s+/).filter(Boolean);
@@ -260,15 +263,23 @@
 		return sorted(list, activeSort === 'attention' ? 'album_artist' : activeSort).slice(0, 12);
 	});
 
-	/** Card badge in the attention view: what's missing, and on how many tracks. */
+	/** Card badge in the attention view: what's missing, and on how many tracks; or which tracks. */
 	function attentionFlag(a: Album) {
 		const at = a.attention;
-		if (!at) return null;
-		const names = at.missing.map((k) => setup.label(k));
-		return {
-			text: names.length === 1 ? names[0] : `${names.length} missing`,
-			title: `Missing ${names.join(', ')} on ${at.tracks} of ${a.track_count} ${a.track_count === 1 ? 'track' : 'tracks'}`
-		};
+		const names = at?.missing.map((k) => setup.label(k)) ?? [];
+		const text = [];
+		const title = [];
+		if (at) {
+			text.push(names.length === 1 ? names[0] : `${names.length} missing`);
+			title.push(
+				`Missing ${names.join(', ')} on ${at.tracks} of ${a.track_count} ${a.track_count === 1 ? 'track' : 'tracks'}`
+			);
+		}
+		if (a.incomplete) {
+			text.push('Incomplete');
+			title.push(describeIncomplete(a.incomplete));
+		}
+		return text.length ? { text: text.join(' · '), title: title.join('. ') } : null;
 	}
 
 	let openId = $derived(page.state.album ?? null);
