@@ -6,11 +6,12 @@ use std::path::Path;
 
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFile};
+use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::items::Timestamp;
-use lofty::tag::{Tag, TagType};
+use lofty::tag::{ItemValue, SplitTag, Tag, TagType};
 
 use crate::model::TagEdit;
 use crate::{Error, Result, rules};
@@ -259,6 +260,446 @@ fn apply(tag: &mut Tag, edit: &TagEdit) -> Result<()> {
     Ok(())
 }
 
+/// The Vorbis comments of a FLAC or Ogg file that lofty's generic [`Tag`]
+/// leaves out, read aside before an edit. Lofty's owned conversions put back
+/// what a generic tag couldn't hold for other tag types, but its Vorbis
+/// conversion rewrites values its generic items don't round-trip (see
+/// [`save_vorbis`]), so Vorbis comments are written here.
+struct VorbisRest {
+    /// The comments lofty has no key for, as read (nothing renamed or
+    /// rejected), with the file's vendor string.
+    rest: VorbisComments,
+    /// The vendor string, which lofty also reads as an ENCODER comment.
+    vendor: String,
+    /// Whether the file has a comment block (a FLAC needn't).
+    had_block: bool,
+    /// Whether the file had ENCODER comments of its own.
+    had_encoder: bool,
+    /// The file's RATING comments, provider-qualified ones (`RATING:MusicBee`)
+    /// included, as written and in their order (blanked in `rest`): coversync
+    /// only ever clears a rating, and lofty can't write a provider's back the
+    /// way it read it.
+    ratings: Vec<(String, String)>,
+}
+
+/// A FLAC or Ogg file's Vorbis comments as written, without pictures, and
+/// whether the file has a comment block (a FLAC needn't); None for a file
+/// whose primary tag isn't Vorbis comments.
+fn vorbis_comments(path: &Path, file_type: FileType) -> Result<Option<(VorbisComments, bool)>> {
+    use lofty::file::AudioFile;
+    // Without implicit conversions: splitting TRACKNUMBER=1/10 removes a
+    // TOTALTRACKS alias in a way that reorders the other comments.
+    let options = ParseOptions::new()
+        .read_properties(false)
+        .read_cover_art(false)
+        .implicit_conversions(false);
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let tag = match file_type {
+        FileType::Flac => {
+            let comments = lofty::flac::FlacFile::read_from(&mut f, options)
+                .map_err(tag_err)?
+                .remove_vorbis_comments();
+            let had = comments.is_some();
+            return Ok(Some((comments.unwrap_or_default(), had)));
+        }
+        FileType::Vorbis => lofty::ogg::VorbisFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
+        FileType::Opus => lofty::ogg::OpusFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
+        FileType::Speex => lofty::ogg::SpeexFile::read_from(&mut f, options)
+            .map_err(tag_err)?
+            .remove_vorbis_comments(),
+        _ => return Ok(None),
+    };
+    Ok(Some((tag, true)))
+}
+
+/// The file's [`VorbisRest`]; None for a file whose primary tag isn't
+/// Vorbis comments.
+fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
+    // Pictures go through `Tag`: not read here, so not kept twice.
+    let Some((tag, had_block)) = vorbis_comments(path, file_type)? else {
+        return Ok(None);
+    };
+    let vendor = tag.vendor().to_string();
+    let had_encoder = tag.get("ENCODER").is_some();
+    let is_rating = |k: &str| {
+        let k = k.to_ascii_uppercase();
+        k == "RATING" || k.starts_with("RATING:")
+    };
+    let ratings: Vec<(String, String)> = tag
+        .items()
+        .filter(|(k, _)| is_rating(k))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut rest = VorbisComments::from(tag.split_tag().0);
+    // Those lofty couldn't read too, so all go back in their order. The
+    // ones left here are blanked rather than removed: lofty's `remove`
+    // reorders the other comments, and its `push` refuses a nameless one
+    // (`=legacy`) a rebuilt list would need; `insert` keeps the others'
+    // order, and an empty value isn't written.
+    let keys: std::collections::HashSet<String> = rest
+        .items()
+        .filter(|(k, _)| is_rating(k))
+        .map(|(k, _)| k.to_ascii_uppercase())
+        .collect();
+    for key in keys {
+        rest.insert(key, String::new());
+    }
+    Ok(Some(VorbisRest {
+        rest,
+        vendor,
+        had_block,
+        had_encoder,
+        ratings,
+    }))
+}
+
+/// Write `tag`, a FLAC or Ogg file's primary tag after an edit, as lofty's
+/// own writer does (each item under its usual key, its text as it is) over
+/// `rest`. The vendor string stays as it was; ENCODER comments are the
+/// file's own, or one the edit set, never the vendor string lofty reads as
+/// one; ratings are the file's own, unless the edit cleared them. `edited`
+/// is the tag kinds (catalog ids) the edit set or cleared.
+fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> Result<()> {
+    use lofty::ogg::OggPictureStorage;
+    use lofty::picture::PictureInformation;
+    let encoders: Vec<String> = tag
+        .get_strings(ItemKey::EncoderSoftware)
+        .map(str::to_string)
+        .collect();
+    let encoder_edited = edited.contains(&"encoder");
+    let vendor_only = !rest.had_encoder && !encoder_edited && encoders == [rest.vendor.as_str()];
+    // A rating can't be typed in, only cleared (`validate_kind`).
+    let ratings = if edited.contains(&"rating") {
+        Vec::new()
+    } else {
+        rest.ratings
+    };
+    let had_block = rest.had_block;
+    let mut out = rest.rest;
+    out.set_vendor(rest.vendor);
+    for item in tag.items() {
+        if matches!(
+            item.key(),
+            ItemKey::EncoderSoftware | ItemKey::Popularimeter
+        ) {
+            continue;
+        }
+        let (ItemValue::Text(value) | ItemValue::Locator(value)) = item.value() else {
+            continue;
+        };
+        if let Some(key) = item.key().map_key(TagType::VorbisComments) {
+            out.push(key.to_string(), value.clone());
+        }
+    }
+    if !vendor_only {
+        for encoder in encoders {
+            out.push("ENCODER".into(), encoder);
+        }
+    }
+    // TRACKNUM is an older name readers fall back to for the track number:
+    // blanked (so not written) when the track number is written or edited,
+    // as lofty's own setter does, so a cleared number doesn't come back.
+    // A canonical number that isn't one (empty, or a vinyl side like A1)
+    // doesn't stand in for it.
+    if out.get("TRACKNUM").is_some()
+        && (lofty::tag::Accessor::track(&tag).is_some() || edited.contains(&"track_number"))
+    {
+        out.insert("TRACKNUM".into(), String::new());
+    }
+    // Ratings: the file's own as written; one from another tag (a FLAC that
+    // had only ID3v2) through lofty's conversion, under its provider's key.
+    if ratings.is_empty() {
+        {
+            // One at a time, each as lofty converts it. Lofty reads a rating
+            // as "owner|stars|count" text, so it can't convert one whose
+            // owner has a "|": that one goes through it under a stand-in
+            // owner (an unknown provider either way, so the same scale), and
+            // gets its own back in the field name. One whose owner can't
+            // name a Vorbis field (it has "=") stays as lofty read it, under
+            // RATING.
+            for item in tag.items().filter(|i| i.key() == ItemKey::Popularimeter) {
+                let ItemValue::Text(text) = item.value() else {
+                    continue;
+                };
+                let convert = |text: String| {
+                    let mut one = Tag::new(TagType::VorbisComments);
+                    one.push(lofty::tag::TagItem::new(
+                        ItemKey::Popularimeter,
+                        ItemValue::Text(text),
+                    ));
+                    VorbisComments::from(one)
+                };
+                let converted = convert(text.clone());
+                if converted.items().len() > 0 {
+                    for (key, value) in converted.items() {
+                        out.push(key.to_string(), value.to_string());
+                    }
+                    continue;
+                }
+                let mut parts = text.rsplitn(3, '|');
+                let fields = (parts.next(), parts.next(), parts.next());
+                let named = |owner: &str| {
+                    !owner.is_empty()
+                        && owner
+                            .bytes()
+                            .all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
+                };
+                if let (Some(count), Some(stars), Some(owner)) = fields
+                    && owner.contains('|')
+                    && named(owner)
+                    && let Some((_, value)) =
+                        convert(format!("coversync|{stars}|{count}")).items().next()
+                {
+                    out.push(format!("RATING:{owner}"), value.to_string());
+                } else {
+                    out.push("RATING".into(), text.clone());
+                }
+            }
+        }
+    } else {
+        for (key, value) in ratings {
+            out.push(key, value);
+        }
+    }
+    // From the end, so each move is cheap; then in their order.
+    let mut pictures = Vec::with_capacity(tag.pictures().len());
+    while !tag.pictures().is_empty() {
+        pictures.push(tag.remove_picture(tag.pictures().len() - 1));
+    }
+    for picture in pictures.into_iter().rev() {
+        let info = PictureInformation::from_picture(&picture).unwrap_or_default();
+        // Lofty keeps one icon of each kind, as the format says; a file
+        // with two isn't saved rather than lose one.
+        if out
+            .insert_picture(picture, Some(info))
+            .map_err(tag_err)?
+            .is_some()
+        {
+            return Err(Error::Tags(
+                "the file has two icons of one kind, which FLAC and Ogg allow one of, so it wasn't changed".into(),
+            ));
+        }
+    }
+    // Lofty writes no comment block, so no vendor string, for a tag with
+    // no comments (an edit that cleared them all): a blank one, which isn't
+    // written itself, keeps the file's. A FLAC that had none gets none, so
+    // its ID3v2 tag still shows.
+    if had_block && out.items().len() == 0 {
+        out.push("COMMENT".into(), String::new());
+    }
+    out.save_to_path(path, WriteOptions::default())
+        .map_err(tag_err)
+}
+
+/// Why lofty wouldn't write the ID3v2 `frame` back as it read it, if it
+/// wouldn't: an ID3v2.2 frame with no ID3v2.4 name (dropped); a
+/// compressed, encrypted or length-prefixed one (it consumes the prefix on
+/// reading but keeps the flag); a chapter or seek index (ASPI) located by
+/// byte offsets, which a resized tag moves away from its audio; a second
+/// root table of contents in one frame list (lofty writes the first);
+/// or, inside a chapter or table of contents, any of those or a frame
+/// flagged as unsynchronised (decoded on reading, written as it is).
+/// `seen_root`: whether the frame list had a root table of contents yet.
+fn unwritable(
+    frame: &lofty::id3::v2::Frame<'_>,
+    nested: bool,
+    seen_root: &mut bool,
+) -> Option<String> {
+    use lofty::id3::v2::Frame;
+    let id = frame.id_str();
+    if frame.id().is_outdated() {
+        return Some(format!("a {id} frame, which has no ID3v2.4 name"));
+    }
+    let flags = frame.flags();
+    if flags.compression || flags.encryption.is_some() || flags.data_length_indicator.is_some() {
+        return Some(format!(
+            "a compressed, encrypted or length-prefixed {id} frame"
+        ));
+    }
+    if nested && flags.unsynchronisation {
+        return Some(format!(
+            "an unsynchronised {id} frame inside a chapter or table of contents"
+        ));
+    }
+    if id == "ASPI" {
+        return Some(
+            "a seek index (ASPI) located by byte offsets, which a resized tag would leave pointing at the wrong audio".into(),
+        );
+    }
+    let children = match frame {
+        Frame::Chapter(c) => {
+            if c.offsets.start != u32::MAX || c.offsets.end != u32::MAX {
+                return Some(format!(
+                    "a chapter ({}) located by byte offsets, which a resized tag would leave pointing at the wrong audio",
+                    c.id
+                ));
+            }
+            &c.children
+        }
+        Frame::TableOfContents(t) => {
+            if t.flags.top_level && std::mem::replace(seen_root, true) {
+                return Some(format!(
+                    "a second root table of contents ({}), of which only one is written",
+                    t.id
+                ));
+            }
+            &t.children
+        }
+        _ => return None,
+    };
+    let mut seen = false;
+    children.iter().find_map(|f| unwritable(f, true, &mut seen))
+}
+
+/// Write `tag`, a primary tag other than Vorbis comments after an edit,
+/// through lofty's owned conversion: unlike its writer for a borrowed
+/// generic tag, it puts back what the generic tag couldn't hold (custom
+/// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
+/// frames) and joins repeated values as the format wants.
+fn save_owned(path: &Path, tag: Tag) -> Result<()> {
+    let options = WriteOptions::default();
+    match tag.tag_type() {
+        TagType::Id3v2 => {
+            let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
+            // A frame lofty wouldn't write back as it read it: not saved
+            // rather than lost or corrupted.
+            let mut seen_root = false;
+            if let Some(why) = (&id3)
+                .into_iter()
+                .find_map(|f| unwritable(f, false, &mut seen_root))
+            {
+                return Err(Error::Tags(format!(
+                    "the file's ID3v2 tag has {why}, which can't be written back as it is, so it wasn't changed"
+                )));
+            }
+            // Frames lofty kept aside come flagged as unsynchronised but
+            // already decoded: written as they are, unflagged, so they aren't
+            // decoded twice.
+            id3.retain_mut(|frame| {
+                let mut flags = frame.flags();
+                flags.unsynchronisation = false;
+                frame.set_flags(flags);
+                true
+            });
+            // Header flags as lofty writes them by default, as before: it
+            // can't write CRC or restrictions back readably, and
+            // unsynchronisation would decode its frames twice.
+            id3.set_flags(lofty::id3::v2::Id3v2TagFlags::default());
+            id3.save_to_path(path, options)
+        }
+        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag).save_to_path(path, options),
+        TagType::Ape => {
+            // Number pairs and the compilation flag as written: the
+            // conversion would read them as numbers (Track=A1 lost, 01/09
+            // made 1/9).
+            let mut tag = tag;
+            let mut literal = Vec::new();
+            let mut typed = Vec::new();
+            for (name, number, total) in [
+                ("Track", ItemKey::TrackNumber, ItemKey::TrackTotal),
+                ("Disc", ItemKey::DiscNumber, ItemKey::DiscTotal),
+            ] {
+                let value = |key| tag.get(key).map(|i| i.value().clone());
+                match (value(number), value(total)) {
+                    (None, None) => {}
+                    (Some(ItemValue::Text(n)), None) => literal.push((name, n)),
+                    (n @ (None | Some(ItemValue::Text(_))), Some(ItemValue::Text(t))) => {
+                        let n = match n {
+                            Some(ItemValue::Text(n)) => n,
+                            _ => "0".into(),
+                        };
+                        literal.push((name, format!("{n}/{t}")));
+                    }
+                    // A binary or locator item, as it was (lofty files it
+                    // under either key).
+                    (Some(v), None) | (None, Some(v)) => typed.push((name, v)),
+                    _ => {
+                        return Err(Error::Tags(format!(
+                            "the file's APE {name} item can't hold both its number and total as they are, so it wasn't changed"
+                        )));
+                    }
+                }
+                tag.remove_key(number);
+                tag.remove_key(total);
+            }
+            // Compilation as it was, text, locator or binary, every value.
+            let compilation: Vec<ItemValue> = tag
+                .items()
+                .filter(|i| i.key() == ItemKey::FlagCompilation)
+                .map(|i| i.value().clone())
+                .collect();
+            tag.remove_key(ItemKey::FlagCompilation);
+            let mut ape = lofty::ape::ApeTag::from(tag);
+            for (name, value) in literal {
+                let item = lofty::ape::ApeItem::new(name.into(), ItemValue::Text(value))
+                    .map_err(tag_err)?;
+                ape.insert(item);
+            }
+            for (name, value) in typed {
+                ape.insert(lofty::ape::ApeItem::new(name.into(), value).map_err(tag_err)?);
+            }
+            for value in compilation {
+                ape.push(lofty::ape::ApeItem::new("Compilation".into(), value).map_err(tag_err)?);
+            }
+            ape.save_to_path(path, options)
+        }
+        // RIFF INFO, AIFF text chunks: as lofty writes them.
+        _ => tag.save_to_path(path, options),
+    }
+    .map_err(tag_err)
+}
+
+/// Save an edit of `file`, read from `path` (`rest`, for Vorbis comments,
+/// read before the edit): its primary tag, keeping what lofty's generic tag
+/// couldn't hold, and of its other tags only those in `changed` (pictures
+/// replaced) that the format can write. Untouched tags stay as they are on
+/// disk. `edited`: the tag kinds the edit set or cleared.
+fn save(
+    path: &Path,
+    mut file: TaggedFile,
+    rest: Option<VorbisRest>,
+    changed: &[TagType],
+    edited: &[&str],
+) -> Result<()> {
+    let primary = file.primary_tag_type();
+    for t in changed.iter().filter(|t| **t != primary) {
+        if file.tag_support(*t).is_writable()
+            && let Some(tag) = file.tag(*t)
+        {
+            tag.save_to_path(path, WriteOptions::default())
+                .map_err(tag_err)?;
+        }
+    }
+    let Some(tag) = file.remove(primary) else {
+        return Ok(());
+    };
+    match rest {
+        Some(rest) => save_vorbis(path, tag, rest, edited),
+        None => save_owned(path, tag),
+    }
+}
+
+/// The tag kinds (catalog ids) `edit` sets or clears.
+fn edit_kinds(edit: &TagEdit) -> Vec<&'static str> {
+    [
+        ("title", &edit.title),
+        ("artist", &edit.artist),
+        ("album", &edit.album),
+        ("album_artist", &edit.album_artist),
+        ("track_number", &edit.track_no),
+        ("disc_number", &edit.disc_no),
+        ("date", &edit.year),
+        ("genre", &edit.genre),
+    ]
+    .into_iter()
+    .filter_map(|(id, value)| value.is_some().then_some(id))
+    .collect()
+}
+
 /// Apply `edit` to the file's primary tag. The change is written to a copy
 /// beside the file and renamed over it, so a failed write leaves the original.
 pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
@@ -268,10 +709,10 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
     fs::copy(path, &tmp)?;
     let result = (|| {
         let mut file = probe(&tmp, true)?;
+        let rest = vorbis_rest(&tmp, file.file_type())?;
         let tag = primary_tag_mut(&mut file);
         apply(tag, edit)?;
-        file.save_to_path(&tmp, WriteOptions::default())
-            .map_err(tag_err)?;
+        save(&tmp, file, rest, &[], &edit_kinds(edit))?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, path)?;
         Ok(())
@@ -355,9 +796,11 @@ pub fn upc(path: &Path) -> Option<String> {
         .guess_file_type()
         .ok()?
         .file_type()?;
+    // As written: lofty's number conversions can reorder two UPCs.
     let options = ParseOptions::new()
         .read_properties(false)
-        .read_cover_art(false);
+        .read_cover_art(false)
+        .implicit_conversions(false);
     let mut f = fs::File::open(path).ok()?;
     let found = match file_type {
         FileType::Flac => {
@@ -411,8 +854,9 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
     if file.primary_tag().is_none() {
         let mut tag = Tag::new(file.primary_tag_type());
         if let Some(existing) = file.first_tag() {
+            // Every value, not the last of each key (two ratings, say).
             for item in existing.items() {
-                tag.insert(item.clone());
+                tag.push(item.clone());
             }
             for picture in existing.pictures() {
                 tag.push_picture(picture.clone());
@@ -421,6 +865,36 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
         file.insert_tag(tag);
     }
     file.primary_tag_mut().expect("primary tag inserted above")
+}
+
+/// Whether an MP3's APE tag has a front or untyped cover of its own (lofty
+/// keeps APE covers as items, not pictures, so they aren't in its generic
+/// tag) other than `new`, the image replacing it. Such a cover isn't
+/// replaced: lofty can't rewrite every APE layout safely (a tag with only a
+/// footer loses 32 bytes of audio). An empty one, or one already `new`,
+/// doesn't count.
+fn secondary_ape_cover(path: &Path, new: &[u8]) -> Result<bool> {
+    use lofty::file::AudioFile;
+    let options = ParseOptions::new().read_properties(false);
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?;
+    let Some(ape) = mpeg.ape() else {
+        return Ok(false);
+    };
+    Ok(["Cover Art (Front)", "Cover Art (Other)"]
+        .iter()
+        .filter_map(|k| ape.get(k))
+        .any(|item| match item.value() {
+            // A file name, a zero byte, then the image.
+            ItemValue::Binary(bytes) => {
+                let image = bytes
+                    .iter()
+                    .position(|b| *b == 0)
+                    .map_or(&bytes[..], |at| &bytes[at + 1..]);
+                !image.is_empty() && image != new
+            }
+            ItemValue::Text(text) | ItemValue::Locator(text) => !text.is_empty(),
+        }))
 }
 
 fn has_pictures(file: &TaggedFile) -> bool {
@@ -546,16 +1020,34 @@ pub fn copy_with_tags_hashed(
         let mut embedded = false;
         if !values.is_empty() || art.is_some() {
             let mut file = probe(&tmp, true)?;
+            let file_type = file.file_type();
             let art = art.filter(|_| replace || !has_pictures(&file));
             if !values.is_empty() || art.is_some() {
+                let rest = vorbis_rest(&tmp, file.file_type())?;
+                // Other tags are only written when their pictures change.
+                let mut changed = Vec::new();
                 if art.is_some() && replace {
+                    if file_type == FileType::Mpeg
+                        && file.tag(TagType::Ape).is_some()
+                        && let Some(new) = art
+                        && secondary_ape_cover(&tmp, new.data())?
+                    {
+                        return Err(Error::Tags(format!(
+                            "{}: the MP3's APE tag has a cover of its own, which can't be replaced safely, so it wasn't changed",
+                            src.display()
+                        )));
+                    }
                     // Untyped pictures go too: players show them as the cover.
                     // Back covers, booklets and the like stay.
                     let types: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
                     for t in types {
                         if let Some(tag) = file.tag_mut(t) {
+                            let before = tag.pictures().len();
                             tag.remove_picture_type(PictureType::CoverFront);
                             tag.remove_picture_type(PictureType::Other);
+                            if tag.pictures().len() != before {
+                                changed.push(t);
+                            }
                         }
                     }
                 }
@@ -564,15 +1056,15 @@ pub fn copy_with_tags_hashed(
                 if let Some(picture) = art {
                     tag.push_picture(picture.clone());
                 }
-                file.save_to_path(&tmp, WriteOptions::default())
-                    .map_err(tag_err)?;
+                let edited: Vec<&str> = values.iter().map(|(id, _)| *id).collect();
+                save(&tmp, file, rest, &changed, &edited)?;
             }
             if art.is_some() {
                 // Some tag formats (RIFF INFO, say) silently drop pictures.
                 if !has_pictures(&probe(&tmp, true)?) {
                     return Err(Error::Tags(format!(
                         "{} files can't hold embedded album art",
-                        format_name(file.file_type())
+                        format_name(file_type)
                     )));
                 }
                 embedded = true;
@@ -750,7 +1242,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A FLAC file with no audio, only these Vorbis comments.
+    /// A FLAC file with these Vorbis comments and a few bytes standing for
+    /// its audio (lofty's writer expects some after the metadata).
     fn flac_with_comments(path: &Path, comments: &[&str]) {
         let mut b = b"fLaC".to_vec();
         // STREAMINFO: 4096-sample blocks, 44.1 kHz, stereo, 16 bits, no samples.
@@ -773,6 +1266,8 @@ mod tests {
         b.push(0x80 | 4);
         b.extend(&(block.len() as u32).to_be_bytes()[1..]);
         b.extend(block);
+        // A frame header's sync code, and some bytes.
+        b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
         fs::write(path, b).unwrap();
     }
 
@@ -822,6 +1317,1017 @@ mod tests {
             read_kinds_split(&path, false, &split).unwrap().values["artist"],
             "A"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FLAC file's own Vorbis comments: its vendor string and every
+    /// comment, as lofty's generic `Tag` doesn't show them.
+    fn vorbis(path: &Path) -> (String, Vec<(String, String)>) {
+        let mut f = fs::File::open(path).unwrap();
+        // As written: no number conversions.
+        let options = ParseOptions::new().implicit_conversions(false);
+        let flac = lofty::flac::FlacFile::read_from(&mut f, options).unwrap();
+        let tag = flac.vorbis_comments().unwrap();
+        let items = tag
+            .items()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        (tag.vendor().to_string(), items)
+    }
+
+    fn has(items: &[(String, String)], key: &str, value: &str) -> bool {
+        items.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    fn keys<'a>(items: &'a [(String, String)], key: &'a str) -> impl Iterator<Item = &'a str> {
+        items
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn an_import_keeps_the_tags_lofty_has_no_key_for() {
+        let dir = std::env::temp_dir().join(format!("coversync-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.flac"), dir.join("out.flac"));
+        let comments = [
+            "TITLE=Song",
+            "ALBUM_JP=僕らのLIVE 君とのLIFE",
+            "CDTOC=3+96+2D2B+6256",
+            "ORGANIZATION=Lantis",
+            "TOTALTRACKS=13",
+        ];
+        flac_with_comments(&src, &comments);
+        let values = [
+            ("title", "Song!".to_string()),
+            ("track_number", "1".to_string()),
+        ];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let (vendor, items) = vorbis(&dest);
+        assert!(
+            has(&items, "ALBUM_JP", "僕らのLIVE 君とのLIFE"),
+            "{items:?}"
+        );
+        assert!(has(&items, "CDTOC", "3+96+2D2B+6256"), "{items:?}");
+        assert!(has(&items, "TITLE", "Song!"));
+        assert!(has(&items, "TRACKNUMBER", "1"));
+        assert_eq!(keys(&items, "TITLE").count(), 1);
+        // Tags lofty knows by another name keep their values, under its name.
+        assert!(has(&items, "LABEL", "Lantis"), "{items:?}");
+        assert!(has(&items, "TRACKTOTAL", "13"), "{items:?}");
+        // The vendor string stays the vendor string, not also an ENCODER comment.
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").count(), 0, "{items:?}");
+        // The source is only read.
+        assert_eq!(vorbis(&src).1.len(), comments.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_vendor_string_and_encoder_stay_apart() {
+        let dir = std::env::temp_dir().join(format!("coversync-vendor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(&path("in.flac"), &["TITLE=Song", "ENCODER=EAC"]);
+        let number = [("track_number", "1".to_string())];
+        copy_with_tags(&path("in.flac"), &path("a.flac"), &number, None, false).unwrap();
+        let (vendor, items) = vorbis(&path("a.flac"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").collect::<Vec<_>>(), ["EAC"]);
+        // An edit to the encoder is the ENCODER comment, the vendor string kept.
+        let encoder = [("encoder", "X".to_string())];
+        copy_with_tags(&path("in.flac"), &path("b.flac"), &encoder, None, false).unwrap();
+        let (vendor, items) = vorbis(&path("b.flac"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").collect::<Vec<_>>(), ["X"]);
+        // And with no ENCODER comment before, too.
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        copy_with_tags(&path("plain.flac"), &path("c.flac"), &encoder, None, false).unwrap();
+        let (vendor, items) = vorbis(&path("c.flac"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").collect::<Vec<_>>(), ["X"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tag_edit_keeps_the_tags_lofty_has_no_key_for() {
+        let dir = std::env::temp_dir().join(format!("coversync-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(&path, &["TITLE=Song", "TITLE_KO=노래", "ARTIST=A"]);
+        let edit = TagEdit {
+            title: Some("New".into()),
+            ..Default::default()
+        };
+        write(&path, &edit).unwrap();
+        let (vendor, items) = vorbis(&path);
+        assert!(has(&items, "TITLE_KO", "노래"), "{items:?}");
+        assert!(has(&items, "TITLE", "New"));
+        assert!(has(&items, "ARTIST", "A"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn flac_pictures_and_kept_tags_go_together() {
+        let dir = std::env::temp_dir().join(format!("coversync-flacart-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(&path("in.flac"), &["TITLE=Song", "ALBUM_JP=アルバム"]);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let art = crate::art::Art::new(png.into_inner())
+            .unwrap()
+            .picture()
+            .unwrap();
+        let number = [("track_number", "1".to_string())];
+        assert!(
+            copy_with_tags(
+                &path("in.flac"),
+                &path("art.flac"),
+                &number,
+                Some(&art),
+                false
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            embedded_cover(&path("art.flac")).unwrap().unwrap(),
+            art.data()
+        );
+        assert!(has(&vorbis(&path("art.flac")).1, "ALBUM_JP", "アルバム"));
+        // A later edit keeps the picture, once.
+        let title = [("title", "New".to_string())];
+        copy_with_tags(&path("art.flac"), &path("again.flac"), &title, None, false).unwrap();
+        let file = probe(&path("again.flac"), true).unwrap();
+        let pictures: usize = file.tags().iter().map(|t| t.pictures().len()).sum();
+        assert_eq!(pictures, 1);
+        let (_, items) = vorbis(&path("again.flac"));
+        assert!(has(&items, "ALBUM_JP", "アルバム"));
+        assert!(has(&items, "TITLE", "New"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_keeps_order_ratings_and_flags_as_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &[
+                "ARTIST=A",
+                "ARTIST=B",
+                "RATING=80",
+                "COMPILATION=YES",
+                "TITLE=Song",
+            ],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        // The artists in their order: the first is still the track's artist.
+        assert_eq!(keys(&items, "ARTIST").collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(
+            read(&path("out.flac")).unwrap().artist.as_deref(),
+            Some("A")
+        );
+        // Values lofty would reinterpret are written as they were.
+        assert!(has(&items, "RATING", "80"), "{items:?}");
+        assert!(has(&items, "COMPILATION", "YES"), "{items:?}");
+        assert!(has(&items, "GENRE", "Anime"));
+        // An encoder set to the vendor string, by an edit, is written.
+        let encoder = [("encoder", "coversync".to_string())];
+        copy_with_tags(&path("in.flac"), &path("enc.flac"), &encoder, None, false).unwrap();
+        let (vendor, items) = vorbis(&path("enc.flac"));
+        assert_eq!(vendor, "coversync");
+        assert_eq!(keys(&items, "ENCODER").collect::<Vec<_>>(), ["coversync"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn replacing_art_leaves_a_tag_the_format_cant_write() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, PrivateFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-roid3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let cover = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            crate::art::Art::new(png.into_inner())
+                .unwrap()
+                .picture()
+                .unwrap()
+        };
+        // A FLAC behind an ID3v2 tag, which lofty reads but won't write there:
+        // a front cover, a title and a private frame.
+        flac_with_comments(&path("plain.flac"), &["TITLE=Song"]);
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Private(PrivateFrame::new(
+            "coversync",
+            vec![1, 2, 3],
+        )));
+        let mut generic: Tag = id3.into();
+        generic.push_picture(cover(4));
+        let id3: Id3v2Tag = generic.into();
+        let mut bytes = Vec::new();
+        id3.dump_to(&mut bytes, WriteOptions::default()).unwrap();
+        bytes.extend(fs::read(path("plain.flac")).unwrap());
+        fs::write(path("in.flac"), bytes).unwrap();
+        let new = cover(8);
+        assert!(
+            copy_with_tags(&path("in.flac"), &path("out.flac"), &[], Some(&new), true).unwrap()
+        );
+        assert_eq!(
+            embedded_cover(&path("out.flac")).unwrap().unwrap(),
+            new.data()
+        );
+        // The ID3v2 tag is as it was, private frame and all.
+        let mut f = fs::File::open(path("out.flac")).unwrap();
+        let flac = lofty::flac::FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let kept = flac.id3v2().unwrap();
+        assert!(kept.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Private(private)
+                if private.owner == "coversync" && private.private_data.as_ref() == [1, 2, 3]
+        )));
+        assert_eq!(kept.title().as_deref(), Some("Song"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn an_mp3_whose_ape_tag_has_a_cover_keeps_its_covers() {
+        use lofty::ape::{ApeItem, ApeTag};
+        use lofty::id3::v2::Id3v2Tag;
+        let dir = std::env::temp_dir().join(format!("coversync-mp3ape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.mp3"), dir.join("out.mp3"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let cover = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            crate::art::Art::new(png.into_inner())
+                .unwrap()
+                .picture()
+                .unwrap()
+        };
+        // ID3v2 with a front cover; APE with a front cover, a back cover and
+        // an item of its own.
+        let mut generic = Tag::new(TagType::Id3v2);
+        generic.set_title("Song".into());
+        generic.push_picture(cover(4));
+        Id3v2Tag::from(generic)
+            .save_to_path(&src, WriteOptions::default())
+            .unwrap();
+        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(item(
+            "Cover Art (Front)",
+            ItemValue::Binary(b"front.jpg\0old".to_vec()),
+        ));
+        ape.insert(item(
+            "Cover Art (Back)",
+            ItemValue::Binary(b"back.jpg\0back".to_vec()),
+        ));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        let new = cover(8);
+        let refused = copy_with_tags(&src, &dest, &[], Some(&new), true)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("APE tag has a cover"), "{refused}");
+        assert!(refused.contains("in.mp3"), "{refused}");
+        assert!(!dest.exists());
+        // One that's empty, or already the new image, has nothing to replace.
+        let mut same = b"front.png\0".to_vec();
+        same.extend_from_slice(new.data());
+        for front in [b"front.jpg\0".to_vec(), same] {
+            let mut ape = ApeTag::default();
+            ape.insert(item("Cover Art (Front)", ItemValue::Binary(front)));
+            ape.save_to_path(&src, WriteOptions::default()).unwrap();
+            assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
+            assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
+            fs::remove_file(&dest).unwrap();
+        }
+        // An APE tag with no cover (ReplayGain, say) doesn't stand in the
+        // way, and stays as it was.
+        let mut ape = ApeTag::default();
+        ape.insert(item(
+            "REPLAYGAIN_TRACK_GAIN",
+            ItemValue::Text("-6.1 dB".into()),
+        ));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
+        assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
+        let mut f = fs::File::open(&dest).unwrap();
+        let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ape = mpeg.ape().unwrap();
+        assert!(matches!(
+            ape.get("Ripper").map(|i| i.value()),
+            Some(ItemValue::Text(t)) if t == "kept"
+        ));
+        assert!(ape.get("REPLAYGAIN_TRACK_GAIN").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ratings_and_comments_lofty_cant_name_stay_as_written() {
+        let dir = std::env::temp_dir().join(format!("coversync-ratings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "RATING:MusicBee=80", "RATING=60", "=legacy"],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        // A provider's rating under its own key and scale, and a bare one.
+        assert!(has(&items, "RATING:MusicBee", "80"), "{items:?}");
+        assert!(has(&items, "RATING", "60"), "{items:?}");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|(k, _)| k.starts_with("RATING"))
+                .count(),
+            2
+        );
+        assert!(has(&items, "GENRE", "Anime"));
+        // A comment with no name, as read.
+        assert!(has(&items, "", "legacy"), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_urls_and_untouched_tags_are_kept() {
+        use lofty::id3::v2::{Frame, FrameId, Id3v2Tag, UrlLinkFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-id3url-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        wav_with_info(&src);
+        // A RIFF INFO item lofty has no key for, beside the ID3v2 tag.
+        let mut f = fs::File::open(&src).unwrap();
+        let mut wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut info = wav.remove_riff_info().unwrap();
+        info.insert("IXYZ".into(), "kept".into());
+        info.save_to_path(&src, WriteOptions::default()).unwrap();
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert(Frame::Url(UrlLinkFrame::new(
+            FrameId::new("WOAR").unwrap(),
+            "https://example.com/artist",
+        )));
+        id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let tag = wav.id3v2().unwrap();
+        assert!(tag.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Url(url) if url.url() == "https://example.com/artist"
+        )));
+        assert_eq!(tag.track(), Some(1));
+        // The RIFF INFO tag wasn't touched.
+        assert_eq!(wav.riff_info().unwrap().get("IXYZ"), Some("kept"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mp4_atoms_lofty_has_no_key_for_are_kept() {
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Mp4File};
+        let dir = std::env::temp_dir().join(format!("coversync-mp4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.m4a"), dir.join("out.m4a"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.m4a")).unwrap();
+        let mut ilst = lofty::mp4::Ilst::default();
+        ilst.set_title("Song".into());
+        ilst.insert(Atom::new(
+            AtomIdent::Freeform {
+                mean: "com.apple.iTunes".into(),
+                name: "CUSTOM".into(),
+            },
+            AtomData::UTF8("kept".into()),
+        ));
+        ilst.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let mp4 = Mp4File::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ilst = mp4.ilst().unwrap();
+        let custom = AtomIdent::Freeform {
+            mean: "com.apple.iTunes".into(),
+            name: "CUSTOM".into(),
+        };
+        let kept: Vec<&AtomData> = ilst.get(&custom).unwrap().data().collect();
+        assert!(
+            matches!(kept[..], [AtomData::UTF8(v)] if v == "kept"),
+            "{kept:?}"
+        );
+        assert_eq!(ilst.title().as_deref(), Some("Song"));
+        assert_eq!(ilst.track(), Some(1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ape_items_covers_and_numbers_are_kept_as_written() {
+        use lofty::ape::{ApeItem, ApeTag};
+        let dir = std::env::temp_dir().join(format!("coversync-ape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wv"), dir.join("out.wv"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(item("Title", ItemValue::Text("Song".into())));
+        ape.insert(item("Track", ItemValue::Text("A1".into())));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.insert(item(
+            "Cover Art (Front)",
+            ItemValue::Binary(b"front.jpg\0data".to_vec()),
+        ));
+        ape.insert(item("Compilation", ItemValue::Binary(vec![1])));
+        ape.insert(item("Disc", ItemValue::Binary(vec![2])));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("title", "New".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wv = lofty::wavpack::WavPackFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ape = wv.ape().unwrap();
+        let text = |k: &str| match ape.get(k).map(|i| i.value()) {
+            Some(ItemValue::Text(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        assert_eq!(text("Title"), Some("New"));
+        assert_eq!(text("Track"), Some("A1"));
+        assert_eq!(text("Ripper"), Some("kept"));
+        assert!(matches!(
+            ape.get("Disc").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == &[2]
+        ));
+        assert!(matches!(
+            ape.get("Compilation").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == &[1]
+        ));
+        assert!(matches!(
+            ape.get("Cover Art (Front)").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == b"front.jpg\0data"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A FLAC file with no Vorbis comments at all, behind `id3`.
+    fn flac_with_only_id3v2(path: &Path, id3: &lofty::id3::v2::Id3v2Tag) {
+        let mut b = Vec::new();
+        id3.dump_to(&mut b, WriteOptions::default()).unwrap();
+        b.extend(b"fLaC");
+        // STREAMINFO, the last block: 4096-sample blocks, 44.1 kHz, stereo, 16 bits.
+        b.extend([
+            0x80, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+        ]);
+        let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+        b.extend(packed.to_be_bytes());
+        b.extend([0u8; 16]);
+        b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn a_rating_from_another_tag_gets_its_providers_key() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, PopularimeterFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-popm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        // Two providers, and one whose name can't be a Vorbis field's.
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "MusicBee", 196, 0,
+        )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "Windows Media Player 9 Series",
+            255,
+            0,
+        )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "a=b@example.org",
+            128,
+            0,
+        )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "a|b@example.org",
+            128,
+            2,
+        )));
+        flac_with_only_id3v2(&path("in.flac"), &id3);
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let ratings: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|(k, _)| k.starts_with("RATING"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        // MusicBee's four stars on its Vorbis scale, under its key; Windows
+        // Media Player's on its own.
+        assert!(ratings.contains(&("RATING:MusicBee", "80")), "{ratings:?}");
+        assert!(
+            ratings.contains(&("RATING:Windows Media Player 9 Series", "255")),
+            "{ratings:?}"
+        );
+        // The third, as lofty read it (owner, stars, play count), under RATING.
+        assert!(
+            ratings.contains(&("RATING", "a=b@example.org|3|0")),
+            "{ratings:?}"
+        );
+        // One with "|" in its owner, under its own key on the default scale.
+        assert!(
+            ratings.contains(&("RATING:a|b@example.org", "60")),
+            "{ratings:?}"
+        );
+        assert_eq!(ratings.len(), 4, "{ratings:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn two_icons_of_one_kind_leave_the_file_unchanged() {
+        let dir = std::env::temp_dir().join(format!("coversync-icons-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(&path("in.flac"), &["TITLE=Song"]);
+        let icon = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            Picture::unchecked(png.into_inner())
+                .pic_type(PictureType::Icon)
+                .mime_type(lofty::picture::MimeType::Png)
+                .build()
+        };
+        // Lofty's own writer puts both in.
+        let mut file = probe(&path("in.flac"), true).unwrap();
+        let tag = primary_tag_mut(&mut file);
+        tag.push_picture(icon(2));
+        tag.push_picture(icon(3));
+        file.save_to_path(path("in.flac"), WriteOptions::default())
+            .unwrap();
+        let genre = [("genre", "Anime".to_string())];
+        let refused = copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false);
+        assert!(refused.unwrap_err().to_string().contains("two icons"));
+        assert!(!path("out.flac").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn unsynchronised_id3v2_frames_are_written_back_plainly() {
+        use lofty::id3::v2::Frame;
+        let dir = std::env::temp_dir().join(format!("coversync-unsync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        // Both the tag and its PRIV frame are unsynchronised: FF 00 00 and
+        // FF 00 E0 on disk decode to FF 00 and FF E0.
+        let tag = b"ID3\x04\x00\x80\x00\x00\x00\x1c\
+                    PRIV\x00\x00\x00\x12\x00\x02coversync\x00\x01\xff\x00\x00\xff\x00\xe0\x02";
+        wav_with_id3_chunk(&src, tag);
+        let private = |path: &Path| {
+            let mut f = fs::File::open(path).unwrap();
+            let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+            let id3 = wav.id3v2().unwrap();
+            let data = id3.into_iter().find_map(|frame| match frame {
+                Frame::Private(p) => Some(p.private_data.to_vec()),
+                _ => None,
+            });
+            (data, id3.flags().unsynchronisation)
+        };
+        let (read, was) = private(&src);
+        assert!(was, "the fixture is unsynchronised");
+        let expected: &[u8] = &[1, 0xFF, 0x00, 0xFF, 0xE0, 2];
+        assert_eq!(read.as_deref(), Some(expected));
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        // The data as lofty read it, in a tag no longer unsynchronised.
+        let (written, unsync) = private(&dest);
+        assert_eq!(written, read);
+        assert!(written.is_some());
+        assert!(!unsync);
+        assert_eq!(
+            read_kinds(&dest, false).unwrap().values["track_number"],
+            "1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ratings_keep_their_order_whatever_the_case_of_their_names() {
+        let dir = std::env::temp_dir().join(format!("coversync-rorder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "RATING:MusicBee=80", "rating:MusicBee=60"],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let ratings: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|(k, _)| k.to_ascii_uppercase().starts_with("RATING"))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            ratings,
+            [("RATING:MusicBee", "80"), ("rating:MusicBee", "60")]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn taking_ratings_out_leaves_the_other_comments_in_order() {
+        let dir = std::env::temp_dir().join(format!("coversync-corder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &[
+                "TITLE=Song",
+                "UPC=111",
+                "UPC=222",
+                "rating:MusicBee=60",
+                "=legacy",
+                "CDTOC=1+96",
+            ],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let kept: Vec<(&str, &str)> = items
+            .iter()
+            .filter(|(k, _)| ["UPC", "", "CDTOC", "rating:MusicBee"].contains(&k.as_str()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("UPC", "111"),
+                ("UPC", "222"),
+                ("", "legacy"),
+                ("CDTOC", "1+96"),
+                ("rating:MusicBee", "60"),
+            ]
+        );
+        // The blank that stood in for the rating isn't written.
+        assert!(items.iter().all(|(_, v)| !v.is_empty()), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn number_pairs_dont_reorder_the_other_comments() {
+        let dir = std::env::temp_dir().join(format!("coversync-npair-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            // In this order lofty's alias removal would swap the barcodes.
+            &[
+                "UPC=111",
+                "UPC=222",
+                "TOTALTRACKS=10",
+                "TRACKNUMBER=1/10",
+                "TITLE=Song",
+            ],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let upc: Vec<&str> = items
+            .iter()
+            .filter(|(k, _)| k == "UPC")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(upc, ["111", "222"]);
+        // Identify reads the same barcode from the file before and after.
+        assert_eq!(super::upc(&path("in.flac")).as_deref(), Some("111"));
+        assert_eq!(super::upc(&path("out.flac")).as_deref(), Some("111"));
+        // The numbers as coversync writes them, the alias under its usual name.
+        assert!(has(&items, "TRACKNUMBER", "1"));
+        assert!(has(&items, "TRACKTOTAL", "10"));
+        assert!(!items.iter().any(|(k, _)| k == "TOTALTRACKS"), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cleared_track_number_doesnt_come_back_from_its_old_name() {
+        let dir = std::env::temp_dir().join(format!("coversync-tracknum-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "TRACKNUM=2", "TRACKNUMBER=1", "UPC=111"],
+        );
+        // An unrelated edit: the number under its usual name only.
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("edit.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("edit.flac"));
+        assert!(has(&items, "TRACKNUMBER", "1"));
+        assert!(!items.iter().any(|(k, _)| k == "TRACKNUM"), "{items:?}");
+        // Next to a number that isn't one, the old name stays.
+        for (n, canonical) in ["TRACKNUMBER=A1", "TRACKNUMBER="].iter().enumerate() {
+            flac_with_comments(
+                &path(&format!("vinyl{n}.flac")),
+                &["TITLE=Song", "TRACKNUM=2", *canonical],
+            );
+            copy_with_tags(
+                &path(&format!("vinyl{n}.flac")),
+                &path(&format!("vinyl{n}-out.flac")),
+                &genre,
+                None,
+                false,
+            )
+            .unwrap();
+            let (_, items) = vorbis(&path(&format!("vinyl{n}-out.flac")));
+            assert!(has(&items, "TRACKNUM", "2"), "{canonical}: {items:?}");
+        }
+        // Cleared: gone under both names.
+        let clear = [("track_number", String::new())];
+        copy_with_tags(&path("in.flac"), &path("clear.flac"), &clear, None, false).unwrap();
+        let (_, items) = vorbis(&path("clear.flac"));
+        assert!(
+            !items.iter().any(|(k, _)| k.starts_with("TRACKNUM")),
+            "{items:?}"
+        );
+        assert!(has(&items, "UPC", "111"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flac_with_only_id3v2_gets_no_empty_comment_block() {
+        use lofty::id3::v2::Id3v2Tag;
+        let dir = std::env::temp_dir().join(format!("coversync-noblock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        // Only a length (TLEN), which Vorbis comments have no field for.
+        let mut generic = Tag::new(TagType::Id3v2);
+        generic.insert_text(ItemKey::Length, "1000".into());
+        let id3: Id3v2Tag = generic.into();
+        flac_with_only_id3v2(&path("in.flac"), &id3);
+        assert_eq!(
+            read_kinds(&path("in.flac"), false).unwrap().values["length"],
+            "1000"
+        );
+        // Clearing a genre it doesn't have.
+        let clear = [("genre", String::new())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &clear, None, false).unwrap();
+        let mut f = fs::File::open(path("out.flac")).unwrap();
+        let flac = lofty::flac::FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        assert!(flac.vorbis_comments().is_none());
+        assert_eq!(
+            read_kinds(&path("out.flac"), false).unwrap().values["length"],
+            "1000"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_the_rating_clears_every_rating() {
+        let dir = std::env::temp_dir().join(format!("coversync-rclear-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            &["TITLE=Song", "RATING=80", "rating:MusicBee=60", "UPC=111"],
+        );
+        let clear = [("rating", String::new())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &clear, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        assert!(
+            items
+                .iter()
+                .all(|(k, _)| !k.to_ascii_uppercase().starts_with("RATING")),
+            "{items:?}"
+        );
+        assert!(has(&items, "UPC", "111"));
+        // A file whose only comment was its rating keeps its comment block,
+        // vendor string and all.
+        flac_with_comments(&path("only.flac"), &["RATING=80"]);
+        copy_with_tags(
+            &path("only.flac"),
+            &path("only-out.flac"),
+            &clear,
+            None,
+            false,
+        )
+        .unwrap();
+        let (vendor, items) = vorbis(&path("only-out.flac"));
+        assert_eq!(vendor, "coversync");
+        assert!(items.is_empty(), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `wav_with_info`'s WAV with `id3` as its ID3 chunk.
+    #[cfg(feature = "server")]
+    fn wav_with_id3_chunk(path: &Path, id3: &[u8]) {
+        wav_with_info(path);
+        let mut wav = fs::read(path).unwrap();
+        wav.extend_from_slice(b"ID3 ");
+        wav.extend_from_slice(&(id3.len() as u32).to_le_bytes());
+        wav.extend_from_slice(id3);
+        // RIFF pads an odd-sized chunk; its size doesn't count the pad.
+        if id3.len() % 2 == 1 {
+            wav.push(0);
+        }
+        let riff_size = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        fs::write(path, wav).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_frames_lofty_cant_write_back_leave_the_file_unchanged() {
+        let dir = std::env::temp_dir().join(format!("coversync-id3refuse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let values = [("track_number", "1".to_string())];
+        // ID3v2.4: a PRIV frame with a data length indicator (flags 00 01),
+        // its payload led by the four-byte length.
+        let src = dir.join("dli.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x1e\
+              PRIV\x00\x00\x00\x14\x00\x01\x00\x00\x00\x10coversync\x00\x01\x02\x03\x04\x05\x06",
+        );
+        let refused = copy_with_tags(&src, &dir.join("dli-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("length-prefixed"));
+        assert!(!dir.join("dli-out.wav").exists());
+        // ID3v2.2: a title, and an XYZ frame with no ID3v2.4 name.
+        let src = dir.join("v22.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x02\x00\x00\x00\x00\x00\x14TT2\x00\x00\x05\x00SongXYZ\x00\x00\x03abc",
+        );
+        let refused = copy_with_tags(&src, &dir.join("v22-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("XYZ"));
+        assert!(!dir.join("v22-out.wav").exists());
+        // ID3v2.3: a chapter by times, holding an XYZ frame with no ID3v2.4
+        // name.
+        let src = dir.join("nested.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x03\x00\x00\x00\x00\x00\x2b\
+              CHAP\x00\x00\x00\x21\x00\x00ch0\x00\
+              \x00\x00\x00\x00\x00\x00\x03\xe8\xff\xff\xff\xff\xff\xff\xff\xff\
+              XYZ\x00\x00\x00\x00\x03\x00\x00abc",
+        );
+        let refused = copy_with_tags(&src, &dir.join("nested-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("XYZ"));
+        assert!(!dir.join("nested-out.wav").exists());
+        // ID3v2.4: a chapter by byte offsets (0 to 100).
+        let src = dir.join("offsets.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x1e\
+              CHAP\x00\x00\x00\x14\x00\x00ch0\x00\
+              \x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x00\x00\x00\x64",
+        );
+        let refused = copy_with_tags(&src, &dir.join("offsets-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("byte offsets"));
+        assert!(!dir.join("offsets-out.wav").exists());
+        // ID3v2.4: a seek index (ASPI) with no index points.
+        let src = dir.join("aspi.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x15\
+              ASPI\x00\x00\x00\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08",
+        );
+        let refused = copy_with_tags(&src, &dir.join("aspi-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("ASPI"));
+        assert!(!dir.join("aspi-out.wav").exists());
+        // ID3v2.4: two root tables of contents, each empty.
+        let src = dir.join("ctoc.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x22\
+              CTOC\x00\x00\x00\x07\x00\x00toc1\x00\x03\x00\
+              CTOC\x00\x00\x00\x07\x00\x00toc2\x00\x03\x00",
+        );
+        let refused = copy_with_tags(&src, &dir.join("ctoc-out.wav"), &values, None, false);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("second root table of contents (toc2)")
+        );
+        assert!(!dir.join("ctoc-out.wav").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn a_chapter_by_times_is_kept() {
+        use lofty::id3::v2::Frame;
+        let dir = std::env::temp_dir().join(format!("coversync-chap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        // ID3v2.4: chapter ch0, 0 to 1000 ms, no byte offsets, titled Intro.
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x2e\
+              CHAP\x00\x00\x00\x24\x00\x00ch0\x00\
+              \x00\x00\x00\x00\x00\x00\x03\xe8\xff\xff\xff\xff\xff\xff\xff\xff\
+              TIT2\x00\x00\x00\x06\x00\x00\x03Intro",
+        );
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let chapter = wav
+            .id3v2()
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame {
+                Frame::Chapter(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("the chapter");
+        assert_eq!(chapter.id, "ch0");
+        assert_eq!(chapter.times, 0..1000);
+        assert_eq!(chapter.offsets, u32::MAX..u32::MAX);
+        let title = chapter.children.iter().find_map(|f| match f {
+            Frame::Text(t) => Some(t.value.to_string()),
+            _ => None,
+        });
+        assert_eq!(title.as_deref(), Some("Intro"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn id3v2_frames_lofty_has_no_key_for_are_kept() {
+        use lofty::id3::v2::{Frame, Id3v2Tag, PrivateFrame};
+        let dir = std::env::temp_dir().join(format!("coversync-id3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
+        wav_with_info(&src);
+        // WAV's primary tag: ID3v2, with a user text frame and a private one.
+        let mut id3 = Id3v2Tag::new();
+        id3.set_title("Song".into());
+        id3.insert_user_text("CUSTOM".into(), "kept".into());
+        id3.insert(Frame::Private(PrivateFrame::new(
+            "coversync",
+            vec![1, 2, 3],
+        )));
+        id3.save_to_path(&src, WriteOptions::default()).unwrap();
+        let values = [("track_number", "1".to_string())];
+        copy_with_tags(&src, &dest, &values, None, false).unwrap();
+        let mut f = fs::File::open(&dest).unwrap();
+        let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let tag = wav.id3v2().unwrap();
+        assert_eq!(tag.get_user_text("CUSTOM"), Some("kept"));
+        assert!(tag.into_iter().any(|frame| matches!(
+            frame,
+            Frame::Private(private)
+                if private.owner == "coversync" && private.private_data.as_ref() == [1, 2, 3]
+        )));
+        assert_eq!(tag.title().as_deref(), Some("Song"));
+        assert_eq!(tag.track(), Some(1));
         let _ = fs::remove_dir_all(&dir);
     }
 
