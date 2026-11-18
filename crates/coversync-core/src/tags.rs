@@ -1071,8 +1071,7 @@ impl Drop for Prepared {
 /// A new file beside `path`, under a name no file had (made so: never
 /// replacing one, or following a link there), short, and keeping `path`'s
 /// extension last, as lofty picks the format from it. Only its owner can
-/// read it until it has the file's permissions. Copies a coversyncd that
-/// stopped mid-save left beside it go first (see [`clear_abandoned`]).
+/// read it until it has the file's permissions.
 fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1080,9 +1079,6 @@ fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    if let Some(dir) = path.parent() {
-        clear_abandoned(dir);
-    }
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let id = format!("{:x}-{n:x}", std::process::id());
@@ -1102,42 +1098,25 @@ fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
     }
 }
 
-/// Remove the copies [`new_beside`] made in `dir` for a process that isn't
-/// this one: a coversyncd that stopped mid-save. This one's are a save's
-/// under way, and saves (and imports, whose copies are named for their
-/// files) take turns, so what's left of either is abandoned. Only files of
-/// their own go, by name, never what a link there leads to.
-fn clear_abandoned(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(id) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix(".coversync-tmp-"))
-            .and_then(|n| n.split('.').next())
-        else {
-            continue;
-        };
-        let Some((pid, n)) = id.split_once('-') else {
-            continue;
-        };
-        let (Ok(pid), Ok(_)) = (u32::from_str_radix(pid, 16), u64::from_str_radix(n, 16)) else {
-            continue;
-        };
-        if pid != std::process::id() && e.file_type().is_ok_and(|t| t.is_file()) {
-            let _ = fs::remove_file(e.path());
-        }
-    }
-}
-
 /// [`write_with_kinds`]'s edit, written to a copy beside the file (see
 /// [`Prepared`]): everything that can refuse it does so here.
 pub fn prepare_with_kinds(
     path: &Path,
     edit: &TagEdit,
     kinds: &[(&str, String)],
+) -> Result<Prepared> {
+    prepare_owned(path, edit, kinds, |_| Ok(()))
+}
+
+/// [`prepare_with_kinds`], telling `owner` the copy's name as soon as it
+/// exists, before any of the file is copied: coversyncd records it, so a
+/// copy left by a coversyncd that stopped meanwhile can be found and
+/// removed (and nothing else by its name). A copy `owner` refuses goes.
+pub fn prepare_owned(
+    path: &Path,
+    edit: &TagEdit,
+    kinds: &[(&str, String)],
+    owner: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<Prepared> {
     let mut source = fs::File::open(path)?;
     let (copy, mut file) = new_beside(path)?;
@@ -1147,6 +1126,7 @@ pub fn prepare_with_kinds(
         copy,
         done: false,
     };
+    owner(&prepared.copy)?;
     io::copy(&mut source, &mut file)?;
     file.set_permissions(source.metadata()?.permissions())?;
     drop(file);
@@ -2315,32 +2295,38 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_prepared_copy_is_private_and_copies_a_stopped_coversyncd_left_go() {
+    fn a_prepared_copy_is_private_and_named_to_its_owner_first() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("coversync-prepare-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.flac");
         flac_with_comments(&path, &["TITLE=Song"]);
-        // Left by a coversyncd that stopped (process 1 is never this one).
-        let left = dir.join(".coversync-tmp-1-0.flac");
-        fs::write(&left, "an old copy").unwrap();
-        // This process's own, names it doesn't make, and a link.
-        let mine = dir.join(format!(".coversync-tmp-{:x}-ffff.flac", std::process::id()));
-        fs::write(&mine, "a copy under way").unwrap();
-        let notes = dir.join(".coversync-tmp-notes.txt");
-        fs::write(&notes, "notes").unwrap();
-        let link = dir.join(".coversync-tmp-2-0.flac");
-        std::os::unix::fs::symlink("a.flac", &link).unwrap();
         let (copy, _file) = new_beside(&path).unwrap();
         assert_eq!(
             fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!left.exists());
-        assert!(mine.exists() && notes.exists());
-        assert!(fs::symlink_metadata(&link).is_ok());
-        assert!(path.exists());
+        // Told before a byte is copied; a copy it refuses goes.
+        let edit = TagEdit {
+            title: Some("New".into()),
+            ..Default::default()
+        };
+        let mut told = None;
+        let prepared = prepare_owned(&path, &edit, &[], |c| {
+            told = Some((c.to_path_buf(), fs::metadata(c).unwrap().len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(told, Some((prepared.copy.clone(), 0)));
+        drop(prepared);
+        let mut refused = None;
+        let err = prepare_owned(&path, &edit, &[], |c| {
+            refused = Some(c.to_path_buf());
+            Err(Error::Invalid("no".into()))
+        });
+        assert!(err.is_err());
+        assert!(!refused.unwrap().exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

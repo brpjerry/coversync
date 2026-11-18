@@ -218,7 +218,7 @@ fn rename_new(
         Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
         r => return Ok(r?),
     }
-    match linkat(from_dir, from, to_dir, to, AtFlags::empty()) {
+    let linked = match linkat(from_dir, from, to_dir, to, AtFlags::empty()) {
         Ok(()) => {
             if let Err(e) = unlinkat(from_dir, from, AtFlags::empty()) {
                 let _ = unlinkat(to_dir, to, AtFlags::empty());
@@ -227,18 +227,39 @@ fn rename_new(
             return Ok(());
         }
         Err(Errno::EXIST) => return Err(Errno::EXIST.into()),
-        Err(_) => {}
-    }
+        Err(e) => e,
+    };
     if entry(to_dir, to)?.is_some() {
         return Err(Errno::EXIST.into());
     }
     if !entry(from_dir, from)?.is_some_and(|st| kind(&st) == FileType::Directory) {
+        let e = io::Error::from(linked);
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the Library's file system can't move a file without the risk of replacing another",
+            e.kind(),
+            format!(
+                "it can't be renamed without the risk of replacing another file, nor given a second name ({e})"
+            ),
         ));
     }
     Ok(renameat(from_dir, from, to_dir, to)?)
+}
+
+/// Whether a file in `dir` can move as a save moves one, never replacing
+/// another (see [`rename_new`]): tried on a file of its own, made and
+/// removed here.
+fn check_moves(dir: BorrowedFd<'_>) -> io::Result<()> {
+    let from = format!(".coversync-probe-{}", random_id());
+    let to = format!("{from}-moved");
+    drop(openat(
+        dir,
+        from.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?);
+    let moved = rename_new(dir, OsStr::new(&from), dir, OsStr::new(&to));
+    let made = if moved.is_ok() { &to } else { &from };
+    unlinkat(dir, made.as_str(), AtFlags::empty())?;
+    moved
 }
 
 /// A folder's entries and what each is, links not followed.
@@ -384,6 +405,7 @@ pub fn plan(
     // itself, so another name for it (a hard link) isn't taken for it.
     let mut leaving: HashSet<Leaving> = HashSet::new();
     let mut devices = Vec::new();
+    let mut checked = HashSet::new();
     for (from, _) in &moving {
         let (dir, name) = split(from)?;
         let fd = open_dir(root_fd, dir).map_err(|e| match Errno::from_io_error(&e) {
@@ -403,6 +425,13 @@ pub fn plan(
             return Err(Error::Invalid(format!("{} {why}.", from.display())));
         }
         let parent = io(fstat(&fd))?;
+        // Each file system once: one where a file can't move safely (see
+        // `rename_new`) is found out before any tags are written.
+        if checked.insert(parent.st_dev) {
+            check_moves(fd.as_fd()).map_err(|e| {
+                Error::Invalid(format!("Files in {} can't be moved: {e}.", dir.display()))
+            })?;
+        }
         leaving.insert((
             parent.st_dev,
             parent.st_ino,
@@ -442,10 +471,15 @@ pub fn plan(
                                 .or_insert(spellings(fd.as_fd())?),
                         };
                         if !names.contains(n) {
-                            let other = names
+                            let Some(other) = names
                                 .iter()
                                 .find(|m| key(Path::new(m), true) == key(Path::new(n), true))
-                                .map_or(n, OsString::as_os_str);
+                            else {
+                                return Err(Error::Invalid(format!(
+                                    "The folder structure says {}, and a folder there answers to that name under another spelling: a save doesn't change a folder name's spelling.",
+                                    at.display()
+                                )));
+                            };
                             return Err(Error::Invalid(format!(
                                 "The folder structure says {}, but the folder there is {}: a save doesn't change a folder name's case.",
                                 at.display(),
@@ -695,7 +729,16 @@ fn movable(
     let mut names = Vec::new();
     for (name, kind) in list(dir).ok()? {
         let path = rel.join(&name);
-        if own(&name) || to.starts_with(&path) {
+        if own(&name) {
+            continue;
+        }
+        // The way down to `to` stays, but audio there that isn't the
+        // album's keeps the rest in place too.
+        if to.starts_with(&path) {
+            if kind == FileType::Directory {
+                let sub = openat(dir, &name, DIR, Mode::empty()).ok()?;
+                departing_audio(sub.as_fd(), &path, departing)?;
+            }
             continue;
         }
         match kind {
@@ -826,6 +869,15 @@ fn step(
     let what = |e: io::Error| (e, format!("{} to {}", r.from, r.to));
     let (dir, name) = split(Path::new(&r.from)).map_err(what)?;
     let fd = open_dir(root, dir).map_err(what)?;
+    // The file recorded, not one put in its place since (a link, say).
+    let source = match (&r.staged, aside) {
+        (Some(staged), false) => OsStr::new(staged),
+        _ => name,
+    };
+    match entry(fd.as_fd(), source).map_err(what)? {
+        Some(st) if st.st_dev == r.dev && st.st_ino == r.ino => {}
+        _ => return Err(what(io::Error::other("it was replaced meanwhile"))),
+    }
     match (&r.staged, aside) {
         (Some(staged), true) => rename_new(fd.as_fd(), name, fd.as_fd(), OsStr::new(staged)),
         (staged, _) => {
@@ -988,7 +1040,10 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> V
         else {
             continue;
         };
-        if !matches!(at(to_dir, to_name, r), Ok(true)) {
+        // One that never left has no other place to come back from.
+        if matches!(at(from_dir, from_name, r), Ok(true))
+            || !matches!(at(to_dir, to_name, r), Ok(true))
+        {
             continue;
         }
         let back = r.staged.as_deref().map_or(from_name, OsStr::new);
@@ -1023,16 +1078,34 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> V
             unsettled.push(r.seq);
             continue;
         };
-        let mut places = vec![at(from_dir, from_name, r)];
-        if !matches!(places[0], Ok(true)) {
-            places.push(at(to_dir, to_name, r));
-            if let Some(staged) = &r.staged {
-                places.push(at(from_dir, OsStr::new(staged), r));
+        let mut others = vec![(to_dir, to_name)];
+        if let Some(staged) = &r.staged {
+            others.push((from_dir, OsStr::new(staged)));
+        }
+        match at(from_dir, from_name, r) {
+            // Back. Another name it has where it went (a move stopped
+            // between giving it a second name and dropping the first) goes:
+            // a scan would take it for another track.
+            Ok(true) => {
+                for (dir, name) in others {
+                    if matches!(at(dir, name, r), Ok(true))
+                        && let Err(e) = open_dir(root, dir)
+                            .and_then(|fd| Ok(unlinkat(&fd, name, AtFlags::empty())?))
+                    {
+                        tracing::warn!(path = %r.from, "couldn't remove a second name for a file put back: {e}");
+                    }
+                }
             }
-            match places[1..].iter().any(|p| !matches!(p, Ok(false))) {
+            // Not back: settled only when it's nowhere at all.
+            Ok(false) => match others
+                .iter()
+                .any(|(dir, name)| !matches!(at(dir, name, r), Ok(false)))
+            {
                 true => unsettled.push(r.seq),
                 false => tracing::warn!(path = %r.from, "a moved file is gone"),
-            }
+            },
+            // Its own place can't be looked in: it may well be there.
+            Err(_) => unsettled.push(r.seq),
         }
     }
     unmake(root, made);
@@ -1140,6 +1213,12 @@ mod tests {
         lib: Library,
     }
 
+    impl Scratch {
+        fn root_fd(&self) -> OwnedFd {
+            open_root(&self.root).unwrap()
+        }
+    }
+
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
@@ -1241,6 +1320,15 @@ mod tests {
             }]
         );
         assert!(p.companions.is_empty());
+        // What planning tried a move on is gone.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with(".coversync")),
+            "{names:?}"
+        );
         apply(&s.lib, &p).unwrap();
         assert_eq!(read(&dir.join("01 - Uno.flac")), "one");
         assert_eq!(read(&dir.join("cover.jpg")), "art");
@@ -1384,6 +1472,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.tracks.len(), 1);
+    }
+
+    /// A record of `from` (relative) moving to `to`, as the file `from` is.
+    fn record_of(
+        s: &Scratch,
+        seq: i64,
+        from: &str,
+        staged: Option<String>,
+        to: &str,
+    ) -> MoveRecord {
+        use std::os::unix::fs::MetadataExt;
+        let st = fs::symlink_metadata(s.root.join(from)).unwrap();
+        MoveRecord {
+            seq,
+            from: from.into(),
+            staged,
+            to: to.into(),
+            dev: st.dev(),
+            ino: st.ino(),
+        }
+    }
+
+    #[test]
+    fn a_move_stopped_between_two_names_leaves_one_after_recovery() {
+        // Where renames can't refuse to replace, a move gives a second name
+        // and drops the first; coversyncd stopped in between.
+        let s = scratch("two-names");
+        let batch = "00000000000000dd";
+        let staged = staged_name(batch, 0);
+        touch(&s.root.join("A").join(&staged), "x");
+        let r = MoveRecord {
+            from: "A/01 - X.flac".into(),
+            ..record_of(
+                &s,
+                0,
+                &format!("A/{staged}"),
+                Some(staged.clone()),
+                "B/01 - X.flac",
+            )
+        };
+        fs::create_dir_all(s.root.join("B")).unwrap();
+        fs::hard_link(s.root.join("A").join(&staged), s.root.join("B/01 - X.flac")).unwrap();
+        // And one of the album's other files, given its new name too.
+        touch(&s.root.join("A/cover.jpg"), "art");
+        let cover = record_of(&s, 1, "A/cover.jpg", None, "B/cover.jpg");
+        fs::hard_link(s.root.join("A/cover.jpg"), s.root.join("B/cover.jpg")).unwrap();
+        s.lib.record_moves(batch, &[r, cover]).unwrap();
+        assert_eq!(
+            recover(&s.lib).unwrap(),
+            Recovered {
+                put_back: 2,
+                stuck: 0
+            }
+        );
+        assert_eq!(read(&s.root.join("A/01 - X.flac")), "x");
+        assert_eq!(read(&s.root.join("A/cover.jpg")), "art");
+        assert!(!s.root.join("A").join(&staged).exists());
+        assert!(!s.root.join("B/01 - X.flac").exists());
+        assert!(!s.root.join("B/cover.jpg").exists());
+    }
+
+    #[test]
+    fn a_place_that_cant_be_looked_in_keeps_its_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch("unreadable");
+        touch(&s.root.join("A/Locked/cover.jpg"), "art");
+        let r = record_of(&s, 0, "A/Locked/cover.jpg", None, "B/cover.jpg");
+        let locked = s.root.join("A/Locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Someone who can look in anyway (root) can't test this.
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        s.lib.record_moves("00000000000000ee", &[r]).unwrap();
+        let done = recover(&s.lib);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            done.unwrap(),
+            Recovered {
+                put_back: 0,
+                stuck: 1
+            }
+        );
+        assert_eq!(s.lib.recorded_moves().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_file_replaced_after_it_was_recorded_isnt_moved() {
+        let s = scratch("replaced");
+        touch(&s.root.join("A/01 - X.flac"), "x");
+        let r = MoveRecord {
+            ino: 1,
+            ..record_of(
+                &s,
+                0,
+                "A/01 - X.flac",
+                Some(staged_name("00000000000000ff", 0)),
+                "B/01 - X.flac",
+            )
+        };
+        let err = step(s.root_fd().as_fd(), &r, true, &mut Vec::new()).unwrap_err();
+        assert!(err.0.to_string().contains("replaced meanwhile"), "{err:?}");
+        assert_eq!(read(&s.root.join("A/01 - X.flac")), "x");
+        assert_eq!(fs::read_dir(s.root.join("A")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn other_audio_on_the_way_into_a_folder_inside_keeps_the_cover() {
+        let s = scratch("way-down");
+        let rec = s.root.join("A/Record");
+        touch(&rec.join("01 - X.flac"), "x");
+        touch(&rec.join("cover.jpg"), "art");
+        touch(&rec.join("New/01 - Other.flac"), "another album's");
+        let t = Template::parse("{album_artist}/Record/{album}/{track_number} - {title}").unwrap();
+        let files = [(rec.join("01 - X.flac"), track("A", "New", "2", "X"))];
+        let p = plan(&t, &s.root, &files).unwrap();
+        assert_eq!(p.tracks.len(), 1);
+        assert!(p.companions.is_empty(), "{p:?}");
     }
 
     #[test]

@@ -590,21 +590,19 @@
 		await loadAlbums();
 		dataGeneration++;
 	}
-	/** A scan ended: show what it found. */
-	function scanFinished() {
+	/**
+	 * A scan ended: show what it found. One that stopped short may still have
+	 * indexed some files, but uploads done before it haven't all been scanned.
+	 */
+	function scanEnded(scan: Status['scan']) {
+		if (scan.phase === 'failed') toast('The scan didn’t finish: see coversyncd’s log.', 'error');
 		// Uploads finished before it have their albums in the Inbox now, if any.
-		uploads.scanFinished();
+		else uploads.scanFinished();
 		dataGeneration++;
 		// The Inbox folder may have come or gone; the empty Inbox's message says which.
 		inboxSetup.refresh();
 		// The Library may have changed, and with it what devices have left to sync.
 		devices.readSyncAll();
-		return loadAlbums();
-	}
-	/** A scan ended, or stopped short: then uploads done before it haven't been scanned. */
-	function scanEnded(scan: Status['scan']) {
-		if (scan.phase !== 'failed') return scanFinished();
-		toast('The scan didn’t finish: see coversyncd’s log.', 'error');
 		return loadAlbums();
 	}
 

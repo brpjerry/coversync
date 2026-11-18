@@ -933,6 +933,19 @@ pub struct MoveRecord {
     pub ino: u64,
 }
 
+/// A copy a tag save is making beside a file (see `tags::prepare_owned`),
+/// recorded in the local database while it exists, so one a coversyncd
+/// that stopped left is found again, by this name and as this file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedCopy {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// The setting holding the [`PreparedCopy`]s of the save under way.
+const PREPARED_COPIES: &str = "prepared_copies";
+
 /// The setting holding [`Library::tag_reader`].
 const TAG_READER: &str = "tag_reader";
 
@@ -2462,6 +2475,33 @@ impl Library {
             }
         }
         Ok(batches)
+    }
+
+    /// Record a copy a save is making (see [`PreparedCopy`]).
+    pub fn record_copy(&self, copy: PreparedCopy) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut copies: Vec<PreparedCopy> =
+            get_setting(&tx, "main", PREPARED_COPIES)?.unwrap_or_default();
+        copies.push(copy);
+        put_setting(&tx, "main", PREPARED_COPIES, &copies)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The copies recorded and not yet forgotten: a save's under way, or,
+    /// before one starts (saves take turns), ones a stopped coversyncd left.
+    pub fn recorded_copies(&self) -> Result<Vec<PreparedCopy>> {
+        Ok(get_setting(&self.conn(), "main", PREPARED_COPIES)?.unwrap_or_default())
+    }
+
+    /// Forget every recorded copy: they're in place or gone.
+    pub fn forget_copies(&self) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM main.settings WHERE key = ?1",
+            [PREPARED_COPIES],
+        )?;
+        Ok(())
     }
 
     /// Forget the covers of albums with no track left (a tag save's new

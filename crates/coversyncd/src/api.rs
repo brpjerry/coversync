@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use coversync_core::appearance::{self, AppearanceSetup};
 use coversync_core::art::{self, Art};
-use coversync_core::db::{CoverSource, FileStat};
+use coversync_core::db::{CoverSource, FileStat, PreparedCopy};
 use coversync_core::import::{self, ImportPlan, ImportResult};
 use coversync_core::scan;
 use coversync_core::scan::Progress;
@@ -1158,6 +1158,7 @@ async fn write_tags(
         // The files are checked, written, moved and indexed before the tag
         // editor can read them again (see `tag_files`).
         let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+        reclaim_copies(&s.lib)?;
         if collection == Collection::Library {
             // Moves a save made and never indexed go back first, before any
             // file is looked at where the index has it.
@@ -1200,7 +1201,10 @@ async fn write_tags(
                 .lib
                 .track_root(*track)?
                 .ok_or(coversync_core::Error::NotFound)?;
-            let copy = tags::prepare_with_kinds(&path, edit, kinds).map_err(|e| named(&path, e))?;
+            // Recorded as soon as it exists, so one left by coversyncd
+            // stopping before it's in place or gone is found again.
+            let copy = tags::prepare_owned(&path, edit, kinds, |copy| record_copy(&s.lib, copy))
+                .map_err(|e| named(&path, e))?;
             prepared.push((*track, root, copy));
         }
         // Where the folder structure puts the album's files, with their tags
@@ -1252,6 +1256,8 @@ async fn write_tags(
                 }
             }
         }
+        // Every copy is in place or gone (those after a failure with it).
+        s.lib.forget_copies()?;
         let count = written.len();
         // Then the files go where their tags now put them, and the index
         // follows, before a stream can look for one (see `moving`).
@@ -1399,6 +1405,43 @@ async fn write_tags(
     .await;
     crate::release_memory();
     saved?.map(Json)
+}
+
+/// Record a copy a save is making, as the file it is (see `PreparedCopy`).
+fn record_copy(lib: &coversync_core::Library, copy: &FsPath) -> coversync_core::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(copy)?;
+    match copy.to_str() {
+        Some(path) => lib.record_copy(PreparedCopy {
+            path: path.into(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Remove the copies saves recorded and never put in place or took away
+/// (coversyncd stopped meanwhile), each only while it's the file recorded:
+/// nothing else is removed by its name. Saves take turns, so before one
+/// starts, every copy recorded is one of these.
+fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for copy in lib.recorded_copies()? {
+        let path = FsPath::new(&copy.path);
+        let ours = std::fs::symlink_metadata(path)
+            .is_ok_and(|m| m.is_file() && m.dev() == copy.dev && m.ino() == copy.ino);
+        if ours {
+            match std::fs::remove_file(path) {
+                Ok(()) => tracing::info!(path = copy.path, "removed a copy a stopped save left"),
+                Err(e) => tracing::warn!(
+                    path = copy.path,
+                    "couldn't remove a copy a stopped save left: {e}"
+                ),
+            }
+        }
+    }
+    lib.forget_copies()
 }
 
 #[cfg(test)]
@@ -1797,6 +1840,38 @@ mod tests {
         state.lib.forget_moves("00000000000000cc", None).unwrap();
         let p = scanned(&state).await;
         assert_eq!(p.phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_copy_a_stopped_save_left_goes_and_nothing_else_by_its_name() {
+        let (state, inbox) = editing_daemon("copies-left");
+        let album = detail(&state, "Record");
+        // A save that stopped once its copy was made: no cleanup ran.
+        let file = inbox.join("Record/01.flac");
+        let left = tags::prepare_owned(&file, &genre("Rock"), &[], |c| record_copy(&state.lib, c))
+            .unwrap();
+        let copy = left.copy.clone();
+        std::mem::forget(left);
+        assert!(copy.is_file());
+        // A recorded name that's another file now, and one named like a copy.
+        let other = inbox.join("Record/.coversync-tmp-dead-1.flac");
+        std::fs::write(&other, "someone's").unwrap();
+        state
+            .lib
+            .record_copy(PreparedCopy {
+                path: other.to_str().unwrap().into(),
+                dev: 0,
+                ino: 0,
+            })
+            .unwrap();
+        let backup = inbox.join("Record/.coversync-tmp-dead-1.flac.backup");
+        std::fs::write(&backup, "a backup").unwrap();
+        put(&state, &album.album.id, edit(genre("Jazz")))
+            .await
+            .unwrap();
+        assert!(!copy.exists(), "the copy left goes");
+        assert!(other.exists() && backup.exists(), "nothing else does");
+        assert!(state.lib.recorded_copies().unwrap().is_empty());
     }
 
     #[tokio::test]
