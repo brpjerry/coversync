@@ -43,6 +43,8 @@ pub struct Plan {
     pub tracks: Vec<Move>,
     /// Its other files and folders that follow them.
     pub companions: Vec<Move>,
+    /// How many files each of `companions` is (a folder can hold several).
+    companion_files: Vec<usize>,
 }
 
 impl Plan {
@@ -59,6 +61,8 @@ pub struct Applied {
     pub batch: String,
     pub tracks: Vec<Move>,
     pub companions: Vec<Move>,
+    /// The files moved, the album's other files counted one by one.
+    pub files: usize,
 }
 
 const DIR: OFlags = OFlags::RDONLY
@@ -66,11 +70,40 @@ const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-/// Names that are coversync's own: its database's folder, and files a save
-/// keeps beside the album's while it works (`.coversync-tmp-*` copies and
+/// Names that are coversync's own, in any case: its database's folder,
+/// uploads being staged, a device's own folder, and files a save keeps
+/// beside the album's while it works (`.coversync-tmp-*` copies and
 /// `.coversync-move-*` files waiting to move).
 fn own(name: &OsStr) -> bool {
-    name.as_bytes().starts_with(b".coversync")
+    name.as_bytes()
+        .to_ascii_lowercase()
+        .starts_with(b".coversync")
+}
+
+/// Why a scan wouldn't find a file at `to` (relative to the Library folder),
+/// if it wouldn't: it skips file names starting with a dot, and coversync's
+/// own folders. (Other folders starting with a dot, `.38 Special` say, it
+/// looks in.)
+fn unscanned(to: &Path) -> Option<&'static str> {
+    let mut parts = to.components().peekable();
+    while let Some(part) = parts.next() {
+        let Component::Normal(name) = part else {
+            return Some("a name that isn't one");
+        };
+        if parts.peek().is_none() {
+            if name.as_bytes().starts_with(b".") {
+                return Some("a file name starting with a dot");
+            }
+        } else if own(name) {
+            return Some("a folder name coversync keeps for itself");
+        }
+    }
+    None
+}
+
+/// The name a moving track waits under, beside where it was.
+fn staged_name(batch: &str, seq: i64) -> String {
+    format!(".coversync-move-{batch}-{seq}")
 }
 
 fn not_in_library(path: &Path) -> io::Error {
@@ -116,17 +149,39 @@ fn open_dir(root: BorrowedFd<'_>, rel: &Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// [`open_dir`], making the folders missing on the way.
-fn make_dirs(root: BorrowedFd<'_>, rel: &Path) -> io::Result<OwnedFd> {
+/// [`open_dir`], making the folders missing on the way (noted in `made`).
+fn make_dirs(root: BorrowedFd<'_>, rel: &Path, made: &mut Vec<PathBuf>) -> io::Result<OwnedFd> {
     let mut fd = openat(root, ".", DIR, Mode::empty())?;
+    let mut at = PathBuf::new();
     for name in names(rel)? {
+        at.push(name);
         match mkdirat(&fd, name, Mode::from_raw_mode(0o777)) {
-            Ok(()) | Err(Errno::EXIST) => {}
+            Ok(()) => made.push(at.clone()),
+            Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
         fd = openat(&fd, name, DIR, Mode::empty())?;
     }
     Ok(fd)
+}
+
+/// Write each of `dirs` (relative to the Library folder) and the folders
+/// above it to disk: the names moves gave and took are there, should the
+/// power go, before the index says so. A folder gone is left out; one that
+/// fails is only logged, as its files are where they should be all the same.
+fn sync_dirs(root: BorrowedFd<'_>, dirs: impl IntoIterator<Item = PathBuf>) {
+    let mut all: BTreeSet<PathBuf> = BTreeSet::new();
+    for dir in dirs {
+        all.extend(dir.ancestors().map(Path::to_path_buf));
+    }
+    for dir in all {
+        let Ok(fd) = open_dir(root, &dir) else {
+            continue;
+        };
+        if let Err(e) = rustix::fs::fsync(&fd) {
+            tracing::warn!(dir = %dir.display(), "couldn't write the folder to disk: {e}");
+        }
+    }
 }
 
 /// What `name` in `dir` is, not following a link; None when there's nothing.
@@ -243,8 +298,8 @@ fn key(rel: &Path, folded: bool) -> String {
 /// leave. Refused, with what's wrong, when the structure needs a value a
 /// file doesn't have or a name a scan skips, two files would be one, a file
 /// would be where a folder has to be or land on one that stays, a link or
-/// another file system is in the way, or a file to move is a link that
-/// would break.
+/// another file system is in the way, or a file to move is a link to a path
+/// from its own folder.
 pub fn plan(
     template: &Template,
     root: &Path,
@@ -261,14 +316,9 @@ pub fn plan(
             .unwrap_or_default();
         match template.render(values, &extension) {
             Ok(to) => {
-                // A scan skips names starting with a dot (and `..` isn't a name).
-                let hidden = to.components().any(|c| match c {
-                    Component::Normal(n) => n.as_bytes().starts_with(b"."),
-                    _ => true,
-                });
-                if hidden {
+                if let Some(why) = unscanned(&to) {
                     return Err(Error::Invalid(format!(
-                        "The folder structure would put {file} at {}, where a scan wouldn't find it: no name in the path can start with a dot.",
+                        "The folder structure would put {file} at {}, where a scan wouldn't find it ({why}).",
                         to.display()
                     )));
                 }
@@ -329,10 +379,11 @@ pub fn plan(
         }
     }
 
-    // The files that move, as they are.
-    let mut leaving: HashSet<(u64, u64)> = HashSet::new();
+    // The files that move, as they are: each by its folder and itself, so
+    // another name for it elsewhere (a hard link) isn't taken for it.
+    let mut leaving: HashSet<Entry> = HashSet::new();
     let mut devices = Vec::new();
-    for (from, to) in &moving {
+    for (from, _) in &moving {
         let (dir, name) = split(from)?;
         let fd = open_dir(root_fd, dir).map_err(|e| match Errno::from_io_error(&e) {
             Some(Errno::LOOP | Errno::NOTDIR) => Error::Invalid(format!(
@@ -349,24 +400,30 @@ pub fn plan(
         })?;
         match kind(&st) {
             FileType::RegularFile => {}
-            FileType::Symlink => {
-                let target = io(readlinkat(&fd, name, Vec::new()))?;
-                if !target.as_bytes().starts_with(b"/") && to.parent() != from.parent() {
-                    return Err(Error::Invalid(format!(
-                        "{} is a link to a path from its own folder, which would lead elsewhere from another folder.",
-                        from.display()
-                    )));
-                }
+            // A link to a path from its own folder may lead elsewhere once
+            // it, or what it leads to, has moved.
+            FileType::Symlink
+                if !io(readlinkat(&fd, name, Vec::new()))?
+                    .as_bytes()
+                    .starts_with(b"/") =>
+            {
+                return Err(Error::Invalid(format!(
+                    "{} is a link to a path from its own folder, which a save doesn't move.",
+                    from.display()
+                )));
             }
+            FileType::Symlink => {}
             _ => {
                 return Err(Error::Invalid(format!("{} isn't a file.", from.display())));
             }
         }
-        leaving.insert((st.st_dev, st.st_ino));
-        devices.push(io(fstat(&fd))?.st_dev);
+        let parent = io(fstat(&fd))?;
+        leaving.insert((parent.st_dev, parent.st_ino, st.st_ino));
+        devices.push(parent.st_dev);
     }
 
     // Where they go: folders, or room for them, on the way, and room at the end.
+    let mut spelled: HashMap<PathBuf, Option<OsString>> = HashMap::new();
     for ((from, to), device) in moving.iter().zip(&devices) {
         let (dir, name) = split(to)?;
         let mut fd = io(openat(root_fd, ".", DIR, Mode::empty()))?;
@@ -378,8 +435,40 @@ pub fn plan(
                 whole = false;
                 break;
             };
+            let here = io(fstat(&fd))?;
             match kind(&st) {
-                FileType::Directory => fd = io(openat(&fd, n, DIR, Mode::empty()))?,
+                FileType::Directory => {
+                    // Where names fold, the folder found can be spelt
+                    // otherwise; the index would have it as the structure
+                    // spells it, and a scan as it is.
+                    if folded {
+                        let other = match spelled.get(&at) {
+                            Some(other) => other.clone(),
+                            None => {
+                                let found = list(fd.as_fd())?
+                                    .into_iter()
+                                    .map(|(name, _)| name)
+                                    .filter(|name| {
+                                        key(Path::new(name), true) == key(Path::new(n), true)
+                                    });
+                                let other = match found.clone().any(|name| name == n) {
+                                    true => None,
+                                    false => found.into_iter().next(),
+                                };
+                                spelled.insert(at.clone(), other.clone());
+                                other
+                            }
+                        };
+                        if let Some(other) = other {
+                            return Err(Error::Invalid(format!(
+                                "The folder structure says {}, but the folder there is {}: a save doesn't change a folder name's case.",
+                                at.display(),
+                                at.with_file_name(other).display()
+                            )));
+                        }
+                    }
+                    fd = io(openat(&fd, n, DIR, Mode::empty()))?;
+                }
                 FileType::Symlink => {
                     return Err(Error::Invalid(format!(
                         "{} is a link, which a save doesn't put files in.",
@@ -387,7 +476,7 @@ pub fn plan(
                     )));
                 }
                 // A file that moves away first leaves room for the folder.
-                _ if leaving.contains(&(st.st_dev, st.st_ino)) => {
+                _ if leaving.contains(&(here.st_dev, here.st_ino, st.st_ino)) => {
                     whole = false;
                     break;
                 }
@@ -399,7 +488,8 @@ pub fn plan(
                 }
             }
         }
-        if io(fstat(&fd))?.st_dev != *device {
+        let here = io(fstat(&fd))?;
+        if here.st_dev != *device {
             return Err(Error::Invalid(format!(
                 "{} would be on another file system than {}.",
                 to.display(),
@@ -408,7 +498,7 @@ pub fn plan(
         }
         if whole
             && let Some(st) = entry(fd.as_fd(), name)?
-            && !leaving.contains(&(st.st_dev, st.st_ino))
+            && !leaving.contains(&(here.st_dev, here.st_ino, st.st_ino))
         {
             return Err(Error::Invalid(format!("{} already exists.", to.display())));
         }
@@ -424,13 +514,16 @@ pub fn plan(
         from: root.join(from),
         to: root.join(to),
     };
-    plan.companions = companions(root_fd, &placed, &departing, &taken)
-        .iter()
-        .map(|(f, t)| absolute(f, t))
-        .collect();
+    for (from, to, files) in companions(root_fd, &placed, &departing, &taken) {
+        plan.companions.push(absolute(&from, &to));
+        plan.companion_files.push(files);
+    }
     plan.tracks = moving.iter().map(|(f, t)| absolute(f, t)).collect();
     Ok(plan)
 }
+
+/// A name in a folder: the folder's device and inode, and the file's inode.
+type Entry = (u64, u64, u64);
 
 /// The names the album's tracks will have, which its other files can't take.
 struct Taken<'a> {
@@ -440,35 +533,58 @@ struct Taken<'a> {
     folded: bool,
 }
 
-/// The album's other files that follow its tracks: from each folder whose
-/// tracks all go to one other folder (a track's folder, or the album folder
-/// a scan gives it, above disc folders), where nothing else would stay
-/// behind, each file and audio-free folder in it, to the same name there
-/// unless that's taken. A folder holding audio that stays, a link,
-/// something stranger, or what can't be listed keeps everything in it.
+/// The album's other files that follow its tracks, with how many files
+/// each is. A folder's go where its album goes (the album folder a scan
+/// gives it, above disc folders), or, for a folder that isn't one, where its
+/// tracks do, when that's one other folder: each file and audio-free folder
+/// in it, to the same name there unless that's taken. A folder holding
+/// audio that stays, a link, something stranger, or what can't be listed
+/// keeps everything in it; coversync's own folders are never looked in.
 fn companions(
     root: BorrowedFd<'_>,
     placed: &[(PathBuf, PathBuf)],
     departing: &HashSet<&Path>,
     taken: &Taken<'_>,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> Vec<(PathBuf, PathBuf, usize)> {
     let parent = |p: &Path| p.parent().unwrap_or(Path::new("")).to_path_buf();
-    let mut goes: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut by_folder: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut by_album: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
     for (from, to) in placed {
-        goes.entry(parent(from)).or_default().insert(parent(to));
-        goes.entry(scan::album_dir(from))
+        by_folder
+            .entry(parent(from))
+            .or_default()
+            .insert(parent(to));
+        by_album
+            .entry(scan::album_dir(from))
             .or_default()
             .insert(scan::album_dir(to));
+    }
+    let only = |to: BTreeSet<PathBuf>| {
+        let mut to = to.into_iter();
+        match (to.next(), to.next()) {
+            (Some(to), None) => Some(to),
+            _ => None,
+        }
+    };
+    let mut goes: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
+    for (from, to) in by_folder {
+        goes.insert(from, only(to));
+    }
+    // An album folder goes with its album, split or not, whatever its own
+    // tracks do (a flat album into disc folders, say).
+    for (from, to) in by_album {
+        goes.insert(from, only(to));
     }
     let mut out = Vec::new();
     let mut claimed: HashSet<String> = HashSet::new();
     for (from, to) in goes {
-        let mut to = to.into_iter();
-        let (Some(to), None) = (to.next(), to.next()) else {
-            continue;
-        };
-        // Not the Library folder's own files, nor into it.
-        if to == from || from.as_os_str().is_empty() || to.as_os_str().is_empty() {
+        let Some(to) = to else { continue };
+        // Not the Library folder's own files, nor into it, nor coversync's.
+        if to == from
+            || from.as_os_str().is_empty()
+            || to.as_os_str().is_empty()
+            || from.iter().any(own)
+        {
             continue;
         }
         let Ok(fd) = open_dir(root, &from) else {
@@ -497,7 +613,7 @@ fn companions(
         if fstat(&at).map(|st| st.st_dev).ok() != fstat(&fd).map(|st| st.st_dev).ok() {
             continue;
         }
-        for name in names {
+        for (name, files) in names {
             let dest = to.join(&name);
             let k = key(&dest, taken.folded);
             if taken.finals.contains_key(&k) || taken.folders.contains(&k) || claimed.contains(&k) {
@@ -507,24 +623,25 @@ fn companions(
                 continue;
             }
             claimed.insert(k);
-            out.push((from.join(&name), dest));
+            out.push((from.join(&name), dest, files));
         }
     }
     out
 }
 
-/// The names in the folder `dir` (`rel`) that can follow the album to `to`:
-/// its files that aren't audio and its folders with no audio at all. None
-/// when it all stays: there's audio there that isn't the album's moving
-/// away, a link or something stranger, or what can't be listed. coversync's
-/// own names, and the way down to `to` (an album moving into a folder of
+/// The names in the folder `dir` (`rel`) that can follow the album to `to`,
+/// with how many files each is: its files that aren't audio and its folders
+/// with no audio at all. None when it all stays: there's audio there that
+/// isn't the album's moving away, a link or something stranger, or what
+/// can't be listed. coversync's own names, names the move record can't hold
+/// (not UTF-8), and the way down to `to` (an album moving into a folder of
 /// its own inside this one), stay.
 fn movable(
     dir: BorrowedFd<'_>,
     rel: &Path,
     departing: &HashSet<&Path>,
     to: &Path,
-) -> Option<Vec<OsString>> {
+) -> Option<Vec<(OsString, usize)>> {
     let mut names = Vec::new();
     for (name, kind) in list(dir).ok()? {
         let path = rel.join(&name);
@@ -537,12 +654,14 @@ fn movable(
                     return None;
                 }
             }
-            FileType::RegularFile => names.push(name),
+            _ if name.to_str().is_none() => {}
+            FileType::RegularFile => names.push((name, 1)),
             FileType::Directory => {
                 let sub = openat(dir, &name, DIR, Mode::empty()).ok()?;
                 // A folder of tracks that move (a disc's) has its own way.
-                if !departing_audio(sub.as_fd(), &path, departing)? {
-                    names.push(name);
+                let (audio, files) = departing_audio(sub.as_fd(), &path, departing)?;
+                if !audio {
+                    names.push((name, files));
                 }
             }
             _ => return None,
@@ -551,10 +670,15 @@ fn movable(
     Some(names)
 }
 
-/// Whether the album's moving tracks are under `dir` (`rel`); None when
-/// something there keeps it all in place (see [`movable`]).
-fn departing_audio(dir: BorrowedFd<'_>, rel: &Path, departing: &HashSet<&Path>) -> Option<bool> {
-    let mut found = false;
+/// Whether the album's moving tracks are under `dir` (`rel`), and how many
+/// other files are; None when something there keeps it all in place (see
+/// [`movable`]).
+fn departing_audio(
+    dir: BorrowedFd<'_>,
+    rel: &Path,
+    departing: &HashSet<&Path>,
+) -> Option<(bool, usize)> {
+    let (mut found, mut files) = (false, 0);
     for (name, kind) in list(dir).ok()? {
         let path = rel.join(&name);
         if own(&name) {
@@ -567,15 +691,17 @@ fn departing_audio(dir: BorrowedFd<'_>, rel: &Path, departing: &HashSet<&Path>) 
                 }
                 found = true;
             }
-            FileType::RegularFile => {}
+            FileType::RegularFile => files += 1,
             FileType::Directory => {
                 let sub = openat(dir, &name, DIR, Mode::empty()).ok()?;
-                found |= departing_audio(sub.as_fd(), &path, departing)?;
+                let (audio, more) = departing_audio(sub.as_fd(), &path, departing)?;
+                found |= audio;
+                files += more;
             }
             _ => return None,
         }
     }
-    Some(found)
+    Some((found, files))
 }
 
 /// Remove each of `dirs` (relative to the Library folder) and the folders
@@ -614,14 +740,46 @@ fn settled(records: &[MoveRecord], unsettled: &[i64]) -> Vec<i64> {
         .collect()
 }
 
+/// One step of a recorded move: aside (a track, beside where it was), or to
+/// its place (from aside, or for one of the album's other files, straight).
+/// Folders made on the way are noted in `made`.
+fn step(
+    root: BorrowedFd<'_>,
+    r: &MoveRecord,
+    aside: bool,
+    made: &mut Vec<PathBuf>,
+) -> std::result::Result<(), (io::Error, String)> {
+    let what = |e: io::Error| (e, format!("{} to {}", r.from, r.to));
+    let (dir, name) = split(Path::new(&r.from)).map_err(what)?;
+    let fd = open_dir(root, dir).map_err(what)?;
+    match (&r.staged, aside) {
+        (Some(staged), true) => rename_new(fd.as_fd(), name, fd.as_fd(), OsStr::new(staged)),
+        (staged, _) => {
+            let (to_dir, to_name) = split(Path::new(&r.to)).map_err(what)?;
+            let to_fd = make_dirs(root, to_dir, made).map_err(what)?;
+            let from = staged.as_deref().map_or(name, OsStr::new);
+            rename_new(fd.as_fd(), from, to_fd.as_fd(), to_name)
+        }
+    }
+    .map_err(what)
+}
+
 /// Make the moves [`plan`] gave, after recording them (see the module's
 /// documentation). Tracks go aside first, under names no file has, so one
 /// can take another's place; one that can't reach its own puts them all
-/// back. Then the album's other files follow, each on its own: one that
-/// can't stays where it was. Folders the album left empty go.
+/// back. Then the album's other files follow, each on its own: one gone or
+/// that can't stays where it was. Folders the album left empty go. Refused
+/// while the Library folder has no database (before its first import), as
+/// the record would be lost with coversyncd.
 pub fn apply(lib: &Library, plan: &Plan) -> Result<Applied> {
     if plan.is_empty() {
         return Ok(Applied::default());
+    }
+    if !lib.library_stored()? {
+        return Err(Error::Invalid(
+            "the Library folder has no database yet (its first import makes one) to record moves in"
+                .into(),
+        ));
     }
     let root = &plan.root;
     let root_fd = open_root(root)?;
@@ -632,48 +790,60 @@ pub fn apply(lib: &Library, plan: &Plan) -> Result<Applied> {
             .map(Path::to_path_buf)
             .map_err(|_| not_in_library(p))
     };
+    let found = |from: &Path| -> io::Result<Option<Stat>> {
+        let (dir, name) = split(from)?;
+        entry(open_dir(root_fd, dir)?.as_fd(), name)
+    };
+    let record = |seq: usize, from: &Path, to: &Path, st: &Stat, staged: bool| MoveRecord {
+        seq: seq as i64,
+        from: from.to_string_lossy().into_owned(),
+        staged: staged.then(|| staged_name(&batch, seq as i64)),
+        to: to.to_string_lossy().into_owned(),
+        dev: st.st_dev,
+        ino: st.st_ino,
+    };
     let mut records = Vec::new();
-    for (i, m) in plan.tracks.iter().chain(&plan.companions).enumerate() {
+    for m in &plan.tracks {
         let (from, to) = (rel(&m.from)?, rel(&m.to)?);
-        let (dir, name) = split(&from)?;
-        let st = entry(open_dir(root_fd, dir)?.as_fd(), name)?.ok_or_else(|| {
+        let st = found(&from)?.ok_or_else(|| {
             Error::Invalid(format!(
                 "{} isn't in the Library folder now.",
                 from.display()
             ))
         })?;
-        records.push(MoveRecord {
-            seq: i as i64,
-            from: from.to_string_lossy().into_owned(),
-            staged: (i < plan.tracks.len()).then(|| format!(".coversync-move-{batch}-{i}")),
-            to: to.to_string_lossy().into_owned(),
-            dev: st.st_dev,
-            ino: st.st_ino,
-        });
+        records.push(record(records.len(), &from, &to, &st, true));
+    }
+    // The album's other files that are still there (and still audio-free).
+    let mut following = Vec::new();
+    for (m, files) in plan.companions.iter().zip(&plan.companion_files) {
+        let (Ok(from), Ok(to)) = (rel(&m.from), rel(&m.to)) else {
+            continue;
+        };
+        let Ok(Some(st)) = found(&from) else { continue };
+        if kind(&st) == FileType::Directory {
+            let still = open_dir(root_fd, &from)
+                .ok()
+                .and_then(|fd| departing_audio(fd.as_fd(), &from, &HashSet::new()));
+            if still != Some((false, *files)) {
+                continue;
+            }
+        }
+        records.push(record(records.len(), &from, &to, &st, false));
+        following.push((m, *files));
     }
     lib.record_moves(&batch, &records)?;
     let (tracks, companions) = records.split_at(plan.tracks.len());
-    let step = |r: &MoveRecord, aside: bool| -> std::result::Result<(), (io::Error, String)> {
-        let what = |e: io::Error| (e, format!("{} to {}", r.from, r.to));
-        let (dir, name) = split(Path::new(&r.from)).map_err(what)?;
-        let fd = open_dir(root_fd, dir).map_err(what)?;
-        match (&r.staged, aside) {
-            (Some(staged), true) => rename_new(fd.as_fd(), name, fd.as_fd(), OsStr::new(staged)),
-            (staged, _) => {
-                let (to_dir, to_name) = split(Path::new(&r.to)).map_err(what)?;
-                let to_fd = make_dirs(root_fd, to_dir).map_err(what)?;
-                let from = staged.as_deref().map_or(name, OsStr::new);
-                rename_new(fd.as_fd(), from, to_fd.as_fd(), to_name)
-            }
-        }
-        .map_err(what)
-    };
+    let mut made = Vec::new();
     let placed = tracks
         .iter()
-        .try_for_each(|r| step(r, true))
-        .and_then(|()| tracks.iter().try_for_each(|r| step(r, false)));
+        .try_for_each(|r| step(root_fd, r, true, &mut made))
+        .and_then(|()| {
+            tracks
+                .iter()
+                .try_for_each(|r| step(root_fd, r, false, &mut made))
+        });
     if let Err((e, what)) = placed {
-        let unsettled = put_back(root_fd, &records);
+        let unsettled = put_back(root_fd, &records, &made);
         lib.forget_moves(&batch, Some(&settled(&records, &unsettled)))?;
         let why = match e.kind() {
             io::ErrorKind::AlreadyExists => "something took its place meanwhile".to_string(),
@@ -682,32 +852,43 @@ pub fn apply(lib: &Library, plan: &Plan) -> Result<Applied> {
         return Err(Error::Invalid(format!("couldn't move {what}: {why}")));
     }
     let mut followed = Vec::new();
-    for (r, m) in companions.iter().zip(&plan.companions) {
-        match step(r, false) {
-            Ok(()) => followed.push(m.clone()),
+    let mut files = plan.tracks.len();
+    for (r, (m, n)) in companions.iter().zip(following) {
+        match step(root_fd, r, false, &mut made) {
+            Ok(()) => {
+                followed.push(m.clone());
+                files += n;
+            }
             Err((e, what)) => tracing::warn!("{what} stays: {e}"),
         }
     }
     prune(root_fd, &parents(&records, |r| &r.from));
+    let mut touched = parents(&records, |r| &r.from);
+    touched.extend(parents(&records, |r| &r.to));
+    sync_dirs(root_fd, touched);
     Ok(Applied {
         batch,
         tracks: plan.tracks.clone(),
         companions: followed,
+        files,
     })
 }
 
 /// Put back the files of recorded moves, each where it was (so files that
-/// traded places trade back), and remove the folders the moves made, if
-/// empty. A file found neither at its new place nor waiting aside is left
-/// alone. Gives the moves it couldn't undo.
-fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord]) -> Vec<i64> {
-    let is_it = |rel: &Path, name: &OsStr, r: &MoveRecord| {
-        open_dir(root, rel)
-            .ok()
-            .and_then(|fd| entry(fd.as_fd(), name).ok().flatten())
-            .is_some_and(|st| st.st_dev == r.dev && st.st_ino == r.ino)
+/// traded places trade back), and remove the folders this save made
+/// (`made`), if empty. Gives the moves not settled: a file that isn't back
+/// where it was, but is still at its new place or aside, or can't be looked
+/// for. One found nowhere (gone meanwhile) is settled.
+fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> Vec<i64> {
+    // Whether the file is at `name` in `rel`; an error when that can't be told.
+    let at = |rel: &Path, name: &OsStr, r: &MoveRecord| -> io::Result<bool> {
+        let fd = match open_dir(root, rel) {
+            Ok(fd) => fd,
+            Err(e) if Errno::from_io_error(&e) == Some(Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        Ok(entry(fd.as_fd(), name)?.is_some_and(|st| st.st_dev == r.dev && st.st_ino == r.ino))
     };
-    let mut unsettled = Vec::new();
     // From their new places aside (or, for files that didn't wait aside,
     // straight back), then from aside back.
     for r in records.iter().rev() {
@@ -716,17 +897,16 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord]) -> Vec<i64> {
         else {
             continue;
         };
-        if !is_it(to_dir, to_name, r) {
+        if !matches!(at(to_dir, to_name, r), Ok(true)) {
             continue;
         }
         let back = r.staged.as_deref().map_or(from_name, OsStr::new);
         let moved = open_dir(root, to_dir).and_then(|to_fd| {
-            let from_fd = make_dirs(root, from_dir)?;
+            let from_fd = make_dirs(root, from_dir, &mut Vec::new())?;
             rename_new(to_fd.as_fd(), to_name, from_fd.as_fd(), back)
         });
         if let Err(e) = moved {
             tracing::error!(from = %r.to, to = %r.from, "couldn't put a file back: {e}");
-            unsettled.push(r.seq);
         }
     }
     for r in records {
@@ -734,47 +914,107 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord]) -> Vec<i64> {
             continue;
         };
         let staged = OsStr::new(staged);
-        if unsettled.contains(&r.seq) || !is_it(dir, staged, r) {
+        if !matches!(at(dir, staged, r), Ok(true)) {
             continue;
         }
         let moved =
             open_dir(root, dir).and_then(|fd| rename_new(fd.as_fd(), staged, fd.as_fd(), name));
         if let Err(e) = moved {
             tracing::error!(path = %r.from, "couldn't put a file back: {e}");
-            unsettled.push(r.seq);
         }
     }
-    prune(root, &parents(records, |r| &r.to));
+    // Back, or nowhere to be found?
+    let mut unsettled = Vec::new();
+    for r in records {
+        let (Ok((from_dir, from_name)), Ok((to_dir, to_name))) =
+            (split(Path::new(&r.from)), split(Path::new(&r.to)))
+        else {
+            unsettled.push(r.seq);
+            continue;
+        };
+        let mut places = vec![at(from_dir, from_name, r)];
+        if !matches!(places[0], Ok(true)) {
+            places.push(at(to_dir, to_name, r));
+            if let Some(staged) = &r.staged {
+                places.push(at(from_dir, OsStr::new(staged), r));
+            }
+            match places[1..].iter().any(|p| !matches!(p, Ok(false))) {
+                true => unsettled.push(r.seq),
+                false => tracing::warn!(path = %r.from, "a moved file is gone"),
+            }
+        }
+    }
+    prune(root, made);
+    let mut touched = parents(records, |r| &r.from);
+    touched.extend(parents(records, |r| &r.to));
+    sync_dirs(root, touched);
     unsettled
+}
+
+/// Whether `records` (a batch, `batch`) are ones [`apply`] made: plain paths
+/// in the Library folder, and the names it waits files under. Anything else
+/// (a database from elsewhere, say) isn't acted on.
+fn valid(batch: &str, records: &[MoveRecord]) -> bool {
+    let path =
+        |p: &str| !p.is_empty() && split(Path::new(p)).is_ok() && names(Path::new(p)).is_ok();
+    batch.len() == 16
+        && batch.bytes().all(|b| b.is_ascii_hexdigit())
+        && records.iter().all(|r| {
+            path(&r.from)
+                && path(&r.to)
+                && r.staged
+                    .as_ref()
+                    .is_none_or(|s| *s == staged_name(batch, r.seq))
+        })
+}
+
+/// What [`recover`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Moves undone, or with nothing left to undo.
+    pub put_back: usize,
+    /// Moves still recorded: their files aren't all back where the index
+    /// has them, so nothing should forget those tracks yet.
+    pub stuck: usize,
 }
 
 /// Put back the files of moves recorded and never indexed (see the module's
 /// documentation): a save that failed after moving files, or coversyncd
-/// stopping while one did. Moves it can't undo stay recorded, to try again.
-/// Gives how many it undid or found nothing to undo for.
-pub fn recover(lib: &Library) -> Result<usize> {
+/// stopping while one did. Moves it can't undo, and records it doesn't
+/// recognise, stay recorded.
+pub fn recover(lib: &Library) -> Result<Recovered> {
     let batches = lib.recorded_moves()?;
+    let mut done = Recovered::default();
     if batches.is_empty() {
-        return Ok(0);
+        return Ok(done);
     }
     let Some(root) = lib.library_folder()? else {
-        return Ok(0);
+        done.stuck = batches.iter().map(|(_, r)| r.len()).sum();
+        return Ok(done);
     };
     let root_fd = open_root(&root)?;
-    let mut count = 0;
     for (batch, records) in batches {
-        let unsettled = put_back(root_fd.as_fd(), &records);
-        let done = settled(&records, &unsettled);
-        count += done.len();
-        lib.forget_moves(&batch, Some(&done))?;
+        if !valid(&batch, &records) {
+            tracing::error!(
+                batch,
+                "a move record this coversyncd didn't make is left alone"
+            );
+            done.stuck += records.len();
+            continue;
+        }
+        let unsettled = put_back(root_fd.as_fd(), &records, &[]);
+        let settled = settled(&records, &unsettled);
+        lib.forget_moves(&batch, Some(&settled))?;
+        done.put_back += settled.len();
+        done.stuck += unsettled.len();
         tracing::info!(
             batch,
-            put_back = done.len(),
+            put_back = settled.len(),
             stuck = unsettled.len(),
             "unindexed moves put back"
         );
     }
-    Ok(count)
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -945,11 +1185,18 @@ mod tests {
         let p = plan(&structure(), &s.root, &files).unwrap();
         apply(&s.lib, &p).unwrap();
         assert!(!old.exists());
-        assert_eq!(recover(&s.lib).unwrap(), 3);
+        assert_eq!(
+            recover(&s.lib).unwrap(),
+            Recovered {
+                put_back: 3,
+                stuck: 0
+            }
+        );
         assert_eq!(read(&old.join("01 - One.flac")), "one");
         assert_eq!(read(&old.join("02 - Two.flac")), "two");
         assert_eq!(read(&old.join("cover.jpg")), "art");
-        assert!(!new.exists());
+        // Which folders the save made isn't recorded, so they stay (empty).
+        assert_eq!(fs::read_dir(&new).unwrap().count(), 0);
         assert!(s.lib.recorded_moves().unwrap().is_empty());
     }
 
@@ -984,25 +1231,143 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_link_moves_only_within_its_folder() {
+    fn a_link_to_a_path_from_its_own_folder_doesnt_move() {
         let s = scratch("rel-link");
         touch(&s.root.join("A/Old/real.flac"), "x");
         let from = s.root.join("A/Old/01 - X.flac");
         std::os::unix::fs::symlink("real.flac", &from).unwrap();
+        // Not elsewhere, nor renamed in its folder: what it leads to may move too.
+        for album in ["New", "Old"] {
+            let err = refused(
+                &structure(),
+                &s.root,
+                &[(from.clone(), track("A", album, "2", "X"))],
+            );
+            assert!(err.contains("link"), "{err}");
+        }
+        // One to a whole path still leads there.
+        std::fs::remove_file(&from).unwrap();
+        std::os::unix::fs::symlink(s.root.join("A/Old/real.flac"), &from).unwrap();
+        let p = plan(
+            &structure(),
+            &s.root,
+            &[(from, track("A", "New", "1", "X"))],
+        )
+        .unwrap();
+        assert_eq!(p.tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_hard_link_elsewhere_isnt_taken_for_the_file_leaving() {
+        let s = scratch("hard-link");
+        let from = s.root.join("A/Old/01 - X.flac");
+        touch(&from, "x");
+        // Another name for the same file, where the file would go.
+        fs::create_dir_all(s.root.join("A/New")).unwrap();
+        fs::hard_link(&from, s.root.join("A/New/01 - X.flac")).unwrap();
         let err = refused(
             &structure(),
             &s.root,
             &[(from.clone(), track("A", "New", "1", "X"))],
         );
-        assert!(err.contains("link"), "{err}");
-        // Renamed in its own folder, it still leads to the same file.
+        assert!(err.contains("already exists"), "{err}");
+        // And where a folder would have to be.
+        fs::hard_link(&from, s.root.join("A/Deep")).unwrap();
+        let t = Template::parse("{album_artist}/Deep/{title}").unwrap();
+        let err = refused(&t, &s.root, &[(from, track("A", "x", "1", "X"))]);
+        assert!(err.contains("needs a folder"), "{err}");
+    }
+
+    #[test]
+    fn a_record_this_coversyncd_didnt_make_is_left_alone() {
+        let s = scratch("bad-record");
+        let outside = s.dir.join("outside");
+        touch(&outside.join("x.flac"), "outside");
+        touch(&s.root.join("A/x.flac"), "inside");
+        let st = fs::metadata(outside.join("x.flac")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        // A name to wait under that's a path (outside, even).
+        let record = MoveRecord {
+            seq: 0,
+            from: "A/x.flac".into(),
+            staged: Some("../../outside/x.flac".to_string()),
+            to: "B/x.flac".into(),
+            dev: st.dev(),
+            ino: st.ino(),
+        };
+        s.lib
+            .record_moves("0123456789abcdef", std::slice::from_ref(&record))
+            .unwrap();
+        // And a batch whose id isn't one.
+        let fine = MoveRecord {
+            staged: Some(staged_name("nothex", 0)),
+            ..record
+        };
+        s.lib.record_moves("nothex", &[fine]).unwrap();
+        assert_eq!(
+            recover(&s.lib).unwrap(),
+            Recovered {
+                put_back: 0,
+                stuck: 2
+            }
+        );
+        assert_eq!(read(&outside.join("x.flac")), "outside");
+        assert_eq!(read(&s.root.join("A/x.flac")), "inside");
+        assert_eq!(
+            s.lib.recorded_moves().unwrap().len(),
+            2,
+            "kept, not forgotten"
+        );
+    }
+
+    #[test]
+    fn a_rollback_leaves_empty_folders_it_didnt_make() {
+        let s = scratch("own-folders");
+        let from = s.root.join("A/Old/01 - X.flac");
+        touch(&from, "x");
+        touch(&s.root.join("A/Old/02 - Y.flac"), "y");
+        // Empty folders that were there before.
+        fs::create_dir_all(s.root.join("A/New/Empty")).unwrap();
+        let files = vec![
+            (from.clone(), track("A", "New", "1", "X")),
+            (
+                s.root.join("A/Old/02 - Y.flac"),
+                track("A", "Newer", "2", "Y"),
+            ),
+        ];
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        touch(&s.root.join("A/Newer/02 - Y.flac"), "taken");
+        assert!(apply(&s.lib, &p).is_err());
+        assert_eq!(read(&from), "x");
+        assert!(s.root.join("A/New/Empty").is_dir(), "not made by the save");
+    }
+
+    #[test]
+    fn moves_wait_for_the_librarys_own_database() {
+        let dir =
+            std::env::temp_dir().join(format!("coversync-relocate-memory-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.join("Lib");
+        touch(&root.join("A/Old/01 - X.flac"), "x");
+        let lib = Library::open(&dir.join("state.sqlite3")).unwrap();
+        lib.set_library_setup(LibrarySetup {
+            folder: Some(root.display().to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        lib.refresh_library().unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(!lib.library_stored().unwrap());
         let p = plan(
             &structure(),
-            &s.root,
-            &[(from, track("A", "Old", "2", "X"))],
+            &root,
+            &[(root.join("A/Old/01 - X.flac"), track("A", "New", "1", "X"))],
         )
         .unwrap();
-        assert_eq!(p.tracks.len(), 1);
+        let err = apply(&lib, &p).unwrap_err().to_string();
+        assert!(err.contains("no database yet"), "{err}");
+        assert_eq!(read(&root.join("A/Old/01 - X.flac")), "x");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1022,11 +1387,23 @@ mod tests {
         touch(&s.root.join("A/New"), "a file");
         let err = refused(&structure(), &s.root, &one(track("A", "New", "1", "X")));
         assert!(err.contains("needs a folder"), "{err}");
-        // Names a scan skips (the structure makes `..` a `_` itself).
-        for album in [".hidden", ".coversync"] {
+        // Names a scan skips: a file name starting with a dot, and coversync's
+        // own folders, in any case (the structure makes `..` a `_` itself).
+        let bare = Template::parse("{album_artist}/{album}/{title}").unwrap();
+        let err = refused(&bare, &s.root, &one(track("A", "New", "1", ".hidden")));
+        assert!(err.contains("a file name starting with a dot"), "{err}");
+        for album in [".coversync", ".CoverSync-Uploads", ".coversync-replica"] {
             let err = refused(&structure(), &s.root, &one(track("A", album, "1", "X")));
-            assert!(err.contains("start with a dot"), "{album}: {err}");
+            assert!(err.contains("keeps for itself"), "{album}: {err}");
         }
+        // Other folders starting with a dot a scan looks in.
+        let p = plan(
+            &structure(),
+            &s.root,
+            &one(track(".38 Special", "Rockin", "1", "X")),
+        )
+        .unwrap();
+        assert_eq!(p.tracks.len(), 1);
         // Two files on one path.
         touch(&s.root.join("A/Old/02 - Y.flac"), "y");
         let err = refused(
@@ -1156,5 +1533,55 @@ mod tests {
         )
         .unwrap();
         assert!(p.companions.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn a_flat_album_into_disc_folders_takes_its_cover_and_counts_its_files() {
+        let s = scratch("into-discs");
+        let old = s.root.join("A/Old");
+        touch(&old.join("01 - X.flac"), "x");
+        touch(&old.join("02 - Y.flac"), "y");
+        touch(&old.join("cover.jpg"), "art");
+        touch(&old.join("Scans/front.jpg"), "f");
+        touch(&old.join("Scans/back.jpg"), "b");
+        let t =
+            Template::parse("{album_artist}/{album}/Disc {disc_number}/{track_number} - {title}")
+                .unwrap();
+        let disc = |n: &str, title: &str| {
+            values(&[
+                ("album_artist", "A"),
+                ("album", "New"),
+                ("disc_number", n),
+                ("track_number", "1"),
+                ("title", title),
+            ])
+        };
+        let files = vec![
+            (old.join("01 - X.flac"), disc("1", "X")),
+            (old.join("02 - Y.flac"), disc("2", "Y")),
+        ];
+        let p = plan(&t, &s.root, &files).unwrap();
+        let done = apply(&s.lib, &p).unwrap();
+        let new = s.root.join("A/New");
+        assert_eq!(read(&new.join("cover.jpg")), "art");
+        assert_eq!(read(&new.join("Scans/back.jpg")), "b");
+        assert_eq!(done.files, 2 + 1 + 2, "two tracks, the cover, two scans");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn audio_kept_in_coversyncs_own_folder_leaves_its_files_there() {
+        let s = scratch("own-source");
+        let own = s.root.join(".coversync");
+        touch(&own.join("01 - X.flac"), "x");
+        let p = plan(
+            &structure(),
+            &s.root,
+            &[(own.join("01 - X.flac"), track("A", "New", "1", "X"))],
+        )
+        .unwrap();
+        assert!(p.companions.is_empty(), "{p:?}");
+        apply(&s.lib, &p).unwrap();
+        assert!(own.join("library.sqlite3").is_file());
     }
 }

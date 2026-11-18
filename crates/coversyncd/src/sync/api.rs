@@ -536,6 +536,8 @@ async fn samples(
             .collect();
         Ok::<_, Problem>((target, work, r.samples.clone()))
     })??;
+    // Read while no save moves files (see `AppState::moving`).
+    let moving = state.moving.read().await;
     let matched = blocking(move || {
         use rayon::prelude::*;
         // Each size's contents once, however many listed files share it,
@@ -608,6 +610,7 @@ async fn samples(
             .collect::<Vec<_>>())
     })
     .await?;
+    drop(moving);
     let finished = state.sync.sessions.with(&id, device, |s| {
         let r = s.reconcile.as_mut()?;
         r.matched.extend(matched);
@@ -1107,6 +1110,8 @@ async fn content(
     let device = device(&access)?;
     let s = state.clone();
     let h = hash.clone();
+    // Found and opened while no save moves files (see `AppState::moving`).
+    let moving = state.moving.read().await;
     let opened = blocking(move || {
         let target = target(&s, device)?;
         if target.source(&h).is_none() {
@@ -1125,6 +1130,7 @@ async fn content(
         Ok(opened)
     })
     .await?;
+    drop(moving);
     let Some((mut file, size)) = opened else {
         return Err(Problem::new(
             StatusCode::GONE,

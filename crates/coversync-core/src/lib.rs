@@ -18,7 +18,8 @@ pub mod lookups;
 pub mod model;
 #[cfg(feature = "server")]
 pub mod musicbrainz;
-#[cfg(all(feature = "server", unix))]
+// Linux: it renames with RENAME_NOREPLACE, and coversyncd runs there.
+#[cfg(all(feature = "server", target_os = "linux"))]
 pub mod relocate;
 #[cfg(feature = "server")]
 pub mod romanize;

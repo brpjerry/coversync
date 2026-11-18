@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use lofty::config::{ParseOptions, WriteOptions};
@@ -57,8 +58,9 @@ pub struct TrackTags {
 /// a file gives changes, so the next scan reads again the files
 /// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
 /// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
-/// for FLACs with an ID3v2 tag, which 1 left out.
-pub const READER: u32 = 2;
+/// for FLACs with an ID3v2 tag, which 1 left out. 3: a FLAC or Ogg file's
+/// vendor string isn't its encoder (see [`drop_vendor_encoder`]).
+pub const READER: u32 = 3;
 
 /// Whether what reading `path` gives has changed since reader `since`: for
 /// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
@@ -112,19 +114,21 @@ fn probe_tags(path: &Path, cover_art: bool) -> Result<TaggedFile> {
 /// Lofty reads a FLAC or Ogg file's vendor string as its encoder when it
 /// has no ENCODER comment: not a tag the file has (an edit keeps the vendor
 /// string apart), so not a value.
+/// `values` are those of `tag`, the tag read; true when the encoder went.
 fn drop_vendor_encoder(
     path: &Path,
     file: &TaggedFile,
+    tag: Option<&Tag>,
     values: &mut HashMap<&'static str, String>,
-) -> Result<()> {
-    if values.contains_key("encoder")
-        && file.primary_tag_type() == TagType::VorbisComments
+) -> Result<bool> {
+    let vendor_only = values.contains_key("encoder")
+        && tag.is_some_and(|t| t.tag_type() == TagType::VorbisComments)
         && !vorbis_comments(path, file.file_type())?
-            .is_some_and(|(raw, _)| raw.get("ENCODER").is_some())
-    {
+            .is_some_and(|(raw, _)| raw.get("ENCODER").is_some());
+    if vendor_only {
         values.remove("encoder");
     }
-    Ok(())
+    Ok(vendor_only)
 }
 
 fn text(s: Option<std::borrow::Cow<'_, str>>) -> Option<String> {
@@ -199,6 +203,9 @@ pub fn read(path: &Path) -> Result<TrackTags> {
         out.year = year(tag);
         out.tag_keys = crate::rules::present(tag);
         out.values = values_of(tag);
+        if drop_vendor_encoder(path, &file, Some(tag), &mut out.values)? {
+            out.tag_keys.retain(|k| *k != "encoder");
+        }
     }
     Ok(out)
 }
@@ -1066,6 +1073,32 @@ impl Drop for Prepared {
     }
 }
 
+/// A new file beside `path`, under a name no file had (made so: never
+/// replacing one, or following a link there), short, and keeping `path`'s
+/// extension last, as lofty picks the format from it.
+fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let extension = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{:x}-{n:x}", std::process::id());
+        let copy = path.with_file_name(format!(".coversync-tmp-{id}{extension}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&copy)
+        {
+            Ok(file) => return Ok((copy, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// [`write_with_kinds`]'s edit, written to a copy beside the file (see
 /// [`Prepared`]): everything that can refuse it does so here.
 pub fn prepare_with_kinds(
@@ -1073,15 +1106,17 @@ pub fn prepare_with_kinds(
     edit: &TagEdit,
     kinds: &[(&str, String)],
 ) -> Result<Prepared> {
-    // Keep the real extension last: lofty picks the format from it.
-    let name = path.file_name().ok_or(Error::NotFound)?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".coversync-tmp-{name}"));
-    fs::copy(path, &tmp)?;
+    let mut source = fs::File::open(path)?;
+    let (copy, mut file) = new_beside(path)?;
+    // Owned now: from here a failure (a full disk, say) takes the copy away.
     let prepared = Prepared {
         path: path.to_path_buf(),
-        copy: tmp,
+        copy,
         done: false,
     };
+    io::copy(&mut source, &mut file)?;
+    file.set_permissions(source.metadata()?.permissions())?;
+    drop(file);
     let tmp = &prepared.copy;
     let mut file = probe_tags(tmp, true)?;
     let rest = vorbis_rest(tmp, file.file_type())?;
@@ -1110,12 +1145,9 @@ pub struct KindValues {
 
 pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     let file = probe_tags(path, pictures)?;
-    let mut values = file
-        .primary_tag()
-        .or_else(|| file.first_tag())
-        .map(values_of)
-        .unwrap_or_default();
-    drop_vendor_encoder(path, &file, &mut values)?;
+    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let mut values = tag.map(values_of).unwrap_or_default();
+    drop_vendor_encoder(path, &file, tag, &mut values)?;
     Ok(KindValues {
         values,
         has_art: pictures && has_pictures(&file),
@@ -1135,7 +1167,7 @@ pub fn read_kinds_split(
     let file = probe_tags(path, pictures)?;
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let mut values = tag.map(values_of).unwrap_or_default();
-    drop_vendor_encoder(path, &file, &mut values)?;
+    drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
         for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
             let all: Vec<&str> = kind
@@ -3238,6 +3270,24 @@ mod tests {
         flac_with_comments(&path("enc.flac"), &["TITLE=Song", "ENCODER=flac 1.4"]);
         assert_eq!(
             file_tags(&path("enc.flac"), "; ").unwrap().values["encoder"],
+            "flac 1.4"
+        );
+        // Nor do the index, imports or placement.
+        let indexed = read(&path("plain.flac")).unwrap();
+        assert!(!indexed.values.contains_key("encoder"));
+        assert!(!indexed.tag_keys.contains(&"encoder"));
+        assert!(
+            !read_kinds(&path("plain.flac"), false)
+                .unwrap()
+                .values
+                .contains_key("encoder")
+        );
+        assert_eq!(
+            read(&path("enc.flac")).unwrap().values["encoder"],
+            "flac 1.4"
+        );
+        assert_eq!(
+            read_kinds(&path("enc.flac"), false).unwrap().values["encoder"],
             "flac 1.4"
         );
         let _ = fs::remove_dir_all(&dir);

@@ -1573,6 +1573,12 @@ impl Library {
         library_root(&self.conn())
     }
 
+    /// Whether the Library folder attached has its own database (rather
+    /// than being indexed in memory, before its first import).
+    pub fn library_stored(&self) -> Result<bool> {
+        Ok(attached(&self.conn())?.is_some_and(|a| a.stored))
+    }
+
     /// Why the Library folder can't hold its database, if it can't: it is
     /// then indexed for this session only, and imports are refused.
     pub fn library_problem(&self) -> Result<Option<String>> {
@@ -1889,7 +1895,7 @@ impl Library {
     /// away from leaves its files out. Each database that takes a row counts
     /// one change, which every row it took carries.
     pub fn upsert(&self, batch: &[IndexedFile]) -> Result<()> {
-        self.upsert_moving(batch, &[], None)
+        self.write_rows(batch, &[], None, false)
     }
 
     /// [`upsert`](Self::upsert), after giving the Library tracks at each
@@ -1898,12 +1904,23 @@ impl Library {
     /// it had (see [`moves_schema`]). Tracks can trade paths. A row already at
     /// a path a track moves to, for a file gone meanwhile, goes. With
     /// `batch_id`, the record of those moves (see [`Self::record_moves`])
-    /// goes in the same transaction.
+    /// goes in the same transaction. For a tag save: the covers of albums
+    /// left with no track (a new title is a new id) go too.
     pub fn upsert_moving(
         &self,
         batch: &[IndexedFile],
         moved: &[(PathBuf, PathBuf)],
         batch_id: Option<&str>,
+    ) -> Result<()> {
+        self.write_rows(batch, moved, batch_id, true)
+    }
+
+    fn write_rows(
+        &self,
+        batch: &[IndexedFile],
+        moved: &[(PathBuf, PathBuf)],
+        batch_id: Option<&str>,
+        tidy_covers: bool,
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1964,7 +1981,6 @@ impl Library {
         if let Some(id) = batch_id {
             tx.execute("DELETE FROM lib.moves WHERE batch = ?1", [id])?;
         }
-        let renamed = !moved.is_empty();
         {
             let mut inbox = tx.prepare_cached(&upsert_sql(
                 "main.tracks",
@@ -2074,15 +2090,15 @@ impl Library {
         if lib_wrote {
             put_setting(&tx, "lib", GENERATION, &lib_next)?;
         }
-        // Rows this reader wrote into an index a newer one filled: its
-        // marker comes down to this reader, so the newer one reads them again.
-        // Albums the moves left with no track (a new title is a new id).
-        if renamed {
+        // Albums a save left with no track (a new title is a new id).
+        if tidy_covers {
             tx.execute(
                 "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM temp.indexed_tracks)",
                 [],
             )?;
         }
+        // Rows this reader wrote into an index a newer one filled: its
+        // marker comes down to this reader, so the newer one reads them again.
         for (wrote, schema) in [(inbox_wrote, "main"), (lib_wrote, "lib")] {
             if wrote
                 && get_setting::<u32>(&tx, schema, TAG_READER)?
@@ -2466,13 +2482,26 @@ impl Library {
         Ok(())
     }
 
-    /// The album a track is in now.
+    /// The album a track is in now (found by its row, as in `track_root`).
     pub fn track_album(&self, id: i64) -> Result<Option<String>> {
         let conn = self.conn();
+        if id >= 0 {
+            return Ok(conn
+                .query_row(
+                    "SELECT album_id FROM main.tracks WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?);
+        }
+        let Some(public) = id.checked_neg() else {
+            return Ok(None);
+        };
         Ok(conn
             .query_row(
-                "SELECT album_id FROM temp.indexed_tracks WHERE id = ?1",
-                [id],
+                "SELECT t.album_id FROM lib.tracks t JOIN temp.lib_root r
+                 WHERE r.prefix = ?1 AND t.id = ?2",
+                [public / ID_SPAN, public % ID_SPAN],
                 |r| r.get(0),
             )
             .optional()?)

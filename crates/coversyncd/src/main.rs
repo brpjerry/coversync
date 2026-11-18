@@ -198,11 +198,16 @@ pub fn spawn_scan(state: Shared) {
             // Files a save moved and never indexed (coversyncd stopped
             // meanwhile, say) go back to where the index has them, before
             // the scan would miss them under the names they waited under.
+            // Any not back would be forgotten (their ids, dates and history
+            // with them), so then there's no scan until they are.
             let moving = s.moving.blocking_write();
-            let recovered = coversync_core::relocate::recover(&s.lib);
+            let recovered = coversync_core::relocate::recover(&s.lib)?;
             drop(moving);
-            if let Err(e) = recovered {
-                tracing::error!("putting back unindexed moves failed: {e}");
+            if recovered.stuck > 0 {
+                return Err(coversync_core::Error::Invalid(format!(
+                    "{} files a save moved couldn't be put back where the index has them; no scan until they are",
+                    recovered.stuck
+                )));
             }
             scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress)
         })
