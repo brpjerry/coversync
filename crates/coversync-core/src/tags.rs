@@ -1238,6 +1238,11 @@ fn read_whole(typed: &str, read: &Timestamp) -> bool {
     if in_range.contains(&false) {
         return false;
     }
+    // Nothing left unfinished after the last number (2024-06-): a T or a Z
+    // may end it, not a separator.
+    if typed.trim().ends_with(['-', '.', ':', ' ']) {
+        return false;
+    }
     // Anything but numbers, separators, T and Z (a PM, say) isn't read.
     if !typed
         .trim()
@@ -1627,16 +1632,16 @@ fn lost(
     // The file's own values in a field an edit shares are kept too (adding
     // Label to an MP3 mustn't overwrite its Publisher: both are TPUB).
     // Each as it comes back under its own name, a total with its number.
-    let kept = sharing.iter().all(|key| {
+    let lost_key = sharing.iter().find(|key| {
         let number = match key {
             ItemKey::TrackTotal => Some(ItemKey::TrackNumber),
             ItemKey::DiscTotal => Some(ItemKey::DiscNumber),
             ItemKey::MovementTotal => Some(ItemKey::MovementNumber),
             _ => None,
         };
-        let with: Vec<ItemKey> = std::iter::once(*key).chain(number).collect();
-        back(&[], &with).is_some_and(|items| {
-            let own: Vec<&(ItemKey, String)> = items.iter().filter(|(k, _)| k == key).collect();
+        let with: Vec<ItemKey> = std::iter::once(**key).chain(number).collect();
+        !back(&[], &with).is_some_and(|items| {
+            let own: Vec<&(ItemKey, String)> = items.iter().filter(|(k, _)| k == *key).collect();
             let expected = if own.is_empty() {
                 items.iter().collect()
             } else {
@@ -1644,8 +1649,12 @@ fn lost(
             };
             expected.iter().all(|item| together.contains(item))
         })
-    });
-    if kept { None } else { set.first().cloned() }
+    })?;
+    // Named by the edit that pushes it out: one in the same field.
+    set.iter()
+        .find(|(k, _)| k.keys.iter().any(|key| field(*key) == field(*lost_key)))
+        .or(set.first())
+        .cloned()
 }
 
 /// Check, before anything is written, that `kinds` can be set on the file
@@ -3396,6 +3405,7 @@ mod tests {
         "2024 6 3",
         "2024 6",
         "20246 03",
+        "999 -06",
     ];
     const DATES_READ_IN_PART: &[&str] = &[
         "2010-08-25 12:30",
@@ -3414,6 +3424,8 @@ mod tests {
         "2010-08-25T01:30 PM",
         "2024 6 03",
         "2024 603",
+        "2024-06-",
+        "2024-06-03T12:",
     ];
 
     #[test]
@@ -3782,6 +3794,15 @@ mod tests {
             file_tags(&path("a.mp3"), "; ").unwrap().values["publisher"],
             "Bandai"
         );
+        // Beside another edit, the error names the one that pushes it out.
+        let refused = write_with_kinds(
+            &path("a.mp3"),
+            &none,
+            &kinds(&[("album", "Record"), ("label", "Lantis")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.starts_with("tags: Label"), "{refused}");
         // A time with words after it isn't read whole.
         assert!(validate_kind("date", "2010-08-25T01:30 PM").is_err());
         // Parts out of range: not a date (the form leaves these to the server).

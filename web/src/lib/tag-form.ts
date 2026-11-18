@@ -86,7 +86,7 @@ export function invalid(kind: string, value: string): boolean {
 	if (!v) return false;
 	if (['track_number', 'track_total', 'disc_number', 'disc_total'].includes(kind))
 		return !/^\d+(\/\d+)?$/.test(v);
-	if (kind === 'date') return !/^\d{4}[\d\-.: TZ]*$/.test(v);
+	if (kind === 'date') return !/^(?=[ \d]*\d)[ \d]{4}[\d\-.: TZ]*$/.test(v);
 	return false;
 }
 

@@ -85,7 +85,8 @@ describe('invalid', () => {
 			'2024 6 3',
 			'20246 03',
 			'2024-6 Z',
-			'2010-08-25T'
+			'2010-08-25T',
+			'999 -06'
 		];
 		for (const date of whole) expect(invalid('date', date), date).toBe(false);
 		for (const date of ['2010/08/25', '10-08-25', 'summer', '2010-08-25T01:30 PM'])
