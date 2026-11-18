@@ -271,6 +271,8 @@ struct VorbisRest {
     rest: VorbisComments,
     /// The vendor string, which lofty also reads as an ENCODER comment.
     vendor: String,
+    /// Whether the file has a comment block (a FLAC needn't).
+    had_block: bool,
     /// Whether the file had ENCODER comments of its own.
     had_encoder: bool,
     /// The file's RATING comments, provider-qualified ones (`RATING:MusicBee`)
@@ -280,20 +282,26 @@ struct VorbisRest {
     ratings: Vec<(String, String)>,
 }
 
-/// The file's [`VorbisRest`]; None for a file whose primary tag isn't
-/// Vorbis comments.
-fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
+/// A FLAC or Ogg file's Vorbis comments as written, without pictures, and
+/// whether the file has a comment block (a FLAC needn't); None for a file
+/// whose primary tag isn't Vorbis comments.
+fn vorbis_comments(path: &Path, file_type: FileType) -> Result<Option<(VorbisComments, bool)>> {
     use lofty::file::AudioFile;
-    // Pictures go through `Tag`: not read here, so not kept twice.
+    // Without implicit conversions: splitting TRACKNUMBER=1/10 removes a
+    // TOTALTRACKS alias in a way that reorders the other comments.
     let options = ParseOptions::new()
         .read_properties(false)
-        .read_cover_art(false);
+        .read_cover_art(false)
+        .implicit_conversions(false);
     let mut f = std::io::BufReader::new(fs::File::open(path)?);
     let tag = match file_type {
-        FileType::Flac => lofty::flac::FlacFile::read_from(&mut f, options)
-            .map_err(tag_err)?
-            .remove_vorbis_comments()
-            .unwrap_or_default(),
+        FileType::Flac => {
+            let comments = lofty::flac::FlacFile::read_from(&mut f, options)
+                .map_err(tag_err)?
+                .remove_vorbis_comments();
+            let had = comments.is_some();
+            return Ok(Some((comments.unwrap_or_default(), had)));
+        }
         FileType::Vorbis => lofty::ogg::VorbisFile::read_from(&mut f, options)
             .map_err(tag_err)?
             .remove_vorbis_comments(),
@@ -304,6 +312,16 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
             .map_err(tag_err)?
             .remove_vorbis_comments(),
         _ => return Ok(None),
+    };
+    Ok(Some((tag, true)))
+}
+
+/// The file's [`VorbisRest`]; None for a file whose primary tag isn't
+/// Vorbis comments.
+fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
+    // Pictures go through `Tag`: not read here, so not kept twice.
+    let Some((tag, had_block)) = vorbis_comments(path, file_type)? else {
+        return Ok(None);
     };
     let vendor = tag.vendor().to_string();
     let had_encoder = tag.get("ENCODER").is_some();
@@ -333,6 +351,7 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
     Ok(Some(VorbisRest {
         rest,
         vendor,
+        had_block,
         had_encoder,
         ratings,
     }))
@@ -359,6 +378,7 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
     } else {
         rest.ratings
     };
+    let had_block = rest.had_block;
     let mut out = rest.rest;
     out.set_vendor(rest.vendor);
     for item in tag.items() {
@@ -456,8 +476,9 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
     }
     // Lofty writes no comment block, so no vendor string, for a tag with
     // no comments (an edit that cleared them all): a blank one, which isn't
-    // written itself, keeps it.
-    if out.items().len() == 0 {
+    // written itself, keeps the file's. A FLAC that had none gets none, so
+    // its ID3v2 tag still shows.
+    if had_block && out.items().len() == 0 {
         out.push("COMMENT".into(), String::new());
     }
     out.save_to_path(path, WriteOptions::default())
@@ -467,11 +488,17 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
 /// Why lofty wouldn't write the ID3v2 `frame` back as it read it, if it
 /// wouldn't: an ID3v2.2 frame with no ID3v2.4 name (dropped); a
 /// compressed, encrypted or length-prefixed one (it consumes the prefix on
-/// reading but keeps the flag); a chapter located by byte offsets, which a
-/// resized tag moves away from its audio; or, inside a chapter or table of
-/// contents, any of those or a frame flagged as unsynchronised (decoded on
-/// reading, written as it is).
-fn unwritable(frame: &lofty::id3::v2::Frame<'_>, nested: bool) -> Option<String> {
+/// reading but keeps the flag); a chapter or seek index (ASPI) located by
+/// byte offsets, which a resized tag moves away from its audio; a second
+/// root table of contents in one frame list (lofty writes the first);
+/// or, inside a chapter or table of contents, any of those or a frame
+/// flagged as unsynchronised (decoded on reading, written as it is).
+/// `seen_root`: whether the frame list had a root table of contents yet.
+fn unwritable(
+    frame: &lofty::id3::v2::Frame<'_>,
+    nested: bool,
+    seen_root: &mut bool,
+) -> Option<String> {
     use lofty::id3::v2::Frame;
     let id = frame.id_str();
     if frame.id().is_outdated() {
@@ -488,6 +515,11 @@ fn unwritable(frame: &lofty::id3::v2::Frame<'_>, nested: bool) -> Option<String>
             "an unsynchronised {id} frame inside a chapter or table of contents"
         ));
     }
+    if id == "ASPI" {
+        return Some(
+            "a seek index (ASPI) located by byte offsets, which a resized tag would leave pointing at the wrong audio".into(),
+        );
+    }
     let children = match frame {
         Frame::Chapter(c) => {
             if c.offsets.start != u32::MAX || c.offsets.end != u32::MAX {
@@ -498,10 +530,19 @@ fn unwritable(frame: &lofty::id3::v2::Frame<'_>, nested: bool) -> Option<String>
             }
             &c.children
         }
-        Frame::TableOfContents(t) => &t.children,
+        Frame::TableOfContents(t) => {
+            if t.flags.top_level && std::mem::replace(seen_root, true) {
+                return Some(format!(
+                    "a second root table of contents ({}), of which only one is written",
+                    t.id
+                ));
+            }
+            &t.children
+        }
         _ => return None,
     };
-    children.iter().find_map(|f| unwritable(f, true))
+    let mut seen = false;
+    children.iter().find_map(|f| unwritable(f, true, &mut seen))
 }
 
 /// Write `tag`, a primary tag other than Vorbis comments after an edit,
@@ -516,7 +557,11 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
             // A frame lofty wouldn't write back as it read it: not saved
             // rather than lost or corrupted.
-            if let Some(why) = (&id3).into_iter().find_map(|f| unwritable(f, false)) {
+            let mut seen_root = false;
+            if let Some(why) = (&id3)
+                .into_iter()
+                .find_map(|f| unwritable(f, false, &mut seen_root))
+            {
                 return Err(Error::Tags(format!(
                     "the file's ID3v2 tag has {why}, which can't be written back as it is, so it wasn't changed"
                 )));
@@ -793,6 +838,29 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
     file.primary_tag_mut().expect("primary tag inserted above")
 }
 
+/// Take the front and untyped covers out of an MP3's APE tag, as written
+/// (lofty keeps APE covers as items, not pictures, so removing pictures
+/// from its generic tag doesn't reach them). Saved only if it had one.
+fn remove_secondary_ape_cover(path: &Path) -> Result<()> {
+    use lofty::file::AudioFile;
+    let options = ParseOptions::new().read_properties(false);
+    let mut mpeg = {
+        let mut f = std::io::BufReader::new(fs::File::open(path)?);
+        lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?
+    };
+    if let Some(mut ape) = mpeg.remove_ape() {
+        let covers = ["Cover Art (Front)", "Cover Art (Other)"];
+        if covers.iter().any(|k| ape.get(k).is_some()) {
+            for key in covers {
+                ape.remove(key);
+            }
+            ape.save_to_path(path, WriteOptions::default())
+                .map_err(tag_err)?;
+        }
+    }
+    Ok(())
+}
+
 fn has_pictures(file: &TaggedFile) -> bool {
     file.tags().iter().any(|t| !t.pictures().is_empty())
 }
@@ -923,6 +991,9 @@ pub fn copy_with_tags_hashed(
                 // Other tags are only written when their pictures change.
                 let mut changed = Vec::new();
                 if art.is_some() && replace {
+                    if file_type == FileType::Mpeg && file.tag(TagType::Ape).is_some() {
+                        remove_secondary_ape_cover(&tmp)?;
+                    }
                     // Untyped pictures go too: players show them as the cover.
                     // Back covers, booklets and the like stay.
                     let types: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
@@ -1455,6 +1526,64 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "server")]
+    fn replacing_an_mp3_cover_takes_its_ape_front_cover_too() {
+        use lofty::ape::{ApeItem, ApeTag};
+        use lofty::id3::v2::Id3v2Tag;
+        let dir = std::env::temp_dir().join(format!("coversync-mp3ape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("in.mp3"), dir.join("out.mp3"));
+        fs::write(&src, include_bytes!("../tests/fixtures/silence.mp3")).unwrap();
+        let cover = |edge: u32| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(edge, edge)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            crate::art::Art::new(png.into_inner())
+                .unwrap()
+                .picture()
+                .unwrap()
+        };
+        // ID3v2 with a front cover; APE with a front cover, a back cover and
+        // an item of its own.
+        let mut generic = Tag::new(TagType::Id3v2);
+        generic.set_title("Song".into());
+        generic.push_picture(cover(4));
+        Id3v2Tag::from(generic)
+            .save_to_path(&src, WriteOptions::default())
+            .unwrap();
+        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
+        let mut ape = ApeTag::default();
+        ape.insert(item(
+            "Cover Art (Front)",
+            ItemValue::Binary(b"front.jpg\0old".to_vec()),
+        ));
+        ape.insert(item(
+            "Cover Art (Back)",
+            ItemValue::Binary(b"back.jpg\0back".to_vec()),
+        ));
+        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        let new = cover(8);
+        assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
+        assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
+        let mut f = fs::File::open(&dest).unwrap();
+        let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        let ape = mpeg.ape().unwrap();
+        assert!(ape.get("Cover Art (Front)").is_none());
+        assert!(matches!(
+            ape.get("Cover Art (Back)").map(|i| i.value()),
+            Some(ItemValue::Binary(b)) if b == b"back.jpg\0back"
+        ));
+        assert!(matches!(
+            ape.get("Ripper").map(|i| i.value()),
+            Some(ItemValue::Text(t)) if t == "kept"
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ratings_and_comments_lofty_cant_name_stay_as_written() {
         let dir = std::env::temp_dir().join(format!("coversync-ratings-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1719,18 +1848,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (src, dest) = (dir.join("in.wav"), dir.join("out.wav"));
-        wav_with_info(&src);
         // Both the tag and its PRIV frame are unsynchronised: FF 00 00 and
         // FF 00 E0 on disk decode to FF 00 and FF E0.
         let tag = b"ID3\x04\x00\x80\x00\x00\x00\x1c\
                     PRIV\x00\x00\x00\x12\x00\x02coversync\x00\x01\xff\x00\x00\xff\x00\xe0\x02";
-        let mut wav = fs::read(&src).unwrap();
-        wav.extend_from_slice(b"ID3 ");
-        wav.extend_from_slice(&(tag.len() as u32).to_le_bytes());
-        wav.extend_from_slice(tag);
-        let riff_size = (wav.len() - 8) as u32;
-        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
-        fs::write(&src, wav).unwrap();
+        wav_with_id3_chunk(&src, tag);
         let private = |path: &Path| {
             let mut f = fs::File::open(path).unwrap();
             let wav = lofty::iff::wav::WavFile::read_from(&mut f, ParseOptions::new()).unwrap();
@@ -1821,6 +1943,68 @@ mod tests {
         );
         // The blank that stood in for the rating isn't written.
         assert!(items.iter().all(|(_, v)| !v.is_empty()), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn number_pairs_dont_reorder_the_other_comments() {
+        let dir = std::env::temp_dir().join(format!("coversync-npair-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(
+            &path("in.flac"),
+            // In this order lofty's alias removal would swap the barcodes.
+            &[
+                "UPC=111",
+                "UPC=222",
+                "TOTALTRACKS=10",
+                "TRACKNUMBER=1/10",
+                "TITLE=Song",
+            ],
+        );
+        let genre = [("genre", "Anime".to_string())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
+        let (_, items) = vorbis(&path("out.flac"));
+        let upc: Vec<&str> = items
+            .iter()
+            .filter(|(k, _)| k == "UPC")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(upc, ["111", "222"]);
+        // The numbers as coversync writes them, the alias under its usual name.
+        assert!(has(&items, "TRACKNUMBER", "1"));
+        assert!(has(&items, "TRACKTOTAL", "10"));
+        assert!(!items.iter().any(|(k, _)| k == "TOTALTRACKS"), "{items:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flac_with_only_id3v2_gets_no_empty_comment_block() {
+        use lofty::id3::v2::Id3v2Tag;
+        let dir = std::env::temp_dir().join(format!("coversync-noblock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        // Only a length (TLEN), which Vorbis comments have no field for.
+        let mut generic = Tag::new(TagType::Id3v2);
+        generic.insert_text(ItemKey::Length, "1000".into());
+        let id3: Id3v2Tag = generic.into();
+        flac_with_only_id3v2(&path("in.flac"), &id3);
+        assert_eq!(
+            read_kinds(&path("in.flac"), false).unwrap().values["length"],
+            "1000"
+        );
+        // Clearing a genre it doesn't have.
+        let clear = [("genre", String::new())];
+        copy_with_tags(&path("in.flac"), &path("out.flac"), &clear, None, false).unwrap();
+        let mut f = fs::File::open(path("out.flac")).unwrap();
+        let flac = lofty::flac::FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        assert!(flac.vorbis_comments().is_none());
+        assert_eq!(
+            read_kinds(&path("out.flac"), false).unwrap().values["length"],
+            "1000"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1929,6 +2113,32 @@ mod tests {
         let refused = copy_with_tags(&src, &dir.join("offsets-out.wav"), &values, None, false);
         assert!(refused.unwrap_err().to_string().contains("byte offsets"));
         assert!(!dir.join("offsets-out.wav").exists());
+        // ID3v2.4: a seek index (ASPI) with no index points.
+        let src = dir.join("aspi.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x15\
+              ASPI\x00\x00\x00\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08",
+        );
+        let refused = copy_with_tags(&src, &dir.join("aspi-out.wav"), &values, None, false);
+        assert!(refused.unwrap_err().to_string().contains("ASPI"));
+        assert!(!dir.join("aspi-out.wav").exists());
+        // ID3v2.4: two root tables of contents, each empty.
+        let src = dir.join("ctoc.wav");
+        wav_with_id3_chunk(
+            &src,
+            b"ID3\x04\x00\x00\x00\x00\x00\x22\
+              CTOC\x00\x00\x00\x07\x00\x00toc1\x00\x03\x00\
+              CTOC\x00\x00\x00\x07\x00\x00toc2\x00\x03\x00",
+        );
+        let refused = copy_with_tags(&src, &dir.join("ctoc-out.wav"), &values, None, false);
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("second root table of contents (toc2)")
+        );
+        assert!(!dir.join("ctoc-out.wav").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
