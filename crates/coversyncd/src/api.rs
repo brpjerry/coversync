@@ -926,10 +926,11 @@ async fn album_tags(
     Path(id): Path<String>,
 ) -> ApiResult<Json<AlbumTags>> {
     blocking(&state, move |s| {
+        // No save writes the files while they're read (a save indexes them
+        // before it lets go), and a scan that indexes meanwhile shows in
+        // the version: read again then.
+        let _files = s.tag_files.read().unwrap_or_else(|e| e.into_inner());
         let separator = s.lib.library_setup()?.rules.separator;
-        // The files as the album version says: read again if a save or scan
-        // changed the album while they were read (writers index after
-        // writing, so the version moves once they're done).
         for _ in 0..3 {
             let detail = s.lib.album(&id)?.ok_or(coversync_core::Error::NotFound)?;
             let tracks = detail
@@ -1146,8 +1147,11 @@ async fn write_tags(
                 tags::validate_kind(id, value)?;
             }
         }
-        // Every file can take its kinds, in its format, before any is
-        // written: an album of mixed formats isn't left half edited.
+        // The files are written and indexed before the tag editor can read
+        // them again (see `tag_files`).
+        let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+        // Every file can take its kinds, as it is, before any is written: an
+        // album of mixed formats or files isn't left half edited.
         for (track, _, kinds) in &edits {
             if kinds.is_empty() {
                 continue;

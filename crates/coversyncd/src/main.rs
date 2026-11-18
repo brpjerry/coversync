@@ -79,6 +79,11 @@ pub struct AppState {
     /// shown: scans, tag writes, imports, setup saves (which can switch the
     /// Library or Inbox folder) and showing hidden Inbox files again.
     pub jobs: Mutex<()>,
+    /// Held to write an album's files and index them (a tag save), and to
+    /// read them for the tag editor, so the editor never reads files a save
+    /// has written before their album's version says so. Not `jobs`: a scan
+    /// holds that for long, and only indexes.
+    pub tag_files: RwLock<()>,
     /// A scan is waiting for `jobs`; scans asked for meanwhile join it.
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
@@ -316,6 +321,7 @@ async fn run() -> anyhow::Result<()> {
         closing: AtomicBool::new(false),
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
+        tag_files: RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
@@ -378,6 +384,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         closing: AtomicBool::new(false),
         allow_writes: false,
         jobs: Mutex::new(()),
+        tag_files: RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),

@@ -73,13 +73,34 @@ describe('invalid', () => {
 		expect(invalid('track_number', '3/12')).toBe(false);
 		expect(invalid('disc_total', 'two')).toBe(true);
 		expect(invalid('date', '2010-08-25')).toBe(false);
-		// Dates as lofty reads them: dotted, and with a time.
-		expect(invalid('date', '2010.08.25')).toBe(false);
-		expect(invalid('date', '2010-08-25T12:30:45')).toBe(false);
-		expect(invalid('date', '20100825')).toBe(false);
-		expect(invalid('date', '2010/08/25')).toBe(true);
-		expect(invalid('date', '10-08-25')).toBe(true);
-		expect(invalid('date', 'summer')).toBe(true);
+		// Dates lofty reads whole, as the server's validate_kind (the same
+		// table as tags.rs's DATES_READ_WHOLE and DATES_READ_IN_PART).
+		const whole = [
+			'2010',
+			'2010-08',
+			'2010-08-25',
+			'2010.08.25',
+			'2010.8.25',
+			'20100825',
+			'201008',
+			'2010-08-25T12',
+			'2010-08-25T12:30:45',
+			'20100825T1230',
+			'2010.08.25T12:30',
+			'2010-08-25Z',
+			'2010-08-25T'
+		];
+		const inPart = [
+			'2010-08-25 12:30',
+			'2010-8-5',
+			'2010/08/25',
+			'2010-08-25T1230',
+			'2010-08-25T12.30',
+			'10-08-25',
+			'summer'
+		];
+		for (const date of whole) expect(invalid('date', date), date).toBe(false);
+		for (const date of inPart) expect(invalid('date', date), date).toBe(true);
 		expect(invalid('label', 'anything at all')).toBe(false);
 		expect(invalid('date', '')).toBe(false);
 	});

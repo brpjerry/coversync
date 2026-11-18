@@ -90,6 +90,11 @@
 		onrefused?: (current: AlbumDetail | null, draft: () => TagDraft | null, id: string) => void;
 		/** Revert was pressed: the edits, kept ones included, are dropped. */
 		onrevert?: () => void;
+		/**
+		 * The album changed while its tags were read: load it as it is now,
+		 * kept edits and all (Try again, then).
+		 */
+		onretry?: () => void;
 	}
 	let {
 		detail,
@@ -100,7 +105,8 @@
 		ondraft,
 		kept = null,
 		onrefused,
-		onrevert
+		onrevert,
+		onretry
 	}: Props = $props();
 
 	/** The editor's own names for the fields up front. */
@@ -126,6 +132,8 @@
 
 	let loading = $state(true);
 	let failed = $state<string | null>(null);
+	/** The failure was the album changing while its tags were read. */
+	let stale = $state(false);
 	let base = $state<Values>({});
 	let form = $state<Values>({});
 	let other = $state<AlbumTags['tracks']>([]);
@@ -140,6 +148,7 @@
 	async function load() {
 		loading = true;
 		failed = null;
+		stale = false;
 		try {
 			const [tags] = await Promise.all([api.albumTags(detail.id), setup.load()]);
 			// The tag list always has kinds once it's loaded.
@@ -150,7 +159,8 @@
 			// Read from the album as it is now: tracks and values from another
 			// version than the one shown (and saved against) can't be paired.
 			if (tags.version !== detail.version) {
-				failed = 'This album changed while its tags were read. Close the editor and open it again.';
+				failed = 'This album changed while its tags were read. Try again to load it as it is now.';
+				stale = true;
 				return;
 			}
 			const values: Values = {};
@@ -277,6 +287,8 @@
 	function revert() {
 		form = structuredClone($state.snapshot(base));
 		added.clear();
+		// The kept edits go, and with them what changed since they were made.
+		elsewhere = {};
 		onrevert?.();
 	}
 
@@ -412,7 +424,7 @@
 	{:else if failed}
 		<p class="status failed">
 			{failed}
-			<button class="link" onclick={load}>Try again</button>
+			<button class="link" onclick={stale && onretry ? onretry : load}>Try again</button>
 		</p>
 	{:else}
 		<section>
@@ -524,7 +536,7 @@
 						<p class="note">
 							Kept as they are when you save, but not editable here: tags coversync has no name for,
 							ones held as data or with a description, and the files' other tag blocks. TRACKNUM, an
-							old name for the track number, is dropped on saving a track number.
+							old name for the track number, is dropped when a file with a track number is saved.
 						</p>
 						<dl>
 							{#each others as o (o.key)}

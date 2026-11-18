@@ -34,8 +34,12 @@
 		onimport?: (edits?: ImportEdits) => void;
 		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
 		changed?: boolean;
-		/** Drop the edits and show the album as it is now. */
-		onreload?: () => void;
+		/**
+		 * Show the album as it is now: dropping the edits (Reload), or with
+		 * the kept ones (`keepDraft`: the editor's Try again, after the album
+		 * changed while its tags were read).
+		 */
+		onreload?: (keepDraft?: boolean) => void;
 		/** Hears what edits the tag editor has. */
 		ondraft?: (draft: Draft) => void;
 		/**
@@ -328,6 +332,7 @@
 							{kept}
 							{onrefused}
 							onrevert={() => ondiscard?.()}
+							onretry={onreload && (() => onreload?.(true))}
 							oncancel={showTracks}
 						/>
 					{/key}

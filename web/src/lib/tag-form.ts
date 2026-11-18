@@ -74,18 +74,23 @@ export function changeCount(form: Values, base: Values, ids: number[]) {
 	return n;
 }
 
+const SEPARATED = /^\d{4}(?:[-.]\d{1,2}(?:[-.]\d{2}(?:T(?:\d{2}(?::\d{2}(?::\d{2})?)?)?)?)?)?Z?$/;
+const COMPACT = /^\d{4}(?:\d{2}(?:\d{2}(?:T\d{2}(?:\d{2}(?:\d{2})?)?)?)?)?Z?$/;
+
 /**
  * Numbers and dates the server would refuse; other kinds take any text. A
- * date is as lofty reads one: a four-digit year, then any of month, day and
- * time, with dashes, dots, colons, spaces, T or Z between (2010.08.25,
- * 2010-08-25T12:30).
+ * date is one lofty reads whole: a year, then a month, a two-digit day and
+ * a time after a T, the parts after dashes or dots and the time's after
+ * colons (2010.08.25, 2010-08-25T12:30), or the digits run together
+ * (20100825T1230); a Z may end it. A time after a space, say, would be
+ * dropped on writing.
  */
 export function invalid(kind: string, value: string): boolean {
 	const v = value.trim();
 	if (!v) return false;
 	if (['track_number', 'track_total', 'disc_number', 'disc_total'].includes(kind))
 		return !/^\d+(\/\d+)?$/.test(v);
-	if (kind === 'date') return !/^\d{4}[\d\-.: TZ]*$/.test(v);
+	if (kind === 'date') return !(SEPARATED.test(v) || COMPACT.test(v));
 	return false;
 }
 
