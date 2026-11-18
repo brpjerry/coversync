@@ -37,9 +37,9 @@
 		/**
 		 * Show the album as it is now: dropping the edits (Reload), or with
 		 * the kept ones (`keepDraft`: the editor's Try again, after the album
-		 * changed while its tags were read; `from` is the version it showed).
+		 * changed while its tags were read; `from` is the album it showed).
 		 */
-		onreload?: (keepDraft?: boolean, from?: string) => void;
+		onreload?: (keepDraft?: boolean, from?: AlbumDetail) => void;
 		/** Hears what edits the tag editor has. */
 		ondraft?: (draft: Draft) => void;
 		/**
@@ -332,7 +332,7 @@
 							{kept}
 							{onrefused}
 							onrevert={() => ondiscard?.()}
-							onretry={onreload && (() => onreload?.(true, detail.version))}
+							onretry={onreload && (() => onreload?.(true, detail ?? undefined))}
 							oncancel={showTracks}
 						/>
 					{/key}

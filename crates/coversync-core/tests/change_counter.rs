@@ -974,3 +974,33 @@ fn a_parallel_import_publishes_every_final_digest_and_preserves_permissions() {
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 }
+
+#[test]
+fn a_new_tag_reader_reads_files_again_and_keeps_their_digests() {
+    let s = setup("reader-digests");
+    for n in 1..=2 {
+        wav(
+            &s.inbox.join(format!("Rec/{n}.wav")),
+            &format!("Track {n}"),
+            "Record",
+            n,
+        );
+    }
+    s.scan();
+    s.import(&s.inbox_album());
+    let before = s.lib.library_hashes().unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(s.lib.tag_reader().unwrap(), coversync_core::tags::READER);
+    // As if the index had been filled by an older reader: the next scan
+    // reads the files again (the change counter says so), digests kept.
+    s.lib.set_tag_reader(0).unwrap();
+    let generation = s.library().generation;
+    s.scan();
+    assert!(s.library().generation > generation);
+    assert_eq!(s.lib.library_hashes().unwrap(), before);
+    assert_eq!(s.lib.tag_reader().unwrap(), coversync_core::tags::READER);
+    // And once read, not again.
+    let generation = s.library().generation;
+    s.scan();
+    assert_eq!(s.library().generation, generation);
+}

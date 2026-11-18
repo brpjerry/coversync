@@ -705,8 +705,8 @@
 				sheet: string;
 				opening: number;
 				keepDraft: boolean;
-				/** For a retry: the album version the editor that asked showed. */
-				from?: string;
+				/** For a retry: the album the editor that asked showed. */
+				from?: Detail;
 		  }
 		| {
 				kind: 'refused';
@@ -879,14 +879,14 @@
 	/**
 	 * Show the album of the sheet opened as `sheet` as it is now: Reload drops
 	 * its edits; the tag editor's Try again (`keepDraft`) keeps the kept ones,
-	 * if the editor that asked (showing version `from`) is still the one shown.
+	 * if the editor that asked (showing the album `from`) is still the one shown.
 	 */
-	async function reload(sheet: string, opening: number, keepDraft: boolean, from?: string) {
+	async function reload(sheet: string, opening: number, keepDraft: boolean, from?: Detail) {
 		const h = holding;
 		const before = saves;
 		// A retry from an editor since replaced (a second Try again, queued
 		// behind the first) would put the kept edits back over new ones.
-		if (keepDraft && from !== undefined && (h ? h.detail : detail)?.version !== from) return;
+		if (keepDraft && from !== undefined && (h ? h.detail : detail) !== from) return;
 		// The sheet it was asked on, still held (or, for the editor's Try
 		// again, open), or it's moot: closed (or reopened) since, or saved over.
 		const current = () => openId === sheet && openings === opening && holding === h;
@@ -896,6 +896,12 @@
 		if (!current() || saves !== before) return;
 		if (fresh === undefined) {
 			toast('Couldn’t reload the album. Try again in a moment.', 'error');
+			return;
+		}
+		if (fresh === null && keepDraft) {
+			// The editor's Try again: its edits stay, with the sheet, for when
+			// the album's new id comes (or to be closed).
+			toast('Couldn’t find this album: it may have been renamed or removed elsewhere.', 'error');
 			return;
 		}
 		if (fresh === null) {
@@ -975,7 +981,7 @@
 	 * unsaved edits (Reload), or keeping them (`keepDraft`: the tag editor's
 	 * Try again after the album changed while its tags were read).
 	 */
-	function reloadHeld(keepDraft = false, from?: string) {
+	function reloadHeld(keepDraft = false, from?: Detail) {
 		if (openId) enqueue({ kind: 'reload', sheet: openId, opening: openings, keepDraft, from });
 	}
 

@@ -484,6 +484,16 @@ fn new_prefix() -> i64 {
     1 + (h.finish() % ((1 << 20) - 1)) as i64
 }
 
+/// A Library index started here (new, or in memory) holds only what this
+/// installation's index read: it takes its tag reader marker too (see
+/// [`Library::tag_reader`]).
+fn start_reader(conn: &Connection, schema: &str) -> Result<()> {
+    if let Some(reader) = get_setting::<u32>(conn, "main", TAG_READER)? {
+        put_setting(conn, schema, TAG_READER, &reader)?;
+    }
+    Ok(())
+}
+
 /// Index `dir` (or nothing, with no `dir`) in an empty in-memory database.
 /// It gets a Library id of its own, like the track id prefix: its rows and
 /// counter start afresh, so what a client knew from before doesn't apply.
@@ -492,6 +502,7 @@ fn attach_memory(conn: &Connection, dir: Option<&Path>, problem: Option<&str>) -
     conn.execute("ATTACH DATABASE ':memory:' AS lib", [])?;
     conn.execute_batch(&library_schema("lib"))?;
     migrate_library(conn, "lib")?;
+    start_reader(conn, "lib")?;
     conn.execute("DELETE FROM temp.lib_root", [])?;
     if let Some(dir) = dir {
         conn.execute(
@@ -534,6 +545,7 @@ fn attach_file(conn: &Connection, dir: &Path, carry: Option<i64>) -> Result<bool
         }
         let prefix = carry.unwrap_or_else(new_prefix);
         put_setting(conn, "lib_new", "track_id_prefix", &prefix)?;
+        start_reader(conn, "lib_new")?;
         if carry.is_some() {
             // The index carries on, as clients may have seen it: the same
             // rows, generations and removals, under the same id and counter,
@@ -857,11 +869,11 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// A setting stored in `schema` ("main" or "lib"). A value this build can't
-/// parse (say, from a newer one) reads as unset.
 /// The setting holding [`Library::tag_reader`].
 const TAG_READER: &str = "tag_reader";
 
+/// A setting stored in `schema` ("main" or "lib"). A value this build can't
+/// parse (say, from a newer one) reads as unset.
 fn get_setting<T: serde::de::DeserializeOwned>(
     conn: &Connection,
     schema: &str,
@@ -2316,13 +2328,24 @@ impl Library {
     }
 
     /// The tag reader the index was last filled by (see
-    /// [`crate::tags::READER`]); 0 before one was kept.
+    /// [`crate::tags::READER`]); 0 before one was kept. Kept in the local
+    /// database and in the Library's own, when one is attached (it can be
+    /// another's, a folder switched to): the older of the two.
     pub fn tag_reader(&self) -> Result<u32> {
-        Ok(self.setting(TAG_READER)?.unwrap_or(0))
+        let conn = self.conn();
+        let local = get_setting::<u32>(&conn, "main", TAG_READER)?.unwrap_or(0);
+        let library = get_setting::<u32>(&conn, "lib", TAG_READER)
+            .ok()
+            .map(|v| v.unwrap_or(0));
+        Ok(library.map_or(local, |l| local.min(l)))
     }
 
     pub fn set_tag_reader(&self, reader: u32) -> Result<()> {
-        self.put_setting(TAG_READER, &reader)
+        let conn = self.conn();
+        put_setting(&conn, "main", TAG_READER, &reader)?;
+        // No Library attached: nothing to keep it in.
+        let _ = put_setting(&conn, "lib", TAG_READER, &reader);
+        Ok(())
     }
 
     /// A setting of this installation, kept in the local database.
