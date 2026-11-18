@@ -366,20 +366,49 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, encoder_edited: bool
     // had only ID3v2) through lofty's conversion, under its provider's key.
     if tag.get(ItemKey::Popularimeter).is_some() {
         if rest.ratings.is_empty() {
-            // One at a time: lofty skips one whose provider can't name a
-            // Vorbis field (an owner with "="), which then stays as lofty
-            // read it, under RATING.
+            // One at a time, each as lofty converts it. Lofty reads a rating
+            // as "owner|stars|count" text, so it can't convert one whose
+            // owner has a "|": that one goes through it under a stand-in
+            // owner (an unknown provider either way, so the same scale), and
+            // gets its own back in the field name. One whose owner can't
+            // name a Vorbis field (it has "=") stays as lofty read it, under
+            // RATING.
             for item in tag.items().filter(|i| i.key() == ItemKey::Popularimeter) {
-                let mut one = Tag::new(TagType::VorbisComments);
-                one.push(item.clone());
-                let converted = VorbisComments::from(one);
-                if converted.items().len() == 0
-                    && let ItemValue::Text(value) = item.value()
-                {
-                    out.push("RATING".into(), value.clone());
+                let ItemValue::Text(text) = item.value() else {
+                    continue;
+                };
+                let convert = |text: String| {
+                    let mut one = Tag::new(TagType::VorbisComments);
+                    one.push(lofty::tag::TagItem::new(
+                        ItemKey::Popularimeter,
+                        ItemValue::Text(text),
+                    ));
+                    VorbisComments::from(one)
+                };
+                let converted = convert(text.clone());
+                if converted.items().len() > 0 {
+                    for (key, value) in converted.items() {
+                        out.push(key.to_string(), value.to_string());
+                    }
+                    continue;
                 }
-                for (key, value) in converted.items() {
-                    out.push(key.to_string(), value.to_string());
+                let mut parts = text.rsplitn(3, '|');
+                let fields = (parts.next(), parts.next(), parts.next());
+                let named = |owner: &str| {
+                    !owner.is_empty()
+                        && owner
+                            .bytes()
+                            .all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
+                };
+                if let (Some(count), Some(stars), Some(owner)) = fields
+                    && owner.contains('|')
+                    && named(owner)
+                    && let Some((_, value)) =
+                        convert(format!("coversync|{stars}|{count}")).items().next()
+                {
+                    out.push(format!("RATING:{owner}"), value.to_string());
+                } else {
+                    out.push("RATING".into(), text.clone());
                 }
             }
         } else {
@@ -437,7 +466,7 @@ fn save_owned(path: &Path, tag: Tag) -> Result<()> {
                 });
                 if encoded {
                     return Err(Error::Tags(
-                        "the file's ID3v2 tag has unsynchronised frames alongside frames lofty can't write back as they are (compressed, encrypted, length-prefixed, or chapters), so it wasn't changed".into(),
+                        "the file's ID3v2 tag is unsynchronised and has frames lofty can't write back as they are (compressed, encrypted, length-prefixed, or chapters), so it wasn't changed".into(),
                     ));
                 }
                 id3.retain_mut(|frame| {
@@ -1540,6 +1569,11 @@ mod tests {
             128,
             0,
         )));
+        id3.insert(Frame::Popularimeter(PopularimeterFrame::new(
+            "a|b@example.org",
+            128,
+            2,
+        )));
         flac_with_only_id3v2(&path("in.flac"), &id3);
         let genre = [("genre", "Anime".to_string())];
         copy_with_tags(&path("in.flac"), &path("out.flac"), &genre, None, false).unwrap();
@@ -1561,7 +1595,12 @@ mod tests {
             ratings.contains(&("RATING", "a=b@example.org|3|0")),
             "{ratings:?}"
         );
-        assert_eq!(ratings.len(), 3, "{ratings:?}");
+        // One with "|" in its owner, under its own key on the default scale.
+        assert!(
+            ratings.contains(&("RATING:a|b@example.org", "60")),
+            "{ratings:?}"
+        );
+        assert_eq!(ratings.len(), 4, "{ratings:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
