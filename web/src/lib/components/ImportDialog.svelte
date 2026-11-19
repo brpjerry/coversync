@@ -105,7 +105,7 @@
 	function consensus(k: string) {
 		const counts = new Map<string, number>();
 		for (const t of tracks) {
-			const v = t.values[k]?.trim();
+			const v = t.values[k];
 			if (v) counts.set(v, (counts.get(v) ?? 0) + 1);
 		}
 		return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
