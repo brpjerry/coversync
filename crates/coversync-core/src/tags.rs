@@ -1294,9 +1294,9 @@ pub fn upc(path: &Path) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Whether a `tag_type` tag can hold `kind` as text (numbers and dates
-/// always fit; some formats have no place for, say, MusicBrainz ids). No
-/// APE tag is written (see [`apply_kinds`]).
+/// Whether coversync can write `kind` as text in a `tag_type` tag: numbers
+/// and dates fit any, some formats have no place for, say, MusicBrainz ids,
+/// and an APE tag holds nothing, as coversync doesn't write one.
 pub fn can_store(tag_type: TagType, kind: &str) -> bool {
     let Some(k) = rules::kind(kind) else {
         return false;
@@ -2711,9 +2711,6 @@ mod tests {
         ));
         ape.insert(item("Ripper", ItemValue::Text("kept".into())));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
-        let new = cover(8);
-        assert!(copy_with_tags(&src, &dest, &[("title", "New".into())], Some(&new), true).unwrap());
-        assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
         // Only the ID3v2 tag before the audio changed: the audio and the
         // APE tag after it are as they were, byte for byte.
         let after_id3v2 = |path: &Path| {
@@ -2721,7 +2718,12 @@ mod tests {
             let size = b[6..10].iter().fold(0, |n, x| n << 7 | usize::from(*x));
             b[10 + size..].to_vec()
         };
-        assert_eq!(after_id3v2(&dest), after_id3v2(&src));
+        let before = after_id3v2(&src);
+        assert!(before.windows(8).any(|b| b == b"APETAGEX"));
+        let new = cover(8);
+        assert!(copy_with_tags(&src, &dest, &[("title", "New".into())], Some(&new), true).unwrap());
+        assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
+        assert_eq!(after_id3v2(&dest), before);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2835,16 +2837,23 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (src, dest) = (dir.join("in.wv"), dir.join("out.wv"));
-        // Untagged: refused for its format, not for a tag it has.
         fs::write(&src, include_bytes!("../tests/fixtures/silence.wv")).unwrap();
-        let before = fs::read(&src).unwrap();
-        let title = [("title", "New".to_string())];
-        let refused = |r: Result<()>| assert!(r.unwrap_err().to_string().contains("APE tag"));
-        refused(write_with_kinds(&src, &TagEdit::default(), &title));
-        refused(check_kinds(&src, &TagEdit::default(), &title));
-        refused(copy_with_tags(&src, &dest, &title, None, false).map(drop));
-        assert_eq!(fs::read(&src).unwrap(), before);
-        assert!(!dest.exists());
+        let refused_whole = || {
+            let before = fs::read(&src).unwrap();
+            let title = [("title", "New".to_string())];
+            let refused = |r: Result<()>| assert!(r.unwrap_err().to_string().contains("APE tag"));
+            refused(write_with_kinds(&src, &TagEdit::default(), &title));
+            refused(check_kinds(&src, &TagEdit::default(), &title));
+            refused(copy_with_tags(&src, &dest, &title, None, false).map(drop));
+            assert_eq!(fs::read(&src).unwrap(), before);
+            assert!(!dest.exists());
+        };
+        // Untagged (refused for its format), then with a tag of its own.
+        refused_whole();
+        let mut ape = lofty::ape::ApeTag::default();
+        lofty::tag::Accessor::set_title(&mut ape, "Song".into());
+        ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        refused_whole();
         let _ = fs::remove_dir_all(&dir);
     }
 
