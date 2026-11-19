@@ -102,7 +102,7 @@ used on a home server.
   cards: tag values have `/ \ : * ? " < > |` replaced, the template's own
   text can't contain them, names Windows keeps for itself (CON, NUL, COM1,
   …) get a `_` in front, and no name ends in a dot or space. Tags a template
-  uses outside `< >` count as required on import. The rules and the
+  uses outside `< >` count as required on import, but `{collection}`. The rules and the
   Library's index live in the Library folder itself (see
   [Moving the Library](#moving-the-library)).
 - **Multiple values** (Library setup): the separator that joins several

@@ -1311,7 +1311,7 @@
 	function within(e: KeyboardEvent, selector: string) {
 		return e.target instanceof Element && !!e.target.closest(selector);
 	}
-	const typing = (e: KeyboardEvent) => within(e, 'input, textarea, [contenteditable]');
+	const typing = (e: KeyboardEvent) => within(e, 'input, textarea, select, [contenteditable]');
 	function onkeydown(e: KeyboardEvent) {
 		// The login view is up: keys are its own, and Escape mustn't close the
 		// album (and its unsaved edits) under it.

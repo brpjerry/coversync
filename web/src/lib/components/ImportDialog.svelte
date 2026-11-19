@@ -117,8 +117,13 @@
 	);
 	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
 	const hadCollection = consensus('collection');
-	let collectionChoices = $derived([...new Set([...collections, hadCollection].filter(Boolean))]);
+	/** Library setup's, and any the tracks have. */
+	let collectionChoices = $derived([
+		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
+	]);
 	let collection = $state(hadCollection);
+	/** Library setup requires one. */
+	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
 		Object.fromEntries(
 			tracks.map((t) => [t.id, Object.fromEntries(trackCols.map((k) => [k, t.values[k] ?? '']))])
@@ -160,11 +165,17 @@
 	// Album fields count once (one input), track fields once per track.
 	let missing = $derived(
 		albumCols.filter(needsValue).length +
-			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
+			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0) +
+			Number(collectionRequired && !collection)
 	);
 	/** The rules require album art and the album has none. */
 	const artNeeded = initial.art.missing;
-	let total = $derived(albumCols.length + tracks.length * trackCols.length + (artNeeded ? 1 : 0));
+	let total = $derived(
+		albumCols.length +
+			tracks.length * trackCols.length +
+			Number(collectionRequired) +
+			Number(artNeeded)
+	);
 
 	type Upload = {
 		url: string;
@@ -269,7 +280,7 @@
 				const v = effective(t.id, k);
 				if (v && v !== original(t.id, k)) (out[t.id] ??= {})[k] = v;
 			}
-			if (collection !== original(t.id, 'collection')) (out[t.id] ??= {}).collection = collection;
+			if (collection !== (t.values.collection ?? '')) (out[t.id] ??= {}).collection = collection;
 		}
 		return out;
 	});
@@ -363,9 +374,10 @@
 
 	let dialog = $state<HTMLElement>();
 	$effect(() => {
-		dialog
-			?.querySelector<HTMLElement>('input.missing, .art-choose')
-			?.focus({ preventScroll: true });
+		const field =
+			dialog?.querySelector<HTMLElement>('input.missing, .art-choose') ??
+			dialog?.querySelector<HTMLElement>('.collection select');
+		field?.focus({ preventScroll: true });
 	});
 </script>
 
@@ -500,10 +512,10 @@
 				</ul>
 			{/if}
 
-			{#if collectionChoices.length}
+			{#if collectionChoices.length || collectionRequired}
 				<label class="field collection">
 					<span class="field-label">Collection</span>
-					<select bind:value={collection}>
+					<select bind:value={collection} class:missing={collectionRequired && !collection}>
 						<option value="">None</option>
 						{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
 					</select>
@@ -1019,7 +1031,8 @@
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
 	}
 	/* Failures stand out, with one pulse when the dialog opens. */
-	input.missing {
+	input.missing,
+	select.missing {
 		border-color: color-mix(in oklab, var(--danger) 70%, transparent);
 		background: color-mix(in oklab, var(--danger) 7%, var(--surface));
 		animation: flag 1.2s var(--ease-out) 250ms 1;

@@ -55,29 +55,12 @@ pub struct TrackTags {
 }
 
 /// The tag reader's version, kept with each index: bumped when what reading
-/// a file gives changes, so the next scan reads again the files
-/// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
-/// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
-/// for FLACs with an ID3v2 tag, which 1 left out. 4: a FLAC or Ogg file's
-/// vendor string isn't its encoder (see [`drop_vendor_encoder`]); 3 said so
-/// too, but named no file to read again.
-pub const READER: u32 = 4;
-
-/// Whether what reading `path` gives has changed since reader `since`, by
-/// its extension: FLAC and Ogg files (their Vorbis comments' vendor string)
-/// since 4, which covers a FLAC's ID3v2 tag (2) too; any other since 1.
-pub fn reader_changed(path: &Path, since: u32) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match ext.as_str() {
-        "ogg" | "oga" | "opus" | "spx" | "flac" if since < 4 => true,
-        "ogg" | "oga" | "opus" | "spx" | "flac" => false,
-        _ => since < 1,
-    }
-}
+/// a file gives changes, so the next scan reads every file again. 1: ID3v2
+/// comments and lyrics with a description (`iTunNORM`) aren't the comment,
+/// or the lyrics. 2: the same for FLACs with an ID3v2 tag. 4: a FLAC or Ogg
+/// file's vendor string isn't its encoder (see [`drop_vendor_encoder`]). 5:
+/// the collection, in any format.
+pub const READER: u32 = 5;
 
 /// The [collection](rules::COLLECTION)'s name in a file: a Vorbis comment
 /// or APE item, an ID3v2 TXXX frame or an iTunes freeform MP4 atom. Lofty
@@ -4164,23 +4147,6 @@ mod tests {
             "65535"
         );
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn files_read_again_for_a_new_reader_are_those_it_reads_differently() {
-        // Since reader 0: MP3s and M4As (ID3v2 descriptions), and FLAC and
-        // Ogg (vendor strings).
-        assert!(reader_changed(Path::new("/m/a.mp3"), 0));
-        assert!(reader_changed(Path::new("/m/a.M4A"), 0));
-        assert!(reader_changed(Path::new("/m/a.Opus"), 0));
-        // Since 1, 2 and 3: FLAC and Ogg files, every one.
-        for since in 1..=3 {
-            assert!(!reader_changed(Path::new("/m/a.mp3"), since));
-            assert!(reader_changed(Path::new("/m/a.flac"), since));
-            assert!(reader_changed(Path::new("/m/a.ogg"), since));
-        }
-        assert!(!reader_changed(Path::new("/m/a.flac"), READER));
-        assert!(!reader_changed(Path::new("/m/a.mp3"), READER));
     }
 
     #[test]

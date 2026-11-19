@@ -396,14 +396,14 @@ impl LibrarySetup {
             crate::split::normalize_phrases(std::mem::take(&mut self.rules.split_at))?;
         self.rules.substitutions =
             crate::substitute::normalize(std::mem::take(&mut self.rules.substitutions))?;
-        let mut collections: Vec<String> = Vec::new();
-        for name in self.rules.collections.drain(..) {
+        let names = std::mem::take(&mut self.rules.collections);
+        let mut seen = HashSet::new();
+        for name in &names {
             let name = name.trim();
-            if !name.is_empty() && !collections.iter().any(|c| c == name) {
-                collections.push(name.to_string());
+            if !name.is_empty() && seen.insert(name) {
+                self.rules.collections.push(name.to_string());
             }
         }
-        self.rules.collections = collections;
         if let Some(bad) = self
             .rules
             .required_tags
