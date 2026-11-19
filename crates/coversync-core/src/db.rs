@@ -946,9 +946,6 @@ pub struct PreparedCopy {
 /// Each [`PreparedCopy`] is a setting of its own, under this and its path.
 const PREPARED_COPY: &str = "prepared_copy:";
 
-/// Where 02df296 kept every [`PreparedCopy`], read and forgotten still.
-const PREPARED_COPIES: &str = "prepared_copies";
-
 /// The setting holding [`Library::tag_reader`].
 const TAG_READER: &str = "tag_reader";
 
@@ -2495,11 +2492,9 @@ impl Library {
     /// before one starts (saves take turns), ones a stopped coversyncd left.
     pub fn recorded_copies(&self) -> Result<Vec<PreparedCopy>> {
         let conn = self.conn();
-        // As 02df296 kept them, all in one setting.
-        let mut copies: Vec<PreparedCopy> =
-            get_setting(&conn, "main", PREPARED_COPIES)?.unwrap_or_default();
         let mut stmt =
             conn.prepare("SELECT value FROM main.settings WHERE substr(key, 1, length(?1)) = ?1")?;
+        let mut copies = Vec::new();
         for value in stmt.query_map([PREPARED_COPY], |r| r.get::<_, String>(0))? {
             if let Ok(copy) = serde_json::from_str(&value?) {
                 copies.push(copy);
@@ -2508,28 +2503,18 @@ impl Library {
         Ok(copies)
     }
 
-    /// Forget a recorded copy: it's in place, gone, or not the file it was.
-    pub fn forget_copy(&self, path: &str) -> Result<()> {
-        let conn = self.conn();
-        conn.execute(
-            "DELETE FROM main.settings WHERE key = ?1",
-            [format!("{PREPARED_COPY}{path}")],
-        )?;
-        // One kept as 02df296 kept them.
-        let mut copies: Vec<PreparedCopy> =
-            get_setting(&conn, "main", PREPARED_COPIES)?.unwrap_or_default();
-        if copies.iter().any(|c| c.path == path) {
-            copies.retain(|c| c.path != path);
-            match copies.is_empty() {
-                true => {
-                    conn.execute(
-                        "DELETE FROM main.settings WHERE key = ?1",
-                        [PREPARED_COPIES],
-                    )?;
-                }
-                false => put_setting(&conn, "main", PREPARED_COPIES, &copies)?,
+    /// Forget recorded copies, by path: in place, gone, or not the file
+    /// they were.
+    pub fn forget_copies(&self, paths: &[String]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM main.settings WHERE key = ?1")?;
+            for path in paths {
+                stmt.execute([format!("{PREPARED_COPY}{path}")])?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -4629,34 +4614,21 @@ mod tests {
     }
 
     #[test]
-    fn prepared_copies_are_recorded_and_forgotten_one_by_one() {
+    fn prepared_copies_are_recorded_one_by_one_and_forgotten_together() {
         let lib = Library::open(&temp_db("prepared-copies")).unwrap();
         let copy = |n: u64| PreparedCopy {
             path: format!("/m/A/.coversync-tmp-1-{n}.flac"),
             dev: 1,
             ino: n,
         };
-        let found = || {
-            let mut found = lib.recorded_copies().unwrap();
-            found.sort_by_key(|c| c.ino);
-            found
-        };
         for n in 0..3 {
             lib.record_copy(copy(n)).unwrap();
         }
-        assert_eq!(found(), [copy(0), copy(1), copy(2)]);
-        lib.forget_copy(&copy(1).path).unwrap();
-        assert_eq!(found(), [copy(0), copy(2)]);
-        // As 02df296 kept them: read, and forgotten, all the same.
-        put_setting(&lib.conn(), "main", PREPARED_COPIES, &vec![copy(7)]).unwrap();
-        assert_eq!(found(), [copy(0), copy(2), copy(7)]);
-        lib.forget_copy(&copy(7).path).unwrap();
-        assert_eq!(found(), [copy(0), copy(2)]);
-        assert!(
-            raw_setting(&lib.conn(), "main", PREPARED_COPIES)
-                .unwrap()
-                .is_none()
-        );
+        let mut found = lib.recorded_copies().unwrap();
+        found.sort_by_key(|c| c.ino);
+        assert_eq!(found, [copy(0), copy(1), copy(2)]);
+        lib.forget_copies(&[copy(0).path, copy(2).path]).unwrap();
+        assert_eq!(lib.recorded_copies().unwrap(), [copy(1)]);
     }
 
     #[test]

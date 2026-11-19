@@ -57,18 +57,20 @@ used on a home server.
   new title renames a file, a new album title (or a tag the structure
   names a folder by) moves the album's files to another folder, and an
   album imported under an older structure moves to the current one. When
-  all of a folder's tracks go to one other folder, the folder's other
-  files and audio-free folders (a cover file, scans) follow them, each to
-  the same name there unless that's taken, when it stays; a folder holding
-  audio that stays, or a link, keeps them all. Folders left empty go.
-  Moved tracks keep their ids and import dates, and a client that knew a
-  track at its old path still finds it. A save the structure couldn't
-  place (a title cleared, two tracks on one path, a file already there or
-  in the way of a folder, a file name starting with a dot, which scans
-  skip, a folder name starting with `.coversync` in any case, a linked
-  folder, another file system, or moves before the Library's database
-  exists, which its first import makes) is refused before anything is
-  written; one whose files can't all be moved after the tags are written
+  all of a folder's tracks go to one other folder, its cover images follow
+  them, unless the name is taken there or audio stays behind. Folders left
+  empty go. An album's folder in the Library holds what its import put
+  there, its tracks and its cover: a save that would leave a folder
+  holding anything else is refused. Moved tracks keep their ids and
+  import dates, and a client that knew a track at its old path still
+  finds it. Files move only on a local file system where names differ by
+  case (ext4, btrfs, NTFS as Linux mounts it), not on a network share or
+  FAT. A save the structure couldn't place (a title cleared, two tracks on
+  one path, a file already there or in the way of a folder, a file name
+  starting with a dot, which scans skip, a folder name starting with
+  `.coversync` in any case, a linked folder, another file system, one of
+  those above, or moves before the Library's database exists, which its
+  first import makes) is refused before anything is written; one whose files can't all be moved after the tags are written
   (a file appearing meanwhile) puts them all back and says so. Moves are
   recorded in the Library's database before they're made, and ones not
   yet indexed when coversyncd stops are put back when it next scans.

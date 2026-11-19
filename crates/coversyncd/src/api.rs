@@ -1261,13 +1261,15 @@ async fn write_tags(
                 }
             }
         }
-        // Every copy is in place or gone (those after a failure with it).
-        // Their records only matter to the next save, which checks them
+        // Every copy is in place or gone (those after a failure with it,
+        // unless removing one failed: its record stays for the next save).
+        // The records only matter to the next save, which checks them
         // again: one not forgotten now doesn't hold this save up.
-        for copy in &recorded {
-            if let Err(e) = s.lib.forget_copy(copy) {
-                tracing::warn!(copy, "couldn't forget a prepared copy's record: {e}");
-            }
+        recorded.retain(|copy| {
+            matches!(std::fs::symlink_metadata(copy), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        });
+        if let Err(e) = s.lib.forget_copies(&recorded) {
+            tracing::warn!("couldn't forget the prepared copies' records: {e}");
         }
         let count = written.len();
         // Then the files go where their tags now put them, and the index
@@ -1445,6 +1447,7 @@ fn record_copy(
 /// or removed (a share away, say) is kept for the next save.
 fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let mut done = Vec::new();
     for copy in lib.recorded_copies()? {
         let path = FsPath::new(&copy.path);
         let settled = match std::fs::symlink_metadata(path) {
@@ -1474,10 +1477,10 @@ fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
             }
         };
         if settled {
-            lib.forget_copy(&copy.path)?;
+            done.push(copy.path);
         }
     }
-    Ok(())
+    lib.forget_copies(&done)
 }
 
 #[cfg(test)]
