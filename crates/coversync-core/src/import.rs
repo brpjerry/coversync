@@ -375,11 +375,13 @@ pub fn plan(
         &splitter,
     )?;
     // Their APE tags can't be written safely (see `tags::apply_kinds`);
-    // WavPack and Monkey's Audio are converted to FLAC instead.
+    // WavPack and Monkey's Audio are converted to FLAC instead, but for
+    // hybrid WavPack (see `transcode::converts`).
     let has_ape = read.iter().any(|t| t.tag_type == lofty::tag::TagType::Ape);
     if has_ape {
         problems.push(
-            "Musepack files can't be imported: coversync can't safely write their APE tags.".into(),
+            "Musepack and hybrid WavPack files can't be imported: coversync can't safely write their APE tags."
+                .into(),
         );
     }
     if read.iter().any(|t| t.to_flac) && !crate::transcode::available() {
@@ -443,14 +445,15 @@ pub fn plan(
         // is: a value its format can't hold makes the plan unready, rather
         // than fail the import part way through the copies.
         let to_write = written_values(&autofilled, edits.get(&track.id));
-        // A FLAC (a converted file's) holds any text; an APE tag isn't written.
-        if typed_ok
-            && !to_flac
-            && read.tag_type != lofty::tag::TagType::Ape
-            && !to_write.is_empty()
-            && let Err(e) = tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write)
-        {
-            problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
+        // A converted file's are checked as a FLAC's; an APE tag isn't written.
+        if typed_ok && read.tag_type != lofty::tag::TagType::Ape && !to_write.is_empty() {
+            let checked = match to_flac {
+                true => tags::check_flac_kinds(&to_write),
+                false => tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write),
+            };
+            if let Err(e) = checked {
+                problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
+            }
         }
         filled_by.push(
             read.autofilled

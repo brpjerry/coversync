@@ -1107,7 +1107,7 @@ impl Drop for Prepared {
 /// replacing one, or following a link there), short, and keeping `path`'s
 /// extension last, as lofty picks the format from it. Only its owner can
 /// read it until it has the file's permissions.
-fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
+pub(crate) fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let extension = path
@@ -1244,8 +1244,10 @@ pub fn read_kinds_split(
 }
 
 /// Give `flac`, a FLAC just converted from `src` and without tags, what
-/// `src`'s tag holds that Vorbis comments can: lofty's generic items,
-/// pictures and the collection. Tags lofty has no key for don't carry over.
+/// `src`'s tag holds that Vorbis comments can, written as an edit would:
+/// lofty's generic items, but those with a description (`COMM:iTunNORM`),
+/// pictures (an APE tag's too) and the collection. Tags lofty has no key
+/// for don't carry over.
 #[cfg(feature = "server")]
 pub fn carry_tags(src: &Path, flac: &Path) -> Result<()> {
     let file = probe_tags(src, true)?;
@@ -1255,17 +1257,33 @@ pub fn carry_tags(src: &Path, flac: &Path) -> Result<()> {
     let mut values = HashMap::new();
     read_collection(src, &file, Some(tag), &mut values)?;
     let mut tag = tag.clone();
-    tag.re_map(TagType::VorbisComments);
-    tag.save_to_path(flac, WriteOptions::default())
-        .map_err(tag_err)?;
-    match values.remove(rules::COLLECTION) {
-        Some(collection) => write_with_kinds(
-            flac,
-            &TagEdit::default(),
-            &[(rules::COLLECTION, collection)],
-        ),
-        None => Ok(()),
+    // Lofty keeps an APE tag's covers as items, not pictures.
+    if tag.tag_type() == TagType::Ape {
+        let ape = lofty::ape::ApeTag::from(tag.clone());
+        for key in lofty::ape::APE_PICTURE_TYPES {
+            if let Some(ItemValue::Binary(bytes)) = ape.get(key).map(|i| i.value()) {
+                tag.push_picture(Picture::from_ape_bytes(key, bytes).map_err(tag_err)?);
+            }
+        }
     }
+    tag.retain(|i| !described(i));
+    // MP4's and ID3v2's BPM is an integer one, which Vorbis comments have
+    // no name for: their BPM.
+    let bpms: Vec<TagItem> = tag.take(ItemKey::IntegerBpm).collect();
+    tag.re_map(TagType::VorbisComments);
+    for bpm in bpms {
+        tag.push(TagItem::new(ItemKey::Bpm, bpm.value().clone()));
+    }
+    let rest = vorbis_rest(flac, FileType::Flac)?.ok_or(Error::NotFound)?;
+    let collection = values.get(rules::COLLECTION).map(String::as_str);
+    // The source's encoder is a tag of its own here, not ffmpeg's.
+    save_vorbis(flac, tag, rest, &["encoder"], collection)
+}
+
+/// Check, before anything is converted, that `kinds` can be set on a FLAC.
+#[cfg(feature = "server")]
+pub fn check_flac_kinds(kinds: &[(&str, String)]) -> Result<()> {
+    apply_kinds(&mut Tag::new(TagType::VorbisComments), kinds)
 }
 
 /// The UPC some stores tag files with instead of a barcode, which lofty

@@ -502,14 +502,14 @@
 				</p>
 			{/if}
 			{#if live.tracks.some((t) => t.to_flac)}
-				{@const n = live.tracks.filter((t) => t.to_flac).length}
+				{@const converted = live.tracks.filter((t) => t.to_flac)}
 				<p class="autofilled">
 					<AudioWaveform size={14} />
 					<span>
-						Converted to FLAC: {n === tracks.length
+						Converted to FLAC: {converted.length === live.tracks.length
 							? 'every track'
-							: `${n} of ${tracks.length} tracks`}, as the Library keeps lossless audio as FLAC
-						only.
+							: converted.map((t) => t.file_name).join(', ')}, as the Library keeps lossless audio
+						as FLAC only.
 					</span>
 				</p>
 			{/if}

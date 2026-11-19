@@ -160,13 +160,15 @@ used on a home server.
   work the same way. FLAC is the Library's only lossless format: WAV, AIFF,
   WavPack, Monkey's Audio and ALAC files are converted to FLAC on import,
   with ffmpeg, and kept only if the FLAC's audio is the original's sample
-  for sample (so float and 32-bit audio is refused). Their tags carry over
-  as far as Vorbis comments can hold them (tags lofty has no key for don't),
-  and the dialog says which tracks are converted. coversync doesn't write
-  APE tags (lofty can cut a file's audio rewriting one): Musepack files
-  can't be imported, and WavPack and Monkey's Audio files can't be edited
-  in place; an MP3's APE tag (ReplayGain from MP3Gain, say) is left as it
-  is.
+  for sample (float or 32-bit audio FLAC can't hold exactly is refused,
+  as is a file with more than one audio stream, or one ffmpeg can't decode
+  without errors). Their tags carry over as far as Vorbis comments can
+  hold them (tags lofty has no key for don't), and the dialog says which
+  tracks are converted. coversync doesn't write APE tags (lofty can cut a
+  file's audio rewriting one): Musepack and hybrid WavPack files (whose
+  correction files ffmpeg can't read) can't be imported, and WavPack and
+  Monkey's Audio files can't be edited in place; an MP3's APE tag
+  (ReplayGain from MP3Gain, say) is left as it is.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added

@@ -389,18 +389,37 @@ fn lossless_audio_that_isnt_flac_is_converted_with_its_tags() {
             track_no: Some(n.to_string()),
             ..Default::default()
         };
-        let collection = [("collection", "Saga".to_string())];
         if n == 2 {
-            tags::write_with_kinds(path, &edit, &collection).unwrap();
+            // The album's collection (the WavPack gets it from autofill),
+            // and a BPM ID3v2 holds as an integer.
+            let kinds = [
+                ("collection", "Saga".to_string()),
+                ("bpm", "120".to_string()),
+            ];
+            tags::write_with_kinds(path, &edit, &kinds).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
         } else {
-            // Not written by coversync: an APE tag.
+            // Not written by coversync: an APE tag, with a cover as an item.
             let mut ape = lofty::ape::ApeTag::default();
-            for (key, value) in [("Album", "Record"), ("Title", "Track 3"), ("Track", "3")] {
-                let value = lofty::tag::ItemValue::Text(value.into());
+            let mut cover = b"front.png\0".to_vec();
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(4, 4)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            cover.extend(png.into_inner());
+            let text = |v: &str| lofty::tag::ItemValue::Text(v.into());
+            for (key, value) in [
+                ("Album", text("Record")),
+                ("Title", text("Track 3")),
+                ("Track", text("3")),
+                ("Cover Art (Front)", lofty::tag::ItemValue::Binary(cover)),
+            ] {
                 ape.insert(lofty::ape::ApeItem::new(key.into(), value).unwrap());
             }
-            let value = lofty::tag::ItemValue::Text("Saga".into());
-            ape.insert(lofty::ape::ApeItem::new("COLLECTION".into(), value).unwrap());
             lofty::tag::TagExt::save_to_path(&ape, path, lofty::config::WriteOptions::default())
                 .unwrap();
         }
@@ -437,9 +456,20 @@ fn lossless_audio_that_isnt_flac_is_converted_with_its_tags() {
             Some(lofty::file::FileType::Flac),
             "{name}"
         );
-        let values = tags::read_kinds(&path, false).unwrap().values;
-        assert_eq!(values["title"], title);
-        assert_eq!(values["collection"], "Saga");
+        let read = tags::read_kinds(&path, true).unwrap();
+        assert_eq!(read.values["title"], title);
+        assert_eq!(read.values["collection"], "Saga");
+        if name.starts_with("02") {
+            assert_eq!(read.values["bpm"], "120");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o640);
+            }
+        } else {
+            assert!(read.has_art, "the APE tag's cover");
+        }
     }
     let names = |dir: &Path| -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
