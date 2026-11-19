@@ -322,6 +322,7 @@
 			if (held && held.from !== id) held = null;
 		});
 	});
+	let sheet = $state<ReturnType<typeof AlbumDetail>>();
 	/** What the album sheet shows. */
 	let sheetAlbum = $derived(holding?.album ?? openAlbum);
 	let sheetDetail = $derived(
@@ -1127,7 +1128,7 @@
 
 	// Import: check the album against the library rules; import straight away
 	// when nothing is missing and there's no collection to pick, otherwise
-	// open the editor with the gaps marked.
+	// open the import dialog with the gaps marked.
 	/** The import editor: the plan plus any edits made before it opened. */
 	let importing = $state<{ album: Album; plan: ImportPlan; edits: ImportEdits } | null>(null);
 
@@ -1139,8 +1140,17 @@
 			return { label: 'Inbox setup', run: () => setView('inbox-setup') };
 	}
 
-	/** `edits` come from the album's tag editor, if the import started there. */
-	async function startImport(album: Album, edits: ImportEdits = {}) {
+	/**
+	 * `edits` come from the album's tag editor, where an import starts
+	 * without MusicBrainz's suggestions: its Import comes back here.
+	 */
+	async function startImport(album: Album, edits?: ImportEdits) {
+		if (!edits && !inboxSetup.saved.suggestions) {
+			await open(album);
+			sheet?.edit();
+			return;
+		}
+		edits ??= {};
 		const checking = toast(`Checking “${album.title}”…`, 'progress', 0);
 		let plan: ImportPlan;
 		try {
@@ -1619,9 +1629,9 @@
 
 {#if sheetAlbum}
 	<AlbumDetail
+		bind:this={sheet}
 		album={sheetAlbum}
 		detail={sheetDetail}
-		allowWrites={sheetAlbum.collection === 'library' || (status?.allow_writes ?? false)}
 		onclose={close}
 		{onsaved}
 		onimport={sheetAlbum.collection === 'inbox'

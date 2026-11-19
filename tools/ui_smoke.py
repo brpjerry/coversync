@@ -1484,8 +1484,7 @@ def main():
         time.sleep(0.8)
         print("changes:", d.js("return document.querySelector('.summary').textContent.trim()"))
         d.shot(out / f"4-editor-{tag}.png")
-        # Save is disabled on servers without --allow-writes.
-        # Save appears only where in-place edits are allowed (Library, or --allow-writes).
+        # Save appears only for Library albums: Inbox files are read-only.
         save = "return [...document.querySelectorAll('.editor .savebar button')].find(b => b.textContent.trim() === 'Save' && !b.disabled) ?? null"
         if "--save" in sys.argv and d.js(save):
             d.click_xpath("//div[contains(@class,'editor')]//div[contains(@class,'savebar')]//button[normalize-space(.)='Save']")

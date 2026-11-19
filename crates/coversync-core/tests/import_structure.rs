@@ -330,6 +330,16 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
         .iter()
         .map(|id| (*id, HashMap::from([("collection".into(), "Saga".into())])))
         .collect();
+    // A read-only original still takes its tags, in a copy coversync can
+    // edit again.
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    fs::set_permissions(
+        s.root.parent().unwrap().join("Inbox/Record/2.flac"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
     import::execute(
         &s.lib,
         &covers,
@@ -339,8 +349,14 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
         &Progress::default(),
     )
     .unwrap();
-    let copy = tags::read_kinds(&s.root.join("Saga/Record/02 - Two.flac"), false).unwrap();
+    let path = s.root.join("Saga/Record/02 - Two.flac");
+    let copy = tags::read_kinds(&path, false).unwrap();
     assert_eq!(copy.values["collection"], "Saga");
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
 }
 
 /// A mono 8 kHz WAV of a second's ramp: 16-bit samples, or 32-bit floats

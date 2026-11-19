@@ -90,7 +90,6 @@ export interface ScanProgress {
 
 export interface Status {
 	version: string;
-	allow_writes: boolean;
 	scan: ScanProgress;
 	hashes: {
 		running: boolean;

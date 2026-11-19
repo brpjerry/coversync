@@ -127,7 +127,6 @@ pub(crate) async fn blocking<T: Send + 'static>(
 #[derive(Serialize)]
 struct Status {
     version: &'static str,
-    allow_writes: bool,
     scan: coversync_core::ScanProgress,
     hashes: coversync_core::hashes::HashProgress,
     /// `library`: the Library's id and change counter (null without a
@@ -145,7 +144,6 @@ async fn status(State(state): State<Shared>) -> ApiResult<Json<Status>> {
     let index = blocking(&state, |s| s.lib.index_versions()).await?;
     Ok(Json(Status {
         version: env!("CARGO_PKG_VERSION"),
-        allow_writes: state.allow_writes,
         scan,
         hashes: state
             .hashes
@@ -331,8 +329,7 @@ fn must_be_folder(path: Option<&str>, what: &str) -> coversync_core::Result<()> 
     Ok(())
 }
 
-/// Library setup is coversync's own configuration, not file contents, so
-/// saving it doesn't need `--allow-writes`. A new folder is indexed right away.
+/// Save Library setup. A new folder is indexed right away.
 async fn save_library_setup(
     State(state): State<Shared>,
     Json(setup): Json<LibrarySetup>,
@@ -1094,7 +1091,6 @@ async fn write_tags(
     // nothing can change the album between the version check and the
     // write: everything that writes tracks, or shows or hides them, takes
     // it. The write, once begun, goes on if the request is dropped.
-    let allow_writes = state.allow_writes;
     let saved = exclusively(&state, move |s| {
         // The album the edits are for, as it is now: found by its tracks, at
         // the paths the editor had them or ones a save moved them from. With
@@ -1111,15 +1107,15 @@ async fn write_tags(
             }
             _ => s.lib.album(&id)?,
         };
-        // Library files are coversync's own; editing Inbox files in place needs --allow-writes.
-        if !allow_writes
-            && current
-                .as_ref()
-                .is_some_and(|d| d.album.collection == Collection::Inbox)
+        // Inbox files are read-only: an album's tags are edited on its way
+        // into the Library, and there.
+        if current
+            .as_ref()
+            .is_some_and(|d| d.album.collection == Collection::Inbox)
         {
             return Ok(Err(ApiError(
                 StatusCode::FORBIDDEN,
-                "Editing Inbox files in place is disabled on this server (start coversyncd with --allow-writes). Import the album to edit its Library copy.".into(),
+                "Inbox files are read-only. Import the album to edit its Library copy.".into(),
             )
             .into()));
         }
@@ -1132,7 +1128,6 @@ async fn write_tags(
             }))));
         }
         let current = current.ok_or(coversync_core::Error::NotFound)?;
-        let collection = current.album.collection;
         let ids: Vec<i64> = current.tracks.iter().map(|t| t.id).collect();
         if let Some(stray) = body
             .tracks
@@ -1173,9 +1168,7 @@ async fn write_tags(
         // editor can read them again (see `tag_files`).
         let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
         reclaim_copies(&s.lib)?;
-        if collection == Collection::Library {
-            moves_put_back(s, "saved")?;
-        }
+        moves_put_back(s, "saved")?;
         // Every file can take its edits, as it is, before any is written: an
         // album of mixed formats or files isn't left half edited.
         for (track, edit, kinds) in &edits {
@@ -1188,14 +1181,9 @@ async fn write_tags(
                 coversync_core::Error::Invalid(format!("{name}: {e}"))
             })?;
         }
-        // A Library album keeps to the folder structure (see `relocate`).
-        let layout = match collection {
-            Collection::Library => {
-                let template = Template::parse(&s.lib.library_setup()?.structure)?;
-                s.lib.library_folder()?.map(|root| (template, root))
-            }
-            Collection::Inbox => None,
-        };
+        // The album keeps to the folder structure (see `relocate`).
+        let template = Template::parse(&s.lib.library_setup()?.structure)?;
+        let layout = s.lib.library_folder()?.map(|root| (template, root));
         let named = |path: &FsPath, e: coversync_core::Error| {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             coversync_core::Error::Invalid(format!("{name}: {e}"))
@@ -1311,7 +1299,7 @@ async fn write_tags(
         let stat_all = |paths: Vec<(PathBuf, PathBuf)>| -> Vec<FileStat> {
             paths
                 .into_iter()
-                .filter_map(|(path, root)| scan::stat(path, &root, collection))
+                .filter_map(|(path, root)| scan::stat(path, &root, Collection::Library))
                 .collect()
         };
         let at_first: Vec<(PathBuf, PathBuf)> = written
@@ -1422,7 +1410,7 @@ async fn write_tags(
                 s.events.publish(Notice::AlbumChanged {
                     previous_id: (renamed && id == new_id).then(|| previous.clone()),
                     id,
-                    collection,
+                    collection: Collection::Library,
                     version,
                 });
             }
@@ -1536,7 +1524,6 @@ fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// A FLAC file with these Vorbis comments and a few bytes standing for its audio.
     fn flac(path: &FsPath, comments: &[&str]) {
@@ -1933,10 +1920,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_copy_a_stopped_save_left_goes_and_nothing_else_by_its_name() {
-        let (state, inbox) = editing_daemon("copies-left");
+        let (state, root) = editing_daemon("copies-left");
         let album = detail(&state, "Record");
         // A save that stopped once its copy was made: no cleanup ran.
-        let file = inbox.join("Record/01.flac");
+        let file = root.join("Record/01.flac");
         let left = tags::prepare_owned(&file, &genre("Rock"), &[], |c, f| {
             record_copy(&state.lib, c, f)
         })
@@ -1945,7 +1932,7 @@ mod tests {
         std::mem::forget(left);
         assert!(copy.is_file());
         // A recorded name that's another file now, and one named like a copy.
-        let other = inbox.join("Record/.coversync-tmp-dead-1.flac");
+        let other = root.join("Record/.coversync-tmp-dead-1.flac");
         std::fs::write(&other, "someone's").unwrap();
         state
             .lib
@@ -1955,11 +1942,11 @@ mod tests {
                 ino: 0,
             })
             .unwrap();
-        let backup = inbox.join("Record/.coversync-tmp-dead-1.flac.backup");
+        let backup = root.join("Record/.coversync-tmp-dead-1.flac.backup");
         std::fs::write(&backup, "a backup").unwrap();
         // And one where it can't be looked for now (a share away, say).
         use std::os::unix::fs::PermissionsExt;
-        let away = inbox.join("Record/Away");
+        let away = root.join("Record/Away");
         std::fs::create_dir_all(&away).unwrap();
         let far_path = away.join(".coversync-tmp-1-0.flac");
         let far = std::fs::File::create(&far_path).unwrap();
@@ -2024,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn a_save_that_would_move_files_waits_for_the_librarys_database() {
         // A Library folder scanned, never imported into: indexed for now only.
-        let (state, inbox) = editing_daemon("relocate-unstored");
+        let (state, inbox) = inbox_daemon("relocate-unstored");
         with_library(&state, &inbox);
         let root = state.lib.library_folder().unwrap().unwrap();
         std::fs::create_dir_all(root.join("Artist/Record")).unwrap();
@@ -2073,7 +2060,7 @@ mod tests {
     /// Inbox into a Library with `structure`: the daemon, the Library
     /// folder, and the album as imported.
     async fn library_record(name: &str, structure: &str) -> (Shared, PathBuf, AlbumDetail) {
-        let (state, inbox) = editing_daemon(name);
+        let (state, inbox) = inbox_daemon(name);
         with_library(&state, &inbox);
         set_structure(&state, structure);
         let id = import_titled(&state, "Record").await;
@@ -2316,7 +2303,7 @@ mod tests {
 
     #[tokio::test]
     async fn placement_uses_the_values_the_files_will_hold() {
-        let (state, inbox) = editing_daemon("relocate-values");
+        let (state, inbox) = inbox_daemon("relocate-values");
         with_library(&state, &inbox);
         // An MP3, whose ID3v2 genre 17 reads back as Rock.
         let mp3 = inbox.join("Tape/song.mp3");
@@ -2516,7 +2503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_title_drops_the_old_albums_cover_row() {
-        let (state, _inbox) = editing_daemon("retitle-cover");
+        let (state, _) = editing_daemon("retitle-cover");
         let base = detail(&state, "Record");
         scan::refresh_covers(&state.lib, &state.covers, &state.progress).unwrap();
         assert!(state.lib.cover(&base.album.id).unwrap().is_some());
@@ -2728,26 +2715,29 @@ mod tests {
         );
     }
 
-    /// A daemon's state that may edit Inbox files in place, over an Inbox
-    /// holding albums "Record" (three tracks) and "Other" (two), scanned;
-    /// and the Inbox folder.
-    fn editing_daemon(name: &str) -> (Shared, std::path::PathBuf) {
-        daemon_with(name, true)
-    }
-
-    /// As `editing_daemon`, editing Inbox files in place only if `allow_writes`.
-    fn daemon_with(name: &str, allow_writes: bool) -> (Shared, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let inbox = dir.join("inbox");
+    /// Albums "Record" (three tracks) and "Other" (two) in `folder`.
+    fn two_albums(folder: &FsPath) {
         for n in 1..=3 {
-            track(&inbox, "Record", n);
+            track(folder, "Record", n);
         }
         for n in 1..=2 {
-            track(&inbox, "Other", n);
+            track(folder, "Other", n);
         }
-        let mut state = Arc::into_inner(crate::test_state(&dir)).unwrap();
-        state.allow_writes = allow_writes;
+    }
+
+    fn daemon_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("coversyncd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A daemon's state over an Inbox holding `two_albums`, scanned; and the
+    /// Inbox folder.
+    fn inbox_daemon(name: &str) -> (Shared, PathBuf) {
+        let dir = daemon_dir(name);
+        let inbox = dir.join("inbox");
+        two_albums(&inbox);
+        let state = crate::test_state(&dir);
         state
             .lib
             .set_inbox_setup(InboxSetup {
@@ -2755,29 +2745,48 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let state = Arc::new(state);
         rescan_now(&state);
         (state, inbox)
+    }
+
+    /// A daemon's state over a Library holding `two_albums`, scanned, whose
+    /// structure (`{album}/{track_number}`) keeps them where they are, so
+    /// tag saves move nothing; and the Library folder.
+    fn editing_daemon(name: &str) -> (Shared, PathBuf) {
+        let dir = daemon_dir(name);
+        let root = dir.join("library");
+        two_albums(&root);
+        let state = crate::test_state(&dir);
+        state
+            .lib
+            .set_library_setup(LibrarySetup {
+                folder: Some(root.display().to_string()),
+                structure: "{album}/{track_number}".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        state.lib.prepare_library(&root).unwrap();
+        rescan_now(&state);
+        (state, root)
     }
 
     fn rescan_now(state: &Shared) {
         scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
     }
 
-    /// The details of the Inbox album titled `title`.
+    /// The details of the album titled `title`: in the Library, or else the Inbox.
     fn detail(state: &Shared, title: &str) -> AlbumDetail {
-        let albums = state
-            .lib
-            .albums(
-                Collection::Inbox,
-                &[],
-                &[],
-                &coversync_core::split::Splitter::default(),
-                &[],
-                None,
-            )
+        let album = [Collection::Library, Collection::Inbox]
+            .into_iter()
+            .find_map(|collection| {
+                let splitter = coversync_core::split::Splitter::default();
+                let albums = state
+                    .lib
+                    .albums(collection, &[], &[], &splitter, &[], None)
+                    .unwrap();
+                albums.into_iter().find(|a| a.title == title)
+            })
             .unwrap();
-        let album = albums.iter().find(|a| a.title == title).unwrap();
         state.lib.album(&album.id).unwrap().unwrap()
     }
 
@@ -2831,20 +2840,19 @@ mod tests {
         }
     }
 
-    /// Give the Inbox file at `path` the track id `id`, as a local database
-    /// restored from an older copy can: the ids it had given out since the
-    /// copy was made go to other files.
-    fn give_id(inbox: &FsPath, path: &FsPath, id: i64) {
-        let db = inbox
-            .parent()
-            .unwrap()
-            .join("state")
-            .join(coversync_core::db::LOCAL_DB);
+    /// Give the Library file at `path` the track id `id`, as a Library
+    /// database restored from an older copy can: the ids it had given out
+    /// since the copy was made go to other files.
+    fn give_id(root: &FsPath, path: &FsPath, id: i64) {
+        let db = root.join(coversync_core::db::LIBRARY_DB);
+        // The row's id, without the database's prefix (see `db`).
+        let row = -id & 0xFFFF_FFFF;
+        let rel = path.strip_prefix(root).unwrap();
         let moved = rusqlite::Connection::open(db)
             .unwrap()
             .execute(
                 "UPDATE tracks SET id = ?1 WHERE path = ?2",
-                rusqlite::params![id, path.to_string_lossy()],
+                rusqlite::params![row, rel.to_string_lossy()],
             )
             .unwrap();
         assert_eq!(moved, 1, "{}", path.display());
@@ -2872,6 +2880,7 @@ mod tests {
         assert_eq!(first.files_written, 3);
         let saved = first.album.unwrap();
         assert_ne!(saved.version, base.version);
+        wait_idle(&state).await;
         let counted = state.lib.index_versions().unwrap();
 
         // The second, from the same base, writes nothing and answers with
@@ -2933,17 +2942,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_after_a_track_left_or_joined_the_album_is_refused() {
-        let (state, inbox) = editing_daemon("conflict-tracks");
+        let (state, root) = editing_daemon("conflict-tracks");
         let base = detail(&state, "Record");
         // Not the track written last: they were all written together.
-        std::fs::remove_file(inbox.join("Record/01.flac")).unwrap();
+        std::fs::remove_file(root.join("Record/01.flac")).unwrap();
         rescan_now(&state);
         let now =
             conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).unwrap();
         assert_eq!(now.tracks.len(), 2);
         assert_eq!(genres(&state, &now), [None, None]);
 
-        track(&inbox, "Record", 4);
+        track(&root, "Record", 4);
         rescan_now(&state);
         let joined =
             conflict(put(&state, &now.album.id, save_on(&now, genre("Rock"))).await).unwrap();
@@ -2984,12 +2993,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_after_every_file_was_re_created_is_refused_with_the_album() {
-        let (state, inbox) = editing_daemon("conflict-recreated");
+        let (state, root) = editing_daemon("conflict-recreated");
         let base = detail(&state, "Record");
         // Renamed in place, as a tagger that names files after their tags
         // does: new tracks, under new ids, in the same album.
         for n in 1..=3 {
-            let dir = inbox.join("Record");
+            let dir = root.join("Record");
             std::fs::rename(
                 dir.join(format!("{n:02}.flac")),
                 dir.join(format!("{n:02} - Song {n}.flac")),
@@ -3022,16 +3031,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_track_id_used_again_comes_back_at_another_path() {
-        let (state, inbox) = editing_daemon("conflict-reused-id");
+        let (state, root) = editing_daemon("conflict-reused-id");
         let base = detail(&state, "Record");
         let last = base.tracks.last().unwrap();
-        let folder = inbox.join(&base.album.title);
-        std::fs::remove_file(inbox.join(&last.rel_path)).unwrap();
+        let folder = root.join(&base.album.title);
+        std::fs::remove_file(root.join(&last.rel_path)).unwrap();
         rescan_now(&state);
-        track(&inbox, &base.album.title, 9);
+        track(&root, &base.album.title, 9);
         rescan_now(&state);
         // The new file gets the removed track's id.
-        give_id(&inbox, &folder.join("09.flac"), last.id);
+        give_id(&root, &folder.join("09.flac"), last.id);
         let now =
             conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).unwrap();
         let again = now
@@ -3046,17 +3055,17 @@ mod tests {
 
     #[tokio::test]
     async fn an_album_whose_ids_all_went_to_new_files_is_not_followed() {
-        let (state, inbox) = editing_daemon("conflict-reused-album");
+        let (state, root) = editing_daemon("conflict-reused-album");
         let base = detail(&state, "Record");
-        std::fs::remove_dir_all(inbox.join(&base.album.title)).unwrap();
+        std::fs::remove_dir_all(root.join(&base.album.title)).unwrap();
         rescan_now(&state);
         for n in 1..=base.tracks.len() {
-            track(&inbox, "Fresh", n as u32);
+            track(&root, "Fresh", n as u32);
         }
         rescan_now(&state);
         // The new files get the removed tracks' ids.
         for (n, t) in (1..).zip(&base.tracks) {
-            give_id(&inbox, &inbox.join(format!("Fresh/{n:02}.flac")), t.id);
+            give_id(&root, &root.join(format!("Fresh/{n:02}.flac")), t.id);
         }
         let fresh = detail(&state, "Fresh");
         let ids = |a: &AlbumDetail| {
@@ -3074,11 +3083,29 @@ mod tests {
         assert!(genres(&state, &fresh).iter().all(Option::is_none));
     }
 
+    /// Once the files a save or scan queued are hashed (which raises the
+    /// Library's change counter).
+    async fn wait_idle(state: &Shared) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let guard = state.hash_jobs.lock().await;
+                if !state.hash_pending.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hash queue drains");
+    }
+
     /// Take the jobs lock as `holder` does, and let it go again.
     async fn hold(state: Shared, holder: &'static str) {
         match holder {
+            // On the album "import" brought into the Library.
             "tag write" => {
-                let base = detail(&state, "Other");
+                let base = detail(&state, "Record");
                 put(&state, &base.album.id, save_on(&base, genre("Rock")))
                     .await
                     .unwrap();
@@ -3105,7 +3132,7 @@ mod tests {
     #[tokio::test]
     async fn a_rescan_asked_for_while_the_jobs_lock_is_taken_still_runs() {
         use std::time::{Duration, Instant};
-        let (state, inbox) = editing_daemon("rescan-queued");
+        let (state, inbox) = inbox_daemon("rescan-queued");
         let root = inbox.parent().unwrap().join("library");
         std::fs::create_dir_all(&root).unwrap();
         state
@@ -3131,7 +3158,7 @@ mod tests {
                 .find(|a| a.title == "Late")
                 .map_or(0, |a| a.track_count)
         };
-        let holders = ["tag write", "import", "unhide", "Library setup", "scan"];
+        let holders = ["import", "tag write", "unhide", "Library setup", "scan"];
         for (n, holder) in (1..).zip(holders) {
             // The holder waits behind this test for the lock, and takes it
             // when the test lets go; the scan is asked for meanwhile.
@@ -3187,22 +3214,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        async fn wait_idle(state: &Shared) {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let guard = state.hash_jobs.lock().await;
-                    if !state.hash_pending.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    drop(guard);
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("hash queue drains");
-        }
-
-        let (state, inbox) = editing_daemon("hash-queue");
+        let (state, inbox) = inbox_daemon("hash-queue");
         with_library(&state, &inbox);
         // Laid out as `track` lays files, so a save doesn't move them.
         let mut setup = state.lib.library_setup().unwrap();
@@ -3302,13 +3314,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_one_file_cant_take_changes_no_file() {
-        let (state, inbox) = editing_daemon("conflict-partial");
+        let (state, root) = editing_daemon("conflict-partial");
         let base = detail(&state, "Record");
         // The second file has two icons, which only writing it finds: every
         // file's edit is written to a copy before any file changes, so the
         // first stays as it was too.
         flac_with_icons(
-            &inbox.join(&base.tracks[1].rel_path),
+            &root.join(&base.tracks[1].rel_path),
             &[
                 "TITLE=Song 2",
                 "ARTIST=Artist",
@@ -3339,7 +3351,7 @@ mod tests {
 
         // A file gone (no scan has noticed) is found before anything is
         // written: the album stays as it was.
-        std::fs::remove_file(inbox.join(&base.tracks[2].rel_path)).unwrap();
+        std::fs::remove_file(root.join(&base.tracks[2].rel_path)).unwrap();
         let failed = put(&state, &base.album.id, save_on(&base, genre("Jazz"))).await;
         assert!(matches!(failed, Err(TagWriteError::Api(_))));
         assert_eq!(tags::read(&first).unwrap().genre, None);
@@ -3347,10 +3359,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn versioned_saves_need_allow_writes_only_for_the_inbox_album_found() {
-        let (state, inbox) = daemon_with("conflict-writes-off", false);
+    async fn inbox_albums_are_never_saved_and_library_saves_find_theirs_by_its_tracks() {
+        let (state, inbox) = inbox_daemon("conflict-writes-off");
         with_library(&state, &inbox);
-        // Inbox files can't be edited in place.
+        // Inbox files are read-only.
         let other = detail(&state, "Other");
         match put(&state, &other.album.id, save_on(&other, genre("Rock"))).await {
             Err(TagWriteError::Api(ApiError(status, _))) => {
@@ -3389,7 +3401,7 @@ mod tests {
     async fn a_scan_waits_for_work_whose_request_was_dropped() {
         use std::time::{Duration, Instant, SystemTime};
         use tokio::sync::broadcast::error::TryRecvError;
-        let (state, inbox) = editing_daemon("cancelled");
+        let (state, inbox) = inbox_daemon("cancelled");
         with_library(&state, &inbox);
         let library = inbox.parent().unwrap().join("library");
         // Enough files that the work outlasts its request by a while.
@@ -3509,7 +3521,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_save_on_a_library_album_from_the_same_version_is_refused() {
-        let (state, inbox) = editing_daemon("conflict-library");
+        let (state, inbox) = inbox_daemon("conflict-library");
         let root = inbox.parent().unwrap().join("library");
         std::fs::create_dir_all(&root).unwrap();
         state
@@ -3549,9 +3561,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_on_an_album_no_longer_there_is_refused_with_none() {
-        let (state, inbox) = editing_daemon("conflict-gone");
+        let (state, root) = editing_daemon("conflict-gone");
         let base = detail(&state, "Other");
-        std::fs::remove_dir_all(inbox.join("Other")).unwrap();
+        std::fs::remove_dir_all(root.join("Other")).unwrap();
         rescan_now(&state);
         assert!(
             conflict(put(&state, &base.album.id, save_on(&base, genre("Rock"))).await).is_none()
@@ -3642,7 +3654,6 @@ mod tests {
         let status = |lib: &coversync_core::Library| {
             serde_json::to_value(Status {
                 version: "0",
-                allow_writes: false,
                 scan: Default::default(),
                 hashes: Default::default(),
                 index: lib.index_versions().unwrap(),
@@ -3655,17 +3666,7 @@ mod tests {
             k
         };
         let v = status(&lib);
-        assert_eq!(
-            keys(&v),
-            [
-                "allow_writes",
-                "hashes",
-                "inbox",
-                "library",
-                "scan",
-                "version"
-            ]
-        );
+        assert_eq!(keys(&v), ["hashes", "inbox", "library", "scan", "version"]);
         assert_eq!(v["library"], serde_json::Value::Null);
         assert_eq!(v["inbox"], serde_json::json!({ "generation": 0 }));
 
