@@ -62,8 +62,8 @@ pub struct TrackTags {
 /// the collection, in any format.
 pub const READER: u32 = 5;
 
-/// The [collection](rules::COLLECTION)'s name in a file: a Vorbis comment
-/// or APE item, an ID3v2 TXXX frame or an iTunes freeform MP4 atom. Lofty
+/// The [collection](rules::COLLECTION)'s name in a file: a Vorbis comment,
+/// an ID3v2 TXXX frame or an iTunes freeform MP4 atom. Lofty
 /// has no key for it, so it's read and written in each format's own way.
 const COLLECTION_KEY: &str = "COLLECTION";
 
@@ -71,8 +71,8 @@ const COLLECTION_KEY: &str = "COLLECTION";
 /// the collection.
 fn is_collection(t: TagType, key: &str) -> bool {
     match t {
-        // These ignore case, as lofty reads them.
-        TagType::VorbisComments | TagType::Ape => key.eq_ignore_ascii_case(COLLECTION_KEY),
+        // Comment names ignore case, as lofty reads them.
+        TagType::VorbisComments => key.eq_ignore_ascii_case(COLLECTION_KEY),
         TagType::Id3v2 => key.strip_prefix("TXXX:") == Some(COLLECTION_KEY),
         TagType::Mp4Ilst => key.strip_prefix("----:com.apple.iTunes:") == Some(COLLECTION_KEY),
         _ => false,
@@ -618,7 +618,6 @@ fn unwritable(
 enum Native {
     Id3v2(lofty::id3::v2::Id3v2Tag),
     Ilst(lofty::mp4::Ilst),
-    Ape(lofty::ape::ApeTag),
     Other(Tag),
 }
 
@@ -651,11 +650,6 @@ fn native(tag: Tag, collection: Option<&str>) -> Result<Native> {
                 ));
             }
         }
-        Native::Ape(t) if value.is_empty() => t.remove(COLLECTION_KEY),
-        Native::Ape(t) => t.insert(
-            lofty::ape::ApeItem::new(COLLECTION_KEY.into(), ItemValue::Text(value.into()))
-                .map_err(tag_err)?,
-        ),
         // Refused by `apply_kinds`.
         Native::Other(_) => {}
     }
@@ -694,62 +688,8 @@ fn native_of(tag: Tag) -> Result<Native> {
             Native::Id3v2(id3)
         }
         TagType::Mp4Ilst => Native::Ilst(lofty::mp4::Ilst::from(tag)),
-        TagType::Ape => {
-            // Number pairs and the compilation flag as written: the
-            // conversion would read them as numbers (Track=A1 lost, 01/09
-            // made 1/9).
-            let mut tag = tag;
-            let mut literal = Vec::new();
-            let mut typed = Vec::new();
-            for (name, number, total) in [
-                ("Track", ItemKey::TrackNumber, ItemKey::TrackTotal),
-                ("Disc", ItemKey::DiscNumber, ItemKey::DiscTotal),
-            ] {
-                let value = |key| tag.get(key).map(|i| i.value().clone());
-                match (value(number), value(total)) {
-                    (None, None) => {}
-                    (Some(ItemValue::Text(n)), None) => literal.push((name, n)),
-                    (n @ (None | Some(ItemValue::Text(_))), Some(ItemValue::Text(t))) => {
-                        let n = match n {
-                            Some(ItemValue::Text(n)) => n,
-                            _ => "0".into(),
-                        };
-                        literal.push((name, format!("{n}/{t}")));
-                    }
-                    // A binary or locator item, as it was (lofty files it
-                    // under either key).
-                    (Some(v), None) | (None, Some(v)) => typed.push((name, v)),
-                    _ => {
-                        return Err(Error::Tags(format!(
-                            "the file's APE {name} item can't hold both its number and total as they are, so it wasn't changed"
-                        )));
-                    }
-                }
-                tag.remove_key(number);
-                tag.remove_key(total);
-            }
-            // Compilation as it was, text, locator or binary, every value.
-            let compilation: Vec<ItemValue> = tag
-                .items()
-                .filter(|i| i.key() == ItemKey::FlagCompilation)
-                .map(|i| i.value().clone())
-                .collect();
-            tag.remove_key(ItemKey::FlagCompilation);
-            let mut ape = lofty::ape::ApeTag::from(tag);
-            for (name, value) in literal {
-                let item = lofty::ape::ApeItem::new(name.into(), ItemValue::Text(value))
-                    .map_err(tag_err)?;
-                ape.insert(item);
-            }
-            for (name, value) in typed {
-                ape.insert(lofty::ape::ApeItem::new(name.into(), value).map_err(tag_err)?);
-            }
-            for value in compilation {
-                ape.push(lofty::ape::ApeItem::new("Compilation".into(), value).map_err(tag_err)?);
-            }
-            Native::Ape(ape)
-        }
-        // RIFF INFO, AIFF text chunks: as lofty writes them.
+        // RIFF INFO, AIFF text chunks: as lofty writes them. (APE tags are
+        // refused before, by `apply_kinds`.)
         _ => Native::Other(tag),
     })
 }
@@ -769,7 +709,6 @@ fn save_owned(path: &Path, tag: Tag, collection: Option<&str>) -> Result<()> {
     match native(tag, collection)? {
         Native::Id3v2(t) => t.save_to_path(path, options),
         Native::Ilst(t) => t.save_to_path(path, options),
-        Native::Ape(t) => t.save_to_path(path, options),
         Native::Other(t) => t.save_to_path(path, options),
     }
     .map_err(tag_err)
@@ -1364,7 +1303,7 @@ pub fn can_store(tag_type: TagType, kind: &str) -> bool {
     if kind == rules::COLLECTION {
         return matches!(
             tag_type,
-            TagType::VorbisComments | TagType::Ape | TagType::Id3v2 | TagType::Mp4Ilst
+            TagType::VorbisComments | TagType::Id3v2 | TagType::Mp4Ilst
         );
     }
     matches!(
@@ -1391,36 +1330,6 @@ fn primary_tag_mut(file: &mut TaggedFile) -> &mut Tag {
         file.insert_tag(tag);
     }
     file.primary_tag_mut().expect("primary tag inserted above")
-}
-
-/// Whether an MP3's APE tag has a front or untyped cover of its own (lofty
-/// keeps APE covers as items, not pictures, so they aren't in its generic
-/// tag) other than `new`, the image replacing it. Such a cover isn't
-/// replaced: lofty can't rewrite every APE layout safely (a tag with only a
-/// footer loses 32 bytes of audio). An empty one, or one already `new`,
-/// doesn't count.
-fn secondary_ape_cover(path: &Path, new: &[u8]) -> Result<bool> {
-    use lofty::file::AudioFile;
-    let options = ParseOptions::new().read_properties(false);
-    let mut f = std::io::BufReader::new(fs::File::open(path)?);
-    let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, options).map_err(tag_err)?;
-    let Some(ape) = mpeg.ape() else {
-        return Ok(false);
-    };
-    Ok(["Cover Art (Front)", "Cover Art (Other)"]
-        .iter()
-        .filter_map(|k| ape.get(k))
-        .any(|item| match item.value() {
-            // A file name, a zero byte, then the image.
-            ItemValue::Binary(bytes) => {
-                let image = bytes
-                    .iter()
-                    .position(|b| *b == 0)
-                    .map_or(&bytes[..], |at| &bytes[at + 1..]);
-                !image.is_empty() && image != new
-            }
-            ItemValue::Text(text) | ItemValue::Locator(text) => !text.is_empty(),
-        }))
 }
 
 fn has_pictures(file: &TaggedFile) -> bool {
@@ -1574,6 +1483,14 @@ fn described(item: &TagItem) -> bool {
 /// that the first this format holds; one the format would drop on writing
 /// (an MP4 compilation flag of "yes") is refused.
 fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
+    // Lofty's APE writer can cut a file's audio (32 bytes, from a tag with
+    // no header), so the Library keeps no WavPack, Monkey's Audio or
+    // Musepack files, and no APE tag is written. An MP3's is left as it is.
+    if tag.tag_type() == TagType::Ape {
+        return Err(Error::Tags(
+            "WavPack, Monkey's Audio and Musepack files keep their tags in an APE tag, which coversync doesn't write".into(),
+        ));
+    }
     // The kinds given values, to check they're all still there as written.
     let mut set: Vec<(&'static rules::TagKind, String)> = Vec::new();
     for (id, value) in values {
@@ -1765,10 +1682,6 @@ fn lost(
                     t.dump_to(&mut sink, options).ok()?;
                     t.into()
                 }
-                Native::Ape(t) => {
-                    t.dump_to(&mut sink, options).ok()?;
-                    t.into()
-                }
                 Native::Other(t) => t,
             };
             Some(
@@ -1953,7 +1866,6 @@ pub fn check_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Res
         match native(tag, collection)? {
             Native::Id3v2(t) => t.dump_to(&mut sink, options),
             Native::Ilst(t) => t.dump_to(&mut sink, options),
-            Native::Ape(t) => t.dump_to(&mut sink, options),
             Native::Other(t) => t.dump_to(&mut sink, options),
         }
         .map_err(tag_err)?;
@@ -2010,16 +1922,6 @@ pub fn copy_with_tags_hashed(
                 // Other tags are only written when their pictures change.
                 let mut changed = Vec::new();
                 if art.is_some() && replace {
-                    if file_type == FileType::Mpeg
-                        && file.tag(TagType::Ape).is_some()
-                        && let Some(new) = art
-                        && secondary_ape_cover(&tmp, new.data())?
-                    {
-                        return Err(Error::Tags(format!(
-                            "{}: the MP3's APE tag has a cover of its own, which can't be replaced safely, so it wasn't changed",
-                            src.display()
-                        )));
-                    }
                     // Untyped pictures go too: players show them as the cover.
                     // Back covers, booklets and the like stay.
                     let types: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
@@ -2501,7 +2403,6 @@ mod tests {
             include_bytes!("../tests/fixtures/silence.m4a"),
         )
         .unwrap();
-        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
         let set = |file: &Path, value: &str| {
             write_with_kinds(
                 file,
@@ -2525,7 +2426,7 @@ mod tests {
                     .id3v2()?
                     .get_user_text("COLLECTION")
                     .map(str::to_string),
-                "a.m4a" => lofty::mp4::Mp4File::read_from(&mut open(name), options)
+                _ => lofty::mp4::Mp4File::read_from(&mut open(name), options)
                     .unwrap()
                     .ilst()?
                     .get(&AtomIdent::Freeform {
@@ -2537,14 +2438,9 @@ mod tests {
                         lofty::mp4::AtomData::UTF8(t) => Some(t.clone()),
                         _ => None,
                     }),
-                _ => lofty::wavpack::WavPackFile::read_from(&mut open(name), options)
-                    .unwrap()
-                    .ape()?
-                    .get("COLLECTION")
-                    .and_then(|i| i.value().text().map(str::to_string)),
             }
         };
-        for name in ["a.flac", "a.mp3", "a.m4a", "a.wv"] {
+        for name in ["a.flac", "a.mp3", "a.m4a"] {
             let file = path(name);
             set(&file, "Saga");
             set(&file, "Saga 2");
@@ -2773,7 +2669,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "server")]
-    fn an_mp3_whose_ape_tag_has_a_cover_keeps_its_covers() {
+    fn an_mp3s_ape_tag_is_left_as_it_is() {
         use lofty::ape::{ApeItem, ApeTag};
         use lofty::id3::v2::Id3v2Tag;
         let dir = std::env::temp_dir().join(format!("coversync-mp3ape-{}", std::process::id()));
@@ -2792,7 +2688,7 @@ mod tests {
                 .unwrap()
         };
         // ID3v2 with a front cover; APE with a front cover, a back cover and
-        // an item of its own.
+        // an item of its own, which an import replacing the cover leaves.
         let mut generic = Tag::new(TagType::Id3v2);
         generic.set_title("Song".into());
         generic.push_picture(cover(4));
@@ -2811,43 +2707,20 @@ mod tests {
         ));
         ape.insert(item("Ripper", ItemValue::Text("kept".into())));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
+        let before = lofty::mpeg::MpegFile::read_from(
+            &mut fs::File::open(&src).unwrap(),
+            ParseOptions::new(),
+        )
+        .unwrap()
+        .ape()
+        .cloned()
+        .unwrap();
         let new = cover(8);
-        let refused = copy_with_tags(&src, &dest, &[], Some(&new), true)
-            .unwrap_err()
-            .to_string();
-        assert!(refused.contains("APE tag has a cover"), "{refused}");
-        assert!(refused.contains("in.mp3"), "{refused}");
-        assert!(!dest.exists());
-        // One that's empty, or already the new image, has nothing to replace.
-        let mut same = b"front.png\0".to_vec();
-        same.extend_from_slice(new.data());
-        for front in [b"front.jpg\0".to_vec(), same] {
-            let mut ape = ApeTag::default();
-            ape.insert(item("Cover Art (Front)", ItemValue::Binary(front)));
-            ape.save_to_path(&src, WriteOptions::default()).unwrap();
-            assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
-            assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
-            fs::remove_file(&dest).unwrap();
-        }
-        // An APE tag with no cover (ReplayGain, say) doesn't stand in the
-        // way, and stays as it was.
-        let mut ape = ApeTag::default();
-        ape.insert(item(
-            "REPLAYGAIN_TRACK_GAIN",
-            ItemValue::Text("-6.1 dB".into()),
-        ));
-        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
-        ape.save_to_path(&src, WriteOptions::default()).unwrap();
-        assert!(copy_with_tags(&src, &dest, &[], Some(&new), true).unwrap());
+        assert!(copy_with_tags(&src, &dest, &[("title", "New".into())], Some(&new), true).unwrap());
         assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
         let mut f = fs::File::open(&dest).unwrap();
         let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, ParseOptions::new()).unwrap();
-        let ape = mpeg.ape().unwrap();
-        assert!(matches!(
-            ape.get("Ripper").map(|i| i.value()),
-            Some(ItemValue::Text(t)) if t == "kept"
-        ));
-        assert!(ape.get("REPLAYGAIN_TRACK_GAIN").is_some());
+        assert_eq!(mpeg.ape(), Some(&before));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2956,49 +2829,24 @@ mod tests {
     }
 
     #[test]
-    fn ape_items_covers_and_numbers_are_kept_as_written() {
+    fn ape_tags_arent_written() {
         use lofty::ape::{ApeItem, ApeTag};
         let dir = std::env::temp_dir().join(format!("coversync-ape-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (src, dest) = (dir.join("in.wv"), dir.join("out.wv"));
         fs::write(&src, include_bytes!("../tests/fixtures/silence.wv")).unwrap();
-        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
         let mut ape = ApeTag::default();
-        ape.insert(item("Title", ItemValue::Text("Song".into())));
-        ape.insert(item("Track", ItemValue::Text("A1".into())));
-        ape.insert(item("Ripper", ItemValue::Text("kept".into())));
-        ape.insert(item(
-            "Cover Art (Front)",
-            ItemValue::Binary(b"front.jpg\0data".to_vec()),
-        ));
-        ape.insert(item("Compilation", ItemValue::Binary(vec![1])));
-        ape.insert(item("Disc", ItemValue::Binary(vec![2])));
+        ape.insert(ApeItem::new("Title".into(), ItemValue::Text("Song".into())).unwrap());
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
-        let values = [("title", "New".to_string())];
-        copy_with_tags(&src, &dest, &values, None, false).unwrap();
-        let mut f = fs::File::open(&dest).unwrap();
-        let wv = lofty::wavpack::WavPackFile::read_from(&mut f, ParseOptions::new()).unwrap();
-        let ape = wv.ape().unwrap();
-        let text = |k: &str| match ape.get(k).map(|i| i.value()) {
-            Some(ItemValue::Text(v)) => Some(v.as_str()),
-            _ => None,
-        };
-        assert_eq!(text("Title"), Some("New"));
-        assert_eq!(text("Track"), Some("A1"));
-        assert_eq!(text("Ripper"), Some("kept"));
-        assert!(matches!(
-            ape.get("Disc").map(|i| i.value()),
-            Some(ItemValue::Binary(b)) if b == &[2]
-        ));
-        assert!(matches!(
-            ape.get("Compilation").map(|i| i.value()),
-            Some(ItemValue::Binary(b)) if b == &[1]
-        ));
-        assert!(matches!(
-            ape.get("Cover Art (Front)").map(|i| i.value()),
-            Some(ItemValue::Binary(b)) if b == b"front.jpg\0data"
-        ));
+        let before = fs::read(&src).unwrap();
+        let title = [("title", "New".to_string())];
+        let refused = |r: Result<()>| assert!(r.unwrap_err().to_string().contains("APE tag"));
+        refused(write_with_kinds(&src, &TagEdit::default(), &title));
+        refused(check_kinds(&src, &TagEdit::default(), &title));
+        refused(copy_with_tags(&src, &dest, &title, None, false).map(drop));
+        assert_eq!(fs::read(&src).unwrap(), before);
+        assert!(!dest.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3945,72 +3793,6 @@ mod tests {
         for date in DATES_READ_IN_PART {
             assert!(validate_kind("date", date).is_err(), "{date}");
         }
-    }
-
-    #[test]
-    #[cfg(feature = "server")]
-    fn ape_items_held_as_data_are_left_and_literal_values_kept() {
-        use lofty::ape::{ApeItem, ApeTag};
-        let dir = std::env::temp_dir().join(format!("coversync-apedata-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = |name: &str| dir.join(name);
-        let item = |k: &str, v: ItemValue| ApeItem::new(k.into(), v).unwrap();
-        let none = TagEdit::default();
-        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
-        let mut ape = ApeTag::default();
-        ape.insert(item("Title", ItemValue::Text("Song".into())));
-        ape.insert(item("UnsyncedLyrics", ItemValue::Binary(vec![1, 2, 3])));
-        ape.insert(item("Track", ItemValue::Binary(vec![4])));
-        ape.save_to_path(path("a.wv"), WriteOptions::default())
-            .unwrap();
-        // Lyrics go under their other name; the data item stays.
-        write_with_kinds(&path("a.wv"), &none, &[("lyrics", "La la".to_string())]).unwrap();
-        // A literal compilation flag, as APE writes it.
-        write_with_kinds(&path("a.wv"), &none, &[("compilation", "yes".to_string())]).unwrap();
-        let mut f = fs::File::open(path("a.wv")).unwrap();
-        let wv = lofty::wavpack::WavPackFile::read_from(&mut f, ParseOptions::new()).unwrap();
-        let ape = wv.ape().unwrap();
-        assert!(matches!(
-            ape.get("UnsyncedLyrics").map(|i| i.value()),
-            Some(ItemValue::Binary(b)) if b == &[1, 2, 3]
-        ));
-        assert!(matches!(
-            ape.get("Lyrics").map(|i| i.value()),
-            Some(ItemValue::Text(t)) if t == "La la"
-        ));
-        assert!(matches!(
-            ape.get("Compilation").map(|i| i.value()),
-            Some(ItemValue::Text(t)) if t == "yes"
-        ));
-        // A date where a data item holds it: refused, by kind or by field.
-        let mut ape = lofty::wavpack::WavPackFile::read_from(
-            &mut fs::File::open(path("a.wv")).unwrap(),
-            ParseOptions::new(),
-        )
-        .unwrap()
-        .remove_ape()
-        .unwrap();
-        ape.insert(item("Year", ItemValue::Binary(vec![9])));
-        ape.save_to_path(path("a.wv"), WriteOptions::default())
-            .unwrap();
-        let date = [("date", "2010".to_string())];
-        assert!(
-            write_with_kinds(&path("a.wv"), &none, &date)
-                .unwrap_err()
-                .to_string()
-                .contains("as data")
-        );
-        let year = TagEdit {
-            year: Some("2010".into()),
-            ..Default::default()
-        };
-        assert!(write(&path("a.wv"), &year).is_err());
-        // A track number where a data item holds the number: refused before
-        // anything is written.
-        let three = [("track_number", "3".to_string())];
-        assert!(check_kinds(&path("a.wv"), &TagEdit::default(), &three).is_err());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

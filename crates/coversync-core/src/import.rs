@@ -362,6 +362,13 @@ pub fn plan(
         art_rules.placement.embedded(),
         &splitter,
     )?;
+    // Their APE tags can't be written safely (see `tags::apply_kinds`).
+    if read.iter().any(|t| t.tag_type == lofty::tag::TagType::Ape) {
+        problems.push(
+            "WavPack, Monkey's Audio and Musepack files can't go in the Library, which keeps no APE tags."
+                .into(),
+        );
+    }
     let gets_art = if upload.is_some() {
         read.len()
     } else {
