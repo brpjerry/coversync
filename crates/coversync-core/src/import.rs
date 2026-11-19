@@ -463,10 +463,11 @@ pub fn plan(
             n.trim_start_matches('0').to_string()
         }));
         // What's required, and what the structure reads, so that what it
-        // needs alike on every track can be checked.
+        // needs alike on every track can be checked; and the collection,
+        // which the import dialog picks.
         let shown: HashMap<&'static str, String> = values
             .into_iter()
-            .filter(|(k, _)| kinds.contains(k) || reads.contains(k))
+            .filter(|(k, _)| kinds.contains(k) || reads.contains(k) || *k == rules::COLLECTION)
             .collect();
         tracks.push((
             path,

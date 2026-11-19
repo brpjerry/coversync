@@ -42,6 +42,8 @@
 		label: (id: string) => string;
 		/** Kinds asked for once per album rather than per track. */
 		albumKinds: string[];
+		/** Library setup's collections, which the album can go in. */
+		collections: string[];
 		notEditable: string[];
 		/** Core tag kinds, shown up front among suggestions. */
 		coreKinds: string[];
@@ -66,6 +68,7 @@
 		baseEdits = {},
 		label,
 		albumKinds,
+		collections,
 		notEditable,
 		coreKinds,
 		kindOrder,
@@ -86,7 +89,12 @@
 	 * once it's there.
 	 */
 	let disagree = $state([...opened]);
-	let albumCols = $derived([...failing.filter((k) => albumKinds.includes(k)), ...disagree]);
+	/** The collection has a field of its own. */
+	let albumCols = $derived(
+		[...failing.filter((k) => albumKinds.includes(k)), ...disagree].filter(
+			(k) => k !== 'collection'
+		)
+	);
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
 	/** The date added an album keeps (Preserve modification date), as a date. */
 	const addedDate = (seconds: number) =>
@@ -107,6 +115,10 @@
 	let albumValues = $state<Record<string, string>>(
 		Object.fromEntries(startCols.map((k) => [k, consensus(k)]))
 	);
+	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
+	const hadCollection = consensus('collection');
+	let collectionChoices = $derived([...new Set([...collections, hadCollection].filter(Boolean))]);
+	let collection = $state(hadCollection);
 	let trackValues = $state<Record<number, Record<string, string>>>(
 		Object.fromEntries(
 			tracks.map((t) => [t.id, Object.fromEntries(trackCols.map((k) => [k, t.values[k] ?? '']))])
@@ -257,6 +269,7 @@
 				const v = effective(t.id, k);
 				if (v && v !== original(t.id, k)) (out[t.id] ??= {})[k] = v;
 			}
+			if (collection !== original(t.id, 'collection')) (out[t.id] ??= {}).collection = collection;
 		}
 		return out;
 	});
@@ -485,6 +498,16 @@
 				<ul class="problems" transition:fly={{ y: -6, duration: 200 }}>
 					{#each live.problems as p (p)}<li><TriangleAlert size={15} /> {p}</li>{/each}
 				</ul>
+			{/if}
+
+			{#if collectionChoices.length}
+				<label class="field collection">
+					<span class="field-label">Collection</span>
+					<select bind:value={collection}>
+						<option value="">None</option>
+						{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
+					</select>
+				</label>
 			{/if}
 
 			{#if artNeeded}
@@ -971,7 +994,11 @@
 		color: var(--danger);
 	}
 
-	input {
+	.collection {
+		max-width: 360px;
+	}
+	input,
+	select {
 		width: 100%;
 		height: 38px;
 		padding: 0 12px;
@@ -985,7 +1012,8 @@
 			background 200ms,
 			box-shadow 200ms;
 	}
-	input:focus {
+	input:focus,
+	select:focus {
 		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
 		background: var(--bg-raised);
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);

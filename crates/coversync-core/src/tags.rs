@@ -79,6 +79,49 @@ pub fn reader_changed(path: &Path, since: u32) -> bool {
     }
 }
 
+/// The [collection](rules::COLLECTION)'s name in a file: a Vorbis comment
+/// or APE item, an ID3v2 TXXX frame or an iTunes freeform MP4 atom. Lofty
+/// has no key for it, so it's read and written in each format's own way.
+const COLLECTION_KEY: &str = "COLLECTION";
+
+/// Whether `key`, an item of a `t` tag as [`unmapped_items`] names it, is
+/// the collection.
+fn is_collection(t: TagType, key: &str) -> bool {
+    match t {
+        // These ignore case, as lofty reads them.
+        TagType::VorbisComments | TagType::Ape => key.eq_ignore_ascii_case(COLLECTION_KEY),
+        TagType::Id3v2 => key.strip_prefix("TXXX:") == Some(COLLECTION_KEY),
+        TagType::Mp4Ilst => key.strip_prefix("----:com.apple.iTunes:") == Some(COLLECTION_KEY),
+        _ => false,
+    }
+}
+
+/// Add to `values` (those of `tag`, the tag of `file` read) the first of
+/// its collections that isn't blank; true when it has one.
+fn read_collection(
+    path: &Path,
+    file: &TaggedFile,
+    tag: Option<&Tag>,
+    values: &mut HashMap<&'static str, String>,
+) -> Result<bool> {
+    let Some(t) = tag
+        .map(Tag::tag_type)
+        .filter(|t| can_store(*t, rules::COLLECTION))
+    else {
+        return Ok(false);
+    };
+    let comments = vorbis_comments(path, file.file_type())?.map(|(raw, _)| raw);
+    let found = unmapped_items(path, file.file_type(), comments, &[t])?
+        .into_iter()
+        .filter(|(block, _)| *block == t)
+        .flat_map(|(_, items)| items)
+        .find(|(k, v)| is_collection(t, k) && !v.trim().is_empty());
+    if let Some((_, v)) = &found {
+        values.insert(rules::COLLECTION, v.trim().to_string());
+    }
+    Ok(found.is_some())
+}
+
 fn tag_err(e: impl std::fmt::Display) -> Error {
     Error::Tags(e.to_string())
 }
@@ -199,6 +242,9 @@ pub fn read(path: &Path) -> Result<TrackTags> {
         out.values = values_of(tag);
         if drop_vendor_encoder(path, &file, Some(tag), &mut out.values)? {
             out.tag_keys.retain(|k| *k != "encoder");
+        }
+        if read_collection(path, &file, Some(tag), &mut out.values)? {
+            out.tag_keys.push(rules::COLLECTION);
         }
     }
     Ok(out)
@@ -381,8 +427,15 @@ fn vorbis_rest(path: &Path, file_type: FileType) -> Result<Option<VorbisRest>> {
 /// `rest`. The vendor string stays as it was; ENCODER comments are the
 /// file's own, or one the edit set, never the vendor string lofty reads as
 /// one; ratings are the file's own, unless the edit cleared them. `edited`
-/// is the tag kinds (catalog ids) the edit set or cleared.
-fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> Result<()> {
+/// is the tag kinds (catalog ids) the edit set or cleared; `collection`, the
+/// collection it set (or cleared, if empty).
+fn save_vorbis(
+    path: &Path,
+    mut tag: Tag,
+    rest: VorbisRest,
+    edited: &[&str],
+    collection: Option<&str>,
+) -> Result<()> {
     use lofty::ogg::OggPictureStorage;
     use lofty::picture::PictureInformation;
     let encoders: Vec<String> = tag
@@ -400,6 +453,10 @@ fn save_vorbis(path: &Path, mut tag: Tag, rest: VorbisRest, edited: &[&str]) -> 
     let had_block = rest.had_block;
     let mut out = rest.rest;
     out.set_vendor(rest.vendor);
+    if let Some(value) = collection {
+        // An empty one isn't written.
+        out.insert(COLLECTION_KEY.into(), value.into());
+    }
     for item in tag.items() {
         if matches!(
             item.key(),
@@ -587,8 +644,43 @@ enum Native {
 /// (refused, as the save is, where it can't be): unlike its writer for a borrowed
 /// generic tag, it puts back what the generic tag couldn't hold (custom
 /// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
-/// frames) and joins repeated values as the format wants.
-fn native(tag: Tag) -> Result<Native> {
+/// frames) and joins repeated values as the format wants. `collection`: the
+/// collection set (or cleared, if empty), which it has no key for.
+fn native(tag: Tag, collection: Option<&str>) -> Result<Native> {
+    let mut native = native_of(tag)?;
+    let Some(value) = collection else {
+        return Ok(native);
+    };
+    match &mut native {
+        Native::Id3v2(t) if value.is_empty() => drop(t.remove_user_text(COLLECTION_KEY)),
+        Native::Id3v2(t) => drop(t.insert_user_text(COLLECTION_KEY.into(), value.into())),
+        Native::Ilst(t) => {
+            let ident = lofty::mp4::AtomIdent::Freeform {
+                mean: "com.apple.iTunes".into(),
+                name: COLLECTION_KEY.into(),
+            };
+            // Not `remove`, which reorders the other atoms.
+            t.retain(|atom| *atom.ident() != ident);
+            if !value.is_empty() {
+                t.insert(lofty::mp4::Atom::new(
+                    ident,
+                    lofty::mp4::AtomData::UTF8(value.into()),
+                ));
+            }
+        }
+        Native::Ape(t) if value.is_empty() => t.remove(COLLECTION_KEY),
+        Native::Ape(t) => t.insert(
+            lofty::ape::ApeItem::new(COLLECTION_KEY.into(), ItemValue::Text(value.into()))
+                .map_err(tag_err)?,
+        ),
+        // Refused by `apply_kinds`.
+        Native::Other(_) => {}
+    }
+    Ok(native)
+}
+
+/// [`native`], leaving the collection as it is.
+fn native_of(tag: Tag) -> Result<Native> {
     Ok(match tag.tag_type() {
         TagType::Id3v2 => {
             let mut id3 = lofty::id3::v2::Id3v2Tag::from(tag);
@@ -679,11 +771,19 @@ fn native(tag: Tag) -> Result<Native> {
     })
 }
 
+/// The collection `values` (tag kinds and their values) set, or clear if empty.
+fn collection_in<'a>(values: &'a [(&str, String)]) -> Option<&'a str> {
+    values
+        .iter()
+        .find(|(id, _)| *id == rules::COLLECTION)
+        .map(|(_, v)| v.trim())
+}
+
 /// Write `tag`, a primary tag other than Vorbis comments after an edit, as
 /// [`native`] makes it.
-fn save_owned(path: &Path, tag: Tag) -> Result<()> {
+fn save_owned(path: &Path, tag: Tag, collection: Option<&str>) -> Result<()> {
     let options = WriteOptions::default();
-    match native(tag)? {
+    match native(tag, collection)? {
         Native::Id3v2(t) => t.save_to_path(path, options),
         Native::Ilst(t) => t.save_to_path(path, options),
         Native::Ape(t) => t.save_to_path(path, options),
@@ -970,7 +1070,22 @@ pub fn file_tags(path: &Path, separator: &str) -> Result<FileTags> {
     let present: Vec<TagType> = file.tags().iter().map(|t| t.tag_type()).collect();
     let mut blocks = unmapped_items(path, file.file_type(), comments, &present)?;
     if let Some(at) = blocks.iter().position(|(t, _)| *t == shown) {
-        out.other.extend(blocks.remove(at).1);
+        // But the collection, which is a kind.
+        let (collections, rest): (Vec<_>, Vec<_>) = blocks
+            .remove(at)
+            .1
+            .into_iter()
+            .partition(|(key, _)| is_collection(shown, key));
+        let collections: Vec<&str> = collections
+            .iter()
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if !collections.is_empty() {
+            out.values
+                .insert(rules::COLLECTION, collections.join(separator));
+        }
+        out.other.extend(rest);
     }
     // The file's other tag blocks, whole.
     for block in file.tags().iter().filter(|t| t.tag_type() != shown) {
@@ -995,13 +1110,13 @@ pub fn file_tags(path: &Path, separator: &str) -> Result<FileTags> {
 /// read before the edit): its primary tag, keeping what lofty's generic tag
 /// couldn't hold, and of its other tags only those in `changed` (pictures
 /// replaced) that the format can write. Untouched tags stay as they are on
-/// disk. `edited`: the tag kinds the edit set or cleared.
+/// disk. `values`: the tag kinds the edit set or cleared, with their values.
 fn save(
     path: &Path,
     mut file: TaggedFile,
     rest: Option<VorbisRest>,
     changed: &[TagType],
-    edited: &[&str],
+    values: &[(&str, String)],
 ) -> Result<()> {
     let primary = file.primary_tag_type();
     for t in changed.iter().filter(|t| **t != primary) {
@@ -1015,15 +1130,14 @@ fn save(
     let Some(tag) = file.remove(primary) else {
         return Ok(());
     };
+    let collection = collection_in(values);
     match rest {
-        Some(rest) => save_vorbis(path, tag, rest, edited),
-        None => save_owned(path, tag),
+        Some(rest) => {
+            let edited: Vec<&str> = values.iter().map(|(id, _)| *id).collect();
+            save_vorbis(path, tag, rest, &edited, collection)
+        }
+        None => save_owned(path, tag, collection),
     }
-}
-
-/// The tag kinds (catalog ids) `edit` sets or clears.
-fn edit_kinds(edit: &TagEdit) -> Vec<&'static str> {
-    edit_values(edit).into_iter().map(|(id, _)| id).collect()
 }
 
 /// Apply `edit` to the file's primary tag. The change is written to a copy
@@ -1132,11 +1246,9 @@ pub fn prepare_owned(
     let tmp = &prepared.copy;
     let mut file = probe_tags(tmp, true)?;
     let rest = vorbis_rest(tmp, file.file_type())?;
-    let tag = primary_tag_mut(&mut file);
-    apply_kinds(tag, &merged(edit, kinds)?)?;
-    let mut edited = edit_kinds(edit);
-    edited.extend(kinds.iter().map(|(id, _)| *id));
-    save(tmp, file, rest, &[], &edited)?;
+    let values = merged(edit, kinds)?;
+    apply_kinds(primary_tag_mut(&mut file), &values)?;
+    save(tmp, file, rest, &[], &values)?;
     fs::File::open(tmp)?.sync_all()?;
     Ok(prepared)
 }
@@ -1160,6 +1272,7 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
+    read_collection(path, &file, tag, &mut values)?;
     Ok(KindValues {
         values,
         has_art: pictures && has_pictures(&file),
@@ -1184,6 +1297,7 @@ pub fn read_kinds_split(
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
+    read_collection(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
         for kind in rules::CATALOG
             .iter()
@@ -1264,6 +1378,12 @@ pub fn can_store(tag_type: TagType, kind: &str) -> bool {
     let Some(k) = rules::kind(kind) else {
         return false;
     };
+    if kind == rules::COLLECTION {
+        return matches!(
+            tag_type,
+            TagType::VorbisComments | TagType::Ape | TagType::Id3v2 | TagType::Mp4Ilst
+        );
+    }
     matches!(
         kind,
         "track_number" | "track_total" | "disc_number" | "disc_total" | "date"
@@ -1478,6 +1598,16 @@ fn apply_kinds(tag: &mut Tag, values: &[(&str, String)]) -> Result<()> {
             rules::kind(id).ok_or_else(|| Error::Invalid(format!("unknown tag kind '{id}'")))?;
         validate_kind(id, value)?;
         let v = value.trim();
+        // Lofty has none of its own: set as the tag is written (`native`).
+        if *id == rules::COLLECTION {
+            if !v.is_empty() && !can_store(tag.tag_type(), id) {
+                return Err(Error::Tags(format!(
+                    "{} can't be stored in this file's tag format",
+                    kind.label
+                )));
+            }
+            continue;
+        }
         // A value held as data (a binary APE item) isn't the field's text,
         // and isn't typed over.
         let field = |i: &TagItem| {
@@ -1643,7 +1773,7 @@ fn lost(
             }
             let mut sink = std::io::sink();
             let options = WriteOptions::default();
-            let converted: Tag = match native(only).ok()? {
+            let converted: Tag = match native_of(only).ok()? {
                 Native::Id3v2(t) => {
                     t.dump_to(&mut sink, options).ok()?;
                     t.into()
@@ -1826,7 +1956,9 @@ pub fn check_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Res
         )
         .read()
         .map_err(tag_err)?;
-    apply_kinds(primary_tag_mut(&mut file), &merged(edit, kinds)?)?;
+    let values = merged(edit, kinds)?;
+    apply_kinds(primary_tag_mut(&mut file), &values)?;
+    let collection = collection_in(&values);
     let primary = file.primary_tag_type();
     if primary != TagType::VorbisComments
         && let Some(tag) = file.remove(primary)
@@ -1835,7 +1967,7 @@ pub fn check_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Res
         // (an ID3v2 timestamp of month 13) fails here, not on saving.
         let mut sink = std::io::sink();
         let options = WriteOptions::default();
-        match native(tag)? {
+        match native(tag, collection)? {
             Native::Id3v2(t) => t.dump_to(&mut sink, options),
             Native::Ilst(t) => t.dump_to(&mut sink, options),
             Native::Ape(t) => t.dump_to(&mut sink, options),
@@ -1924,8 +2056,7 @@ pub fn copy_with_tags_hashed(
                 if let Some(picture) = art {
                     tag.push_picture(picture.clone());
                 }
-                let edited: Vec<&str> = values.iter().map(|(id, _)| *id).collect();
-                save(&tmp, file, rest, &changed, &edited)?;
+                save(&tmp, file, rest, &changed, values)?;
             }
             if art.is_some() {
                 // Some tag formats (RIFF INFO, say) silently drop pictures.
@@ -2361,6 +2492,124 @@ mod tests {
         assert!(has(&items, "ARTIST", "A"));
         assert_eq!(vendor, "coversync");
         assert_eq!(keys(&items, "ENCODER").count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_collection_is_a_kind_written_in_each_formats_own_way() {
+        use lofty::file::AudioFile;
+        use lofty::mp4::AtomIdent;
+        let dir = std::env::temp_dir().join(format!("coversync-collection-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name);
+        flac_with_comments(&path("a.flac"), &["TITLE=Song", "collection=Old"]);
+        assert_eq!(
+            read_kinds(&path("a.flac"), false).unwrap().values[rules::COLLECTION],
+            "Old"
+        );
+        fs::write(
+            path("a.mp3"),
+            include_bytes!("../tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        fs::write(
+            path("a.m4a"),
+            include_bytes!("../tests/fixtures/silence.m4a"),
+        )
+        .unwrap();
+        fs::write(path("a.wv"), include_bytes!("../tests/fixtures/silence.wv")).unwrap();
+        let set = |file: &Path, value: &str| {
+            write_with_kinds(
+                file,
+                &TagEdit::default(),
+                &[(rules::COLLECTION, value.into())],
+            )
+            .unwrap()
+        };
+        let options = ParseOptions::new().read_properties(false);
+        let open = |name: &str| std::io::BufReader::new(fs::File::open(path(name)).unwrap());
+        // As other programs read it.
+        let native = |name: &str| -> Option<String> {
+            match name {
+                "a.flac" => lofty::flac::FlacFile::read_from(&mut open(name), options)
+                    .unwrap()
+                    .vorbis_comments()?
+                    .get("COLLECTION")
+                    .map(str::to_string),
+                "a.mp3" => lofty::mpeg::MpegFile::read_from(&mut open(name), options)
+                    .unwrap()
+                    .id3v2()?
+                    .get_user_text("COLLECTION")
+                    .map(str::to_string),
+                "a.m4a" => lofty::mp4::Mp4File::read_from(&mut open(name), options)
+                    .unwrap()
+                    .ilst()?
+                    .get(&AtomIdent::Freeform {
+                        mean: "com.apple.iTunes".into(),
+                        name: "COLLECTION".into(),
+                    })?
+                    .data()
+                    .find_map(|d| match d {
+                        lofty::mp4::AtomData::UTF8(t) => Some(t.clone()),
+                        _ => None,
+                    }),
+                _ => lofty::wavpack::WavPackFile::read_from(&mut open(name), options)
+                    .unwrap()
+                    .ape()?
+                    .get("COLLECTION")
+                    .and_then(|i| i.value().text().map(str::to_string)),
+            }
+        };
+        for name in ["a.flac", "a.mp3", "a.m4a", "a.wv"] {
+            let file = path(name);
+            set(&file, "Saga");
+            set(&file, "Saga 2");
+            assert_eq!(native(name).as_deref(), Some("Saga 2"), "{name}");
+            assert_eq!(
+                read_kinds(&file, false).unwrap().values[rules::COLLECTION],
+                "Saga 2",
+                "{name}"
+            );
+            let scanned = read(&file).unwrap();
+            assert!(scanned.tag_keys.contains(&rules::COLLECTION), "{name}");
+            assert_eq!(scanned.values[rules::COLLECTION], "Saga 2", "{name}");
+            // The editor shows it as the kind, not again with the others.
+            let tags = file_tags(&file, ";").unwrap();
+            assert_eq!(tags.values[rules::COLLECTION], "Saga 2", "{name}");
+            assert!(
+                !tags.other.iter().any(|(k, _)| k.contains("COLLECTION")),
+                "{name}: {:?}",
+                tags.other
+            );
+            // An edit of other tags keeps it.
+            write(
+                &file,
+                &TagEdit {
+                    title: Some("New".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(native(name).as_deref(), Some("Saga 2"), "{name}");
+            set(&file, "");
+            assert_eq!(native(name), None, "{name}");
+            assert!(
+                !read_kinds(&file, false)
+                    .unwrap()
+                    .values
+                    .contains_key(rules::COLLECTION),
+                "{name}"
+            );
+        }
+        // The old name in another case went with the first change.
+        let (_, items) = vorbis(&path("a.flac"));
+        assert!(
+            !items
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("COLLECTION")),
+            "{items:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -321,6 +321,44 @@ fn substitutions_change_tags_on_import_once_names_are_split() {
 }
 
 #[test]
+fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
+    let s = setup(
+        "collection",
+        "{collection}/{album}/<{track_number} - >{title}",
+    );
+    let plan = s.plan([&[], &[]]);
+    assert!(plan.ready(), "{:?}", plan.problems);
+    assert_eq!(
+        s.dests(&plan),
+        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+    );
+    let saga: &[(&str, &str)] = &[("collection", "Saga")];
+    let plan = s.plan([saga, saga]);
+    assert_eq!(
+        s.dests(&plan),
+        ["Saga/Record/01 - One.wav", "Saga/Record/02 - Two.wav"]
+    );
+
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    let edits: Edits = s
+        .tracks
+        .iter()
+        .map(|id| (*id, HashMap::from([("collection".into(), "Saga".into())])))
+        .collect();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &edits,
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    let copy = tags::read_kinds(&s.root.join("Saga/Record/02 - Two.wav"), false).unwrap();
+    assert_eq!(copy.values["collection"], "Saga");
+}
+
+#[test]
 fn no_phrases_split_nothing() {
     let s = setup("no-split", "{album}/<{track_number} - >{title}");
     let mut setup = s.lib.library_setup().unwrap();

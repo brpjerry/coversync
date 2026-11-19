@@ -139,6 +139,14 @@ used on a home server.
   into `Song`; `s/^(.+), The$/The \1/` on the artist turns `Beatles, The`
   into `The Beatles`. A rule that would leave a tag empty is skipped, and
   suggestions a rule makes invalid (a date that isn't one) aren't offered.
+- **Collections** (under Library setup): groups of albums, all of a
+  franchise say. The import dialog offers them for each album, None by
+  default, and writes the one picked to the files' `COLLECTION` tag (a
+  Vorbis comment or APE item, an ID3v2 `TXXX` frame, an MP4
+  `----:com.apple.iTunes` atom); the tag editor changes it like any other
+  tag. In the folder structure `{collection}` is always optional:
+  `{collection}/{album_artist}/{album}/…` puts albums in none straight under
+  `{album_artist}`.
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never

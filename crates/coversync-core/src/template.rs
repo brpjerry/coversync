@@ -10,6 +10,8 @@
 //! has one disc, or when it holds `{track_number}` and the album is a
 //! single (one track on one disc). A folder that's nothing but such parts
 //! is left out with them. Variables only in optional parts aren't required.
+//! `{collection}` is optional wherever it is, as albums in none have no
+//! value: `{collection}/{album}` is just `{album}` for them.
 //! The album's disc and track totals come from the `disc_total` and
 //! `track_total` values, or a `2/3` style number.
 //!
@@ -36,6 +38,7 @@ pub const SUGGESTIONS: &[&str] = &[
     "{album_artist}/{album}/<Disc {disc_number}>/<{track_number} - >{title}",
     "{album_artist}/{album}/{track_number} - {title}",
     "{genre}/{album_artist}/{album}/<{disc_number}-><{track_number} - >{title}",
+    "{collection}/{album_artist}/{album}/<{disc_number}-><{track_number} - >{title}",
     "{album_artist} - {album}/<{disc_number}-><{track_number} >{artist} - {title}",
 ];
 
@@ -80,14 +83,14 @@ fn segment(raw: &str) -> Result<Vec<Part>> {
     loop {
         match rest.find(['<', '>']) {
             None => {
-                parts.extend(tokens(rest, raw)?);
+                parts.extend(outside(tokens(rest, raw)?));
                 return Ok(parts);
             }
             Some(i) if rest.as_bytes()[i] == b'>' => {
                 return invalid(format!("Unmatched > in '{raw}'."));
             }
             Some(i) => {
-                parts.extend(tokens(&rest[..i], raw)?);
+                parts.extend(outside(tokens(&rest[..i], raw)?));
                 let inside = &rest[i + 1..];
                 let Some(end) = inside.find(['<', '>']) else {
                     return invalid(format!("Unclosed < in '{raw}'."));
@@ -106,6 +109,14 @@ fn segment(raw: &str) -> Result<Vec<Part>> {
             }
         }
     }
+}
+
+/// Parts outside `< >`, with `{collection}` made optional.
+fn outside(parts: Vec<Part>) -> impl Iterator<Item = Part> {
+    parts.into_iter().map(|p| match p {
+        Part::Var(rules::COLLECTION, _) => Part::Optional(vec![p]),
+        p => p,
+    })
 }
 
 /// Text and `{variables}` in `chunk`, a piece of the folder `raw`.
@@ -945,5 +956,18 @@ mod tests {
         for good in SUGGESTIONS {
             assert!(Template::parse(good).is_ok(), "{good}");
         }
+    }
+
+    #[test]
+    fn an_album_in_no_collection_has_no_folder_for_it() {
+        let t = Template::parse("{collection}/{album}/{collection} {title}").unwrap();
+        assert!(t.required_kinds().iter().all(|k| *k != "collection"));
+        let mut v = vals(&[("album", "B"), ("title", "T")]);
+        assert_eq!(t.render(&v, "flac").unwrap(), PathBuf::from("B/T.flac"));
+        v.insert("collection", "Saga".into());
+        assert_eq!(
+            t.render(&v, "flac").unwrap(),
+            PathBuf::from("Saga/B/Saga T.flac")
+        );
     }
 }
