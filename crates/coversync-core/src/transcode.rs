@@ -27,8 +27,9 @@ pub fn converts(path: &Path) -> Result<bool> {
         .map_err(tags::tag_err)?
         .guess_file_type()?;
     let options = lofty::config::ParseOptions::new().read_tags(false);
-    let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
-    Ok(match probe.file_type() {
+    let file_type = probe.file_type();
+    let mut f = probe.into_inner();
+    Ok(match file_type {
         Some(FileType::Wav | FileType::Aiff | FileType::Ape) => true,
         // Not hybrid: ffmpeg can't read its correction file, so the FLAC
         // would hold the lossy part alone.
@@ -59,7 +60,7 @@ pub fn to_flac(src: &Path, dest: &Path) -> Result<PathBuf> {
         .any(|s| !s.ends_with(",1"));
     if extra || streams.lines().filter(|s| s.starts_with("audio")).count() != 1 {
         return Err(Error::Tags(format!(
-            "{}: it holds more than one audio stream and its cover, which a FLAC would lose, so it wasn't imported",
+            "{}: a FLAC holds one audio stream and cover pictures, and this file has more, so it wasn't imported",
             src.display()
         )));
     }
@@ -222,7 +223,7 @@ mod tests {
         let refused = to_flac(&two, &path("out/two.flac"))
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("more than one audio stream"), "{refused}");
+        assert!(refused.contains("this file has more"), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

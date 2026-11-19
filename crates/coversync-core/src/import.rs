@@ -386,7 +386,7 @@ pub fn plan(
     }
     if read.iter().any(|t| t.to_flac) && !crate::transcode::available() {
         problems.push(
-            "Converting WAV, AIFF, WavPack, Monkey's Audio and ALAC files to FLAC needs ffmpeg, which isn't installed on the server."
+            "Converting WAV, AIFF, WavPack, Monkey's Audio and ALAC files to FLAC needs ffmpeg and its ffprobe, which the server can't run."
                 .into(),
         );
     }

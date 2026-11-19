@@ -1269,10 +1269,14 @@ pub fn carry_tags(src: &Path, flac: &Path) -> Result<()> {
     tag.retain(|i| !described(i));
     // MP4's and ID3v2's BPM is an integer one, which Vorbis comments have
     // no name for: their BPM.
-    let bpms: Vec<TagItem> = tag.take(ItemKey::IntegerBpm).collect();
+    // (Copied, not taken: `take` reorders the other items.)
+    let bpms: Vec<ItemValue> = tag
+        .get_items(ItemKey::IntegerBpm)
+        .map(|i| i.value().clone())
+        .collect();
     tag.re_map(TagType::VorbisComments);
     for bpm in bpms {
-        tag.push(TagItem::new(ItemKey::Bpm, bpm.value().clone()));
+        tag.push(TagItem::new(ItemKey::Bpm, bpm));
     }
     let rest = vorbis_rest(flac, FileType::Flac)?.ok_or(Error::NotFound)?;
     let collection = values.get(rules::COLLECTION).map(String::as_str);
