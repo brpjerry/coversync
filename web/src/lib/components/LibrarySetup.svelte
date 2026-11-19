@@ -21,8 +21,11 @@
 	import X from '@lucide/svelte/icons/x';
 	import Replace from '@lucide/svelte/icons/replace';
 	import Plus from '@lucide/svelte/icons/plus';
+	import FolderSync from '@lucide/svelte/icons/folder-sync';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import Toggle from './Toggle.svelte';
-	import type { ArtPlacement, TagKind } from '#lib/api.ts';
+	import { api, ApiError, type ArtPlacement, type TagKind } from '#lib/api.ts';
+	import { toast } from '#lib/toast.svelte.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { setup } from '#lib/setup.svelte.ts';
 	import SetupPane, { type Back } from './SetupPane.svelte';
@@ -174,6 +177,44 @@
 			: ''
 	);
 
+	// Moving every album to fit the folder structure: asked first.
+	let confirmingMove = $state(false);
+	let moving = $state(false);
+	/** Why albums can't be moved now, if they can't. */
+	let moveBlocked = $derived(
+		!setup.saved.folder
+			? 'Choose a Library folder first'
+			: setup.structure.trim() !== setup.saved.structure
+				? 'Save the new structure first'
+				: null
+	);
+	async function restructure() {
+		moving = true;
+		const n = (k: number, one: string) => `${count(k)} ${k === 1 ? one : `${one}s`}`;
+		try {
+			const r = await api.restructureLibrary();
+			if (r.albums)
+				toast(
+					`Moved ${n(r.files, 'file')} of ${n(r.albums, 'album')} to fit the folder structure`,
+					'success'
+				);
+			else if (!r.failed.length)
+				toast('Every album is already where the folder structure puts it', 'success');
+			if (r.failed.length)
+				toast(
+					`${n(r.failed.length, 'album')} couldn't be moved: ` +
+						r.failed.map((f) => `${f.title} (${f.error})`).join('; '),
+					'error',
+					12000
+				);
+		} catch (e) {
+			toast(e instanceof ApiError ? e.message : 'Moving the albums failed', 'error', 8000);
+		} finally {
+			moving = false;
+			confirmingMove = false;
+		}
+	}
+
 	function groupState(kinds: TagKind[]) {
 		const on = kinds.filter((k) => setup.required.has(k.id)).length;
 		return { on, all: on === kinds.length, some: on > 0 && on < kinds.length };
@@ -249,6 +290,33 @@
 					variables={setup.variables}
 					label={(id) => setup.label(id)}
 				/>
+				<div class="restructure">
+					<p>
+						Albums stay in the folders they were put in until their tags are saved. Move them all to
+						where this structure puts them.
+					</p>
+					{#if confirmingMove}
+						<div class="confirm" in:fly={{ x: 12, duration: 220 }}>
+							<span>Move every album that doesn't fit?</span>
+							<button class="btn sm" onclick={() => (confirmingMove = false)} disabled={moving}
+								>Cancel</button
+							>
+							<button class="btn sm primary" onclick={restructure} disabled={moving}>
+								{#if moving}<span class="spin"><LoaderCircle size={14} /></span>{/if}
+								Move files
+							</button>
+						</div>
+					{:else}
+						<button
+							class="btn"
+							onclick={() => (confirmingMove = true)}
+							disabled={!!moveBlocked}
+							title={moveBlocked ?? undefined}
+						>
+							<FolderSync size={16} /> Move files to fit
+						</button>
+					{/if}
+				</div>
 			</div>
 		</section>
 
@@ -671,6 +739,36 @@
 </SetupPane>
 
 <style>
+	.restructure {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px 16px;
+		flex-wrap: wrap;
+		margin-top: 16px;
+	}
+	.restructure p {
+		margin: 0;
+		flex: 1 1 260px;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.confirm {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 13.5px;
+		color: var(--text-2);
+	}
+	.spin {
+		display: inline-grid;
+		animation: spin 900ms linear infinite;
+	}
+	@keyframes spin {
+		to {
+			rotate: 360deg;
+		}
+	}
 	.rule-text p {
 		margin: 2px 0 0;
 		color: var(--text-2);

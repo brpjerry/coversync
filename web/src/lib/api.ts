@@ -353,6 +353,15 @@ export interface InboxSetup {
 	keep_added: boolean;
 }
 
+/** What moving the Library's albums to fit the folder structure did. */
+export interface Restructured {
+	/** Albums moved, and their files (tracks and covers). */
+	albums: number;
+	files: number;
+	/** Albums left where they were, with why. */
+	failed: { title: string; error: string }[];
+}
+
 export interface HiddenStats {
 	files: number;
 	albums: number;
@@ -948,6 +957,8 @@ export const api = {
 	/** Check a CA certificate path as it's typed; null for an empty one. */
 	checkCa: (path: string) =>
 		request<CaInfo | null>(`/api/pairing/check-ca?path=${encodeURIComponent(path)}`),
+	/** Move every Library album to where the saved folder structure puts it. */
+	restructureLibrary: () => request<Restructured>('/api/library/restructure', { method: 'POST' }),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
 	uploads: () => request<UploadsInfo>('/api/uploads'),
