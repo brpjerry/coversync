@@ -116,6 +116,45 @@ impl Setup {
 }
 
 #[test]
+fn a_date_with_no_year_leaves_a_required_year_unplaced() {
+    // As another tagger can leave it: a typed one would be refused.
+    let undated = |s: &Setup| {
+        use lofty::prelude::*;
+        for n in [1, 2] {
+            let path = s
+                .root
+                .parent()
+                .unwrap()
+                .join(format!("Inbox/Record/{n}.flac"));
+            let mut file = lofty::read_from_path(&path).unwrap();
+            let tag = file.primary_tag_mut().unwrap();
+            tag.insert_text(lofty::tag::ItemKey::RecordingDate, "03.05.99".into());
+            file.save_to_path(&path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+        rescan(s);
+    };
+    let s = setup("no-year", "{year}/{album}/{title}");
+    undated(&s);
+    let plan = s.plan([&[], &[]]);
+    assert!(!plan.ready());
+    // The dialog offers the date to fill in again.
+    assert_eq!(plan.failing, ["date"]);
+    assert_eq!(
+        plan.problems,
+        [
+            "The date “03.05.99” has no year for the folder structure's {year}: four digits in a row."
+        ]
+    );
+    // Optional, it's left out.
+    let s = setup("no-year-optional", "{album}< ({year})>/{title}");
+    undated(&s);
+    let plan = s.plan([&[], &[]]);
+    assert!(plan.ready(), "{:?}", plan.problems);
+    assert_eq!(s.dests(&plan), ["Record/One.flac", "Record/Two.flac"]);
+}
+
+#[test]
 fn optional_album_wide_values_have_to_agree() {
     let s = setup("wide", "{album}< ({genre})>/<{track_number} - >{title}");
     // Not required: an album without a genre goes in one folder.

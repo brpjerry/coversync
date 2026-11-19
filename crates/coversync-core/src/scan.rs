@@ -64,16 +64,11 @@ pub fn album_dir_in(collection: Collection, root: &Path, file: &Path) -> PathBuf
 
 /// The disc number of a `CD1` / `Disc 2` / `disk_3` style folder name.
 pub fn disc_folder_number(name: &str) -> Option<u32> {
-    let name = name.to_lowercase();
-    let rest = ["cd", "disc", "disk"]
-        .iter()
-        .find_map(|p| name.strip_prefix(p))?
-        .trim_start_matches([' ', '-', '_', '.']);
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
+    static DISC: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(?:cd|disc|disk)[ ._-]*([0-9]+)").unwrap()
+    });
+    // Lowercased, not the regex's case folding, which takes "ſ" for "s".
+    DISC.captures(&name.to_lowercase())?[1].parse().ok()
 }
 
 /// The id of an album of `collection` found under `root`. A Library album's
@@ -377,6 +372,8 @@ mod tests {
 
     #[test]
     fn disc_folders_group_under_album() {
+        assert_eq!(disc_folder_number("diſc 1"), None);
+        assert_eq!(disc_folder_number("disK_2"), Some(2));
         assert_eq!(
             album_dir(Path::new("/m/A/Album/CD1/01.flac")),
             Path::new("/m/A/Album")
