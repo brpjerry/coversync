@@ -142,8 +142,8 @@ used on a home server.
 - **Collections** (under Library setup): groups of albums, all of a
   franchise say. The import dialog offers them for each album, None by
   default, and writes the one picked to the files' `COLLECTION` tag (a
-  Vorbis comment or APE item, an ID3v2 `TXXX` frame, an MP4
-  `----:com.apple.iTunes` atom); the tag editor changes it like any other
+  Vorbis comment, an ID3v2 `TXXX` frame, an MP4 `----:com.apple.iTunes`
+  atom); the tag editor changes it like any other
   tag. In the folder structure `{collection}` is always optional:
   `{collection}/{album_artist}/{album}/…` puts albums in none straight under
   `{album_artist}`.
@@ -157,7 +157,10 @@ used on a home server.
   as `TRACKNUMBER=1` and `TRACKTOTAL=12`, and ID3v2 tags as version 2.4. A file
   whose tags can't be written back as they are (an ID3v2 chapter located by
   byte offsets, say) is left alone and the import says why. Tag editor saves
-  work the same way.
+  work the same way. WavPack, Monkey's Audio and Musepack files keep their
+  tags in an APE tag, which coversync doesn't write (lofty can cut a file's
+  audio rewriting one), so they can't be imported or edited; an MP3's APE
+  tag (ReplayGain from MP3Gain, say) is left as it is.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added
@@ -301,7 +304,8 @@ options:
   rename it back before going back to an older release.
   Everything in the cache directory is rebuilt when missing.
 - `--allow-writes` lets the tag editor change Inbox files in place; it is off
-  by default. Library files can always be edited. Writes go to a copy beside
+  by default. Library files can always be edited (but no APE tag is
+  written, see Import). Writes go to a copy beside
   the file that is renamed into place, and every edit is validated before any
   file is touched.
 

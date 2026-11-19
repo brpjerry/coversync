@@ -359,6 +359,27 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
 }
 
 #[test]
+fn an_album_with_an_ape_tagged_file_stays_out_of_the_library() {
+    let s = setup("ape", "{album}/<{track_number} - >{title}");
+    let dir = s.root.parent().unwrap();
+    let wv = dir.join("Inbox/Record/3.wv");
+    fs::write(&wv, include_bytes!("fixtures/silence.wv")).unwrap();
+    let mut ape = lofty::ape::ApeTag::default();
+    for (key, value) in [("Album", "Record"), ("Title", "Three"), ("Track", "3")] {
+        let value = lofty::tag::ItemValue::Text(value.into());
+        ape.insert(lofty::ape::ApeItem::new(key.into(), value).unwrap());
+    }
+    lofty::tag::TagExt::save_to_path(&ape, &wv, lofty::config::WriteOptions::default()).unwrap();
+    touch_and_rescan(&s, [1, 2]);
+    let plan = import::plan(&s.lib, &s.album, &Edits::new(), None).unwrap();
+    assert!(
+        plan.problems.iter().any(|p| p.contains("APE tags")),
+        "{:?}",
+        plan.problems
+    );
+}
+
+#[test]
 fn no_phrases_split_nothing() {
     let s = setup("no-split", "{album}/<{track_number} - >{title}");
     let mut setup = s.lib.library_setup().unwrap();
