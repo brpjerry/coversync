@@ -1167,11 +1167,11 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
-/// As [`read_kinds`], but a tag that holds several values that the file
-/// holds several times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`,
-/// say) has them all, joined by `split`'s separator, when `split` would
-/// rewrite them (at a phrase, or by a substitution): the import then
-/// rewrites the tag, and would otherwise keep only the first.
+/// As [`read_kinds`], but a tag the file holds several times (Vorbis
+/// comments `ARTIST=A feat. B` and `ARTIST=C`, say) has its different values
+/// all, joined by `split`'s separator, when `split` would rewrite them or
+/// the first (at a phrase, or by a substitution): the import writes the tag
+/// whole, and from the first alone would lose the others.
 pub fn read_kinds_split(
     path: &Path,
     pictures: bool,
@@ -1182,13 +1182,19 @@ pub fn read_kinds_split(
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
-        for kind in rules::CATALOG
-            .iter()
-            .filter(|k| crate::split::holds_several(k.id))
-        {
-            let all: Vec<&str> = texts(tag, kind).collect();
+        for kind in rules::CATALOG {
+            // Once each: DATE and YEAR can both say 2003.
+            let mut all: Vec<&str> = Vec::new();
+            for v in texts(tag, kind) {
+                if !all.contains(&v) {
+                    all.push(v);
+                }
+            }
             let joined = all.join(split.separator());
-            if all.len() > 1 && split.rewrite(kind.id, &joined).is_some() {
+            if all.len() > 1
+                && (split.rewrite(kind.id, &joined).is_some()
+                    || split.rewrite(kind.id, all[0]).is_some())
+            {
                 values.insert(kind.id, joined);
             }
         }
@@ -2211,6 +2217,26 @@ mod tests {
                 "Rock"
             );
         }
+        // Another tag, held twice: both are kept, changed whole or not at all.
+        let label = |expression: &str| {
+            crate::split::Splitter::new(";", &[]).substituting(vec![
+                Substitute::new(&Substitution {
+                    expression: expression.into(),
+                    tags: vec!["label".into()],
+                })
+                .unwrap(),
+            ])
+        };
+        flac_with_comments(&path, &["LABEL=Old Name", "LABEL=Second Label"]);
+        let renames = label("s/Old/New/");
+        let read = read_kinds_split(&path, false, &renames).unwrap();
+        assert_eq!(
+            renames.rewrite("label", &read.values["label"]).unwrap(),
+            "New Name;Second Label"
+        );
+        let first_only = label("s/^Old Name$/New/");
+        let read = read_kinds_split(&path, false, &first_only).unwrap();
+        assert_eq!(first_only.rewrite("label", &read.values["label"]), None);
         // A tag holding one value, under two names, is read as one.
         let year = Substitute::new(&Substitution {
             expression: "s/2003/2004/".into(),

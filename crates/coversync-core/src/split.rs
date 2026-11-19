@@ -365,7 +365,7 @@ impl Splitter {
                 .map(|v| sub.apply(v).trim().to_string())
                 .filter(|v| !v.is_empty())
                 .collect();
-            if next.iter().map(String::len).sum::<usize>() > SUBSTITUTED_BYTES {
+            if next.iter().map(String::len).sum::<usize>() > SUBSTITUTED_BYTES && next != values {
                 return None;
             }
             if !next.is_empty() {
@@ -789,6 +789,13 @@ mod tests {
         // Rules feeding each other don't grow a tag without bound.
         let double = |n| Splitter::new(";", &[]).substituting(vec![sub("s/.+/&&/", "title"); n]);
         assert_eq!(double(21).rewrite("title", "a"), None);
+        // A tag that was that long already can still be shortened.
+        let big = "a".repeat(SUBSTITUTED_BYTES + 1);
+        let shorten = Splitter::new(";", &[]).substituting(vec![
+            sub("s/^b$/c/", "title"),
+            sub("s/^a+$/short/", "title"),
+        ]);
+        assert_eq!(shorten.rewrite("title", &big).as_deref(), Some("short"));
         assert_eq!(double(3).rewrite("title", "a").as_deref(), Some("aaaaaaaa"));
         let mut values: HashMap<&'static str, String> = HashMap::from([
             ("artist", "The A feat. B".to_string()),
