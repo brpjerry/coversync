@@ -234,6 +234,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 				});
 				this.#apply(r);
 				this.version++;
+				// A report on albums in another folder or structure.
+				this.unmoved = [];
 				if (r.adopted)
 					toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
 				else toast('Library setup saved', 'success');

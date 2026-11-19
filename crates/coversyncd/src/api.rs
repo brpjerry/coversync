@@ -1465,9 +1465,20 @@ async fn restructure(
 async fn restructure_all(state: Shared) -> ApiResult<Restructured> {
     let mut done = Restructured::default();
     // A second pass for albums another one was in the way of.
-    for _ in 0..2 {
+    for pass in 0..2 {
         let moved = done.files;
-        let (to_move, mut failed) = exclusively(&state, misplaced).await?;
+        // Under the jobs lock, as other work on the Library is; the saves
+        // take it themselves (and queue the hashing they need).
+        let checked = {
+            let _jobs = state.jobs.lock().await;
+            blocking(&state, misplaced).await
+        };
+        let (to_move, mut failed) = match checked {
+            Ok(found) => found,
+            Err(e) if pass == 0 => return Err(e),
+            // The first pass's moves and report stand.
+            Err(_) => break,
+        };
         for (detail, dir) in to_move {
             // Saved on the version found, so one changed meanwhile is reported, not moved.
             let body = TagWrite {

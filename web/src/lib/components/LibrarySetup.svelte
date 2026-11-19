@@ -301,7 +301,7 @@
 							{setup.unmoved.length === 1 ? 'album' : 'albums'} couldn't be moved:
 						</p>
 						<ul>
-							{#each setup.unmoved as u (u.dir)}
+							{#each setup.unmoved as u (u)}
 								<li><b>{u.title}</b> <span class="dir">{u.dir}</span> {u.error}</li>
 							{/each}
 						</ul>
