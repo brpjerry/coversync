@@ -591,7 +591,8 @@ def import_flow(d, out, tag, library_folder):
         if i == 1:
             time.sleep(0.3)
             d.shot(out / f"8b-context-menu-{tag}.png")
-        album = d.js(text, "[role=menu] .title")
+        # The title as it is (the toast's), not with its spaces collapsed.
+        album = d.js("return document.querySelector('[role=menu]').getAttribute('aria-label')")
         # This album's toast, not an earlier one's.
         imported = "[...document.querySelectorAll('.toast')].some(t => t.textContent.includes(`Imported “${arguments[0]}”`))"
         import_from_menu(d)
