@@ -356,7 +356,7 @@ fn number(v: &str) -> Option<u32> {
 }
 
 fn year(v: &str) -> Option<i32> {
-    v.trim().get(..4)?.parse().ok()
+    crate::template::year(v)?.parse().ok()
 }
 
 /// For comparing: typographic punctuation as ASCII, spacing collapsed.
@@ -2153,6 +2153,7 @@ mod tests {
         assert!(!differs("track_number", "01", "1"));
         assert!(!differs("track_number", "3/12", "3"));
         assert!(!differs("date", "2015", "2015-03-29"));
+        assert!(!differs("date", "05/2003", "2003-05-01"));
         assert!(differs("date", "2014", "2015-03-29"));
         assert!(differs("date", "soon", "2015"));
         assert_eq!(genre_case("drum and bass"), "Drum and Bass");

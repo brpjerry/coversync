@@ -609,7 +609,7 @@ pub fn split_extension(name: &str) -> (&str, &str) {
 /// CON, NUL, COM1 and the like, which FAT cards and SMB shares can't hold
 /// either. Such a name gets a `_` in front.
 pub(crate) fn reserved(stem: &str) -> bool {
-    // As Library setup's cover file name check has it.
+    // The device names Library setup's cover file name check has.
     static DEVICE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])\s*(?:\.|$)")
             .unwrap()
