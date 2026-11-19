@@ -41,6 +41,8 @@ pub struct ImportTrack {
     /// autofill fills, names split at Library setup's phrases, and its
     /// substitutions (edits override these).
     pub autofilled: HashMap<&'static str, String>,
+    /// Lossless audio that isn't FLAC: the import converts it to FLAC.
+    pub to_flac: bool,
 }
 
 /// What happens to the album art on import.
@@ -199,7 +201,11 @@ pub struct ReadTrack {
     pub autofilled: Vec<&'static str>,
     /// Embedded art (only looked for when asked).
     pub has_art: bool,
+    /// The tag type values are written to: Vorbis comments for a file
+    /// converted to FLAC.
     pub tag_type: lofty::tag::TagType,
+    /// Lossless audio that isn't FLAC (see [`crate::transcode`]).
+    pub to_flac: bool,
 }
 
 /// Read every track of `detail`, in order, and apply `autofill`, which
@@ -230,7 +236,12 @@ pub fn read_album(
                 .unwrap_or_default(),
             values: read.values,
         });
-        extra.push((read.has_art, read.tag_type));
+        let to_flac = crate::transcode::converts(&path)?;
+        let tag_type = match to_flac {
+            true => lofty::tag::TagType::VorbisComments,
+            false => read.tag_type,
+        };
+        extra.push((read.has_art, tag_type, to_flac));
         paths.push(path);
     }
     let album_folder = Path::new(&detail.dir)
@@ -244,12 +255,13 @@ pub fn read_album(
         .zip(filled)
         .zip(extra)
         .map(
-            |(((path, info), autofilled), (has_art, tag_type))| ReadTrack {
+            |(((path, info), autofilled), (has_art, tag_type, to_flac))| ReadTrack {
                 path,
                 values: info.values,
                 autofilled,
                 has_art,
                 tag_type,
+                to_flac,
             },
         )
         .collect())
@@ -362,12 +374,19 @@ pub fn plan(
         art_rules.placement.embedded(),
         &splitter,
     )?;
-    // Their APE tags can't be written safely (see `tags::apply_kinds`).
-    let ape = lofty::tag::TagType::Ape;
-    let has_ape = read.iter().any(|t| t.tag_type == ape);
+    // Their APE tags can't be written safely (see `tags::apply_kinds`);
+    // WavPack and Monkey's Audio are converted to FLAC instead, but for
+    // hybrid WavPack (see `transcode::converts`).
+    let has_ape = read.iter().any(|t| t.tag_type == lofty::tag::TagType::Ape);
     if has_ape {
         problems.push(
-            "WavPack, Monkey's Audio and Musepack files can't be imported: coversync can't safely write their APE tags."
+            "Musepack and hybrid WavPack files can't be imported: coversync can't safely write their APE tags."
+                .into(),
+        );
+    }
+    if read.iter().any(|t| t.to_flac) && !crate::transcode::available() {
+        problems.push(
+            "Converting WAV, AIFF, WavPack, Monkey's Audio and ALAC files to FLAC needs ffmpeg and its ffprobe, which the server can't run."
                 .into(),
         );
     }
@@ -393,6 +412,7 @@ pub fn plan(
     let mut substituted_by = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
         let path = read.path;
+        let to_flac = read.to_flac;
         let mut values = read.values;
         // After autofill, so an album artist filled from the artist is split too.
         let (split, substituted) = splitter.rewrite_all(&mut values);
@@ -425,12 +445,15 @@ pub fn plan(
         // is: a value its format can't hold makes the plan unready, rather
         // than fail the import part way through the copies.
         let to_write = written_values(&autofilled, edits.get(&track.id));
-        if typed_ok
-            && read.tag_type != ape
-            && !to_write.is_empty()
-            && let Err(e) = tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write)
-        {
-            problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
+        // A converted file's are checked as a FLAC's; an APE tag isn't written.
+        if typed_ok && read.tag_type != lofty::tag::TagType::Ape && !to_write.is_empty() {
+            let checked = match to_flac {
+                true => tags::check_flac_kinds(&to_write),
+                false => tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write),
+            };
+            if let Err(e) = checked {
+                problems.push(format!("Track {}: {e}", track.track_no.unwrap_or(0)));
+            }
         }
         filled_by.push(
             read.autofilled
@@ -452,10 +475,13 @@ pub fn plan(
             .copied()
             .filter(|k| !values.contains_key(k))
             .collect();
-        let extension = path
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let extension = match to_flac {
+            true => "flac".to_string(),
+            false => path
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
         let dest = folder.as_ref().and_then(|f| {
             template
                 .render(&values, &extension)
@@ -494,6 +520,7 @@ pub fn plan(
                 missing,
                 dest: dest.map(|d| d.display().to_string()),
                 autofilled,
+                to_flac,
             },
         ));
     }
@@ -685,8 +712,18 @@ pub fn execute(
                         .expect("ready plans have destinations"),
                 );
                 let values = written_values(&track.autofilled, edits.get(&track.id));
-                let (added, hash) =
-                    tags::copy_with_tags_hashed(&src, &dest, &values, picture.as_ref(), replace)?;
+                let copy = |from: &Path| {
+                    tags::copy_with_tags_hashed(from, &dest, &values, picture.as_ref(), replace)
+                };
+                let (added, hash) = if track.to_flac {
+                    // Converted beside its place, then copied in as any file is.
+                    let flac = crate::transcode::to_flac(&src, &dest)?;
+                    let copied = copy(&flac);
+                    let _ = fs::remove_file(&flac);
+                    copied?
+                } else {
+                    copy(&src)?
+                };
                 Ok((src, dest, added, hash))
             })
             .collect();

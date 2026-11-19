@@ -53,6 +53,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy without the server feature
         run: cargo clippy -p coversync-core --no-default-features --all-targets --locked -- -D warnings
+      # The import converts lossless audio to FLAC with it.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Tests
         run: cargo test --workspace --locked
 

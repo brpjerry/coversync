@@ -247,6 +247,8 @@ export interface ImportTrack {
 	/** What the import sets by itself on this track, by kind: empty tags
 	 * autofill fills, names split at Library setup's phrases, and its substitutions. */
 	autofilled: Record<string, string>;
+	/** Lossless audio that isn't FLAC, which the import converts to FLAC. */
+	to_flac: boolean;
 }
 
 export interface ImportPlan {

@@ -31,6 +31,8 @@ pub mod sync;
 pub mod tags;
 pub mod template;
 #[cfg(feature = "server")]
+pub mod transcode;
+#[cfg(feature = "server")]
 pub mod upload;
 
 pub use db::Library;
