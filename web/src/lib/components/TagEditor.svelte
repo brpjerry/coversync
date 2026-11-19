@@ -138,7 +138,7 @@
 	 * CollectionsSetup), never typed; an Inbox album's in the import dialog.
 	 */
 	const COLLECTION = 'collection';
-	/** Shown as a placeholder while tracks' collections differ. */
+	/** "Differs per track": the tracks' own collections, as they are. */
 	const MIXED = '\u0000';
 	const WIDE = new Set(['album', 'album_artist']);
 	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
@@ -344,20 +344,24 @@
 			.filter((g) => g.kinds.length)
 	);
 	let others = $derived(otherTags(other));
-	/** A Library album's collections to pick from: Library setup's, and any its tracks are in. */
+	/**
+	 * A Library album's collections to pick from: Library setup's, and any
+	 * its tracks are in or are to be put in (one removed from setup since).
+	 */
 	let collections = $derived(
 		onimport
 			? []
 			: [
 					...new Set([
 						...setup.saved.collections,
-						...ids.map((id) => valueOf(base, id, COLLECTION))
+						...ids.flatMap((id) => [valueOf(base, id, COLLECTION), valueOf(form, id, COLLECTION)])
 					])
 				].filter(Boolean)
 	);
-	/** Every track goes in the collection; None ('') takes them out of theirs. */
+	/** Every track goes in the collection; None ('') takes them out of theirs; MIXED keeps each one's. */
 	function setCollection(value: string) {
-		for (const id of ids) (form[id] ??= {})[COLLECTION] = value;
+		for (const id of ids)
+			(form[id] ??= {})[COLLECTION] = value === MIXED ? valueOf(base, id, COLLECTION) : value;
 	}
 
 	function addKind(kind: string) {
@@ -600,7 +604,9 @@
 							aria-label="Collection"
 							onchange={(e) => setCollection(e.currentTarget.value)}
 						>
-							{#if value === null}<option value={MIXED} disabled>Differs per track</option>{/if}
+							{#if value === null || shared(base, ids, COLLECTION) === null}<option value={MIXED}
+									>Differs per track</option
+								>{/if}
 							<option value="">None</option>
 							{#each collections as c (c)}<option value={c}>{c}</option>{/each}
 						</select>

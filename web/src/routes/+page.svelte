@@ -1167,7 +1167,10 @@
 		// The editor needs the tag catalog (labels, album-wide kinds) up front.
 		await setup.load();
 		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
-		if (!edits || asks || setup.saved.collections.length) {
+		// A collection to pick: Library setup's, or one the files are in already.
+		const collection =
+			setup.saved.collections.length || plan.tracks.some((t) => t.values.collection);
+		if (!edits || asks || collection) {
 			importing = { album, plan, edits: edits ?? {} };
 		} else if (plan.problems.length) {
 			toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));

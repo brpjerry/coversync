@@ -532,6 +532,9 @@
 						<option value="">None</option>
 						{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
 					</select>
+					{#if collectionRequired && !collectionChoices.length}
+						<span class="note bad">Add one in Library › Collections to import this album.</span>
+					{/if}
 				</label>
 			{/if}
 

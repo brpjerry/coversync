@@ -37,7 +37,8 @@ used on a home server.
 - **Tag editor** (a Library album's Edit tags, or an Inbox album's Import
   without Smart suggestions; see Import): album-wide fields (album, album
   artist, date, genre) and each track's (number, disc, title, artist) up
-  front, and **Show all tags** for every other tag the album has, grouped
+  front (and on a Library album, Collection; see Collections), and
+  **Show all tags** for every other tag the album has, grouped
   as in Library setup, with **Add a tag** for one it doesn't. An album-wide
   field shows the value every track shares; where they differ it says so,
   typing there sets every track, and **Per track** edits each track's own.
