@@ -1167,11 +1167,14 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
-/// As [`read_kinds`], but a tag the file holds several times (Vorbis
-/// comments `ARTIST=A feat. B` and `ARTIST=C`, say) has its different values
+/// As [`read_kinds`], but a tag that [holds several
+/// values](crate::split::holds_several) and that the file holds several
+/// times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them
 /// all, joined by `split`'s separator, when `split` would rewrite them or
 /// the first (at a phrase, or by a substitution): the import writes the tag
-/// whole, and from the first alone would lose the others.
+/// whole, and from the first alone would drop the others. Other tags are
+/// read by their first value, and a rewrite replaces every copy, as a value
+/// typed in the import dialog does.
 pub fn read_kinds_split(
     path: &Path,
     pictures: bool,
@@ -1182,18 +1185,16 @@ pub fn read_kinds_split(
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
-        for kind in rules::CATALOG {
-            // Once each: DATE and YEAR can both say 2003.
-            let mut all: Vec<&str> = Vec::new();
-            for v in texts(tag, kind) {
-                if !all.contains(&v) {
-                    all.push(v);
-                }
+        for kind in rules::CATALOG
+            .iter()
+            .filter(|k| crate::split::holds_several(k.id))
+        {
+            let all: Vec<&str> = texts(tag, kind).collect();
+            if all.len() < 2 {
+                continue;
             }
             let joined = all.join(split.separator());
-            if all.len() > 1
-                && (split.rewrite(kind.id, &joined).is_some()
-                    || split.rewrite(kind.id, all[0]).is_some())
+            if split.rewrite(kind.id, &joined).is_some() || split.rewrite(kind.id, all[0]).is_some()
             {
                 values.insert(kind.id, joined);
             }
@@ -2217,36 +2218,36 @@ mod tests {
                 "Rock"
             );
         }
-        // Another tag, held twice: both are kept, changed whole or not at all.
-        let label = |expression: &str| {
+        // A list keeps its values in order, repeats and all.
+        let rename = |expression: &str, tag: &str| {
             crate::split::Splitter::new(";", &[]).substituting(vec![
                 Substitute::new(&Substitution {
                     expression: expression.into(),
-                    tags: vec!["label".into()],
+                    tags: vec![tag.into()],
                 })
                 .unwrap(),
             ])
         };
-        flac_with_comments(&path, &["LABEL=Old Name", "LABEL=Second Label"]);
-        let renames = label("s/Old/New/");
-        let read = read_kinds_split(&path, false, &renames).unwrap();
+        let artists = rename("s/^B$/C/", "artists");
+        flac_with_comments(&path, &["ARTISTS=A", "ARTISTS=B", "ARTISTS=A"]);
+        let read = read_kinds_split(&path, false, &artists).unwrap();
         assert_eq!(
-            renames.rewrite("label", &read.values["label"]).unwrap(),
-            "New Name;Second Label"
+            artists.rewrite("artists", &read.values["artists"]).unwrap(),
+            "A;C;A"
         );
-        let first_only = label("s/^Old Name$/New/");
-        let read = read_kinds_split(&path, false, &first_only).unwrap();
-        assert_eq!(first_only.rewrite("label", &read.values["label"]), None);
-        // A tag holding one value, under two names, is read as one.
-        let year = Substitute::new(&Substitution {
-            expression: "s/2003/2004/".into(),
-            tags: vec!["date".into()],
-        })
-        .unwrap();
-        let year = crate::split::Splitter::new(";", &[]).substituting(vec![year]);
-        flac_with_comments(&path, &["DATE=2003", "YEAR=2003"]);
-        let read = read_kinds_split(&path, false, &year).unwrap();
-        assert_eq!(year.rewrite("date", &read.values["date"]).unwrap(), "2004");
+        // Other tags are read by their first value, as before: identifiers
+        // stay whole, and a date beside a YEAR alias is the date.
+        let isrc = rename("s/-//g", "isrc");
+        flac_with_comments(&path, &["ISRC=JP-AB1-23-00001", "ISRC=JP-AB1-23-00002"]);
+        let read = read_kinds_split(&path, false, &isrc).unwrap();
+        assert_eq!(read.values["isrc"], "JP-AB1-23-00001");
+        let month = rename("s/-05-/-06-/", "date");
+        flac_with_comments(&path, &["DATE=2003-05-01", "YEAR=2003"]);
+        let read = read_kinds_split(&path, false, &month).unwrap();
+        assert_eq!(
+            month.rewrite("date", &read.values["date"]).unwrap(),
+            "2003-06-01"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

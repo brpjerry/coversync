@@ -131,8 +131,11 @@ used on a home server.
   the import writes (the dialog says which tags they changed; typed values
   stay as typed) and in what MusicBrainz suggests. A tag holding several
   values (names, genres, release types, MusicBrainz artist IDs) has each
-  changed on its own; other tags are changed whole. A tag a file holds
-  several times is read whole when a rule would change it, so none is lost. `s/ \(Live\)$//` on the title turns `Song (Live)`
+  changed on its own; other tags are changed whole. A list a file holds
+  several times (two `ARTISTS` comments, say) is read whole, so none is
+  lost; any other tag is read by its first value, and a rule that changes
+  it replaces the file's other copies, as a value typed in the import
+  dialog does. `s/ \(Live\)$//` on the title turns `Song (Live)`
   into `Song`; `s/^(.+), The$/The \1/` on the artist turns `Beatles, The`
   into `The Beatles`. A rule that would leave a tag empty is skipped, and
   suggestions a rule makes invalid (a date that isn't one) aren't offered.
