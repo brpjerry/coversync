@@ -51,7 +51,8 @@ check() {
 package_coversync() {
   pkgdesc='Music library manager and tag editor that serves its UI to the browser'
   depends=('glibc' 'libgcc')
-  optdepends=('chromaprint: audio fingerprints (fpcalc) for Smart suggestions')
+  optdepends=('chromaprint: audio fingerprints (fpcalc) for Smart suggestions'
+              "ffmpeg: converting WAV, AIFF, WavPack, Monkey's Audio and ALAC to FLAC on import")
 
   cd "$pkgbase-$pkgver"
   install -Dm755 target/release/coversyncd -t "$pkgdir/usr/bin/"

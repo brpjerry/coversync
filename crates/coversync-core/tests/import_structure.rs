@@ -43,7 +43,7 @@ fn setup(name: &str, structure: &str) -> Setup {
     })
     .unwrap();
     for (n, title) in [(1, "One"), (2, "Two")] {
-        wav(&inbox.join(format!("Record/{n}.wav")), title, n);
+        track(&inbox.join(format!("Record/{n}.flac")), title, n);
     }
     let covers = CoverCache::new(dir.join("cache")).unwrap();
     let roots = [
@@ -73,27 +73,9 @@ fn setup(name: &str, structure: &str) -> Setup {
     }
 }
 
-/// A tiny silent WAV tagged with `title`, album "Record" and track `n`.
-fn wav(path: &Path, title: &str, n: u32) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let samples = [0u8; 16];
-    let mut b = Vec::new();
-    b.extend(b"RIFF");
-    b.extend(((4 + 24 + 8 + samples.len()) as u32).to_le_bytes());
-    b.extend(b"WAVEfmt ");
-    b.extend(16u32.to_le_bytes());
-    for v in [1u16, 1] {
-        b.extend(v.to_le_bytes());
-    }
-    b.extend(8000u32.to_le_bytes());
-    b.extend(16000u32.to_le_bytes());
-    for v in [2u16, 16] {
-        b.extend(v.to_le_bytes());
-    }
-    b.extend(b"data");
-    b.extend((samples.len() as u32).to_le_bytes());
-    b.extend(samples);
-    fs::write(path, b).unwrap();
+/// A tiny FLAC tagged with `title`, album "Record" and track `n`.
+fn track(path: &Path, title: &str, n: u32) {
+    flac(path, &[]);
     let edit = TagEdit {
         title: Some(title.into()),
         album: Some("Record".into()),
@@ -141,13 +123,13 @@ fn optional_album_wide_values_have_to_agree() {
     assert!(plan.failing.is_empty() && plan.disagree.is_empty());
     assert_eq!(
         s.dests(&plan),
-        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+        ["Record/01 - One.flac", "Record/02 - Two.flac"]
     );
     let plan = s.plan([&[("genre", "Rock")], &[("genre", "Rock")]]);
     assert!(plan.disagree.is_empty());
     assert_eq!(
         s.dests(&plan),
-        ["Record (Rock)/01 - One.wav", "Record (Rock)/02 - Two.wav"]
+        ["Record (Rock)/01 - One.flac", "Record (Rock)/02 - Two.flac"]
     );
     // Two genres, or one on one track only, would split the album.
     for edits in [
@@ -171,7 +153,7 @@ fn values_only_in_parts_every_track_leaves_out_needn_t_agree() {
     assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
     assert_eq!(
         s.dests(&plan),
-        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+        ["Record/01 - One.flac", "Record/02 - Two.flac"]
     );
     // A label on one track keeps the part there: then they differ.
     let plan = s.plan([&[("genre", "Rock"), ("label", "L")], &[("genre", "Rock")]]);
@@ -192,14 +174,14 @@ fn an_albums_discs_have_to_count_alike() {
     assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
     assert_eq!(
         s.dests(&plan),
-        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+        ["Record/01 - One.flac", "Record/02 - Two.flac"]
     );
     // Two discs: both numbered.
     let plan = s.plan([&disc("1", "2"), &disc("2", "2")]);
     assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
     assert_eq!(
         s.dests(&plan),
-        ["Record/1-01 - One.wav", "Record/2-02 - Two.wav"]
+        ["Record/1-01 - One.flac", "Record/2-02 - Two.flac"]
     );
     // "1 of 1" and "2 of 2", as separate totals or in the disc numbers
     // alone: the first disc would go without its number.
@@ -222,7 +204,7 @@ fn names_are_split_at_library_setups_phrases() {
             album_artist: Some("Ado feat. Eve".into()),
             ..Default::default()
         };
-        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+        tags::write(&inbox.join(format!("{n}.flac")), &edit).unwrap();
     }
     let plan = s.plan([&[], &[]]);
     assert_eq!(plan.split, ["artist", "album_artist"]);
@@ -236,7 +218,10 @@ fn names_are_split_at_library_setups_phrases() {
     assert_eq!(plan.tracks[1].autofilled["artist"], "Rin;Riho");
     assert_eq!(
         s.dests(&plan),
-        ["Ado;Eve/Record/01 - One.wav", "Ado;Eve/Record/02 - Two.wav"]
+        [
+            "Ado;Eve/Record/01 - One.flac",
+            "Ado;Eve/Record/02 - Two.flac"
+        ]
     );
     // What's typed in the dialog stays as typed.
     let plan = s.plan([&[("artist", "Ado feat. Eve")], &[("artist", "Rin")]]);
@@ -256,9 +241,9 @@ fn names_are_split_at_library_setups_phrases() {
     assert_eq!(done.files, 2);
     let copy =
         |name: &str| tags::read_kinds(&s.root.join("Ado;Eve/Record").join(name), false).unwrap();
-    assert_eq!(copy("01 - One.wav").values["artist"], "Ado;Eve");
-    assert_eq!(copy("02 - Two.wav").values["artist"], "Rin;Riho");
-    assert_eq!(copy("02 - Two.wav").values["album_artist"], "Ado;Eve");
+    assert_eq!(copy("01 - One.flac").values["artist"], "Ado;Eve");
+    assert_eq!(copy("02 - Two.flac").values["artist"], "Rin;Riho");
+    assert_eq!(copy("02 - Two.flac").values["album_artist"], "Ado;Eve");
 }
 
 #[test]
@@ -287,7 +272,7 @@ fn substitutions_change_tags_on_import_once_names_are_split() {
             album_artist: Some("Ado".into()),
             ..Default::default()
         };
-        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+        tags::write(&inbox.join(format!("{n}.flac")), &edit).unwrap();
     }
     let plan = s.plan([&[], &[]]);
     assert_eq!(plan.split, ["artist"]);
@@ -298,7 +283,7 @@ fn substitutions_change_tags_on_import_once_names_are_split() {
     assert_eq!(plan.tracks[0].autofilled["artist"], "ADO;Eve");
     assert_eq!(
         s.dests(&plan),
-        ["ADO/Record/01 - One.wav", "ADO/Record/02 - Two.wav"]
+        ["ADO/Record/01 - One.flac", "ADO/Record/02 - Two.flac"]
     );
     // What's typed in the dialog stays as typed.
     let plan = s.plan([&[("title", "One (Live)")], &[]]);
@@ -314,7 +299,7 @@ fn substitutions_change_tags_on_import_once_names_are_split() {
         &Progress::default(),
     )
     .unwrap();
-    let copy = tags::read_kinds(&s.root.join("ADO/Record/01 - One.wav"), false).unwrap();
+    let copy = tags::read_kinds(&s.root.join("ADO/Record/01 - One.flac"), false).unwrap();
     assert_eq!(copy.values["title"], "One");
     assert_eq!(copy.values["artist"], "ADO;Eve");
     assert_eq!(copy.values["album_artist"], "ADO");
@@ -330,13 +315,13 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
     assert!(plan.ready(), "{:?}", plan.problems);
     assert_eq!(
         s.dests(&plan),
-        ["Record/01 - One.wav", "Record/02 - Two.wav"]
+        ["Record/01 - One.flac", "Record/02 - Two.flac"]
     );
     let saga: &[(&str, &str)] = &[("collection", "Saga")];
     let plan = s.plan([saga, saga]);
     assert_eq!(
         s.dests(&plan),
-        ["Saga/Record/01 - One.wav", "Saga/Record/02 - Two.wav"]
+        ["Saga/Record/01 - One.flac", "Saga/Record/02 - Two.flac"]
     );
 
     let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
@@ -354,29 +339,156 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
         &Progress::default(),
     )
     .unwrap();
-    let copy = tags::read_kinds(&s.root.join("Saga/Record/02 - Two.wav"), false).unwrap();
+    let copy = tags::read_kinds(&s.root.join("Saga/Record/02 - Two.flac"), false).unwrap();
     assert_eq!(copy.values["collection"], "Saga");
 }
 
+/// A mono 8 kHz WAV of a second's ramp: 16-bit samples, or 32-bit floats
+/// FLAC can't hold.
+fn wav(path: &Path, float: bool) {
+    let (format, bits) = if float { (3u16, 32u16) } else { (1, 16) };
+    let data: Vec<u8> = (0..8000u32)
+        .flat_map(|i| match float {
+            true => (i as f32 / 8000.0 + 0.000_01).to_le_bytes().to_vec(),
+            false => ((i % 2000) as i16 * 16).to_le_bytes().to_vec(),
+        })
+        .collect();
+    let mut b = Vec::new();
+    b.extend(b"RIFF");
+    b.extend((4 + 24 + 8 + data.len() as u32).to_le_bytes());
+    b.extend(b"WAVEfmt ");
+    b.extend(16u32.to_le_bytes());
+    b.extend(format.to_le_bytes());
+    b.extend(1u16.to_le_bytes());
+    b.extend(8000u32.to_le_bytes());
+    b.extend((8000 * u32::from(bits) / 8).to_le_bytes());
+    b.extend((bits / 8).to_le_bytes());
+    b.extend(bits.to_le_bytes());
+    b.extend(b"data");
+    b.extend((data.len() as u32).to_le_bytes());
+    b.extend(data);
+    fs::write(path, b).unwrap();
+}
+
 #[test]
-fn an_album_with_an_ape_tagged_file_stays_out_of_the_library() {
-    let s = setup("ape", "{album}/<{track_number} - >{title}");
-    let dir = s.root.parent().unwrap();
-    let wv = dir.join("Inbox/Record/3.wv");
-    fs::write(&wv, include_bytes!("fixtures/silence.wv")).unwrap();
-    let mut ape = lofty::ape::ApeTag::default();
-    for (key, value) in [("Album", "Record"), ("Title", "Three"), ("Track", "3")] {
-        let value = lofty::tag::ItemValue::Text(value.into());
-        ape.insert(lofty::ape::ApeItem::new(key.into(), value).unwrap());
+fn lossless_audio_that_isnt_flac_is_converted_with_its_tags() {
+    if !coversync_core::transcode::available() {
+        eprintln!("ffmpeg isn't installed: skipped");
+        return;
     }
-    lofty::tag::TagExt::save_to_path(&ape, &wv, lofty::config::WriteOptions::default()).unwrap();
-    touch_and_rescan(&s, [1, 2]);
+    let s = setup("convert", "{collection}/{album}/<{track_number} - >{title}");
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    fs::remove_file(inbox.join("2.flac")).unwrap();
+    wav(&inbox.join("2.wav"), false);
+    let wv = inbox.join("3.wv");
+    fs::write(&wv, include_bytes!("fixtures/silence.wv")).unwrap();
+    for (n, path) in [(2, &inbox.join("2.wav")), (3, &wv)] {
+        let edit = TagEdit {
+            title: Some(format!("Track {n}")),
+            album: Some("Record".into()),
+            track_no: Some(n.to_string()),
+            ..Default::default()
+        };
+        let collection = [("collection", "Saga".to_string())];
+        if n == 2 {
+            tags::write_with_kinds(path, &edit, &collection).unwrap();
+        } else {
+            // Not written by coversync: an APE tag.
+            let mut ape = lofty::ape::ApeTag::default();
+            for (key, value) in [("Album", "Record"), ("Title", "Track 3"), ("Track", "3")] {
+                let value = lofty::tag::ItemValue::Text(value.into());
+                ape.insert(lofty::ape::ApeItem::new(key.into(), value).unwrap());
+            }
+            let value = lofty::tag::ItemValue::Text("Saga".into());
+            ape.insert(lofty::ape::ApeItem::new("COLLECTION".into(), value).unwrap());
+            lofty::tag::TagExt::save_to_path(&ape, path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+    }
+    rescan(&s);
+    let album = s.lib.album(&s.album).unwrap().unwrap();
+    assert_eq!(album.tracks.len(), 3);
     let plan = import::plan(&s.lib, &s.album, &Edits::new(), None).unwrap();
-    assert!(
-        plan.problems.iter().any(|p| p.contains("APE tags")),
-        "{:?}",
-        plan.problems
+    assert!(plan.ready(), "{:?}", plan.problems);
+    let converted: Vec<bool> = plan.tracks.iter().map(|t| t.to_flac).collect();
+    assert_eq!(converted, [false, true, true]);
+
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    for (name, title) in [
+        ("02 - Track 2.flac", "Track 2"),
+        ("03 - Track 3.flac", "Track 3"),
+    ] {
+        let path = s.root.join("Saga/Record").join(name);
+        let file = lofty::probe::Probe::open(&path)
+            .unwrap()
+            .guess_file_type()
+            .unwrap();
+        assert_eq!(
+            file.file_type(),
+            Some(lofty::file::FileType::Flac),
+            "{name}"
+        );
+        let values = tags::read_kinds(&path, false).unwrap().values;
+        assert_eq!(values["title"], title);
+        assert_eq!(values["collection"], "Saga");
+    }
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    // Nothing of the conversion is left beside the tracks.
+    assert_eq!(
+        names(&s.root.join("Saga/Record")),
+        ["01 - One.flac", "02 - Track 2.flac", "03 - Track 3.flac"]
     );
+}
+
+#[test]
+fn float_audio_isnt_imported() {
+    if !coversync_core::transcode::available() {
+        eprintln!("ffmpeg isn't installed: skipped");
+        return;
+    }
+    let s = setup("float", "{album}/<{track_number} - >{title}");
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    fs::remove_file(inbox.join("2.flac")).unwrap();
+    wav(&inbox.join("2.wav"), true);
+    let edit = TagEdit {
+        title: Some("Two".into()),
+        album: Some("Record".into()),
+        track_no: Some("2".into()),
+        ..Default::default()
+    };
+    tags::write(&inbox.join("2.wav"), &edit).unwrap();
+    rescan(&s);
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    let refused = import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("without loss"), "{refused}");
+    // Nothing is left: no copy, no conversion.
+    let left = fs::read_dir(s.root.join("Record")).map_or(0, |d| d.count());
+    assert_eq!(left, 0);
 }
 
 #[test]
@@ -390,7 +502,7 @@ fn no_phrases_split_nothing() {
         artist: Some("Ado feat. Eve".into()),
         ..Default::default()
     };
-    tags::write(&inbox.join("1.wav"), &edit).unwrap();
+    tags::write(&inbox.join("1.flac"), &edit).unwrap();
     let plan = s.plan([&[], &[]]);
     assert!(plan.split.is_empty());
     assert!(!plan.tracks[0].autofilled.contains_key("artist"));
@@ -408,7 +520,7 @@ fn an_album_artist_autofill_fills_from_the_artist_is_split_too() {
             artist: Some("Ado feat. Eve".into()),
             ..Default::default()
         };
-        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+        tags::write(&inbox.join(format!("{n}.flac")), &edit).unwrap();
     }
     let plan = s.plan([&[], &[]]);
     assert!(
@@ -420,7 +532,10 @@ fn an_album_artist_autofill_fills_from_the_artist_is_split_too() {
     assert_eq!(plan.tracks[0].autofilled["album_artist"], "Ado;Eve");
     assert_eq!(
         s.dests(&plan),
-        ["Ado;Eve/Record/01 - One.wav", "Ado;Eve/Record/02 - Two.wav"]
+        [
+            "Ado;Eve/Record/01 - One.flac",
+            "Ado;Eve/Record/02 - Two.flac"
+        ]
     );
 }
 
@@ -430,11 +545,16 @@ fn touch_and_rescan(s: &Setup, times: [u64; 2]) {
     for (n, secs) in [1, 2].into_iter().zip(times) {
         let file = fs::File::options()
             .write(true)
-            .open(dir.join(format!("Inbox/Record/{n}.wav")))
+            .open(dir.join(format!("Inbox/Record/{n}.flac")))
             .unwrap();
         file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
             .unwrap();
     }
+    rescan(s);
+}
+
+fn rescan(s: &Setup) {
+    let dir = s.root.parent().unwrap();
     let covers = CoverCache::new(dir.join("cache")).unwrap();
     let roots = [
         (dir.join("Inbox"), Collection::Inbox),

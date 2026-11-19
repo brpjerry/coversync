@@ -157,10 +157,16 @@ used on a home server.
   as `TRACKNUMBER=1` and `TRACKTOTAL=12`, and ID3v2 tags as version 2.4. A file
   whose tags can't be written back as they are (an ID3v2 chapter located by
   byte offsets, say) is left alone and the import says why. Tag editor saves
-  work the same way. WavPack, Monkey's Audio and Musepack files keep their
-  tags in an APE tag, which coversync doesn't write (lofty can cut a file's
-  audio rewriting one), so they can't be imported or edited; an MP3's APE
-  tag (ReplayGain from MP3Gain, say) is left as it is.
+  work the same way. FLAC is the Library's only lossless format: WAV, AIFF,
+  WavPack, Monkey's Audio and ALAC files are converted to FLAC on import,
+  with ffmpeg, and kept only if the FLAC's audio is the original's sample
+  for sample (so float and 32-bit audio is refused). Their tags carry over
+  as far as Vorbis comments can hold them (tags lofty has no key for don't),
+  and the dialog says which tracks are converted. coversync doesn't write
+  APE tags (lofty can cut a file's audio rewriting one): Musepack files
+  can't be imported, and WavPack and Monkey's Audio files can't be edited
+  in place; an MP3's APE tag (ReplayGain from MP3Gain, say) is left as it
+  is.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added
@@ -261,6 +267,7 @@ service:
 ```sh
 sudo pacman -U coversync-0.1.0-1-x86_64.pkg.tar.zst
 sudo pacman -S --asdeps chromaprint                # optional: fpcalc for Smart suggestions
+sudo pacman -S --asdeps ffmpeg                     # optional: converts WAV, AIFF, WavPack, … to FLAC on import
 systemctl --user enable --now coversyncd
 coversyncd set-password                            # the password to sign in with
 ```

@@ -49,26 +49,19 @@ fn setup(name: &str) -> Setup {
     }
 }
 
-/// A tiny silent WAV tagged with `title`, `album` and track number `n`.
-fn wav(path: &Path, title: &str, album: &str, n: u32) {
+/// A tiny FLAC tagged with `title`, `album` and track number `n`.
+fn track(path: &Path, title: &str, album: &str, n: u32) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let samples = [0u8; 16];
-    let mut b = Vec::new();
-    b.extend(b"RIFF");
-    b.extend(((4 + 24 + 8 + samples.len()) as u32).to_le_bytes());
-    b.extend(b"WAVEfmt ");
-    b.extend(16u32.to_le_bytes());
-    for v in [1u16, 1] {
-        b.extend(v.to_le_bytes());
-    }
-    b.extend(8000u32.to_le_bytes());
-    b.extend(16000u32.to_le_bytes());
-    for v in [2u16, 16] {
-        b.extend(v.to_le_bytes());
-    }
-    b.extend(b"data");
-    b.extend((samples.len() as u32).to_le_bytes());
-    b.extend(samples);
+    // fLaC, then STREAMINFO (the last block): 4096-sample blocks, 44.1 kHz,
+    // stereo, 16 bits, no samples; then a frame's sync code.
+    let mut b = b"fLaC".to_vec();
+    b.extend([
+        0x80, 0x00, 0x00, 34, 0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0,
+    ]);
+    let packed: u64 = (44100 << 44) | (1 << 41) | (15 << 36);
+    b.extend(packed.to_be_bytes());
+    b.extend([0u8; 16]);
+    b.extend([0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
     fs::write(path, b).unwrap();
     retag(
         path,
@@ -210,8 +203,8 @@ impl Setup {
 #[test]
 fn an_import_counts_one_change_to_each_collection() {
     let s = setup("import");
-    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
-    wav(&s.inbox.join("Rec/2.wav"), "Two", "Record", 2);
+    track(&s.inbox.join("Rec/1.flac"), "One", "Record", 1);
+    track(&s.inbox.join("Rec/2.flac"), "Two", "Record", 2);
     s.scan();
     assert_eq!(s.inbox_generation(), 1);
     // The Library folder is indexed in memory until the first import.
@@ -225,8 +218,8 @@ fn an_import_counts_one_change_to_each_collection() {
     assert_eq!(
         s.changed(0),
         [
-            ("Record/01 - One.wav".into(), result.album_id.clone(), 1),
-            ("Record/02 - Two.wav".into(), result.album_id.clone(), 1),
+            ("Record/01 - One.flac".into(), result.album_id.clone(), 1),
+            ("Record/02 - Two.flac".into(), result.album_id.clone(), 1),
         ]
     );
     // Copy mode hides the originals, which changes the Inbox.
@@ -243,8 +236,8 @@ fn a_scan_and_an_import_count_each_batch_they_commit() {
     let s = setup("batches");
     // More files than one batch (256) holds.
     for i in 1..=300 {
-        wav(
-            &s.inbox.join(format!("Rec/{i:03}.wav")),
+        track(
+            &s.inbox.join(format!("Rec/{i:03}.flac")),
             &format!("T{i}"),
             "Record",
             i,
@@ -274,11 +267,11 @@ fn a_move_import_counts_the_inbox_files_it_takes() {
     let mut setup = s.lib.inbox_setup().unwrap();
     setup.ingest = IngestMode::Move;
     s.lib.set_inbox_setup(setup).unwrap();
-    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
+    track(&s.inbox.join("Rec/1.flac"), "One", "Record", 1);
     s.scan();
     assert_eq!(s.inbox_generation(), 1);
     s.import(&s.inbox_album());
-    assert!(!s.inbox.join("Rec/1.wav").exists());
+    assert!(!s.inbox.join("Rec/1.flac").exists());
     assert_eq!(s.inbox_generation(), 2);
     assert_eq!(s.library().generation, 1);
     s.scan();
@@ -290,8 +283,8 @@ fn an_import_that_fails_to_index_its_copies_counts_nothing() {
     use std::os::unix::fs::PermissionsExt;
     let s = setup("importfail");
     s.lib.prepare_library(&s.root).unwrap();
-    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
-    wav(&s.inbox.join("Rec/2.wav"), "Two", "Record", 2);
+    track(&s.inbox.join("Rec/1.flac"), "One", "Record", 1);
+    track(&s.inbox.join("Rec/2.flac"), "Two", "Record", 2);
     s.scan();
     let before = s.lib.index_versions().unwrap();
     // The files can be copied, but the Library database can't take them:
@@ -320,8 +313,8 @@ fn an_import_that_fails_to_index_its_copies_counts_nothing() {
     // originals stay in the Inbox, shown. Nothing was committed, so nothing
     // is counted or removed.
     assert!(s.root.join("Record").is_dir());
-    assert!(!s.root.join("Record/01 - One.wav").exists());
-    assert!(!s.root.join("Record/02 - Two.wav").exists());
+    assert!(!s.root.join("Record/01 - One.flac").exists());
+    assert!(!s.root.join("Record/02 - Two.flac").exists());
     assert_eq!(s.lib.index_versions().unwrap(), before);
     assert!(s.changed(-1).is_empty());
     assert!(s.removed(-1).is_empty());
@@ -334,8 +327,8 @@ fn an_import_that_fails_to_index_its_copies_counts_nothing() {
 #[test]
 fn a_tag_edit_counts_a_change_to_its_tracks_even_when_the_album_id_changes() {
     let s = setup("tags");
-    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
-    wav(&s.inbox.join("Rec/2.wav"), "Two", "Record", 2);
+    track(&s.inbox.join("Rec/1.flac"), "One", "Record", 1);
+    track(&s.inbox.join("Rec/2.flac"), "Two", "Record", 2);
     s.scan();
     let old_album = s.import(&s.inbox_album()).album_id;
     assert_eq!(s.library().generation, 1);
@@ -373,8 +366,8 @@ fn a_tag_edit_counts_a_change_to_its_tracks_even_when_the_album_id_changes() {
     assert_eq!(
         s.changed_paths(1),
         [
-            ("Record/01 - One.wav".into(), 2),
-            ("Record/02 - Two.wav".into(), 2)
+            ("Record/01 - One.flac".into(), 2),
+            ("Record/02 - Two.flac".into(), 2)
         ]
     );
     assert!(s.removed(0).is_empty());
@@ -386,20 +379,20 @@ fn a_tag_edit_counts_a_change_to_its_tracks_even_when_the_album_id_changes() {
 fn a_scan_counts_new_changed_removed_and_moved_files() {
     let s = setup("scan");
     s.lib.prepare_library(&s.root).unwrap();
-    wav(&s.root.join("A/1.wav"), "One", "A", 1);
-    wav(&s.root.join("A/2.wav"), "Two", "A", 2);
+    track(&s.root.join("A/1.flac"), "One", "A", 1);
+    track(&s.root.join("A/2.flac"), "Two", "A", 2);
     s.scan();
     assert_eq!(s.library().generation, 1);
     assert_eq!(
         s.changed_paths(0),
-        [("A/1.wav".into(), 1), ("A/2.wav".into(), 1)]
+        [("A/1.flac".into(), 1), ("A/2.flac".into(), 1)]
     );
     s.scan();
     assert_eq!(s.library().generation, 1, "nothing changed");
 
     // Changed outside coversync.
     retag(
-        &s.root.join("A/1.wav"),
+        &s.root.join("A/1.flac"),
         TagEdit {
             title: Some("First".into()),
             ..Default::default()
@@ -407,14 +400,14 @@ fn a_scan_counts_new_changed_removed_and_moved_files() {
     );
     s.scan();
     assert_eq!(s.library().generation, 2);
-    assert_eq!(s.changed_paths(1), [("A/1.wav".into(), 2)]);
+    assert_eq!(s.changed_paths(1), [("A/1.flac".into(), 2)]);
 
     // Deleted.
-    fs::remove_file(s.root.join("A/2.wav")).unwrap();
+    fs::remove_file(s.root.join("A/2.flac")).unwrap();
     s.scan();
     assert_eq!(s.library().generation, 3);
     assert!(s.changed_paths(2).is_empty());
-    assert_eq!(s.removed(2), [("A/2.wav".into(), 3)]);
+    assert_eq!(s.removed(2), [("A/2.flac".into(), 3)]);
 
     // Moved, as a change of folder structure would: the new paths are new
     // tracks, the old ones removed.
@@ -422,8 +415,8 @@ fn a_scan_counts_new_changed_removed_and_moved_files() {
     s.scan();
     let now = s.library().generation;
     assert!(now > 3);
-    assert_eq!(s.changed_paths(3), [("B/1.wav".into(), 4)]);
-    assert_eq!(s.removed(3), [("A/1.wav".into(), now)]);
+    assert_eq!(s.changed_paths(3), [("B/1.flac".into(), 4)]);
+    assert_eq!(s.removed(3), [("A/1.flac".into(), now)]);
     s.scan();
     assert_eq!(s.library().generation, now);
 }
@@ -443,10 +436,10 @@ fn regenre(path: &Path, genre: &str) {
 fn an_inbox_albums_version_changes_with_its_tracks_and_only_then() {
     let s = setup("version-inbox");
     for n in 1..=3 {
-        wav(&s.inbox.join(format!("Rec/{n}.wav")), "T", "Record", n);
+        track(&s.inbox.join(format!("Rec/{n}.flac")), "T", "Record", n);
     }
     for n in 1..=2 {
-        wav(&s.inbox.join(format!("Other/{n}.wav")), "T", "Other", n);
+        track(&s.inbox.join(format!("Other/{n}.flac")), "T", "Other", n);
     }
     s.scan();
     let (record, other) = (
@@ -466,27 +459,27 @@ fn an_inbox_albums_version_changes_with_its_tracks_and_only_then() {
 
     // Another album's change leaves this one's version alone.
     let other_before = s.version(&other);
-    regenre(&s.inbox.join("Other/1.wav"), "Jazz");
+    regenre(&s.inbox.join("Other/1.flac"), "Jazz");
     s.scan();
     assert_eq!(s.version(&record), v0);
     assert_ne!(s.version(&other), other_before);
 
     // Any of its tracks written.
-    regenre(&s.inbox.join("Rec/3.wav"), "Rock");
+    regenre(&s.inbox.join("Rec/3.flac"), "Rock");
     s.scan();
     let v1 = s.version(&record);
     assert_ne!(v1, v0);
 
     // A track removed that wasn't the latest written: the highest
     // generation among those left stays as it was.
-    fs::remove_file(s.inbox.join("Rec/1.wav")).unwrap();
+    fs::remove_file(s.inbox.join("Rec/1.flac")).unwrap();
     s.scan();
     let v2 = s.version(&record);
     assert_eq!(s.lib.album(&record).unwrap().unwrap().tracks.len(), 2);
     assert!(![&v0, &v1].contains(&&v2));
 
     // A track added.
-    wav(&s.inbox.join("Rec/4.wav"), "T", "Record", 4);
+    track(&s.inbox.join("Rec/4.flac"), "T", "Record", 4);
     s.scan();
     let v3 = s.version(&record);
     assert!(![&v0, &v1, &v2].contains(&&v3));
@@ -498,8 +491,8 @@ fn an_inbox_albums_version_changes_with_its_tracks_and_only_then() {
 fn a_library_albums_version_changes_with_its_tracks_and_only_then() {
     let s = setup("version-library");
     for n in 1..=3 {
-        wav(
-            &s.inbox.join(format!("Rec/{n}.wav")),
+        track(
+            &s.inbox.join(format!("Rec/{n}.flac")),
             &format!("T{n}"),
             "Record",
             n,
@@ -513,21 +506,21 @@ fn a_library_albums_version_changes_with_its_tracks_and_only_then() {
 
     // The last track written, then the first removed: the tracks left
     // still top out at the generation of that write.
-    regenre(&s.root.join("Record/03 - T3.wav"), "Rock");
+    regenre(&s.root.join("Record/03 - T3.flac"), "Rock");
     s.scan();
     let v1 = s.version(&album);
     assert_ne!(v1, v0);
     let written = s.library().generation;
-    fs::remove_file(s.root.join("Record/01 - T1.wav")).unwrap();
+    fs::remove_file(s.root.join("Record/01 - T1.flac")).unwrap();
     s.scan();
     assert_eq!(
         s.changed_paths(written - 1),
-        [("Record/03 - T3.wav".into(), written)]
+        [("Record/03 - T3.flac".into(), written)]
     );
     let v2 = s.version(&album);
     assert!(![&v0, &v1].contains(&&v2));
 
-    wav(&s.root.join("Record/04 - T4.wav"), "T4", "Record", 4);
+    track(&s.root.join("Record/04 - T4.flac"), "T4", "Record", 4);
     s.scan();
     assert!(![&v0, &v1, &v2].contains(&&s.version(&album)));
 }
@@ -536,7 +529,7 @@ fn a_library_albums_version_changes_with_its_tracks_and_only_then() {
 fn an_albums_tracks_find_it_under_a_new_id() {
     let s = setup("album-of-tracks");
     for n in 1..=3 {
-        wav(&s.inbox.join(format!("Rec/{n}.wav")), "T", "Record", n);
+        track(&s.inbox.join(format!("Rec/{n}.flac")), "T", "Record", n);
     }
     s.scan();
     let record = s.album(Collection::Inbox, "Record");
@@ -555,7 +548,7 @@ fn an_albums_tracks_find_it_under_a_new_id() {
     // A new title gives the album a new id.
     for n in 1..=3 {
         retag(
-            &s.inbox.join(format!("Rec/{n}.wav")),
+            &s.inbox.join(format!("Rec/{n}.flac")),
             TagEdit {
                 album: Some("Renamed".into()),
                 ..Default::default()
@@ -572,7 +565,7 @@ fn an_albums_tracks_find_it_under_a_new_id() {
 
     // Split across albums: the one most of them are in.
     retag(
-        &s.inbox.join("Rec/1.wav"),
+        &s.inbox.join("Rec/1.flac"),
         TagEdit {
             album: Some("Single".into()),
             ..Default::default()
@@ -623,7 +616,7 @@ fn an_albums_tracks_find_it_under_a_new_id() {
 fn imports_and_background_tag_rehashes_publish_hashes_of_the_final_bytes() {
     use coversync_core::hashes;
     let s = setup("hash-import");
-    wav(&s.inbox.join("Rec/1.wav"), "One", "Record", 1);
+    track(&s.inbox.join("Rec/1.flac"), "One", "Record", 1);
     s.scan();
     let album = s.import(&s.inbox_album()).album_id;
     let path = s
@@ -667,8 +660,8 @@ fn scans_notice_same_size_changes_within_one_second_and_backfill_hashes() {
     use coversync_core::hashes;
     use std::time::{Duration, UNIX_EPOCH};
     let s = setup("hash-scan");
-    let path = s.root.join("A/1.wav");
-    wav(&path, "One", "A", 1);
+    let path = s.root.join("A/1.flac");
+    track(&path, "One", "A", 1);
     let timestamp = |ns| {
         fs::File::open(&path)
             .unwrap()
@@ -683,14 +676,15 @@ fn scans_notice_same_size_changes_within_one_second_and_backfill_hashes() {
     let version = s.version(&album);
     hashes::run(&s.lib, &progress).unwrap();
     assert_eq!(s.version(&album), version);
-    let before = s.lib.library_hashes().unwrap()[Path::new("A/1.wav")].clone();
+    let before = s.lib.library_hashes().unwrap()[Path::new("A/1.flac")].clone();
     let generation = s.library().generation;
     assert_eq!(progress.read().unwrap().files_done, 1);
     assert!(!progress.read().unwrap().running);
     // Replace just an audio byte: tags and file length stay unchanged.
     let mut bytes = fs::read(&path).unwrap();
-    let offset = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
-    bytes[offset] ^= 1;
+    // The last: the fixture's audio frame ends the file.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
     fs::write(&path, &bytes).unwrap();
     timestamp(200);
     s.scan();
@@ -699,7 +693,7 @@ fn scans_notice_same_size_changes_within_one_second_and_backfill_hashes() {
         "stale digest was invalidated"
     );
     hashes::run(&s.lib, &progress).unwrap();
-    let after = s.lib.library_hashes().unwrap()[Path::new("A/1.wav")].clone();
+    let after = s.lib.library_hashes().unwrap()[Path::new("A/1.flac")].clone();
     assert_eq!(after.size, before.size);
     assert_ne!(after.hash, before.hash);
     assert_eq!(after, hashes::file(&path).unwrap());
@@ -715,8 +709,8 @@ fn scans_notice_same_size_changes_within_one_second_and_backfill_hashes() {
 fn a_background_hash_cannot_overwrite_a_newer_row_or_another_library() {
     use coversync_core::hashes;
     let s = setup("hash-lease");
-    let path = s.root.join("A/1.wav");
-    wav(&path, "One", "A", 1);
+    let path = s.root.join("A/1.flac");
+    track(&path, "One", "A", 1);
     s.scan();
     let job = s.lib.hash_jobs().unwrap().pop().unwrap();
     let hash = hashes::file(&path).unwrap();
@@ -743,8 +737,8 @@ fn a_background_hash_cannot_overwrite_a_newer_row_or_another_library() {
 fn hash_publication_rechecks_disk_and_survives_persisting_the_library() {
     use coversync_core::hashes;
     let s = setup("hash-persist");
-    let path = s.root.join("A/1.wav");
-    wav(&path, "One", "A", 1);
+    let path = s.root.join("A/1.flac");
+    track(&path, "One", "A", 1);
     s.scan();
     let job = s.lib.hash_jobs().unwrap().pop().unwrap();
     let hash = hashes::file(&path).unwrap();
@@ -765,8 +759,8 @@ fn old_daemon_writes_invalidate_hashes_and_a_cancelled_pass_can_resume() {
     use coversync_core::hashes;
     use std::sync::atomic::AtomicBool;
     let s = setup("hash-compat");
-    let path = s.root.join("A/1.wav");
-    wav(&path, "One", "A", 1);
+    let path = s.root.join("A/1.flac");
+    track(&path, "One", "A", 1);
     s.scan();
     s.lib.prepare_library(&s.root).unwrap();
     let progress = Default::default();
@@ -798,8 +792,8 @@ fn a_failed_parallel_import_joins_workers_before_removing_their_copies() {
     setup.structure = "{album}/CD{disc_number}/{track_number} - {title}".into();
     s.lib.set_library_setup(setup).unwrap();
     for disc in 1..=2 {
-        let path = s.inbox.join(format!("Record/CD{disc}/1.wav"));
-        wav(&path, "One", "Record", 1);
+        let path = s.inbox.join(format!("Record/CD{disc}/1.flac"));
+        track(&path, "One", "Record", 1);
         retag(
             &path,
             TagEdit {
@@ -831,8 +825,8 @@ fn a_failed_parallel_import_joins_workers_before_removing_their_copies() {
     );
     fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(result.is_err());
-    assert!(!s.root.join("Record/CD1/01 - One.wav").exists());
-    assert!(!s.root.join("Record/CD2/01 - One.wav").exists());
+    assert!(!s.root.join("Record/CD1/01 - One.flac").exists());
+    assert!(!s.root.join("Record/CD2/01 - One.flac").exists());
     assert!(s.lib.library_hashes().unwrap().is_empty());
     assert_eq!(
         s.lib.album(&s.inbox_album()).unwrap().unwrap().tracks.len(),
@@ -845,10 +839,10 @@ fn an_unreadable_hash_job_does_not_prevent_other_files_from_finishing() {
     use coversync_core::hashes;
     let s = setup("hash-error");
     for n in 1..=2 {
-        wav(&s.root.join(format!("A/{n}.wav")), "One", "A", n);
+        track(&s.root.join(format!("A/{n}.flac")), "One", "A", n);
     }
     s.scan();
-    fs::rename(s.root.join("A/1.wav"), s.root.join("A/1.gone")).unwrap();
+    fs::rename(s.root.join("A/1.flac"), s.root.join("A/1.gone")).unwrap();
     let progress = Default::default();
     hashes::run(&s.lib, &progress).unwrap();
     let p = progress.read().unwrap();
@@ -861,9 +855,9 @@ fn an_unreadable_hash_job_does_not_prevent_other_files_from_finishing() {
 fn out_of_range_nanoseconds_do_not_remove_readable_tracks() {
     use std::time::{Duration, UNIX_EPOCH};
     let s = setup("hash-future-time");
-    let paths = [s.inbox.join("Inbox/1.wav"), s.root.join("Library/1.wav")];
+    let paths = [s.inbox.join("Inbox/1.flac"), s.root.join("Library/1.flac")];
     for path in &paths {
-        wav(path, "Song", "Album", 1);
+        track(path, "Song", "Album", 1);
     }
     s.scan();
     assert_eq!(s.lib.file_stats().unwrap().len(), 2);
@@ -891,8 +885,8 @@ fn written_files_rehash_stale_supplied_digests_and_index_even_when_hashing_fails
     use coversync_core::hashes;
     use std::time::{Duration, UNIX_EPOCH};
     let s = setup("hash-written-mismatch");
-    let path = s.root.join("A/1.wav");
-    wav(&path, "One", "A", 1);
+    let path = s.root.join("A/1.flac");
+    track(&path, "One", "A", 1);
     s.scan();
     let old = hashes::file(&path).unwrap();
     regenre(&path, "Jazz");
@@ -900,7 +894,7 @@ fn written_files_rehash_stale_supplied_digests_and_index_even_when_hashing_fails
     stat.hash = Some(old);
     scan::index_written_files(&s.lib, vec![stat], &s.progress).unwrap();
     assert_eq!(
-        s.lib.library_hashes().unwrap()[Path::new("A/1.wav")],
+        s.lib.library_hashes().unwrap()[Path::new("A/1.flac")],
         hashes::file(&path).unwrap()
     );
     regenre(&path, "Rock");
@@ -922,7 +916,7 @@ fn written_files_rehash_stale_supplied_digests_and_index_even_when_hashing_fails
 fn a_v3_library_gets_nanosecond_metadata_then_hashes_after_its_next_scan() {
     use coversync_core::hashes;
     let mut s = setup("hash-v3");
-    wav(&s.root.join("A/1.wav"), "One", "A", 1);
+    track(&s.root.join("A/1.flac"), "One", "A", 1);
     s.scan();
     s.lib.prepare_library(&s.root).unwrap();
     let state_dir = s.root.parent().unwrap().join("state");
@@ -940,15 +934,18 @@ fn a_v3_library_gets_nanosecond_metadata_then_hashes_after_its_next_scan() {
     .unwrap();
     drop(own);
     s.lib = Library::open_in(&state_dir).unwrap();
-    assert_eq!(s.lib.file_mtimes_ns().unwrap()[&s.root.join("A/1.wav")], -1);
+    assert_eq!(
+        s.lib.file_mtimes_ns().unwrap()[&s.root.join("A/1.flac")],
+        -1
+    );
     assert!(s.lib.library_hashes().unwrap().is_empty());
     assert!(s.lib.hash_jobs().unwrap().is_empty());
     s.scan();
     assert_eq!(s.lib.hash_jobs().unwrap().len(), 1);
     hashes::run(&s.lib, &Default::default()).unwrap();
     assert_eq!(
-        s.lib.library_hashes().unwrap()[Path::new("A/1.wav")],
-        hashes::file(&s.root.join("A/1.wav")).unwrap()
+        s.lib.library_hashes().unwrap()[Path::new("A/1.flac")],
+        hashes::file(&s.root.join("A/1.flac")).unwrap()
     );
 }
 
@@ -959,8 +956,8 @@ fn a_parallel_import_publishes_every_final_digest_and_preserves_permissions() {
     use std::os::unix::fs::PermissionsExt;
     let s = setup("hash-multi-import");
     for n in 1..=5 {
-        let path = s.inbox.join(format!("Rec/{n}.wav"));
-        wav(&path, &format!("Track {n}"), "Record", n);
+        let path = s.inbox.join(format!("Rec/{n}.flac"));
+        track(&path, &format!("Track {n}"), "Record", n);
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
     s.scan();
@@ -979,8 +976,8 @@ fn a_parallel_import_publishes_every_final_digest_and_preserves_permissions() {
 fn a_new_tag_reader_reads_files_again_and_keeps_their_digests() {
     let s = setup("reader-digests");
     for n in 1..=2 {
-        wav(
-            &s.inbox.join(format!("Rec/{n}.wav")),
+        track(
+            &s.inbox.join(format!("Rec/{n}.flac")),
             &format!("Track {n}"),
             "Record",
             n,
@@ -1029,7 +1026,7 @@ fn a_new_tag_reader_reads_files_again_and_keeps_their_digests() {
     s.lib
         .set_tag_reader(Collection::Inbox, coversync_core::tags::READER + 1)
         .unwrap();
-    wav(&s.inbox.join("Other/3.wav"), "Track 3", "Other", 3);
+    track(&s.inbox.join("Other/3.flac"), "Track 3", "Other", 3);
     s.scan();
     assert_eq!(
         s.lib.tag_reader(Collection::Inbox).unwrap(),

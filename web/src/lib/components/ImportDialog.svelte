@@ -18,6 +18,7 @@
 	import ImageIcon from '@lucide/svelte/icons/image';
 	import Split from '@lucide/svelte/icons/split';
 	import Replace from '@lucide/svelte/icons/replace';
+	import AudioWaveform from '@lucide/svelte/icons/audio-waveform';
 	import ImagePlus from '@lucide/svelte/icons/image-plus';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import {
@@ -497,6 +498,18 @@
 					<span>
 						Changed by substitutions:
 						{live.substituted.map((k) => label(k)).join(', ')}. Change them in Library setup.
+					</span>
+				</p>
+			{/if}
+			{#if live.tracks.some((t) => t.to_flac)}
+				{@const n = live.tracks.filter((t) => t.to_flac).length}
+				<p class="autofilled">
+					<AudioWaveform size={14} />
+					<span>
+						Converted to FLAC: {n === tracks.length
+							? 'every track'
+							: `${n} of ${tracks.length} tracks`}, as the Library keeps lossless audio as FLAC
+						only.
 					</span>
 				</p>
 			{/if}

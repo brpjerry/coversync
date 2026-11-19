@@ -105,7 +105,7 @@ fn read_collection(
     Ok(found.is_some())
 }
 
-fn tag_err(e: impl std::fmt::Display) -> Error {
+pub(crate) fn tag_err(e: impl std::fmt::Display) -> Error {
     Error::Tags(e.to_string())
 }
 
@@ -1241,6 +1241,31 @@ pub fn read_kinds_split(
         has_art: pictures && has_pictures(&file),
         tag_type: file.primary_tag_type(),
     })
+}
+
+/// Give `flac`, a FLAC just converted from `src` and without tags, what
+/// `src`'s tag holds that Vorbis comments can: lofty's generic items,
+/// pictures and the collection. Tags lofty has no key for don't carry over.
+#[cfg(feature = "server")]
+pub fn carry_tags(src: &Path, flac: &Path) -> Result<()> {
+    let file = probe_tags(src, true)?;
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(());
+    };
+    let mut values = HashMap::new();
+    read_collection(src, &file, Some(tag), &mut values)?;
+    let mut tag = tag.clone();
+    tag.re_map(TagType::VorbisComments);
+    tag.save_to_path(flac, WriteOptions::default())
+        .map_err(tag_err)?;
+    match values.remove(rules::COLLECTION) {
+        Some(collection) => write_with_kinds(
+            flac,
+            &TagEdit::default(),
+            &[(rules::COLLECTION, collection)],
+        ),
+        None => Ok(()),
+    }
 }
 
 /// The UPC some stores tag files with instead of a barcode, which lofty
