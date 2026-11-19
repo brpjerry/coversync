@@ -144,8 +144,11 @@ used on a home server.
   franchise say. The import dialog offers them for each album, None by
   default, and writes the one picked to the files' `COLLECTION` tag (a
   Vorbis comment, an ID3v2 `TXXX` frame, an MP4 `----:com.apple.iTunes`
-  atom); the tag editor changes it like any other
-  tag. In the folder structure `{collection}` is always optional:
+  atom). A Library album's tag editor has a Collection dropdown of the same
+  choices (and any collection its tracks are in already); saving another
+  moves the album's files where the folder structure puts them. Collections
+  are only picked, never typed. In the folder structure `{collection}` is
+  always optional:
   `{collection}/{album_artist}/{album}/…` puts albums in none straight under
   `{album_artist}`.
 - **Import** (an Inbox album's Import, or right-click it): Inbox files are

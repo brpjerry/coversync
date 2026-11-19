@@ -133,6 +133,13 @@
 		artist: 'Artist'
 	};
 	const label = (kind: string) => LABEL[kind] ?? setup.label(kind);
+	/**
+	 * The album's collection is picked from Library setup's (see
+	 * CollectionsSetup), never typed; an Inbox album's in the import dialog.
+	 */
+	const COLLECTION = 'collection';
+	/** Shown as a placeholder while tracks' collections differ. */
+	const MIXED = '\u0000';
 	const WIDE = new Set(['album', 'album_artist']);
 	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
 
@@ -307,7 +314,8 @@
 		const marked = new Set(Object.values(elsewhere).flatMap((kinds) => Object.keys(kinds)));
 		const all = setup.kinds.length ? setup.kinds.map((k) => k.id) : [...present].sort();
 		return all.filter(
-			(k) => !CORE.includes(k) && (present.has(k) || added.has(k) || marked.has(k))
+			(k) =>
+				!CORE.includes(k) && k !== COLLECTION && (present.has(k) || added.has(k) || marked.has(k))
 		);
 	});
 	let extraGroups = $derived(
@@ -328,6 +336,7 @@
 					(k) =>
 						k.group === g.id &&
 						!CORE.includes(k.id) &&
+						k.id !== COLLECTION &&
 						!extra.includes(k.id) &&
 						!setup.notEditable.includes(k.id)
 				)
@@ -335,6 +344,21 @@
 			.filter((g) => g.kinds.length)
 	);
 	let others = $derived(otherTags(other));
+	/** A Library album's collections to pick from: Library setup's, and any its tracks are in. */
+	let collections = $derived(
+		onimport
+			? []
+			: [
+					...new Set([
+						...setup.saved.collections,
+						...ids.map((id) => valueOf(base, id, COLLECTION))
+					])
+				].filter(Boolean)
+	);
+	/** Every track goes in the collection; None ('') takes them out of theirs. */
+	function setCollection(value: string) {
+		for (const id of ids) (form[id] ??= {})[COLLECTION] = value;
+	}
 
 	function addKind(kind: string) {
 		if (!kind) return;
@@ -559,6 +583,29 @@
 						{@render input(null, kind, label(kind))}
 					</div>
 				{/each}
+				{#if collections.length}
+					{@const value = shared(form, ids, COLLECTION)}
+					<div
+						class="field"
+						class:changed={anyChanged(COLLECTION)}
+						class:elsewhere={anyElsewhere(COLLECTION)}
+					>
+						<span class="label"
+							>Collection{#if anyChanged(COLLECTION)}<i class="dot" in:fly={{ y: -4 }}
+								></i>{/if}{#if anyElsewhere(COLLECTION)}<i class="dot warn"></i>{/if}</span
+						>
+						<select
+							value={value ?? MIXED}
+							title={albumNote(COLLECTION)}
+							aria-label="Collection"
+							onchange={(e) => setCollection(e.currentTarget.value)}
+						>
+							{#if value === null}<option value={MIXED} disabled>Differs per track</option>{/if}
+							<option value="">None</option>
+							{#each collections as c (c)}<option value={c}>{c}</option>{/each}
+						</select>
+					</div>
+				{/if}
 			</div>
 			{#each ALBUM_CORE.filter((k) => perTrack.has(k)) as kind (kind)}
 				<div class="per-track-block" transition:slide={{ duration: 200 }}>
@@ -766,7 +813,8 @@
 		border-radius: 999px;
 		background: var(--accent);
 	}
-	input {
+	input,
+	.field select {
 		width: 100%;
 		height: 40px;
 		padding: 0 12px;
@@ -783,27 +831,36 @@
 		color: var(--text-3);
 		font-style: italic;
 	}
-	input:hover {
+	.field select {
+		color: var(--text);
+		font: inherit;
+	}
+	input:hover,
+	.field select:hover {
 		border-color: var(--border-strong);
 	}
-	input:focus {
+	input:focus,
+	.field select:focus {
 		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
 		background: var(--bg-raised);
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
 	}
 	/* Changed elsewhere since kept edits were made (see TagDraft). */
 	.elsewhere input,
+	.elsewhere select,
 	input.elsewhere {
 		border-color: var(--warn-border);
 		background: color-mix(in oklab, var(--warn-surface) 70%, var(--surface));
 	}
 	.changed input,
+	.changed select,
 	input.changed {
 		border-color: color-mix(in oklab, var(--accent) 55%, transparent);
 		background: color-mix(in oklab, var(--accent) 8%, var(--surface));
 	}
 	/* Edited here and changed elsewhere too: the edit is on top. */
 	.changed.elsewhere input,
+	.changed.elsewhere select,
 	input.changed.elsewhere {
 		background: color-mix(in oklab, var(--warn-surface) 70%, var(--surface));
 	}
