@@ -781,8 +781,12 @@ async fn import_album(
     // Under the jobs lock, in a task of its own: a scan asked for meanwhile
     // waits for the whole import, even if the request is dropped.
     let result = exclusively(&state, move |s| {
-        // Not onto a path a track an earlier save moved has to come back to.
-        moves_put_back(s, "imported")?;
+        // Not onto a path a track an earlier save moved has to come back to
+        // (nor while the tag editor reads a file there).
+        {
+            let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+            moves_put_back(s, "imported")?;
+        }
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
         let art = req
@@ -1282,9 +1286,9 @@ async fn write_tags(
         let mut moved = relocate::Applied::default();
         let mut warning = None;
         // Files a failed move couldn't put back: what's at their old paths
-        // now isn't theirs, so nothing is indexed until they're back (scans
-        // and saves wait for that too).
-        let mut stuck = false;
+        // now isn't theirs, so those aren't indexed until they're back
+        // (scans and saves wait for that too).
+        let mut pending = HashSet::new();
         if failed.is_none()
             && let Some(plan) = &plan
         {
@@ -1292,11 +1296,11 @@ async fn write_tags(
                 Ok(done) => moved = done,
                 Err(e) => {
                     tracing::warn!(error = %e, "tags saved, files not moved");
-                    stuck = !s.lib.recorded_moves()?.is_empty();
-                    warning = Some(match stuck {
-                        false => format!("Saved, but the files weren't moved: {e}"),
-                        true => format!(
-                            "Saved, but the files weren't moved ({e}), and some couldn't be put back: see coversyncd's log."
+                    pending = pending_moves(&s.lib)?;
+                    warning = Some(match pending.len() {
+                        0 => format!("Saved, but the files weren't moved: {e}"),
+                        n => format!(
+                            "Saved, but the files weren't moved ({e}), and {n} couldn't be put back: see coversyncd's log."
                         ),
                     });
                 }
@@ -1324,6 +1328,7 @@ async fn write_tags(
                 let path = now.get(path.as_path()).copied().unwrap_or(path);
                 (path.to_path_buf(), root.clone())
             })
+            .filter(|(path, _)| !pending.contains(path))
             .collect();
         if let Some((_, root)) = &layout {
             let mut indexed: HashSet<PathBuf> = paths.iter().map(|(p, _)| p.clone()).collect();
@@ -1350,7 +1355,6 @@ async fn write_tags(
             .find(|m| !found.contains(m.to.as_path()))
             .map(|m| m.to.clone());
         let indexed = match lost {
-            _ if stuck => Ok(()),
             Some(to) => Err(coversync_core::Error::Invalid(format!(
                 "{} can't be read where it went",
                 to.display()
@@ -1372,17 +1376,19 @@ async fn write_tags(
                 ),
             });
             moved = relocate::Applied::default();
-            // Back where the index has them: indexed as saved. A new title's
-            // album leaves its old cover behind.
-            if stuck == 0 {
-                scan::index_files(&s.lib, stat_all(at_first), &s.progress)?;
-                s.lib.forget_orphan_covers()?;
-            }
+            // Back where the index has them: indexed as saved, but for any
+            // not back. A new title's album leaves its old cover behind.
+            let pending = pending_moves(&s.lib)?;
+            let back: Vec<(PathBuf, PathBuf)> = at_first
+                .into_iter()
+                .filter(|(path, _)| !pending.contains(path))
+                .collect();
+            scan::index_files(&s.lib, stat_all(back), &s.progress)?;
+            s.lib.forget_orphan_covers()?;
         }
-        drop(files);
-        // Covers name where their files are now before anything reads them.
-        scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
         drop(moving);
+        drop(files);
+        scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
         // The albums the tracks are in now (a moved track keeps its id):
         // the first written track's, which the editor follows, and any other.
         let previous = current.album.id;
@@ -1446,6 +1452,20 @@ fn moves_put_back(s: &crate::AppState, done: &str) -> coversync_core::Result<()>
             "Files an earlier save moved couldn't all be put back (see coversyncd's log), so nothing was {done}."
         ))),
     }
+}
+
+/// The Library paths moves recorded and not yet put back are to come back
+/// to (see `relocate::recover`).
+fn pending_moves(lib: &coversync_core::Library) -> coversync_core::Result<HashSet<PathBuf>> {
+    let Some(root) = lib.library_folder()? else {
+        return Ok(HashSet::new());
+    };
+    Ok(lib
+        .recorded_moves()?
+        .into_iter()
+        .flat_map(|(_, records)| records)
+        .map(|r| root.join(r.from))
+        .collect())
 }
 
 /// Record a copy a save is making, as the file it is (see `PreparedCopy`):
