@@ -26,6 +26,7 @@ pub mod romanize;
 pub mod rules;
 pub mod scan;
 pub mod split;
+pub mod substitute;
 pub mod sync;
 pub mod tags;
 pub mod template;

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use coversync_core::cover::CoverCache;
 use coversync_core::import::{self, Edits, ImportPlan};
 use coversync_core::scan::{self, Progress};
+use coversync_core::substitute::Substitution;
 use coversync_core::{Collection, InboxSetup, Library, LibrarySetup, TagEdit, tags};
 
 struct Setup {
@@ -258,6 +259,65 @@ fn names_are_split_at_library_setups_phrases() {
     assert_eq!(copy("01 - One.wav").values["artist"], "Ado;Eve");
     assert_eq!(copy("02 - Two.wav").values["artist"], "Rin;Riho");
     assert_eq!(copy("02 - Two.wav").values["album_artist"], "Ado;Eve");
+}
+
+#[test]
+fn substitutions_change_tags_on_import_once_names_are_split() {
+    let s = setup(
+        "substitute",
+        "{album_artist}/{album}/<{track_number} - >{title}",
+    );
+    let mut setup = s.lib.library_setup().unwrap();
+    setup.rules.substitutions = vec![
+        Substitution {
+            expression: r"s/ \(Live\)$//".into(),
+            tags: vec!["title".into()],
+        },
+        Substitution {
+            expression: r"s/^Ado$/\U&/".into(),
+            tags: vec!["artist".into(), "album_artist".into()],
+        },
+    ];
+    s.lib.set_library_setup(setup).unwrap();
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    for (n, title) in [(1, "One (Live)"), (2, "Two")] {
+        let edit = TagEdit {
+            title: Some(title.into()),
+            artist: Some("Ado feat. Eve".into()),
+            album_artist: Some("Ado".into()),
+            ..Default::default()
+        };
+        tags::write(&inbox.join(format!("{n}.wav")), &edit).unwrap();
+    }
+    let plan = s.plan([&[], &[]]);
+    assert_eq!(plan.split, ["artist"]);
+    assert_eq!(plan.substituted, ["title", "artist", "album_artist"]);
+    assert_eq!(plan.tracks[0].autofilled["title"], "One");
+    assert!(!plan.tracks[1].autofilled.contains_key("title"));
+    // Each name on its own, once split.
+    assert_eq!(plan.tracks[0].autofilled["artist"], "ADO;Eve");
+    assert_eq!(
+        s.dests(&plan),
+        ["ADO/Record/01 - One.wav", "ADO/Record/02 - Two.wav"]
+    );
+    // What's typed in the dialog stays as typed.
+    let plan = s.plan([&[("title", "One (Live)")], &[]]);
+    assert_eq!(plan.substituted, ["artist", "album_artist"]);
+
+    let covers = CoverCache::new(s.root.parent().unwrap().join("cache")).unwrap();
+    import::execute(
+        &s.lib,
+        &covers,
+        &s.album,
+        &Edits::new(),
+        None,
+        &Progress::default(),
+    )
+    .unwrap();
+    let copy = tags::read_kinds(&s.root.join("ADO/Record/01 - One.wav"), false).unwrap();
+    assert_eq!(copy.values["title"], "One");
+    assert_eq!(copy.values["artist"], "ADO;Eve");
+    assert_eq!(copy.values["album_artist"], "ADO");
 }
 
 #[test]

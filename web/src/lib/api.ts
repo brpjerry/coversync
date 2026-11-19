@@ -182,9 +182,19 @@ export interface LibrarySetup {
 		/** Phrases like "feat." that join names in tags naming people: the
 		 * import and suggestions put the separator there, and filters split at them. */
 		split_at: string[];
+		/** Regular expressions the import and suggestions run on tags, once names are split. */
+		substitutions: Substitution[];
 	};
 	folder: string | null;
 	structure: string;
+}
+
+/** One of Library setup's substitutions. */
+export interface Substitution {
+	/** s/pattern/replacement/flags, as typed. */
+	expression: string;
+	/** Catalog ids of the tags it changes. */
+	tags: string[];
 }
 
 /** A configured folder as coversyncd sees it on disk. */
@@ -233,7 +243,7 @@ export interface ImportTrack {
 	missing: string[];
 	dest: string | null;
 	/** What the import sets by itself on this track, by kind: empty tags
-	 * autofill fills, and names split at Library setup's phrases. */
+	 * autofill fills, names split at Library setup's phrases, and its substitutions. */
 	autofilled: Record<string, string>;
 }
 
@@ -251,6 +261,8 @@ export interface ImportPlan {
 	autofilled: string[];
 	/** Kinds naming people the import splits at Library setup's phrases. */
 	split: string[];
+	/** Kinds Library setup's substitutions change on at least one track. */
+	substituted: string[];
 	art: ArtPlan;
 	/** Smart suggestions are on: the import dialog looks the album up. */
 	suggest: boolean;

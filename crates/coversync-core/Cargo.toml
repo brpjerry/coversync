@@ -41,6 +41,7 @@ tracing = "0.1.44"
 ureq = { version = "3.5.0", optional = true, features = ["json"] }
 walkdir = { version = "2.5.0", optional = true }
 blake3 = "1.8.7"
+regex = "1.13.1"
 
 # Linux file clones and I/O priority, access(2) and the uploads' disk calls;
 # moving Library files one name at a time, never following a link.

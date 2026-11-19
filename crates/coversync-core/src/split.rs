@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use crate::substitute::Substitute;
 use crate::{Error, Result};
 
 /// Tag kinds that name people, the only ones split at phrases. Sort names
@@ -32,6 +33,25 @@ pub const PEOPLE: &[&str] = &[
     "original_artist",
     "original_lyricist",
 ];
+
+/// Other tags that hold several values joined by the separator: the ones
+/// MusicBrainz's suggestions join.
+const LISTS: &[&str] = &[
+    "genre",
+    "release_type",
+    "mb_artist_id",
+    "mb_release_artist_id",
+];
+
+/// Whether `kind` holds several values joined by the separator: names, and
+/// the others in [`LISTS`]. Substitutions change each on its own.
+pub fn holds_several(kind: &str) -> bool {
+    PEOPLE.contains(&kind) || LISTS.contains(&kind)
+}
+
+/// Longer than this, a substitution's result is dropped, so rules feeding
+/// each other can't grow a tag without bound.
+const SUBSTITUTED_BYTES: usize = 1 << 20;
 
 /// Phrases Library setup starts with.
 pub const DEFAULT_PHRASES: &[&str] = &["feat.", "ft.", "featuring", "(CV"];
@@ -185,11 +205,13 @@ struct Phrase {
 
 /// How Library setup splits tags that hold several values: at the
 /// separator, and in tags that name people, at its phrases too. The
+/// import and MusicBrainz's suggestions then run its substitutions. The
 /// default splits nothing.
 #[derive(Debug, Clone, Default)]
 pub struct Splitter {
     separator: String,
     phrases: Vec<Phrase>,
+    substitutions: Vec<Substitute>,
 }
 
 impl Splitter {
@@ -210,7 +232,14 @@ impl Splitter {
         Self {
             separator: separator.to_string(),
             phrases,
+            substitutions: Vec::new(),
         }
+    }
+
+    /// With `substitutions` run, in order, once names are split.
+    pub fn substituting(mut self, substitutions: Vec<Substitute>) -> Self {
+        self.substitutions = substitutions;
+        self
     }
 
     pub fn separator(&self) -> &str {
@@ -266,9 +295,38 @@ impl Splitter {
         out
     }
 
+    /// `value` of `kind` as the import and suggestions write it: names
+    /// split, then substituted in; None when that changes nothing.
+    pub fn rewrite(&self, kind: &str, value: &str) -> Option<String> {
+        let split = self.split_names(kind, value);
+        self.substitute(kind, split.as_deref().unwrap_or(value))
+            .or(split)
+    }
+
+    /// Rewrite every value in `values`; returns the kinds split at phrases,
+    /// and the kinds substitutions changed.
+    pub fn rewrite_all(
+        &self,
+        values: &mut HashMap<&'static str, String>,
+    ) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut split = Vec::new();
+        let mut substituted = Vec::new();
+        for (kind, value) in values.iter_mut() {
+            if let Some(v) = self.split_names(kind, value) {
+                *value = v;
+                split.push(*kind);
+            }
+            if let Some(v) = self.substitute(kind, value) {
+                *value = v;
+                substituted.push(*kind);
+            }
+        }
+        (split, substituted)
+    }
+
     /// `value` of `kind` with the separator for each phrase that joins two
     /// names, or None when it has none (or `kind` doesn't name people).
-    pub fn rewrite(&self, kind: &str, value: &str) -> Option<String> {
+    fn split_names(&self, kind: &str, value: &str) -> Option<String> {
         if !PEOPLE.contains(&kind) || self.separator.trim().is_empty() {
             return None;
         }
@@ -279,17 +337,42 @@ impl Splitter {
         (joined != value && !joined.is_empty()).then_some(joined)
     }
 
-    /// Rewrite every value in `values` that a phrase splits; returns the
-    /// kinds rewritten.
-    pub fn rewrite_all(&self, values: &mut HashMap<&'static str, String>) -> Vec<&'static str> {
-        let mut changed = Vec::new();
-        for (kind, value) in values.iter_mut() {
-            if let Some(v) = self.rewrite(kind, value) {
-                *value = v;
-                changed.push(*kind);
+    /// `value` of `kind` with the substitutions for `kind` run in turn, on
+    /// each of its values if it [holds several](holds_several), trimmed.
+    /// One that would leave nothing is skipped. None when nothing changed,
+    /// or the result grew past [`SUBSTITUTED_BYTES`].
+    fn substitute(&self, kind: &str, value: &str) -> Option<String> {
+        let mut subs = self
+            .substitutions
+            .iter()
+            .filter(|s| s.changes(kind))
+            .peekable();
+        subs.peek()?;
+        let before: Vec<&str> = if holds_several(kind) && !self.separator.trim().is_empty() {
+            value.split(self.separator.as_str()).collect()
+        } else {
+            vec![value]
+        };
+        let before: Vec<&str> = before
+            .into_iter()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut values: Vec<String> = before.iter().map(|v| v.to_string()).collect();
+        for sub in subs {
+            let next: Vec<String> = values
+                .iter()
+                .map(|v| sub.apply(v).trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+            if next.iter().map(String::len).sum::<usize>() > SUBSTITUTED_BYTES && next != values {
+                return None;
+            }
+            if !next.is_empty() {
+                values = next;
             }
         }
-        changed
+        (values != before).then(|| values.join(&self.separator))
     }
 
     /// Byte ranges of `value` to cut out: each phrase joining two names
@@ -646,9 +729,88 @@ mod tests {
             ("title", "Song feat. C".to_string()),
             ("album_artist", "A".to_string()),
         ]);
-        assert_eq!(s.rewrite_all(&mut values), vec!["artist"]);
+        assert_eq!(s.rewrite_all(&mut values), (vec!["artist"], vec![]));
         assert_eq!(values["artist"], "A / C");
         assert_eq!(values["title"], "Song feat. C");
+    }
+
+    #[test]
+    fn substitutions_run_in_order_once_names_are_split_on_each_name_of_their_tags() {
+        use crate::substitute::Substitution;
+        let sub = |expression: &str, tag: &str| {
+            Substitute::new(&Substitution {
+                expression: expression.into(),
+                tags: vec![tag.into()],
+            })
+            .unwrap()
+        };
+        let s = Splitter::new("; ", &["feat.".to_string()]).substituting(vec![
+            sub(r"s/^The (.+)$/\1, The/", "artist"),
+            sub(r"s/\(Remaster(ed)?\)$//i", "title"),
+            sub("s/Song/Track/", "title"),
+        ]);
+        assert_eq!(
+            rw(&s, "The Ado feat. The Eve").as_deref(),
+            Some("Ado, The; Eve, The")
+        );
+        assert_eq!(
+            s.rewrite("title", "Song (remastered)").as_deref(),
+            Some("Track")
+        );
+        // Only in the tags each names; unchanged is None, spaces and all.
+        assert_eq!(s.rewrite("album", "The Album"), None);
+        assert_eq!(s.rewrite("title", " Track "), None);
+        // A value left blank goes; a rule that would leave the tag blank is
+        // skipped, after the rules before it.
+        let unknown = Splitter::new(";", &[]).substituting(vec![
+            sub("s/^Legacy$/Rock/", "genre"),
+            sub("s/^Unknown$//", "genre"),
+            sub("s/^Rock$//", "genre"),
+        ]);
+        assert_eq!(
+            unknown.rewrite("genre", "Pop; Unknown; Rock").as_deref(),
+            Some("Pop")
+        );
+        assert_eq!(unknown.rewrite("genre", "Unknown"), None);
+        assert_eq!(
+            unknown.rewrite("genre", "Legacy; Unknown").as_deref(),
+            Some("Rock")
+        );
+        // Only tags that hold several values are split at the separator.
+        let slash = Splitter::new("/", &[]).substituting(vec![
+            sub("s#^https://old/#https://new/#", "artist_url"),
+            sub("s/^AC$/AB/", "title"),
+        ]);
+        assert_eq!(
+            slash.rewrite("artist_url", "https://old/a").as_deref(),
+            Some("https://new/a")
+        );
+        assert_eq!(slash.rewrite("title", "AC/DC"), None);
+        // Rules feeding each other don't grow a tag without bound.
+        let double = |n| Splitter::new(";", &[]).substituting(vec![sub("s/.+/&&/", "title"); n]);
+        assert_eq!(double(21).rewrite("title", "a"), None);
+        // A tag that was that long already can still be shortened.
+        let big = "a".repeat(SUBSTITUTED_BYTES + 1);
+        let shorten = Splitter::new(";", &[]).substituting(vec![
+            sub("s/^b$/c/", "title"),
+            sub("s/^a+$/short/", "title"),
+        ]);
+        assert_eq!(shorten.rewrite("title", &big).as_deref(), Some("short"));
+        assert_eq!(double(3).rewrite("title", "a").as_deref(), Some("aaaaaaaa"));
+        let mut values: HashMap<&'static str, String> = HashMap::from([
+            ("artist", "The A feat. B".to_string()),
+            ("title", "Song (Remaster)".to_string()),
+            ("album", "Song".to_string()),
+        ]);
+        let (split, mut substituted) = s.rewrite_all(&mut values);
+        substituted.sort();
+        assert_eq!(
+            (split, substituted),
+            (vec!["artist"], vec!["artist", "title"])
+        );
+        assert_eq!(values["artist"], "A, The; B");
+        assert_eq!(values["title"], "Track");
+        assert_eq!(values["album"], "Song");
     }
 
     #[test]

@@ -233,12 +233,23 @@ pub struct Rules {
     /// instead, and filters split at them (see [`crate::split`]).
     #[serde(default = "default_split_at")]
     pub split_at: Vec<String>,
+    /// Regular expressions the import and MusicBrainz's suggestions run on
+    /// tags, after names are split (see [`crate::substitute`]).
+    #[serde(default)]
+    pub substitutions: Vec<crate::substitute::Substitution>,
 }
 
 impl Rules {
-    /// How these rules split tags that hold several values.
+    /// How these rules split tags that hold several values, and substitute
+    /// in them. A substitution that no longer compiles (all did when saved)
+    /// is left out.
     pub fn splitter(&self) -> crate::split::Splitter {
-        crate::split::Splitter::new(&self.separator, &self.split_at)
+        let substitutions = self
+            .substitutions
+            .iter()
+            .filter_map(|s| crate::substitute::Substitute::new(s).ok())
+            .collect();
+        crate::split::Splitter::new(&self.separator, &self.split_at).substituting(substitutions)
     }
 }
 
@@ -249,6 +260,7 @@ impl Default for Rules {
             art: Default::default(),
             separator: default_separator(),
             split_at: default_split_at(),
+            substitutions: Vec::new(),
         }
     }
 }
@@ -371,6 +383,8 @@ impl LibrarySetup {
         }
         self.rules.split_at =
             crate::split::normalize_phrases(std::mem::take(&mut self.rules.split_at))?;
+        self.rules.substitutions =
+            crate::substitute::normalize(std::mem::take(&mut self.rules.substitutions))?;
         if let Some(bad) = self
             .rules
             .required_tags

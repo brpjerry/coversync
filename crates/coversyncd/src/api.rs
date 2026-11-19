@@ -350,9 +350,10 @@ async fn save_library_setup(
             setup.folder.as_deref(),
         )?;
         let saved = s.lib.set_library_setup(setup.clone())?;
-        // Suggestions joined or split the old way shouldn't linger.
+        // Suggestions joined, split or substituted the old way shouldn't linger.
         if before.rules.separator != saved.rules.separator
             || before.rules.split_at != saved.rules.split_at
+            || before.rules.substitutions != saved.rules.substitutions
         {
             s.identify.clear();
         }
@@ -2640,6 +2641,17 @@ mod tests {
         let mut separator = state.lib.library_setup().unwrap();
         separator.rules.separator = " / ".into();
         let _ = save_library_setup(State(state.clone()), Json(separator))
+            .await
+            .unwrap();
+        assert_eq!(state.identify.count(), 0);
+        // And the substitutions.
+        state.identify.finished("a");
+        let mut substitutions = state.lib.library_setup().unwrap();
+        substitutions.rules.substitutions = vec![coversync_core::substitute::Substitution {
+            expression: "s/a/b/".into(),
+            tags: vec!["title".into()],
+        }];
+        let _ = save_library_setup(State(state.clone()), Json(substitutions))
             .await
             .unwrap();
         assert_eq!(state.identify.count(), 0);

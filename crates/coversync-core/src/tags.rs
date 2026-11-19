@@ -1167,10 +1167,14 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
-/// As [`read_kinds`], but a tag naming people that the file holds several
+/// As [`read_kinds`], but a tag that [holds several
+/// values](crate::split::holds_several) and that the file holds several
 /// times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them
-/// all, joined by `split`'s separator, when one has a phrase to split at:
-/// the import then rewrites the tag, and would otherwise keep only the first.
+/// all, joined by `split`'s separator, when `split` would rewrite them or
+/// the first (at a phrase, or by a substitution): the import writes the tag
+/// whole, and from the first alone would drop the others. Other tags are
+/// read by their first value, and a rewrite replaces every copy, as a value
+/// typed in the import dialog does.
 pub fn read_kinds_split(
     path: &Path,
     pictures: bool,
@@ -1181,16 +1185,18 @@ pub fn read_kinds_split(
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
-        for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
-            let all: Vec<&str> = kind
-                .keys
-                .iter()
-                .flat_map(|key| tag.get_strings(*key))
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .collect();
-            if all.len() > 1 && all.iter().any(|v| split.rewrite(kind.id, v).is_some()) {
-                values.insert(kind.id, all.join(split.separator()));
+        for kind in rules::CATALOG
+            .iter()
+            .filter(|k| crate::split::holds_several(k.id))
+        {
+            let all: Vec<&str> = texts(tag, kind).collect();
+            if all.len() < 2 {
+                continue;
+            }
+            let joined = all.join(split.separator());
+            if split.rewrite(kind.id, &joined).is_some() || split.rewrite(kind.id, all[0]).is_some()
+            {
+                values.insert(kind.id, joined);
             }
         }
     }
@@ -1321,21 +1327,24 @@ fn has_pictures(file: &TaggedFile) -> bool {
 fn values_of(tag: &Tag) -> HashMap<&'static str, String> {
     let mut out = HashMap::new();
     for kind in rules::CATALOG {
-        if let Some(v) = kind
-            .keys
-            .iter()
-            .flat_map(|k| tag.get_items(*k))
-            .filter(|i| !described(i))
-            .filter_map(|i| match i.value() {
-                ItemValue::Text(t) | ItemValue::Locator(t) => Some(t.trim()),
-                ItemValue::Binary(_) => None,
-            })
-            .find(|v| !v.is_empty())
-        {
+        if let Some(v) = texts(tag, kind).next() {
             out.insert(kind.id, v.to_string());
         }
     }
     out
+}
+
+/// The text values `tag` holds for `kind`, trimmed, without blanks.
+fn texts<'a>(tag: &'a Tag, kind: &rules::TagKind) -> impl Iterator<Item = &'a str> {
+    kind.keys
+        .iter()
+        .flat_map(|k| tag.get_items(*k))
+        .filter(|i| !described(i))
+        .filter_map(|i| match i.value() {
+            ItemValue::Text(t) | ItemValue::Locator(t) => Some(t.trim()),
+            ItemValue::Binary(_) => None,
+        })
+        .filter(|v| !v.is_empty())
 }
 
 /// Whether `read` (lofty's reading of the date `typed`) has every part of
@@ -2175,6 +2184,69 @@ mod tests {
         assert_eq!(
             read_kinds_split(&path, false, &split).unwrap().values["artist"],
             "A"
+        );
+        // Any tag one of them a substitution changes.
+        use crate::substitute::{Substitute, Substitution};
+        let genre = Substitute::new(&Substitution {
+            expression: "s/Rock/Metal/".into(),
+            tags: vec!["genre".into()],
+        })
+        .unwrap();
+        let substitutes = split.substituting(vec![genre]);
+        flac_with_comments(&path, &["GENRE=Rock", "GENRE=Pop"]);
+        let read = read_kinds_split(&path, false, &substitutes).unwrap();
+        assert_eq!(read.values["genre"], "Rock;Pop");
+        assert_eq!(
+            substitutes.rewrite("genre", &read.values["genre"]).unwrap(),
+            "Metal;Pop"
+        );
+        // One that goes, wherever it is.
+        let unknown = Substitute::new(&Substitution {
+            expression: "s/^Unknown$//".into(),
+            tags: vec!["genre".into()],
+        })
+        .unwrap();
+        let drops = crate::split::Splitter::new(";", &[]).substituting(vec![unknown]);
+        for comments in [
+            ["GENRE=Rock", "GENRE=Unknown"],
+            ["GENRE=Unknown", "GENRE=Rock"],
+        ] {
+            flac_with_comments(&path, &comments);
+            let read = read_kinds_split(&path, false, &drops).unwrap();
+            assert_eq!(
+                drops.rewrite("genre", &read.values["genre"]).unwrap(),
+                "Rock"
+            );
+        }
+        // A list keeps its values in order, repeats and all.
+        let rename = |expression: &str, tag: &str| {
+            crate::split::Splitter::new(";", &[]).substituting(vec![
+                Substitute::new(&Substitution {
+                    expression: expression.into(),
+                    tags: vec![tag.into()],
+                })
+                .unwrap(),
+            ])
+        };
+        let artists = rename("s/^B$/C/", "artists");
+        flac_with_comments(&path, &["ARTISTS=A", "ARTISTS=B", "ARTISTS=A"]);
+        let read = read_kinds_split(&path, false, &artists).unwrap();
+        assert_eq!(
+            artists.rewrite("artists", &read.values["artists"]).unwrap(),
+            "A;C;A"
+        );
+        // Other tags are read by their first value, as before: identifiers
+        // stay whole, and a date beside a YEAR alias is the date.
+        let isrc = rename("s/-//g", "isrc");
+        flac_with_comments(&path, &["ISRC=JP-AB1-23-00001", "ISRC=JP-AB1-23-00002"]);
+        let read = read_kinds_split(&path, false, &isrc).unwrap();
+        assert_eq!(read.values["isrc"], "JP-AB1-23-00001");
+        let month = rename("s/-05-/-06-/", "date");
+        flac_with_comments(&path, &["DATE=2003-05-01", "YEAR=2003"]);
+        let read = read_kinds_split(&path, false, &month).unwrap();
+        assert_eq!(
+            month.rewrite("date", &read.values["date"]).unwrap(),
+            "2003-06-01"
         );
         let _ = fs::remove_dir_all(&dir);
     }
