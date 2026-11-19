@@ -41,7 +41,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		art: { required: false, placement: 'file', file_name: 'cover' } as ArtRules,
 		separator: ';',
 		splitAt: [] as string[],
-		substitutions: [] as Substitution[]
+		substitutions: [] as Substitution[],
+		collections: [] as string[]
 	});
 	/** Being edited. */
 	required = new SvelteSet<string>();
@@ -54,6 +55,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	splitAt = $state<string[]>([]);
 	/** Regular expressions run on tags once names are split, in order. */
 	substitutions = $state<Substitution[]>([]);
+	/** What the import offers for an album's collection, in order. */
+	collections = $state<string[]>([]);
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
 	/** Why the saved folder can't hold the library's database, if it can't. */
@@ -61,7 +64,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
-	/** Tags added or removed, plus a changed folder, structure, art rule, separator, phrases or substitutions. */
+	/** Tags added or removed, plus a changed folder, structure, art rule, separator, phrases, substitutions or collections. */
 	changes = $derived(
 		this.saved.required.filter((id) => !this.required.has(id)).length +
 			[...this.required].filter((id) => !this.saved.required.includes(id)).length +
@@ -72,7 +75,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			((this.art.file_name.trim() || 'cover') !== this.saved.art.file_name ? 1 : 0) +
 			(this.separator !== this.saved.separator ? 1 : 0) +
 			(sameList(this.splitAt, this.saved.splitAt) ? 0 : 1) +
-			(sameSubs(this.substitutions, this.saved.substitutions) ? 0 : 1)
+			(sameSubs(this.substitutions, this.saved.substitutions) ? 0 : 1) +
+			(sameList(this.collections, this.saved.collections) ? 0 : 1)
 	);
 
 	protected fetch() {
@@ -116,7 +120,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			art: s.rules.art,
 			separator: s.rules.separator,
 			splitAt: s.rules.split_at,
-			substitutions: s.rules.substitutions
+			substitutions: s.rules.substitutions,
+			collections: s.rules.collections
 		};
 		const requiredKept =
 			this.required.size === was.required.length &&
@@ -135,6 +140,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		if (sameList(this.splitAt, was.splitAt)) this.splitAt = [...s.rules.split_at];
 		if (sameSubs(this.substitutions, was.substitutions))
 			this.substitutions = copySubs(s.rules.substitutions);
+		if (sameList(this.collections, was.collections)) this.collections = [...s.rules.collections];
 		this.folderStatus = r.folder;
 		this.libraryProblem = r.library_problem;
 	}
@@ -150,6 +156,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.separator = s.rules.separator;
 		this.splitAt = [...s.rules.split_at];
 		this.substitutions = copySubs(s.rules.substitutions);
+		this.collections = [...s.rules.collections];
 	}
 
 	label(id: string) {
@@ -175,6 +182,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.separator = this.saved.separator;
 		this.splitAt = [...this.saved.splitAt];
 		this.substitutions = copySubs(this.saved.substitutions);
+		this.collections = [...this.saved.collections];
 	}
 
 	save() {
@@ -188,7 +196,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 						art: { ...this.art, file_name: this.art.file_name.trim() },
 						separator: this.separator,
 						split_at: this.splitAt,
-						substitutions: this.substitutions
+						substitutions: this.substitutions,
+						collections: this.collections
 					},
 					folder: this.folder.trim() || null,
 					structure: this.structure.trim()

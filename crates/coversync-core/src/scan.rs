@@ -277,7 +277,7 @@ pub fn scan(
                 return Some(f);
             }
             let read_by = since(f.collection);
-            if read_by < crate::tags::READER && crate::tags::reader_changed(&f.path, read_by) {
+            if read_by < crate::tags::READER {
                 // Kept by path in the Library folder.
                 let rel = f.path.strip_prefix(&f.root).unwrap_or(&f.path);
                 f.hash = digests.get(rel).cloned();

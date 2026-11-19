@@ -66,13 +66,14 @@ pub const GROUPS: &[TagGroup] = &[
 ];
 
 macro_rules! kinds {
-    ($($group:literal => [$($id:literal, $label:literal, [$($key:ident),+];)+])+) => {
-        &[$($(TagKind { id: $id, label: $label, group: $group, keys: &[$(ItemKey::$key),+] },)+)+]
+    ($($group:literal => [$($id:literal, $label:literal, [$($key:ident),*];)+])+) => {
+        &[$($(TagKind { id: $id, label: $label, group: $group, keys: &[$(ItemKey::$key),*] },)+)+]
     };
 }
 
 /// Every tag kind a rule can refer to, in display order. Podcast, internet
-/// radio, TV show and Apple-internal keys are left out.
+/// radio, TV show and Apple-internal keys are left out. [`COLLECTION`] is
+/// coversync's own, which lofty has no key for (see `tags`).
 pub const CATALOG: &[TagKind] = kinds! {
     "core" => [
         "title", "Title", [TrackTitle];
@@ -123,6 +124,7 @@ pub const CATALOG: &[TagKind] = kinds! {
     "work" => [
         "subtitle", "Subtitle", [TrackSubtitle];
         "grouping", "Grouping", [ContentGroup];
+        "collection", "Collection", [];
         "work", "Work", [Work];
         "movement", "Movement", [Movement];
         "movement_number", "Movement number", [MovementNumber];
@@ -186,6 +188,10 @@ pub const CATALOG: &[TagKind] = kinds! {
     ]
 };
 
+/// Groups albums, of a franchise say, for the folder structure: one of
+/// Library setup's [`Rules::collections`], picked on import.
+pub const COLLECTION: &str = "collection";
+
 /// A sensible starting point for "require tags".
 pub const ESSENTIALS: &[&str] = &[
     "title",
@@ -237,6 +243,9 @@ pub struct Rules {
     /// tags, after names are split (see [`crate::substitute`]).
     #[serde(default)]
     pub substitutions: Vec<crate::substitute::Substitution>,
+    /// The collections the import offers for an album's [`COLLECTION`].
+    #[serde(default)]
+    pub collections: Vec<String>,
 }
 
 impl Rules {
@@ -261,6 +270,7 @@ impl Default for Rules {
             separator: default_separator(),
             split_at: default_split_at(),
             substitutions: Vec::new(),
+            collections: Vec::new(),
         }
     }
 }
@@ -310,6 +320,7 @@ pub const ALBUM_KINDS: &[&str] = &[
     "rg_album_peak",
     "r128_album_gain",
     "original_album",
+    COLLECTION,
 ];
 
 /// Kinds that can't be typed in as text (ratings are binary frames).
@@ -385,6 +396,14 @@ impl LibrarySetup {
             crate::split::normalize_phrases(std::mem::take(&mut self.rules.split_at))?;
         self.rules.substitutions =
             crate::substitute::normalize(std::mem::take(&mut self.rules.substitutions))?;
+        let names = std::mem::take(&mut self.rules.collections);
+        let mut seen = HashSet::new();
+        for name in &names {
+            let name = name.trim();
+            if !name.is_empty() && seen.insert(name) {
+                self.rules.collections.push(name.to_string());
+            }
+        }
         if let Some(bad) = self
             .rules
             .required_tags

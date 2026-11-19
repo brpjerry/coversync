@@ -42,6 +42,8 @@
 		label: (id: string) => string;
 		/** Kinds asked for once per album rather than per track. */
 		albumKinds: string[];
+		/** Library setup's collections, which the album can go in. */
+		collections: string[];
 		notEditable: string[];
 		/** Core tag kinds, shown up front among suggestions. */
 		coreKinds: string[];
@@ -66,6 +68,7 @@
 		baseEdits = {},
 		label,
 		albumKinds,
+		collections,
 		notEditable,
 		coreKinds,
 		kindOrder,
@@ -86,7 +89,12 @@
 	 * once it's there.
 	 */
 	let disagree = $state([...opened]);
-	let albumCols = $derived([...failing.filter((k) => albumKinds.includes(k)), ...disagree]);
+	/** The collection has a field of its own. */
+	let albumCols = $derived(
+		[...failing.filter((k) => albumKinds.includes(k)), ...disagree].filter(
+			(k) => k !== 'collection'
+		)
+	);
 	const trackCols = failing.filter((k) => !albumKinds.includes(k));
 	/** The date added an album keeps (Preserve modification date), as a date. */
 	const addedDate = (seconds: number) =>
@@ -97,7 +105,7 @@
 	function consensus(k: string) {
 		const counts = new Map<string, number>();
 		for (const t of tracks) {
-			const v = t.values[k]?.trim();
+			const v = t.values[k];
 			if (v) counts.set(v, (counts.get(v) ?? 0) + 1);
 		}
 		return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
@@ -107,6 +115,15 @@
 	let albumValues = $state<Record<string, string>>(
 		Object.fromEntries(startCols.map((k) => [k, consensus(k)]))
 	);
+	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
+	const hadCollection = consensus('collection');
+	/** Library setup's, and any the tracks have. */
+	let collectionChoices = $derived([
+		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
+	]);
+	let collection = $state(hadCollection);
+	/** Library setup requires one. */
+	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
 		Object.fromEntries(
 			tracks.map((t) => [t.id, Object.fromEntries(trackCols.map((k) => [k, t.values[k] ?? '']))])
@@ -148,11 +165,17 @@
 	// Album fields count once (one input), track fields once per track.
 	let missing = $derived(
 		albumCols.filter(needsValue).length +
-			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0)
+			tracks.reduce((n, t) => n + trackCols.filter((k) => !effective(t.id, k)).length, 0) +
+			Number(collectionRequired && !collection)
 	);
 	/** The rules require album art and the album has none. */
 	const artNeeded = initial.art.missing;
-	let total = $derived(albumCols.length + tracks.length * trackCols.length + (artNeeded ? 1 : 0));
+	let total = $derived(
+		albumCols.length +
+			tracks.length * trackCols.length +
+			Number(collectionRequired) +
+			Number(artNeeded)
+	);
 
 	type Upload = {
 		url: string;
@@ -257,6 +280,7 @@
 				const v = effective(t.id, k);
 				if (v && v !== original(t.id, k)) (out[t.id] ??= {})[k] = v;
 			}
+			if (collection !== (t.values.collection ?? '')) (out[t.id] ??= {}).collection = collection;
 		}
 		return out;
 	});
@@ -350,9 +374,10 @@
 
 	let dialog = $state<HTMLElement>();
 	$effect(() => {
-		dialog
-			?.querySelector<HTMLElement>('input.missing, .art-choose')
-			?.focus({ preventScroll: true });
+		const field =
+			dialog?.querySelector<HTMLElement>('input.missing, .art-choose') ??
+			dialog?.querySelector<HTMLElement>('.collection select');
+		field?.focus({ preventScroll: true });
 	});
 </script>
 
@@ -485,6 +510,16 @@
 				<ul class="problems" transition:fly={{ y: -6, duration: 200 }}>
 					{#each live.problems as p (p)}<li><TriangleAlert size={15} /> {p}</li>{/each}
 				</ul>
+			{/if}
+
+			{#if collectionChoices.length || collectionRequired}
+				<label class="field collection">
+					<span class="field-label">Collection</span>
+					<select bind:value={collection} class:missing={collectionRequired && !collection}>
+						<option value="">None</option>
+						{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
+					</select>
+				</label>
 			{/if}
 
 			{#if artNeeded}
@@ -971,7 +1006,11 @@
 		color: var(--danger);
 	}
 
-	input {
+	.collection {
+		max-width: 360px;
+	}
+	input,
+	select {
 		width: 100%;
 		height: 38px;
 		padding: 0 12px;
@@ -985,13 +1024,15 @@
 			background 200ms,
 			box-shadow 200ms;
 	}
-	input:focus {
+	input:focus,
+	select:focus {
 		border-color: color-mix(in oklab, var(--accent) 70%, transparent);
 		background: var(--bg-raised);
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
 	}
 	/* Failures stand out, with one pulse when the dialog opens. */
-	input.missing {
+	input.missing,
+	select.missing {
 		border-color: color-mix(in oklab, var(--danger) 70%, transparent);
 		background: color-mix(in oklab, var(--danger) 7%, var(--surface));
 		animation: flag 1.2s var(--ease-out) 250ms 1;

@@ -246,9 +246,10 @@ impl Splitter {
         &self.separator
     }
 
-    /// The names in `value` of `kind`: split at the separator, and at the
-    /// phrases if `kind` names people (and there is a separator to put in
-    /// their place). Trimmed, without blanks or repeats.
+    /// The names in `value` of `kind`: split at the separator (but a
+    /// collection, one name like "Steins;Gate"), and at the phrases if
+    /// `kind` names people (and there is a separator to put in their
+    /// place). Trimmed, without blanks or repeats.
     pub fn parts(&self, kind: &str, value: &str) -> Vec<String> {
         let cuts = if PEOPLE.contains(&kind) {
             self.cuts(value)
@@ -262,11 +263,12 @@ impl Splitter {
         for (i, (start, end)) in segments.enumerate() {
             let segment = &value[from..start];
             from = end;
-            let pieces: Vec<&str> = if self.separator.trim().is_empty() {
-                vec![segment]
-            } else {
-                segment.split(self.separator.as_str()).collect()
-            };
+            let pieces: Vec<&str> =
+                if kind == crate::rules::COLLECTION || self.separator.trim().is_empty() {
+                    vec![segment]
+                } else {
+                    segment.split(self.separator.as_str()).collect()
+                };
             let last = pieces.len() - 1;
             for (j, raw) in pieces.into_iter().enumerate() {
                 // List punctuation goes only where a phrase split the names.
@@ -822,6 +824,7 @@ mod tests {
             ["Rock", "Pop feat. Jazz"]
         );
         assert_eq!(s.parts("artist", " A ; ; A "), ["A"]);
+        assert_eq!(s.parts("collection", "Steins;Gate"), ["Steins;Gate"]);
         assert_eq!(
             Splitter::default().parts("artist", "A feat. B;C"),
             ["A feat. B;C"]

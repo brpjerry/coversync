@@ -7,6 +7,7 @@
 	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import FolderCog from '@lucide/svelte/icons/folder-cog';
 	import Settings2 from '@lucide/svelte/icons/settings-2';
+	import Folders from '@lucide/svelte/icons/folders';
 	import Palette from '@lucide/svelte/icons/palette';
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import MonitorSmartphone from '@lucide/svelte/icons/monitor-smartphone';
@@ -64,6 +65,7 @@
 	const setups = [
 		{ id: 'inbox-setup', label: 'Inbox', icon: FolderCog },
 		{ id: 'library-setup', label: 'Library', icon: Settings2 },
+		{ id: 'collections-setup', label: 'Collections', icon: Folders, under: true },
 		{ id: 'appearance', label: 'Appearance', icon: Palette },
 		{ id: 'sync-setup', label: 'Sync', icon: FolderSync }
 	] as const;
@@ -290,6 +292,7 @@
 				{#each setups as item (item.id)}
 					<button
 						class="nav-item"
+						class:under={'under' in item}
 						class:on={view === item.id}
 						aria-current={view === item.id ? 'page' : undefined}
 						onclick={() => onview(item.id)}
@@ -729,6 +732,10 @@
 		transition:
 			color 160ms,
 			background 140ms;
+	}
+	/* Part of the screen above it. */
+	.nav-item.under {
+		padding-left: 30px;
 	}
 	/* Not a setup screen: set apart from them. */
 	.sign-out {

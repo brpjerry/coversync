@@ -57,6 +57,7 @@
 	import SortMenu from '#lib/components/SortMenu.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
 	import LibrarySetup from '#lib/components/LibrarySetup.svelte';
+	import CollectionsSetup from '#lib/components/CollectionsSetup.svelte';
 	import InboxSetup from '#lib/components/InboxSetup.svelte';
 	import AppearanceSetup from '#lib/components/AppearanceSetup.svelte';
 	import SyncSetup from '#lib/components/SyncSetup.svelte';
@@ -1125,7 +1126,8 @@
 	});
 
 	// Import: check the album against the library rules; import straight away
-	// when nothing is missing, otherwise open the editor with the gaps marked.
+	// when nothing is missing and there's no collection to pick, otherwise
+	// open the editor with the gaps marked.
 	/** The import editor: the plan plus any edits made before it opened. */
 	let importing = $state<{ album: Album; plan: ImportPlan; edits: ImportEdits } | null>(null);
 
@@ -1149,9 +1151,10 @@
 		} finally {
 			dismiss(checking);
 		}
-		if (plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest) {
-			// The editor needs the tag catalog (labels, album-wide kinds) up front.
-			await setup.load();
+		// The editor needs the tag catalog (labels, album-wide kinds) up front.
+		await setup.load();
+		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
+		if (asks || setup.saved.collections.length) {
 			importing = { album, plan, edits };
 		} else if (plan.problems.length) {
 			toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));
@@ -1308,7 +1311,7 @@
 	function within(e: KeyboardEvent, selector: string) {
 		return e.target instanceof Element && !!e.target.closest(selector);
 	}
-	const typing = (e: KeyboardEvent) => within(e, 'input, textarea, [contenteditable]');
+	const typing = (e: KeyboardEvent) => within(e, 'input, textarea, select, [contenteditable]');
 	function onkeydown(e: KeyboardEvent) {
 		// The login view is up: keys are its own, and Escape mustn't close the
 		// album (and its unsaved edits) under it.
@@ -1444,6 +1447,7 @@
 			dirty={{
 				'inbox-setup': inboxSetup.changes > 0,
 				'library-setup': setup.changes > 0,
+				'collections-setup': setup.changes > 0,
 				appearance: appearance.changes > 0,
 				'sync-setup': syncSetup.changes > 0
 			}}
@@ -1481,6 +1485,8 @@
 							{gridWidth}
 							albums={previewAlbums}
 						/>
+					{:else if view === 'collections-setup'}
+						<CollectionsSetup back={setupBack} />
 					{:else if view === 'inbox-setup'}
 						<InboxSetup
 							back={setupBack}
@@ -1651,6 +1657,7 @@
 		baseEdits={importing.edits}
 		label={(id) => setup.label(id)}
 		albumKinds={setup.albumKinds}
+		collections={setup.saved.collections}
 		notEditable={setup.notEditable}
 		coreKinds={setup.kinds.filter((k) => k.group === 'core').map((k) => k.id)}
 		kindOrder={setup.kinds.map((k) => k.id)}

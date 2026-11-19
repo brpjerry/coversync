@@ -2,16 +2,24 @@
 
 /**
  * The inbox is the scanned on-disk files; the library is what coversync
- * manages. Each has a setup screen, appearance covers the browser itself,
- * and sync setup the devices the library will sync to.
+ * manages. Each has a setup screen (the library's collections one of their
+ * own), appearance covers the browser itself, and sync setup the devices
+ * the library will sync to.
  */
 export type View =
-	'inbox' | 'inbox-setup' | 'library' | 'library-setup' | 'appearance' | 'sync-setup';
+	| 'inbox'
+	| 'inbox-setup'
+	| 'library'
+	| 'library-setup'
+	| 'collections-setup'
+	| 'appearance'
+	| 'sync-setup';
 export const VIEWS: View[] = [
 	'inbox',
 	'inbox-setup',
 	'library',
 	'library-setup',
+	'collections-setup',
 	'appearance',
 	'sync-setup'
 ];
@@ -25,7 +33,7 @@ export function parseView(v: string | null): View {
 /** The collection (top tab) a view belongs to, if any. */
 export function collection(v: View): 'inbox' | 'library' | null {
 	if (v === 'appearance' || v === 'sync-setup') return null;
-	return v.startsWith('library') ? 'library' : 'inbox';
+	return v.startsWith('library') || v === 'collections-setup' ? 'library' : 'inbox';
 }
 export const isSetup = (v: View) => v.endsWith('-setup') || v === 'appearance';
 

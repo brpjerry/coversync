@@ -61,8 +61,10 @@
 	let setup = $derived(isSetup(view));
 	/** Library setup and Appearance reuse the search field to filter tags. */
 	let filtering = $derived(view === 'library-setup' || view === 'appearance');
-	/** Inbox setup and sync setup have nothing to search. */
-	let searchable = $derived(view !== 'inbox-setup' && view !== 'sync-setup');
+	/** Inbox setup, collections and sync setup have nothing to search. */
+	let searchable = $derived(
+		view !== 'inbox-setup' && view !== 'collections-setup' && view !== 'sync-setup'
+	);
 	/** Phones: the field is too short for the long placeholder. */
 	const phone = new MediaQuery('max-width: 600px');
 	let placeholder = $derived(

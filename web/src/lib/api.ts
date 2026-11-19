@@ -184,6 +184,8 @@ export interface LibrarySetup {
 		split_at: string[];
 		/** Regular expressions the import and suggestions run on tags, once names are split. */
 		substitutions: Substitution[];
+		/** What the import dialog offers for an album's collection tag. */
+		collections: string[];
 	};
 	folder: string | null;
 	structure: string;
