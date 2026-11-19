@@ -132,8 +132,8 @@ used on a home server.
   stay as typed) and in what MusicBrainz suggests. A tag holding several
   values (names, genres, release types, MusicBrainz artist IDs) has each
   changed on its own; other tags are changed whole. A list a file holds
-  several times (two `ARTISTS` comments, say) is read whole, so none is
-  lost; any other tag is read by its first value, and a rule that changes
+  several times (two `ARTISTS` comments, say) is read whole when a rule
+  would change it, so none is lost; any other tag is read by its first value, and a rule that changes
   it replaces the file's other copies, as a value typed in the import
   dialog does. `s/ \(Live\)$//` on the title turns `Song (Live)`
   into `Song`; `s/^(.+), The$/The \1/` on the artist turns `Beatles, The`
