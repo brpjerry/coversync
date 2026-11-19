@@ -1167,10 +1167,11 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
-/// As [`read_kinds`], but a tag naming people that the file holds several
-/// times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them
-/// all, joined by `split`'s separator, when one has a phrase to split at:
-/// the import then rewrites the tag, and would otherwise keep only the first.
+/// As [`read_kinds`], but a tag that the file holds several times (Vorbis
+/// comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them all, joined by
+/// `split`'s separator, when `split` would rewrite one (at a phrase, or by
+/// a substitution): the import then rewrites the tag, and would otherwise
+/// keep only the first.
 pub fn read_kinds_split(
     path: &Path,
     pictures: bool,
@@ -1181,14 +1182,8 @@ pub fn read_kinds_split(
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
-        for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
-            let all: Vec<&str> = kind
-                .keys
-                .iter()
-                .flat_map(|key| tag.get_strings(*key))
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .collect();
+        for kind in rules::CATALOG {
+            let all: Vec<&str> = texts(tag, kind).collect();
             if all.len() > 1 && all.iter().any(|v| split.rewrite(kind.id, v).is_some()) {
                 values.insert(kind.id, all.join(split.separator()));
             }
@@ -1321,21 +1316,24 @@ fn has_pictures(file: &TaggedFile) -> bool {
 fn values_of(tag: &Tag) -> HashMap<&'static str, String> {
     let mut out = HashMap::new();
     for kind in rules::CATALOG {
-        if let Some(v) = kind
-            .keys
-            .iter()
-            .flat_map(|k| tag.get_items(*k))
-            .filter(|i| !described(i))
-            .filter_map(|i| match i.value() {
-                ItemValue::Text(t) | ItemValue::Locator(t) => Some(t.trim()),
-                ItemValue::Binary(_) => None,
-            })
-            .find(|v| !v.is_empty())
-        {
+        if let Some(v) = texts(tag, kind).next() {
             out.insert(kind.id, v.to_string());
         }
     }
     out
+}
+
+/// The text values `tag` holds for `kind`, trimmed, without blanks.
+fn texts<'a>(tag: &'a Tag, kind: &rules::TagKind) -> impl Iterator<Item = &'a str> {
+    kind.keys
+        .iter()
+        .flat_map(|k| tag.get_items(*k))
+        .filter(|i| !described(i))
+        .filter_map(|i| match i.value() {
+            ItemValue::Text(t) | ItemValue::Locator(t) => Some(t.trim()),
+            ItemValue::Binary(_) => None,
+        })
+        .filter(|v| !v.is_empty())
 }
 
 /// Whether `read` (lofty's reading of the date `typed`) has every part of
@@ -2175,6 +2173,21 @@ mod tests {
         assert_eq!(
             read_kinds_split(&path, false, &split).unwrap().values["artist"],
             "A"
+        );
+        // Any tag one of them a substitution changes.
+        use crate::substitute::{Substitute, Substitution};
+        let genre = Substitute::new(&Substitution {
+            expression: "s/Rock/Metal/".into(),
+            tags: vec!["genre".into()],
+        })
+        .unwrap();
+        let substitutes = split.substituting(vec![genre]);
+        flac_with_comments(&path, &["GENRE=Rock", "GENRE=Pop"]);
+        let read = read_kinds_split(&path, false, &substitutes).unwrap();
+        assert_eq!(read.values["genre"], "Rock;Pop");
+        assert_eq!(
+            substitutes.rewrite("genre", &read.values["genre"]).unwrap(),
+            "Metal;Pop"
         );
         let _ = fs::remove_dir_all(&dir);
     }

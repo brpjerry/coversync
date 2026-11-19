@@ -38,8 +38,8 @@ pub struct ImportTrack {
     /// Where the file would land, once every folder-structure variable has a value.
     pub dest: Option<String>,
     /// What the import sets by itself, by kind: empty tags Inbox setup's
-    /// autofill fills, and names split at Library setup's phrases (edits
-    /// override these).
+    /// autofill fills, names split at Library setup's phrases, and its
+    /// substitutions (edits override these).
     pub autofilled: HashMap<&'static str, String>,
 }
 
@@ -84,6 +84,9 @@ pub struct ImportPlan {
     /// Kinds naming people that the import splits into one name each, at
     /// Library setup's phrases, on at least one track; in catalog order.
     pub split: Vec<&'static str>,
+    /// Kinds Library setup's substitutions change on at least one track, in
+    /// catalog order.
+    pub substituted: Vec<&'static str>,
     pub art: ArtPlan,
     /// Smart suggestions are on: the import dialog looks the album up.
     pub suggest: bool,
@@ -374,19 +377,21 @@ pub fn plan(
     // agree on. One only in optional parts every track leaves out can't
     // split the album.
     let mut shown_vars: Vec<&'static str> = Vec::new();
-    // Per track, the kinds autofill filled and the kinds split at phrases,
-    // while no edit replaces them.
+    // Per track, the kinds autofill filled, split at phrases and
+    // substitutions changed, while no edit replaces them.
     let mut filled_by = Vec::new();
     let mut split_by = Vec::new();
+    let mut substituted_by = Vec::new();
     for (track, read) in detail.tracks.iter().zip(read) {
         let path = read.path;
         let mut values = read.values;
         // After autofill, so an album artist filled from the artist is split too.
-        let split = splitter.rewrite_all(&mut values);
+        let (split, substituted) = splitter.rewrite_all(&mut values);
         let mut autofilled: HashMap<&'static str, String> = read
             .autofilled
             .iter()
             .chain(&split)
+            .chain(&substituted)
             .map(|k| (*k, values.get(k).cloned().unwrap_or_default()))
             .collect();
         let mut typed_ok = true;
@@ -424,12 +429,14 @@ pub fn plan(
                 .filter(|k| autofilled.contains_key(k))
                 .collect::<Vec<_>>(),
         );
-        split_by.push(
-            split
+        let kept = |kinds: Vec<&'static str>| -> Vec<&'static str> {
+            kinds
                 .into_iter()
                 .filter(|k| autofilled.contains_key(k))
-                .collect::<Vec<_>>(),
-        );
+                .collect()
+        };
+        split_by.push(kept(split));
+        substituted_by.push(kept(substituted));
         let missing: Vec<&'static str> = kinds
             .iter()
             .copied()
@@ -548,6 +555,7 @@ pub fn plan(
     };
     let autofilled = in_order(&filled_by);
     let split = in_order(&split_by);
+    let substituted = in_order(&substituted_by);
 
     let found = upload.is_none().then(|| found_art(lib, album_id)).flatten();
     let art = upload
@@ -575,6 +583,7 @@ pub fn plan(
         art,
         autofilled,
         split,
+        substituted,
         added: (inbox.keep_added && detail.album.added_at > 0).then_some(detail.album.added_at),
         suggest: inbox.suggestions.enabled,
         album_id: album_id.to_string(),

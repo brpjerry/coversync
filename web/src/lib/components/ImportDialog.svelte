@@ -17,6 +17,7 @@
 	import WandSparkles from '@lucide/svelte/icons/wand-sparkles';
 	import ImageIcon from '@lucide/svelte/icons/image';
 	import Split from '@lucide/svelte/icons/split';
+	import Replace from '@lucide/svelte/icons/replace';
 	import ImagePlus from '@lucide/svelte/icons/image-plus';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import {
@@ -462,6 +463,15 @@
 					<span>
 						Split into one name each:
 						{live.split.map((k) => label(k)).join(', ')}. Change the phrases in Library setup.
+					</span>
+				</p>
+			{/if}
+			{#if live.substituted.length}
+				<p class="autofilled">
+					<Replace size={14} />
+					<span>
+						Changed by substitutions:
+						{live.substituted.map((k) => label(k)).join(', ')}. Change them in Library setup.
 					</span>
 				</p>
 			{/if}

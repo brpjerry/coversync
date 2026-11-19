@@ -9,6 +9,7 @@ import {
 	type ArtRules,
 	type FolderStatus,
 	type SetupResponse,
+	type Substitution,
 	type TagCoverage,
 	type TagGroup,
 	type TagKind
@@ -18,6 +19,8 @@ import { toast } from './toast.svelte';
 
 const sameList = (a: string[], b: string[]) =>
 	a.length === b.length && a.every((v, i) => v === b[i]);
+const copySubs = (subs: Substitution[]) => subs.map((s) => ({ ...s, tags: [...s.tags] }));
+const sameSubs = (a: Substitution[], b: Substitution[]) => JSON.stringify(a) === JSON.stringify(b);
 
 class LibrarySetupStore extends SetupStore<SetupResponse> {
 	groups = $state<TagGroup[]>([]);
@@ -37,7 +40,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		structure: '',
 		art: { required: false, placement: 'file', file_name: 'cover' } as ArtRules,
 		separator: ';',
-		splitAt: [] as string[]
+		splitAt: [] as string[],
+		substitutions: [] as Substitution[]
 	});
 	/** Being edited. */
 	required = new SvelteSet<string>();
@@ -48,6 +52,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	separator = $state(';');
 	/** Phrases names are split at, like "feat.", in order. */
 	splitAt = $state<string[]>([]);
+	/** Regular expressions run on tags once names are split, in order. */
+	substitutions = $state<Substitution[]>([]);
 	/** The saved folder as the daemon sees it. */
 	folderStatus = $state<FolderStatus | null>(null);
 	/** Why the saved folder can't hold the library's database, if it can't. */
@@ -55,7 +61,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
 
-	/** Tags added or removed, plus a changed folder, structure, art rule, separator or phrases. */
+	/** Tags added or removed, plus a changed folder, structure, art rule, separator, phrases or substitutions. */
 	changes = $derived(
 		this.saved.required.filter((id) => !this.required.has(id)).length +
 			[...this.required].filter((id) => !this.saved.required.includes(id)).length +
@@ -65,7 +71,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			(this.art.placement !== this.saved.art.placement ? 1 : 0) +
 			((this.art.file_name.trim() || 'cover') !== this.saved.art.file_name ? 1 : 0) +
 			(this.separator !== this.saved.separator ? 1 : 0) +
-			(sameList(this.splitAt, this.saved.splitAt) ? 0 : 1)
+			(sameList(this.splitAt, this.saved.splitAt) ? 0 : 1) +
+			(sameSubs(this.substitutions, this.saved.substitutions) ? 0 : 1)
 	);
 
 	protected fetch() {
@@ -108,7 +115,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			structure: s.structure,
 			art: s.rules.art,
 			separator: s.rules.separator,
-			splitAt: s.rules.split_at
+			splitAt: s.rules.split_at,
+			substitutions: s.rules.substitutions
 		};
 		const requiredKept =
 			this.required.size === was.required.length &&
@@ -125,6 +133,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			this.art.file_name = s.rules.art.file_name;
 		if (this.separator === was.separator) this.separator = s.rules.separator;
 		if (sameList(this.splitAt, was.splitAt)) this.splitAt = [...s.rules.split_at];
+		if (sameSubs(this.substitutions, was.substitutions))
+			this.substitutions = copySubs(s.rules.substitutions);
 		this.folderStatus = r.folder;
 		this.libraryProblem = r.library_problem;
 	}
@@ -139,6 +149,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.art = { ...s.rules.art };
 		this.separator = s.rules.separator;
 		this.splitAt = [...s.rules.split_at];
+		this.substitutions = copySubs(s.rules.substitutions);
 	}
 
 	label(id: string) {
@@ -163,6 +174,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.art = { ...this.saved.art };
 		this.separator = this.saved.separator;
 		this.splitAt = [...this.saved.splitAt];
+		this.substitutions = copySubs(this.saved.substitutions);
 	}
 
 	save() {
@@ -175,7 +187,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 						required_tags: ids,
 						art: { ...this.art, file_name: this.art.file_name.trim() },
 						separator: this.separator,
-						split_at: this.splitAt
+						split_at: this.splitAt,
+						substitutions: this.substitutions
 					},
 					folder: this.folder.trim() || null,
 					structure: this.structure.trim()

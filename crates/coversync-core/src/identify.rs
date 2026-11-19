@@ -2253,6 +2253,31 @@ mod tests {
     }
 
     #[test]
+    fn substitutions_run_on_both_sides_once_names_are_split() {
+        use crate::substitute::{Substitute, Substitution};
+        let sub = |expression: &str, tag: &str| {
+            Substitute::new(&Substitution {
+                expression: expression.into(),
+                tags: vec![tag.into()],
+            })
+            .unwrap()
+        };
+        let split = Splitter::new(";", &[]).substituting(vec![
+            sub("s/^drum and bass$/DnB/i", "genre"),
+            sub(r"s/ \(Live\)$//", "title"),
+        ]);
+        let tracks = [
+            local(10, &[("track_number", "1"), ("title", "Thaw (Live)")]),
+            local(11, &[("track_number", "2"), ("title", "Don’t Look Back")]),
+        ];
+        let out = suggestions(&tracks, &release(), None, &split);
+        // MusicBrainz's genres, each on its own.
+        assert_eq!(find(&out[0], "genre").unwrap().value, "DnB;Ambient");
+        // The title as the import would write it: nothing to suggest.
+        assert!(find(&out[0], "title").is_none());
+    }
+
+    #[test]
     fn fills_empty_tags_and_suggests_changes() {
         let mut first = local(
             10,

@@ -19,6 +19,8 @@
 	import FileMusic from '@lucide/svelte/icons/file-music';
 	import Combine from '@lucide/svelte/icons/combine';
 	import X from '@lucide/svelte/icons/x';
+	import Replace from '@lucide/svelte/icons/replace';
+	import Plus from '@lucide/svelte/icons/plus';
 	import Toggle from './Toggle.svelte';
 	import type { ArtPlacement, TagKind } from '#lib/api.ts';
 	import { count, fold } from '#lib/format.ts';
@@ -351,6 +353,96 @@
 					{:else}
 						Names stay as they are.
 					{/if}
+				</p>
+			</div>
+		</section>
+
+		<section
+			class="card"
+			aria-labelledby="subs-title"
+			in:fly={{ y: 12, duration: 420, delay: 105 }}
+		>
+			<header class="card-head">
+				<span class="card-icon"><Replace size={20} /></span>
+				<div>
+					<h2 id="subs-title">Substitutions</h2>
+					<p>
+						Regular expressions that change tags on import and in MusicBrainz's suggestions, once
+						names are split, in this order. Tags typed in the import dialog stay as typed.
+					</p>
+				</div>
+			</header>
+			<div class="card-body subs">
+				{#each setup.substitutions as sub, i}
+					<div class="sub" transition:slide={{ duration: 160 }}>
+						<span class="name-input sub-input">
+							<input
+								bind:value={sub.expression}
+								placeholder="s/pattern/replacement/g"
+								spellcheck="false"
+								autocomplete="off"
+								aria-label={`Substitution ${i + 1}`}
+							/>
+						</span>
+						<button
+							class="phrase-remove"
+							aria-label={`Remove substitution ${i + 1}`}
+							onclick={() => setup.substitutions.splice(i, 1)}><X size={15} /></button
+						>
+						<ul class="phrases" aria-label={`Tags substitution ${i + 1} changes`}>
+							{#each sub.tags as t (t)}
+								<li class="phrase tag">
+									{setup.label(t)}
+									<button
+										class="phrase-remove"
+										aria-label={`Don't change ${setup.label(t)}`}
+										onclick={() => (sub.tags = sub.tags.filter((x) => x !== t))}
+										><X size={13} /></button
+									>
+								</li>
+							{/each}
+							<li>
+								<select
+									class:bad={sub.expression.trim() && !sub.tags.length}
+									aria-label={`Add a tag substitution ${i + 1} changes`}
+									onchange={(e) => {
+										const id = e.currentTarget.value;
+										e.currentTarget.value = '';
+										// In catalog order, as the daemon saves them.
+										if (id)
+											sub.tags = setup.kinds
+												.map((k) => k.id)
+												.filter((k) => k === id || sub.tags.includes(k));
+									}}
+								>
+									<option value="">{sub.tags.length ? 'Add a tag…' : 'Choose tags…'}</option>
+									{#each setup.groups as g (g.id)}
+										<optgroup label={g.label}>
+											{#each setup.kinds.filter((k) => k.group === g.id && !setup.notEditable.includes(k.id) && !sub.tags.includes(k.id)) as k (k.id)}
+												<option value={k.id}>{k.label}</option>
+											{/each}
+										</optgroup>
+									{/each}
+								</select>
+							</li>
+						</ul>
+					</div>
+				{/each}
+				<div>
+					<button
+						class="btn sm"
+						onclick={() => setup.substitutions.push({ expression: '', tags: [] })}
+						><Plus size={14} /> Add substitution</button
+					>
+				</div>
+				<p class="name-hint">
+					Written as in vim, <code>s/pattern/replacement/flags</code>, with Perl-style patterns:
+					<code>(a|b)+</code>, <code>\d{'{'}4}</code>, <code>\b</code>. Flags: <code>g</code> for
+					every match, <code>i</code> to ignore case. In the replacement, <code>&amp;</code> is the
+					match,
+					<code>\1</code>–<code>\9</code> its groups; <code>\u</code> and <code>\U…\E</code>
+					make them upper case, <code>\l</code> and <code>\L…\E</code> lower. A tag holding several names,
+					split by the separator, has each changed on its own.
 				</p>
 			</div>
 		</section>
@@ -877,6 +969,39 @@
 	.phrase-new .name-input input {
 		width: 9ch;
 		text-align: left;
+	}
+	.subs {
+		display: grid;
+		gap: 16px;
+	}
+	.sub {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 8px;
+		align-items: center;
+	}
+	.sub .phrases {
+		grid-column: 1 / -1;
+	}
+	.sub-input input {
+		width: 100%;
+		text-align: left;
+	}
+	.phrase.tag {
+		font-family: inherit;
+	}
+	.sub select {
+		height: 30px;
+		padding: 0 8px;
+		border-radius: 8px;
+		border: 1px solid var(--border);
+		background: var(--surface);
+		color: var(--text-2);
+		font: inherit;
+		font-size: 12.5px;
+	}
+	.sub select.bad {
+		border-color: color-mix(in oklab, var(--danger) 60%, transparent);
 	}
 	/* Spaces in a separator are part of it, so they show. */
 	.joined {
