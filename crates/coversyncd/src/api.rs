@@ -1476,8 +1476,16 @@ async fn restructure_all(state: Shared) -> ApiResult<Restructured> {
         let (to_move, mut failed) = match checked {
             Ok(found) => found,
             Err(e) if pass == 0 => return Err(e),
-            // The first pass's moves and report stand.
-            Err(_) => break,
+            // The first pass's moves and report stand, saying why they
+            // weren't looked at again.
+            Err(ApiError(_, e)) => {
+                for failure in &mut done.failed {
+                    failure
+                        .error
+                        .push_str(&format!(" (Not checked again: {e})"));
+                }
+                break;
+            }
         };
         for (detail, dir) in to_move {
             // Saved on the version found, so one changed meanwhile is reported, not moved.

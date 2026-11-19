@@ -129,6 +129,9 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			substitutions: s.rules.substitutions,
 			collections: s.rules.collections
 		};
+		// A report on albums in another folder or structure goes.
+		if (this.saved.folder !== was.folder || this.saved.structure !== was.structure)
+			this.unmoved = [];
 		const requiredKept =
 			this.required.size === was.required.length &&
 			was.required.every((id) => this.required.has(id));
@@ -234,8 +237,6 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 				});
 				this.#apply(r);
 				this.version++;
-				// A report on albums in another folder or structure.
-				this.unmoved = [];
 				if (r.adopted)
 					toast(`Opened the library in ${r.setup.folder}, with its own rules`, 'info', 6000);
 				else toast('Library setup saved', 'success');
