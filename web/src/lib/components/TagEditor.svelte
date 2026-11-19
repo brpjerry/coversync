@@ -437,9 +437,7 @@
 				toast(
 					e.album
 						? 'Not saved: this album was changed elsewhere'
-						: sent.collection === 'inbox'
-							? 'Not saved: this album is no longer in the Inbox. It may have been imported or removed elsewhere.'
-							: 'Not saved: this album is no longer in the Library. It may have been removed elsewhere.',
+						: 'Not saved: this album is no longer in the Library. It may have been removed elsewhere.',
 					'error',
 					8000
 				);

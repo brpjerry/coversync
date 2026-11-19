@@ -1145,16 +1145,10 @@
 	 * without MusicBrainz's suggestions: its Import comes back here.
 	 */
 	async function startImport(album: Album, edits?: ImportEdits) {
-		if (!edits && !inboxSetup.saved.suggestions) {
-			await open(album);
-			sheet?.edit();
-			return;
-		}
-		edits ??= {};
 		const checking = toast(`Checking “${album.title}”…`, 'progress', 0);
 		let plan: ImportPlan;
 		try {
-			plan = await api.importPlan(album.id, edits);
+			plan = await api.importPlan(album.id, edits ?? {});
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Could not check the album', 'error', 6000);
 			return;
@@ -1163,6 +1157,12 @@
 		}
 		// The editor needs the tag catalog (labels, album-wide kinds) up front.
 		await setup.load();
+		if (!edits && !plan.suggest) {
+			await open(album);
+			sheet?.edit();
+			return;
+		}
+		edits ??= {};
 		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
 		if (asks || setup.saved.collections.length) {
 			importing = { album, plan, edits };

@@ -131,9 +131,11 @@
 	export function edit() {
 		mode = 'edit';
 	}
-	// Another album's editor doesn't stay open for an Inbox album.
+	// Another album's editor doesn't stay open for an Inbox album. By id:
+	// the grids' refreshes hand over a new object for the same album.
+	let albumId = $derived(album.id);
 	$effect(() => {
-		void album.id;
+		void albumId;
 		untrack(() => {
 			if (onimport) mode = 'tracks';
 		});
