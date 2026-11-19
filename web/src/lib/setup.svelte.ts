@@ -199,9 +199,12 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		if (this.moving) return;
 		this.moving = true;
 		const n = (k: number, one: string) => `${count(k)} ${k === 1 ? one : `${one}s`}`;
+		const { folder, structure } = this.saved;
 		try {
 			const r = await api.restructureLibrary();
-			this.unmoved = r.failed;
+			// Kept only while it's about the folder and structure it was made in.
+			if (this.saved.folder === folder && this.saved.structure === structure)
+				this.unmoved = r.failed;
 			if (r.albums)
 				toast(
 					`Moved ${n(r.files, 'file')} of ${n(r.albums, 'album')} to fit the folder structure`,
