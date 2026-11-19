@@ -1126,9 +1126,9 @@
 		return items;
 	});
 
-	// Import: check the album against the library rules; import straight away
-	// when nothing is missing and there's no collection to pick, otherwise
-	// open the import dialog with the gaps marked.
+	// Import: check the album against the library rules and open the import
+	// dialog with the gaps marked; after the tag editor, only when something
+	// is missing or there's a collection to pick (see startImport).
 	/** The import editor: the plan plus any edits made before it opened. */
 	let importing = $state<{ album: Album; plan: ImportPlan; edits: ImportEdits } | null>(null);
 
@@ -1141,10 +1141,17 @@
 	}
 
 	/**
-	 * `edits` come from the album's tag editor, where an import starts
-	 * without MusicBrainz's suggestions: its Import comes back here.
+	 * Without MusicBrainz's suggestions an import starts in the album's tag
+	 * editor, whose Import comes back here with its `edits`. One that didn't
+	 * start there always opens the import dialog, so the album is looked
+	 * over first even if this page's copy of the setting is out of date.
 	 */
 	async function startImport(album: Album, edits?: ImportEdits) {
+		if (!edits && !inboxSetup.saved.suggestions) {
+			await open(album);
+			sheet?.edit();
+			return;
+		}
 		const checking = toast(`Checking “${album.title}”…`, 'progress', 0);
 		let plan: ImportPlan;
 		try {
@@ -1157,15 +1164,9 @@
 		}
 		// The editor needs the tag catalog (labels, album-wide kinds) up front.
 		await setup.load();
-		if (!edits && !plan.suggest) {
-			await open(album);
-			sheet?.edit();
-			return;
-		}
-		edits ??= {};
 		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
-		if (asks || setup.saved.collections.length) {
-			importing = { album, plan, edits };
+		if (!edits || asks || setup.saved.collections.length) {
+			importing = { album, plan, edits: edits ?? {} };
 		} else if (plan.problems.length) {
 			toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));
 		} else {

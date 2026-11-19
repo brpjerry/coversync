@@ -546,7 +546,10 @@ def edit_tags(d):
     """Open the open album's tag editor: a Library album's Edit tags, or an
     Inbox album's Import, which opens it when Smart suggestions are off."""
     d.click(".sheet .actions .import, .sheet .mode button:last-child")
-    d.wait("return !!document.querySelector('.editor .album-grid')")
+    d.wait("return !!document.querySelector('.editor .album-grid, .dialog')")
+    if d.js("return !!document.querySelector('.dialog')"):
+        raise SystemExit("Smart suggestions are on, so Inbox albums have no tag editor: "
+                         "turn them off, or open a Library album first.")
 
 
 def import_from_menu(d):
@@ -554,7 +557,7 @@ def import_from_menu(d):
     when that opens (Smart suggestions off), with no edits."""
     d.click_text("*[@role='menu']", "Import to Library")
     editor = ".sheet .editor .savebar .primary"
-    d.wait("return !!document.querySelector(arguments[0] + ', .dialog') || [...document.querySelectorAll('.toast')].some(t => /failed|Choose/.test(t.textContent))", 20, editor)
+    d.wait("return !!document.querySelector(arguments[0])", 20, f"{editor}, .dialog")
     if d.js("return !!document.querySelector(arguments[0])", editor):
         d.wait("return !document.querySelector(arguments[0]).disabled", 20, editor)
         # A toast can cover the save bar, so not a pointer click.
@@ -589,8 +592,10 @@ def import_flow(d, out, tag, library_folder):
             time.sleep(0.3)
             d.shot(out / f"8b-context-menu-{tag}.png")
         album = d.js(text, "[role=menu] .title")
+        # This album's toast, not an earlier one's.
+        imported = "[...document.querySelectorAll('.toast')].some(t => t.textContent.includes(`Imported “${arguments[0]}”`))"
         import_from_menu(d)
-        d.wait("return !!document.querySelector('.dialog') || [...document.querySelectorAll('.toast')].some(t => /Imported|failed|Choose/.test(t.textContent))", 20)
+        d.wait(f"return !!document.querySelector('.dialog') || {imported}", 20, album)
         if d.js("return !!document.querySelector('.dialog')"):
             time.sleep(0.8)
             print(f"editor for {album}:", d.js(text, ".status-text"),
@@ -602,7 +607,7 @@ def import_flow(d, out, tag, library_folder):
             print("after filling:", d.js(text, ".status-text"), "| dest:", d.js(text, ".dest-path"))
             d.shot(out / f"8d-import-ready-{tag}.png")
             d.click(".dialog .btn.primary")
-        d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Imported'))", 20)
+        d.wait(f"return {imported}", 20, album)
         print("toasts:", [t for t in d.toasts() if 'Imported' in t][-1:])
         time.sleep(0.8)
     d.click_text("header", "Library")
