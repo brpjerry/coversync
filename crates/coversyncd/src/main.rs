@@ -204,9 +204,12 @@ pub fn spawn_scan(state: Shared) {
             // the scan would miss them under the names they waited under.
             // Any not back would be forgotten (their ids, dates and history
             // with them), so then there's no scan until they are.
+            // (Nor while the tag editor reads a file there.)
+            let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
             let moving = s.moving.blocking_write();
             let recovered = coversync_core::relocate::recover(&s.lib)?;
             drop(moving);
+            drop(files);
             if recovered.stuck > 0 {
                 return Err(coversync_core::Error::Invalid(format!(
                     "{} files a save moved couldn't be put back where the index has them; no scan until they are",

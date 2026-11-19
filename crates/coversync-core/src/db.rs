@@ -2627,8 +2627,11 @@ impl Library {
                     MAX(t.mtime) || ':' || COUNT(*)
                         -- Album ids survive a move (of the Library, or of
                         -- files a save or a rename elsewhere moved, which
-                        -- keeps their times); the cover's paths don't.
-                        || ':' || MIN(t.path) AS sig,
+                        -- keeps their times); the cover's paths don't, and
+                        -- files that trade names keep the paths' set too,
+                        -- but not the rows' content generations.
+                        || ':' || MIN(t.path)
+                        || ':' || MAX(t.content_generation) AS sig,
                     c.signature
              FROM temp.indexed_tracks t LEFT JOIN covers c ON c.album_id = t.album_id
              GROUP BY t.album_id",
@@ -4667,6 +4670,28 @@ mod tests {
         let jobs = lib.cover_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].first_track, root.join("A/0.flac"));
+
+        // Two files trading names: the same paths, count and times, but
+        // another file first.
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        let job = lib.cover_jobs().unwrap().remove(0);
+        lib.set_cover(&job.album_id, Some(&cover), &job.signature)
+            .unwrap();
+        assert!(lib.cover_jobs().unwrap().is_empty());
+        lib.upsert_moving(
+            &[
+                library_file(&root, "A/0.flac", "A", 7),
+                library_file(&root, "A/1.flac", "A", 7),
+            ],
+            &[
+                (root.join("A/0.flac"), root.join("A/1.flac")),
+                (root.join("A/1.flac"), root.join("A/0.flac")),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(lib.cover_jobs().unwrap().len(), 1, "looked at again");
     }
 
     #[test]

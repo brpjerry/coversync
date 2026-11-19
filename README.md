@@ -63,9 +63,11 @@ used on a home server.
   there, its tracks and its cover: a save that would leave a folder
   holding anything else is refused. Moved tracks keep their ids and
   import dates, and a client that knew a track at its old path still
-  finds it. Files move only on a local file system where names differ by
-  case (ext4, btrfs, NTFS as Linux mounts it), not on a network share or
-  FAT. A save the structure couldn't place (a title cleared, two tracks on
+  finds it. The Library is supported on a local file system where names
+  differ by case (ext4, btrfs, NTFS as Linux mounts it), not on a network
+  share or FAT: a save that would move files is refused where they can't
+  be renamed without risk of replacing one, or names fold. A save the
+  structure couldn't place (a title cleared, two tracks on
   one path, a file already there or in the way of a folder, a file name
   starting with a dot, which scans skip, a folder name starting with
   `.coversync` in any case, a linked folder, another file system, one of

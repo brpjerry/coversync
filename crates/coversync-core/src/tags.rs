@@ -63,10 +63,9 @@ pub struct TrackTags {
 /// too, but named no file to read again.
 pub const READER: u32 = 4;
 
-/// Whether what reading `path` gives has changed since reader `since`: for
-/// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
-/// one, or can't be opened to tell; since 2); for FLAC and Ogg files, whose
-/// Vorbis comments have a vendor string, since 4.
+/// Whether what reading `path` gives has changed since reader `since`, by
+/// its extension: FLAC and Ogg files (their Vorbis comments' vendor string)
+/// since 4, which covers a FLAC's ID3v2 tag (2) too; any other since 1.
 pub fn reader_changed(path: &Path, since: u32) -> bool {
     let ext = path
         .extension()

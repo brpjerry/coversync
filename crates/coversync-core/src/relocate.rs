@@ -529,21 +529,16 @@ fn companions(
             _ => None,
         }
     };
-    let mut goes: BTreeMap<PathBuf, Option<PathBuf>> = BTreeMap::new();
-    for (from, to) in by_folder {
-        goes.insert(from, only(to));
-    }
-    // An album folder goes with its album, split or not, whatever its own
-    // tracks do (a flat album into disc folders, say).
-    for (from, to) in by_album {
-        goes.insert(from, only(to));
-    }
+    // An album folder goes with its album, whatever its own tracks do (a
+    // flat album into disc folders, say).
+    let mut goes = by_folder;
+    goes.extend(by_album);
     let mut out = Vec::new();
     let mut claimed: HashSet<PathBuf> = HashSet::new();
     for (from, to) in goes {
-        // Not a folder the album stays in, nor the Library folder or
+        // Not a folder some of the album stays in, nor the Library folder or
         // coversync's own.
-        if to.as_ref() == Some(&from) || from.as_os_str().is_empty() || from.iter().any(own) {
+        if to.contains(&from) || from.as_os_str().is_empty() || from.iter().any(own) {
             continue;
         }
         let fd = open_dir(root, &from)?;
@@ -565,7 +560,7 @@ fn companions(
                 }
             }
         }
-        let Some(to) = to.filter(|to| !stays && !to.as_os_str().is_empty()) else {
+        let Some(to) = only(to).filter(|to| !stays && !to.as_os_str().is_empty()) else {
             continue;
         };
         let there = open_dir(root, &to).ok();
@@ -1173,9 +1168,18 @@ mod tests {
         let err = refused(&structure(), &s.root, &leave);
         assert!(err.contains("holds notes.txt"), "{err}");
         assert_eq!(read(&old.join("01 - X.flac")), "x");
-        // A rename in the folder doesn't leave it.
+        // A rename in the folder doesn't leave it, nor a split that keeps a
+        // track there.
         let stay = [(old.join("01 - X.flac"), track("A", "Old", "2", "X"))];
         assert_eq!(plan(&structure(), &s.root, &stay).unwrap().tracks.len(), 1);
+        touch(&old.join("02 - Y.flac"), "y");
+        let split = [
+            (old.join("01 - X.flac"), track("A", "New", "1", "X")),
+            (old.join("02 - Y.flac"), track("A", "Old", "2", "Y")),
+        ];
+        let p = plan(&structure(), &s.root, &split).unwrap();
+        assert_eq!((p.tracks.len(), p.companions.len()), (1, 0));
+        fs::remove_file(old.join("02 - Y.flac")).unwrap();
         // A cover taken out after planning stays out; the tracks still go.
         fs::remove_file(old.join("notes.txt")).unwrap();
         let p = plan(&structure(), &s.root, &leave).unwrap();

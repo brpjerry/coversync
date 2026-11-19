@@ -781,6 +781,8 @@ async fn import_album(
     // Under the jobs lock, in a task of its own: a scan asked for meanwhile
     // waits for the whole import, even if the request is dropped.
     let result = exclusively(&state, move |s| {
+        // Not onto a path a track an earlier save moved has to come back to.
+        moves_put_back(s, "imported")?;
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
         let art = req
@@ -854,10 +856,14 @@ async fn cover(
     req: Request,
 ) -> ApiResult<Response> {
     let size = q.size.unwrap_or(512);
+    // A thumbnail not made yet reads the art where the album's files are
+    // (see `AppState::moving`).
+    let moving = state.moving.read().await;
     let (path, current) = blocking(&state, move |s| {
         s.covers.thumbnail(&s.lib, &id, size, q.v.as_deref())
     })
     .await?;
+    drop(moving);
     Ok(serve_file(path, req, cover_caching(current)).await)
 }
 
@@ -868,6 +874,8 @@ async fn full_cover(
     Path(id): Path<String>,
     req: Request,
 ) -> ApiResult<Response> {
+    // Read where the album's files are (see `AppState::moving`).
+    let _moving = state.moving.read().await;
     let source = blocking(&state, move |s| {
         s.lib
             .cover_source(&id)?
@@ -1160,14 +1168,7 @@ async fn write_tags(
         let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
         reclaim_copies(&s.lib)?;
         if collection == Collection::Library {
-            // Moves a save made and never indexed go back first, before any
-            // file is looked at where the index has it.
-            let _moving = s.moving.blocking_write();
-            if relocate::recover(&s.lib)?.stuck > 0 {
-                return Err(coversync_core::Error::Invalid(
-                    "Files an earlier save moved couldn't all be put back (see coversyncd's log), so nothing was saved.".into(),
-                ));
-            }
+            moves_put_back(s, "saved")?;
         }
         // Every file can take its edits, as it is, before any is written: an
         // album of mixed formats or files isn't left half edited.
@@ -1280,6 +1281,10 @@ async fn write_tags(
             .map(|_| s.moving.blocking_write());
         let mut moved = relocate::Applied::default();
         let mut warning = None;
+        // Files a failed move couldn't put back: what's at their old paths
+        // now isn't theirs, so nothing is indexed until they're back (scans
+        // and saves wait for that too).
+        let mut stuck = false;
         if failed.is_none()
             && let Some(plan) = &plan
         {
@@ -1287,7 +1292,13 @@ async fn write_tags(
                 Ok(done) => moved = done,
                 Err(e) => {
                     tracing::warn!(error = %e, "tags saved, files not moved");
-                    warning = Some(format!("Saved, but the files weren't moved: {e}"));
+                    stuck = !s.lib.recorded_moves()?.is_empty();
+                    warning = Some(match stuck {
+                        false => format!("Saved, but the files weren't moved: {e}"),
+                        true => format!(
+                            "Saved, but the files weren't moved ({e}), and some couldn't be put back: see coversyncd's log."
+                        ),
+                    });
                 }
             }
         }
@@ -1339,6 +1350,7 @@ async fn write_tags(
             .find(|m| !found.contains(m.to.as_path()))
             .map(|m| m.to.clone());
         let indexed = match lost {
+            _ if stuck => Ok(()),
             Some(to) => Err(coversync_core::Error::Invalid(format!(
                 "{} can't be read where it went",
                 to.display()
@@ -1360,14 +1372,17 @@ async fn write_tags(
                 ),
             });
             moved = relocate::Applied::default();
-            // Only files found are indexed; a track not back stays as the
-            // index has it. A new title's album leaves its old cover behind.
-            scan::index_files(&s.lib, stat_all(at_first), &s.progress)?;
-            s.lib.forget_orphan_covers()?;
+            // Back where the index has them: indexed as saved. A new title's
+            // album leaves its old cover behind.
+            if stuck == 0 {
+                scan::index_files(&s.lib, stat_all(at_first), &s.progress)?;
+                s.lib.forget_orphan_covers()?;
+            }
         }
-        drop(moving);
         drop(files);
+        // Covers name where their files are now before anything reads them.
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
+        drop(moving);
         // The albums the tracks are in now (a moved track keeps its id):
         // the first written track's, which the editor follows, and any other.
         let previous = current.album.id;
@@ -1418,6 +1433,19 @@ async fn write_tags(
     .await;
     crate::release_memory();
     saved?.map(Json)
+}
+
+/// Put back the moves saves made and never indexed (see `relocate`), before
+/// a file is looked at where the index has it or written where one has to
+/// come back to; refused, nothing `done`, while any can't be.
+fn moves_put_back(s: &crate::AppState, done: &str) -> coversync_core::Result<()> {
+    let _moving = s.moving.blocking_write();
+    match relocate::recover(&s.lib)?.stuck {
+        0 => Ok(()),
+        _ => Err(coversync_core::Error::Invalid(format!(
+            "Files an earlier save moved couldn't all be put back (see coversyncd's log), so nothing was {done}."
+        ))),
+    }
 }
 
 /// Record a copy a save is making, as the file it is (see `PreparedCopy`):
@@ -1938,6 +1966,37 @@ mod tests {
         }
         assert!(!far_path.exists());
         assert!(state.lib.recorded_copies().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_import_waits_for_moves_that_couldnt_be_put_back() {
+        let (state, _root, _) =
+            library_record("relocate-import", coversync_core::template::DEFAULT).await;
+        // A record recovery won't act on (not one it made): stuck.
+        let stuck = coversync_core::db::MoveRecord {
+            seq: 0,
+            from: "A/x.flac".into(),
+            staged: Some("not-ours".into()),
+            to: "B/x.flac".into(),
+            dev: 0,
+            ino: 0,
+        };
+        state
+            .lib
+            .record_moves("00000000000000cd", &[stuck])
+            .unwrap();
+        let request = serde_json::from_value(
+            serde_json::json!({ "album_id": detail(&state, "Other").album.id }),
+        )
+        .unwrap();
+        let refused = import_album(State(state.clone()), Json(request)).await;
+        let Err(ApiError(_, said)) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("nothing was imported"), "{said}");
+        // Once it's settled, the import goes through.
+        state.lib.forget_moves("00000000000000cd", None).unwrap();
+        import_titled(&state, "Other").await;
     }
 
     #[tokio::test]
