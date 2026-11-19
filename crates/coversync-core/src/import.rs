@@ -470,7 +470,7 @@ pub fn plan(
         };
         split_by.push(kept(split));
         substituted_by.push(kept(substituted));
-        let missing: Vec<&'static str> = kinds
+        let mut missing: Vec<&'static str> = kinds
             .iter()
             .copied()
             .filter(|k| !values.contains_key(k))
@@ -485,24 +485,30 @@ pub fn plan(
         let dest = match template.render(&values, &extension) {
             Ok(rel) => folder.as_ref().map(|f| Path::new(f).join(rel)),
             // Tags it has that give the structure nothing: a date with no
-            // year in it for {year}, say. Not ready, then, with no place.
-            Err(vars) if missing.is_empty() => {
+            // year in it for {year} is the date to fill in again (the dialog
+            // offers it); anything else, a problem. Not ready, with no place.
+            Err(vars) => {
                 let problem = match values.get("date") {
-                    Some(date) if vars.contains(&template::YEAR) => format!(
-                        "The date “{date}” has no year for the folder structure's {{year}}: four digits in a row."
-                    ),
-                    _ => format!(
+                    Some(date) if vars.contains(&template::YEAR) => {
+                        missing.push("date");
+                        Some(format!(
+                            "The date “{date}” has no year for the folder structure's {{year}}: four digits in a row."
+                        ))
+                    }
+                    _ if missing.is_empty() => Some(format!(
                         "{}: the folder structure's {{{}}} can't be made from its tags.",
                         file_name(&path),
                         vars.join("}, {")
-                    ),
+                    )),
+                    _ => None,
                 };
-                if !problems.contains(&problem) {
+                if let Some(problem) = problem
+                    && !problems.contains(&problem)
+                {
                     problems.push(problem);
                 }
                 None
             }
-            Err(_) => None,
         };
         one_disc.push(template::one_disc(&values));
         for v in template.shown_variables(&values) {

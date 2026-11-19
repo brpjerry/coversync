@@ -138,6 +138,8 @@ fn a_date_with_no_year_leaves_a_required_year_unplaced() {
     undated(&s);
     let plan = s.plan([&[], &[]]);
     assert!(!plan.ready());
+    // The dialog offers the date to fill in again.
+    assert_eq!(plan.failing, ["date"]);
     assert_eq!(
         plan.problems,
         [
