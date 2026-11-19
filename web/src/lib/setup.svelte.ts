@@ -203,8 +203,8 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		try {
 			const r = await api.restructureLibrary();
 			// Kept only while it's about the folder and structure it was made in.
-			if (this.saved.folder === folder && this.saved.structure === structure)
-				this.unmoved = r.failed;
+			const kept = this.saved.folder === folder && this.saved.structure === structure;
+			if (kept) this.unmoved = r.failed;
 			if (r.albums)
 				toast(
 					`Moved ${n(r.files, 'file')} of ${n(r.albums, 'album')} to fit the folder structure`,
@@ -213,7 +213,12 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			else if (!r.failed.length)
 				toast('Every album is already where the folder structure puts it', 'success');
 			if (r.failed.length)
-				toast(`${n(r.failed.length, 'album')} couldn't be moved: see Library setup`, 'error', 8000);
+				toast(
+					`${n(r.failed.length, 'album')} couldn't be moved: ` +
+						(kept ? 'see Library setup' : 'the Library folder or structure changed meanwhile'),
+					'error',
+					8000
+				);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Moving the albums failed', 'error', 8000);
 		} finally {
