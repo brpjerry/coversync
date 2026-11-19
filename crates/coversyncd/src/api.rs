@@ -1196,6 +1196,7 @@ async fn write_tags(
         // Each file's edit, written to a copy beside it: what can refuse an
         // edit does so before any file changes.
         let mut prepared = Vec::new();
+        let mut recorded = Vec::new();
         for (track, edit, kinds) in &edits {
             let (path, root) = s
                 .lib
@@ -1203,7 +1204,11 @@ async fn write_tags(
                 .ok_or(coversync_core::Error::NotFound)?;
             // Recorded as soon as it exists, so one left by coversyncd
             // stopping before it's in place or gone is found again.
-            let copy = tags::prepare_owned(&path, edit, kinds, |copy| record_copy(&s.lib, copy))
+            let copy = tags::prepare_owned(&path, edit, kinds, |copy, file| {
+                record_copy(&s.lib, copy, file)?;
+                recorded.extend(copy.to_str().map(String::from));
+                Ok(())
+            })
                 .map_err(|e| named(&path, e))?;
             prepared.push((*track, root, copy));
         }
@@ -1257,7 +1262,13 @@ async fn write_tags(
             }
         }
         // Every copy is in place or gone (those after a failure with it).
-        s.lib.forget_copies()?;
+        // Their records only matter to the next save, which checks them
+        // again: one not forgotten now doesn't hold this save up.
+        for copy in &recorded {
+            if let Err(e) = s.lib.forget_copy(copy) {
+                tracing::warn!(copy, "couldn't forget a prepared copy's record: {e}");
+            }
+        }
         let count = written.len();
         // Then the files go where their tags now put them, and the index
         // follows, before a stream can look for one (see `moving`).
@@ -1407,10 +1418,15 @@ async fn write_tags(
     saved?.map(Json)
 }
 
-/// Record a copy a save is making, as the file it is (see `PreparedCopy`).
-fn record_copy(lib: &coversync_core::Library, copy: &FsPath) -> coversync_core::Result<()> {
+/// Record a copy a save is making, as the file it is (see `PreparedCopy`):
+/// told by the copy itself, open, not looked up again by its name.
+fn record_copy(
+    lib: &coversync_core::Library,
+    copy: &FsPath,
+    file: &std::fs::File,
+) -> coversync_core::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(copy)?;
+    let meta = file.metadata()?;
     match copy.to_str() {
         Some(path) => lib.record_copy(PreparedCopy {
             path: path.into(),
@@ -1424,24 +1440,44 @@ fn record_copy(lib: &coversync_core::Library, copy: &FsPath) -> coversync_core::
 /// Remove the copies saves recorded and never put in place or took away
 /// (coversyncd stopped meanwhile), each only while it's the file recorded:
 /// nothing else is removed by its name. Saves take turns, so before one
-/// starts, every copy recorded is one of these.
+/// starts, every copy recorded is one of these. A record is forgotten once
+/// its copy is gone or its name is another file's; one that can't be told
+/// or removed (a share away, say) is kept for the next save.
 fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
     use std::os::unix::fs::MetadataExt;
     for copy in lib.recorded_copies()? {
         let path = FsPath::new(&copy.path);
-        let ours = std::fs::symlink_metadata(path)
-            .is_ok_and(|m| m.is_file() && m.dev() == copy.dev && m.ino() == copy.ino);
-        if ours {
-            match std::fs::remove_file(path) {
-                Ok(()) => tracing::info!(path = copy.path, "removed a copy a stopped save left"),
-                Err(e) => tracing::warn!(
-                    path = copy.path,
-                    "couldn't remove a copy a stopped save left: {e}"
-                ),
+        let settled = match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_file() && m.dev() == copy.dev && m.ino() == copy.ino => {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        tracing::info!(path = copy.path, "removed a copy a stopped save left");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = copy.path,
+                            "couldn't remove a copy a stopped save left: {e}"
+                        );
+                        false
+                    }
+                }
             }
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = copy.path,
+                    "couldn't look for a copy a stopped save left: {e}"
+                );
+                false
+            }
+        };
+        if settled {
+            lib.forget_copy(&copy.path)?;
         }
     }
-    lib.forget_copies()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1848,8 +1884,10 @@ mod tests {
         let album = detail(&state, "Record");
         // A save that stopped once its copy was made: no cleanup ran.
         let file = inbox.join("Record/01.flac");
-        let left = tags::prepare_owned(&file, &genre("Rock"), &[], |c| record_copy(&state.lib, c))
-            .unwrap();
+        let left = tags::prepare_owned(&file, &genre("Rock"), &[], |c, f| {
+            record_copy(&state.lib, c, f)
+        })
+        .unwrap();
         let copy = left.copy.clone();
         std::mem::forget(left);
         assert!(copy.is_file());
@@ -1866,11 +1904,36 @@ mod tests {
             .unwrap();
         let backup = inbox.join("Record/.coversync-tmp-dead-1.flac.backup");
         std::fs::write(&backup, "a backup").unwrap();
+        // And one where it can't be looked for now (a share away, say).
+        use std::os::unix::fs::PermissionsExt;
+        let away = inbox.join("Record/Away");
+        std::fs::create_dir_all(&away).unwrap();
+        let far_path = away.join(".coversync-tmp-1-0.flac");
+        let far = std::fs::File::create(&far_path).unwrap();
+        record_copy(&state.lib, &far_path, &far).unwrap();
+        std::fs::set_permissions(&away, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checkable = std::fs::read_dir(&away).is_ok();
         put(&state, &album.album.id, edit(genre("Jazz")))
             .await
             .unwrap();
+        std::fs::set_permissions(&away, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!copy.exists(), "the copy left goes");
         assert!(other.exists() && backup.exists(), "nothing else does");
+        let kept: Vec<String> = state
+            .lib
+            .recorded_copies()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        // Kept for the next save, which can look (root could all along).
+        if !checkable {
+            assert_eq!(kept, [far_path.to_str().unwrap()]);
+            put(&state, &album.album.id, edit(genre("Pop")))
+                .await
+                .unwrap();
+        }
+        assert!(!far_path.exists());
         assert!(state.lib.recorded_copies().unwrap().is_empty());
     }
 

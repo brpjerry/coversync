@@ -250,16 +250,29 @@ fn rename_new(
 fn check_moves(dir: BorrowedFd<'_>) -> io::Result<()> {
     let from = format!(".coversync-probe-{}", random_id());
     let to = format!("{from}-moved");
-    drop(openat(
+    let probe = openat(
         dir,
         from.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-    )?);
-    let moved = rename_new(dir, OsStr::new(&from), dir, OsStr::new(&to));
+    )?;
+    let before = io(fstat(&probe));
+    drop(probe);
+    let moved = before.and_then(|before| {
+        rename_new(dir, OsStr::new(&from), dir, OsStr::new(&to))?;
+        Ok(before)
+    });
     let made = if moved.is_ok() { &to } else { &from };
+    // Moves are checked, and undone, by the file's device and inode, which
+    // some file systems make from the name: one that changes them can't.
+    let kept = moved.and_then(|before| match entry(dir, OsStr::new(&to))? {
+        Some(after) if after.st_dev == before.st_dev && after.st_ino == before.st_ino => Ok(()),
+        _ => Err(io::Error::other(
+            "a file renamed there doesn't stay the same file to the system",
+        )),
+    });
     unlinkat(dir, made.as_str(), AtFlags::empty())?;
-    moved
+    kept
 }
 
 /// A folder's entries and what each is, links not followed.
@@ -1023,14 +1036,40 @@ pub fn apply(lib: &Library, plan: &Plan) -> Result<Applied> {
 /// where it was, but is still at its new place or aside, or can't be looked
 /// for. One found nowhere (gone meanwhile) is settled.
 fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> Vec<i64> {
-    // Whether the file is at `name` in `rel`; an error when that can't be told.
+    // Whether the file is at `name` in `rel`, under that spelling; an error
+    // when that can't be told.
     let at = |rel: &Path, name: &OsStr, r: &MoveRecord| -> io::Result<bool> {
         let fd = match open_dir(root, rel) {
             Ok(fd) => fd,
             Err(e) if Errno::from_io_error(&e) == Some(Errno::NOENT) => return Ok(false),
             Err(e) => return Err(e),
         };
-        Ok(entry(fd.as_fd(), name)?.is_some_and(|st| st.st_dev == r.dev && st.st_ino == r.ino))
+        let recorded = |st: Stat| st.st_dev == r.dev && st.st_ino == r.ino;
+        if !entry(fd.as_fd(), name)?.is_some_and(recorded) {
+            return Ok(false);
+        }
+        // Where names fold (a share from Windows, say), a file renamed in
+        // its folder answers to both its names as one entry: it's under the
+        // one the folder lists.
+        if let (Ok((from_dir, from)), Ok((to_dir, to))) =
+            (split(Path::new(&r.from)), split(Path::new(&r.to)))
+            && from_dir == rel
+            && to_dir == rel
+            && from != to
+            && (name == from || name == to)
+        {
+            let other = if name == from { to } else { from };
+            if entry(fd.as_fd(), other)?.is_some_and(recorded) {
+                let listed = spellings(fd.as_fd())?;
+                return match (listed.contains(name), listed.contains(other)) {
+                    (false, false) => Err(io::Error::other(
+                        "the folder lists it under neither of its names",
+                    )),
+                    (here, _) => Ok(here),
+                };
+            }
+        }
+        Ok(true)
     };
     // From their new places aside (or, for files that didn't wait aside,
     // straight back), then from aside back.
@@ -1047,7 +1086,13 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> V
             continue;
         }
         let back = r.staged.as_deref().map_or(from_name, OsStr::new);
+        // Still aside too (a move stopped between giving it its new name
+        // and dropping that one), it only loses the new name.
+        let aside = r.staged.is_some() && matches!(at(from_dir, back, r), Ok(true));
         let moved = open_dir(root, to_dir).and_then(|to_fd| {
+            if aside {
+                return Ok(unlinkat(&to_fd, to_name, AtFlags::empty())?);
+            }
             let from_fd = make_dirs(root, from_dir, &mut Vec::new())?;
             rename_new(to_fd.as_fd(), to_name, from_fd.as_fd(), back)
         });
@@ -1085,14 +1130,20 @@ fn put_back(root: BorrowedFd<'_>, records: &[MoveRecord], made: &[PathBuf]) -> V
         match at(from_dir, from_name, r) {
             // Back. Another name it has where it went (a move stopped
             // between giving it a second name and dropping the first) goes:
-            // a scan would take it for another track.
+            // a scan would take it for another track. Until it has, the
+            // record stays.
             Ok(true) => {
                 for (dir, name) in others {
-                    if matches!(at(dir, name, r), Ok(true))
-                        && let Err(e) = open_dir(root, dir)
-                            .and_then(|fd| Ok(unlinkat(&fd, name, AtFlags::empty())?))
-                    {
+                    let gone = match at(dir, name, r) {
+                        Ok(false) => Ok(()),
+                        Ok(true) => open_dir(root, dir)
+                            .and_then(|fd| Ok(unlinkat(&fd, name, AtFlags::empty())?)),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = gone {
                         tracing::warn!(path = %r.from, "couldn't remove a second name for a file put back: {e}");
+                        unsettled.push(r.seq);
+                        break;
                     }
                 }
             }
@@ -1126,6 +1177,7 @@ fn valid(batch: &str, records: &[MoveRecord]) -> bool {
         && records.iter().all(|r| {
             path(&r.from)
                 && path(&r.to)
+                && r.from != r.to
                 && r.staged
                     .as_ref()
                     .is_none_or(|s| *s == staged_name(batch, r.seq))
@@ -1226,8 +1278,11 @@ mod tests {
     }
 
     fn scratch(name: &str) -> Scratch {
-        let dir =
-            std::env::temp_dir().join(format!("coversync-relocate-{name}-{}", std::process::id()));
+        scratch_in(&std::env::temp_dir(), name)
+    }
+
+    fn scratch_in(base: &Path, name: &str) -> Scratch {
+        let dir = base.join(format!("coversync-relocate-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let root = dir.join("Lib");
@@ -1534,6 +1589,34 @@ mod tests {
     }
 
     #[test]
+    fn a_second_name_that_cant_be_removed_keeps_the_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = scratch("second-name-stays");
+        touch(&s.root.join("A/cover.jpg"), "art");
+        let cover = record_of(&s, 0, "A/cover.jpg", None, "B/cover.jpg");
+        fs::create_dir_all(s.root.join("B")).unwrap();
+        fs::hard_link(s.root.join("A/cover.jpg"), s.root.join("B/cover.jpg")).unwrap();
+        let b = s.root.join("B");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o555)).unwrap();
+        // Someone who can write there anyway (root) can't test this.
+        let writable = fs::File::create(b.join("probe")).is_ok();
+        s.lib.record_moves("00000000000000ab", &[cover]).unwrap();
+        let done = recover(&s.lib);
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            return;
+        }
+        assert_eq!(
+            done.unwrap(),
+            Recovered {
+                put_back: 0,
+                stuck: 1
+            }
+        );
+        assert!(s.root.join("B/cover.jpg").exists());
+    }
+
+    #[test]
     fn a_place_that_cant_be_looked_in_keeps_its_record() {
         use std::os::unix::fs::PermissionsExt;
         let s = scratch("unreadable");
@@ -1591,6 +1674,58 @@ mod tests {
         let p = plan(&t, &s.root, &files).unwrap();
         assert_eq!(p.tracks.len(), 1);
         assert!(p.companions.is_empty(), "{p:?}");
+    }
+
+    /// Run where names fold: with `COVERSYNC_CASEFOLD_DIR` naming a folder
+    /// that does (a casefold tmpfs, made in a user namespace, say);
+    /// skipped otherwise.
+    #[test]
+    fn a_case_only_rename_is_undone_without_losing_the_track() {
+        let Some(base) = std::env::var_os("COVERSYNC_CASEFOLD_DIR") else {
+            return;
+        };
+        let s = scratch_in(Path::new(&base), "case");
+        let old = s.root.join("A/Old");
+        touch(&old.join("01 - song.flac"), "one");
+        touch(&old.join("02 - Two.flac"), "two");
+        assert!(
+            old.join("01 - SONG.flac").exists(),
+            "the folder doesn't fold names"
+        );
+        let files = vec![
+            (old.join("01 - song.flac"), track("A", "Old", "1", "Song")),
+            (old.join("02 - Two.flac"), track("A", "New", "2", "Two")),
+        ];
+        let listed = || -> Vec<String> {
+            let mut names: Vec<_> = fs::read_dir(&old)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        // The second can't land: the first, already renamed, comes back.
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        touch(&s.root.join("A/New/02 - Two.flac"), "taken");
+        assert!(apply(&s.lib, &p).is_err());
+        assert_eq!(listed(), ["01 - song.flac", "02 - Two.flac"]);
+        assert_eq!(read(&old.join("01 - song.flac")), "one");
+        assert!(s.lib.recorded_moves().unwrap().is_empty());
+
+        // Moved and never indexed: recovery puts the old spelling back.
+        fs::remove_file(s.root.join("A/New/02 - Two.flac")).unwrap();
+        let p = plan(&structure(), &s.root, &files).unwrap();
+        apply(&s.lib, &p).unwrap();
+        assert!(listed().contains(&"01 - Song.flac".to_string()));
+        assert_eq!(
+            recover(&s.lib).unwrap(),
+            Recovered {
+                put_back: 2,
+                stuck: 0
+            }
+        );
+        assert_eq!(listed(), ["01 - song.flac", "02 - Two.flac"]);
+        assert_eq!(read(&old.join("01 - song.flac")), "one");
     }
 
     #[test]

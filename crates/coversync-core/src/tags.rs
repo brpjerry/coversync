@@ -1105,18 +1105,18 @@ pub fn prepare_with_kinds(
     edit: &TagEdit,
     kinds: &[(&str, String)],
 ) -> Result<Prepared> {
-    prepare_owned(path, edit, kinds, |_| Ok(()))
+    prepare_owned(path, edit, kinds, |_, _| Ok(()))
 }
 
-/// [`prepare_with_kinds`], telling `owner` the copy's name as soon as it
-/// exists, before any of the file is copied: coversyncd records it, so a
-/// copy left by a coversyncd that stopped meanwhile can be found and
+/// [`prepare_with_kinds`], telling `owner` the copy's name and file as soon
+/// as it exists, before any of the file is copied: coversyncd records it,
+/// so a copy left by a coversyncd that stopped meanwhile can be found and
 /// removed (and nothing else by its name). A copy `owner` refuses goes.
 pub fn prepare_owned(
     path: &Path,
     edit: &TagEdit,
     kinds: &[(&str, String)],
-    owner: impl FnOnce(&Path) -> Result<()>,
+    owner: impl FnOnce(&Path, &fs::File) -> Result<()>,
 ) -> Result<Prepared> {
     let mut source = fs::File::open(path)?;
     let (copy, mut file) = new_beside(path)?;
@@ -1126,7 +1126,7 @@ pub fn prepare_owned(
         copy,
         done: false,
     };
-    owner(&prepared.copy)?;
+    owner(&prepared.copy, &file)?;
     io::copy(&mut source, &mut file)?;
     file.set_permissions(source.metadata()?.permissions())?;
     drop(file);
@@ -2313,7 +2313,7 @@ mod tests {
             ..Default::default()
         };
         let mut told = None;
-        let prepared = prepare_owned(&path, &edit, &[], |c| {
+        let prepared = prepare_owned(&path, &edit, &[], |c, _| {
             told = Some((c.to_path_buf(), fs::metadata(c).unwrap().len()));
             Ok(())
         })
@@ -2321,7 +2321,7 @@ mod tests {
         assert_eq!(told, Some((prepared.copy.clone(), 0)));
         drop(prepared);
         let mut refused = None;
-        let err = prepare_owned(&path, &edit, &[], |c| {
+        let err = prepare_owned(&path, &edit, &[], |c, _| {
             refused = Some(c.to_path_buf());
             Err(Error::Invalid("no".into()))
         });
