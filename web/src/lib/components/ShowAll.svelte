@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack, type Snippet } from 'svelte';
+	import type { Snippet } from 'svelte';
 	import { slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
@@ -13,13 +13,18 @@
 		badge?: string;
 		/** Keep it open regardless, e.g. while a filter is typed. */
 		forceOpen?: boolean;
-		/** Open when it first shows (it can be closed). */
-		initiallyOpen?: boolean;
+		/** Whether it's open, for a parent that keeps it (bind:open). */
+		open?: boolean;
 		children: Snippet;
 	}
-	let { label, count, badge, forceOpen = false, initiallyOpen = false, children }: Props = $props();
-
-	let open = $state(untrack(() => initiallyOpen));
+	let {
+		label,
+		count,
+		badge,
+		forceOpen = false,
+		open = $bindable(false),
+		children
+	}: Props = $props();
 	let shown = $derived(open || forceOpen);
 </script>
 

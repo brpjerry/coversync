@@ -871,8 +871,80 @@ fn migrate_library(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
             5,
         )?;
     }
+    if version < 6 {
+        conn.execute_batch(&format!(
+            "BEGIN;
+             {}
+             PRAGMA {schema}.user_version = 6;
+             COMMIT;",
+            moves_schema(schema)
+        ))
+        .inspect_err(|_| {
+            let _ = conn.execute_batch("ROLLBACK");
+        })?;
+    }
     Ok(())
 }
+
+/// v6: what a tag save that moves an album's files needs (see
+/// `relocate`). A moved track keeps its row, and so its id, at its new
+/// path; `moved_from` keeps the paths it had, for a client that still knows
+/// one. `moves` records a save's moves before it makes them, so files left
+/// half moved (by a crash, say) can be put back; the index writes the new
+/// paths and clears the record in one transaction.
+fn moves_schema(schema: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.moved_from (
+             track_id INTEGER NOT NULL,
+             path     TEXT NOT NULL,
+             PRIMARY KEY (track_id, path)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS {schema}.moves (
+             batch  TEXT NOT NULL,
+             seq    INTEGER NOT NULL,
+             -- Relative to the Library folder.
+             from_path TEXT NOT NULL,
+             -- Where the file waits between the two (beside from_path),
+             -- for files that do.
+             staged TEXT,
+             to_path TEXT NOT NULL,
+             -- The file's device and inode: what is found at a path is
+             -- only put back if it's the file moved.
+             dev    INTEGER NOT NULL,
+             ino    INTEGER NOT NULL,
+             PRIMARY KEY (batch, seq)
+         );
+         CREATE TRIGGER IF NOT EXISTS {schema}.tracks_moved_from_removed AFTER DELETE ON tracks
+            BEGIN DELETE FROM moved_from WHERE track_id = OLD.id; END;"
+    )
+}
+
+/// A file a save is moving, as `moves` records it (see [`moves_schema`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveRecord {
+    pub seq: i64,
+    /// Relative to the Library folder.
+    pub from: String,
+    /// The name it waits under beside `from`, if it does.
+    pub staged: Option<String>,
+    /// Relative to the Library folder.
+    pub to: String,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// A copy a tag save is making beside a file (see `tags::prepare_owned`),
+/// recorded in the local database while it exists, so one a coversyncd
+/// that stopped left is found again, by this name and as this file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedCopy {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Each [`PreparedCopy`] is a setting of its own, under this and its path.
+const PREPARED_COPY: &str = "prepared_copy:";
 
 /// The setting holding [`Library::tag_reader`].
 const TAG_READER: &str = "tag_reader";
@@ -1028,6 +1100,7 @@ fn track_from_row(row: &Row<'_>) -> rusqlite::Result<(Track, String)> {
             format: row.get("format")?,
             rel_path: rel,
             collection: Collection::parse(&row.get::<_, String>("collection")?),
+            moved_from: Vec::new(),
         },
         row.get("album_dir")?,
     ))
@@ -1508,6 +1581,17 @@ impl Library {
         }
     }
 
+    /// The Library folder attached, if one is.
+    pub fn library_folder(&self) -> Result<Option<PathBuf>> {
+        library_root(&self.conn())
+    }
+
+    /// Whether the Library folder attached has its own database (rather
+    /// than being indexed in memory, before its first import).
+    pub fn library_stored(&self) -> Result<bool> {
+        Ok(attached(&self.conn())?.is_some_and(|a| a.stored))
+    }
+
     /// Why the Library folder can't hold its database, if it can't: it is
     /// then indexed for this session only, and imports are refused.
     pub fn library_problem(&self) -> Result<Option<String>> {
@@ -1824,6 +1908,33 @@ impl Library {
     /// away from leaves its files out. Each database that takes a row counts
     /// one change, which every row it took carries.
     pub fn upsert(&self, batch: &[IndexedFile]) -> Result<()> {
+        self.write_rows(batch, &[], None, false)
+    }
+
+    /// [`upsert`](Self::upsert), after giving the Library tracks at each
+    /// `moved` pair's first path the second (absolute paths, in the attached
+    /// Library): a track moved keeps its row and id, and remembers the path
+    /// it had (see [`moves_schema`]). Tracks can trade paths. A row already at
+    /// a path a track moves to, for a file gone meanwhile, goes. With
+    /// `batch_id`, the record of those moves (see [`Self::record_moves`])
+    /// goes in the same transaction. For a tag save: the covers of albums
+    /// left with no track (a new title is a new id) go too.
+    pub fn upsert_moving(
+        &self,
+        batch: &[IndexedFile],
+        moved: &[(PathBuf, PathBuf)],
+        batch_id: Option<&str>,
+    ) -> Result<()> {
+        self.write_rows(batch, moved, batch_id, true)
+    }
+
+    fn write_rows(
+        &self,
+        batch: &[IndexedFile],
+        moved: &[(PathBuf, PathBuf)],
+        batch_id: Option<&str>,
+        tidy_covers: bool,
+    ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let library = library_root(&tx)?;
@@ -1831,6 +1942,58 @@ impl Library {
         let inbox_next = generation(&tx, "main", INBOX_GENERATION)? + 1;
         let lib_next = generation(&tx, "lib", GENERATION)? + 1;
         let (mut inbox_wrote, mut lib_wrote) = (false, false);
+        if !moved.is_empty() {
+            let root = library.as_deref().ok_or(Error::NotFound)?;
+            let rel = |p: &Path| -> Result<String> {
+                Ok(p.strip_prefix(root)
+                    .map_err(|_| {
+                        Error::Invalid(format!("{} isn't in the Library folder", p.display()))
+                    })?
+                    .to_string_lossy()
+                    .into_owned())
+            };
+            let pairs: Vec<(String, String)> = moved
+                .iter()
+                .map(|(from, to)| Ok((rel(from)?, rel(to)?)))
+                .collect::<Result<_>>()?;
+            let leaving: HashSet<&str> = pairs.iter().map(|(f, _)| f.as_str()).collect();
+            // Out of the way first, under paths no file has (a NUL can't be
+            // in one), so tracks can trade paths.
+            let mut aside = Vec::new();
+            for (i, (from, _)) in pairs.iter().enumerate() {
+                let tmp = format!("\0moving\0{i}");
+                let id: Option<i64> = tx
+                    .query_row(
+                        "UPDATE lib.tracks SET path = ?1 WHERE path = ?2 RETURNING id",
+                        params![tmp, from],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                aside.push(id.map(|id| (id, tmp)));
+            }
+            for ((from, to), aside) in pairs.iter().zip(aside) {
+                if !leaving.contains(to.as_str()) {
+                    tx.execute("DELETE FROM lib.tracks WHERE path = ?1", [to])?;
+                }
+                let Some((id, tmp)) = aside else { continue };
+                tx.execute(
+                    "UPDATE lib.tracks SET path = ?1, generation = ?2 WHERE path = ?3",
+                    params![to, lib_next, tmp],
+                )?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO lib.moved_from (track_id, path) VALUES (?1, ?2)",
+                    params![id, from],
+                )?;
+                tx.execute(
+                    "DELETE FROM lib.moved_from WHERE track_id = ?1 AND path = ?2",
+                    params![id, to],
+                )?;
+                lib_wrote = true;
+            }
+        }
+        if let Some(id) = batch_id {
+            tx.execute("DELETE FROM lib.moves WHERE batch = ?1", [id])?;
+        }
         {
             let mut inbox = tx.prepare_cached(&upsert_sql(
                 "main.tracks",
@@ -1939,6 +2102,13 @@ impl Library {
         }
         if lib_wrote {
             put_setting(&tx, "lib", GENERATION, &lib_next)?;
+        }
+        // Albums a save left with no track (a new title is a new id).
+        if tidy_covers {
+            tx.execute(
+                "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM temp.indexed_tracks)",
+                [],
+            )?;
         }
         // Rows this reader wrote into an index a newer one filled: its
         // marker comes down to this reader, so the newer one reads them again.
@@ -2154,6 +2324,21 @@ impl Library {
         let Some(collection) = tracks.first().map(|t| t.collection) else {
             return Ok(None);
         };
+        if collection == Collection::Library {
+            let conn = self.conn();
+            let mut moved = conn.prepare_cached(
+                "SELECT m.path FROM lib.moved_from m JOIN temp.lib_root r
+                 WHERE r.prefix = ?1 AND m.track_id = ?2 ORDER BY m.path",
+            )?;
+            for t in &mut tracks {
+                let Some(public) = t.id.checked_neg() else {
+                    continue;
+                };
+                t.moved_from = moved
+                    .query_map([public / ID_SPAN, public % ID_SPAN], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+            }
+        }
         sort_tracks(&mut tracks);
         let covers = self.covers()?;
         let refs: Vec<&Track> = tracks.iter().collect();
@@ -2169,8 +2354,9 @@ impl Library {
 
     /// The album most of `tracks` (ids, with their `rel_path`s) are in now
     /// (the earliest listed on a tie), counting those still indexed and
-    /// shown under the same id and at the same path: a database restored
-    /// from an older copy can give a removed track's id to a new file. None
+    /// shown under the same id and at the same path, or one a save moved
+    /// them from: a database restored from an older copy can give a removed
+    /// track's id to a new file. None
     /// when none of them is. An album's tracks can be found this way after
     /// an edit elsewhere has given it a new id, as a new title does.
     pub fn album_of_tracks(&self, tracks: &[(i64, String)]) -> Result<Option<String>> {
@@ -2183,6 +2369,11 @@ impl Library {
         let mut lib = conn.prepare_cached(
             "SELECT t.album_id, t.path FROM lib.tracks t JOIN temp.lib_root r
              WHERE r.prefix = ?1 AND t.id = ?2",
+        )?;
+        // A save that moved a Library track kept its id (see moves_schema).
+        let mut moved = conn.prepare_cached(
+            "SELECT 1 FROM lib.moved_from m JOIN temp.lib_root r
+             WHERE r.prefix = ?1 AND m.track_id = ?2 AND m.path = ?3",
         )?;
         let mut counts: Vec<(String, usize)> = Vec::new();
         for (id, path) in tracks {
@@ -2200,10 +2391,18 @@ impl Library {
                 let Some(public) = id.checked_neg() else {
                     continue;
                 };
-                lib.query_row([public / ID_SPAN, public % ID_SPAN], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-                .optional()?
+                let (prefix, row) = (public / ID_SPAN, public % ID_SPAN);
+                let found: Option<(String, String)> = lib
+                    .query_row([prefix, row], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                match found {
+                    Some((album, at))
+                        if at != *path && moved.exists(params![prefix, row, path])? =>
+                    {
+                        Some((album, path.clone()))
+                    }
+                    found => found,
+                }
             };
             let Some((album, _)) = found.filter(|(_, at)| at == path) else {
                 continue;
@@ -2218,6 +2417,158 @@ impl Library {
             .enumerate()
             .max_by_key(|(i, (_, n))| (*n, std::cmp::Reverse(*i)))
             .map(|(_, (album, _))| album.clone()))
+    }
+
+    /// Record the moves a save is about to make, as one batch (see
+    /// [`moves_schema`]), before it makes any.
+    pub fn record_moves(&self, batch: &str, moves: &[MoveRecord]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO lib.moves (batch, seq, from_path, staged, to_path, dev, ino)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for m in moves {
+                insert.execute(params![
+                    batch,
+                    m.seq,
+                    m.from,
+                    m.staged,
+                    m.to,
+                    m.dev as i64,
+                    m.ino as i64
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Moves recorded and not yet written to the index, by batch, each in
+    /// the order recorded.
+    pub fn recorded_moves(&self) -> Result<Vec<(String, Vec<MoveRecord>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT batch, seq, from_path, staged, to_path, dev, ino FROM lib.moves
+             ORDER BY batch, seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                MoveRecord {
+                    seq: r.get(1)?,
+                    from: r.get(2)?,
+                    staged: r.get(3)?,
+                    to: r.get(4)?,
+                    dev: r.get::<_, i64>(5)? as u64,
+                    ino: r.get::<_, i64>(6)? as u64,
+                },
+            ))
+        })?;
+        let mut batches: Vec<(String, Vec<MoveRecord>)> = Vec::new();
+        for row in rows {
+            let (batch, m) = row?;
+            match batches.last_mut() {
+                Some((b, ms)) if *b == batch => ms.push(m),
+                _ => batches.push((batch, vec![m])),
+            }
+        }
+        Ok(batches)
+    }
+
+    /// Record a copy a save is making (see [`PreparedCopy`]): a setting of
+    /// its own, so a save of many files writes each once.
+    pub fn record_copy(&self, copy: PreparedCopy) -> Result<()> {
+        put_setting(
+            &self.conn(),
+            "main",
+            &format!("{PREPARED_COPY}{}", copy.path),
+            &copy,
+        )
+    }
+
+    /// The copies recorded and not yet forgotten: a save's under way, or,
+    /// before one starts (saves take turns), ones a stopped coversyncd left.
+    pub fn recorded_copies(&self) -> Result<Vec<PreparedCopy>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT value FROM main.settings WHERE substr(key, 1, length(?1)) = ?1")?;
+        let mut copies = Vec::new();
+        for value in stmt.query_map([PREPARED_COPY], |r| r.get::<_, String>(0))? {
+            if let Ok(copy) = serde_json::from_str(&value?) {
+                copies.push(copy);
+            }
+        }
+        Ok(copies)
+    }
+
+    /// Forget recorded copies, by path: in place, gone, or not the file
+    /// they were.
+    pub fn forget_copies(&self, paths: &[String]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM main.settings WHERE key = ?1")?;
+            for path in paths {
+                stmt.execute([format!("{PREPARED_COPY}{path}")])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forget the covers of albums with no track left (a tag save's new
+    /// title is a new id), as [`Self::upsert_moving`] does with its rows.
+    pub fn forget_orphan_covers(&self) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM covers WHERE album_id NOT IN (SELECT album_id FROM temp.indexed_tracks)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Forget recorded moves: `seqs` of `batch`, or all of it.
+    pub fn forget_moves(&self, batch: &str, seqs: Option<&[i64]>) -> Result<()> {
+        let conn = self.conn();
+        match seqs {
+            None => {
+                conn.execute("DELETE FROM lib.moves WHERE batch = ?1", [batch])?;
+            }
+            Some(seqs) => {
+                let mut stmt =
+                    conn.prepare_cached("DELETE FROM lib.moves WHERE batch = ?1 AND seq = ?2")?;
+                for seq in seqs {
+                    stmt.execute(params![batch, seq])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The album a track is in now (found by its row, as in `track_root`).
+    pub fn track_album(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn();
+        if id >= 0 {
+            return Ok(conn
+                .query_row(
+                    "SELECT album_id FROM main.tracks WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?);
+        }
+        let Some(public) = id.checked_neg() else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT t.album_id FROM lib.tracks t JOIN temp.lib_root r
+                 WHERE r.prefix = ?1 AND t.id = ?2",
+                [public / ID_SPAN, public % ID_SPAN],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn track_path(&self, id: i64) -> Result<Option<PathBuf>> {
@@ -2274,8 +2625,13 @@ impl Library {
         let mut stmt = conn.prepare(
             "SELECT t.album_id, t.album_dir, MIN(t.path),
                     MAX(t.mtime) || ':' || COUNT(*)
-                        -- Library album ids survive a move; their cover paths don't.
-                        || CASE t.collection WHEN 'library' THEN ':' || t.root ELSE '' END AS sig,
+                        -- Album ids survive a move (of the Library, or of
+                        -- files a save or a rename elsewhere moved, which
+                        -- keeps their times); the cover's paths don't, and
+                        -- files that trade names keep the paths' set too,
+                        -- but not the rows' content generations.
+                        || ':' || MIN(t.path)
+                        || ':' || MAX(t.content_generation) AS sig,
                     c.signature
              FROM temp.indexed_tracks t LEFT JOIN covers c ON c.album_id = t.album_id
              GROUP BY t.album_id",
@@ -3294,7 +3650,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     /// Turn a Library database this build made into what v2 left: no
@@ -3525,7 +3881,7 @@ mod tests {
         let journal: String = conn
             .query_row("PRAGMA lib.journal_mode", [], |r| r.get(0))
             .unwrap();
-        assert_eq!((version, journal.as_str()), (5, "delete"));
+        assert_eq!((version, journal.as_str()), (6, "delete"));
         drop(conn);
         // The rows there start at generation 0, with the counter: nothing
         // has changed since.
@@ -3576,7 +3932,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA lib.user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         // The rows came along, ids, digests and generations and all, with
         // every index and trigger, and the removal is still recorded.
         assert_eq!(tracks_objects(&lib.conn(), "lib"), objects);
@@ -4258,6 +4614,84 @@ mod tests {
         let jobs = lib.cover_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].first_track, moved.join("A/1.flac"));
+    }
+
+    #[test]
+    fn prepared_copies_are_recorded_one_by_one_and_forgotten_together() {
+        let lib = Library::open(&temp_db("prepared-copies")).unwrap();
+        let copy = |n: u64| PreparedCopy {
+            path: format!("/m/A/.coversync-tmp-1-{n}.flac"),
+            dev: 1,
+            ino: n,
+        };
+        for n in 0..3 {
+            lib.record_copy(copy(n)).unwrap();
+        }
+        let mut found = lib.recorded_copies().unwrap();
+        found.sort_by_key(|c| c.ino);
+        assert_eq!(found, [copy(0), copy(1), copy(2)]);
+        lib.forget_copies(&[copy(0).path, copy(2).path]).unwrap();
+        assert_eq!(lib.recorded_copies().unwrap(), [copy(1)]);
+    }
+
+    #[test]
+    #[cfg(feature = "server")]
+    fn a_track_a_save_moves_keeps_its_id_and_its_albums_cover_is_found_again() {
+        let dir = temp_dir("movedcover", &["state", "Lib"]);
+        let root = dir.join("Lib");
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&root, &[])).unwrap();
+        lib.prepare_library(&root).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        let job = lib.cover_jobs().unwrap().remove(0);
+        let cover = found(CoverSource::Embedded(root.join("A/1.flac")), "1");
+        lib.set_cover(&job.album_id, Some(&cover), &job.signature)
+            .unwrap();
+        let id = lib.album(&job.album_id).unwrap().unwrap().tracks[0].id;
+        let since = lib.library_changes(0).unwrap().unwrap().library.generation;
+
+        // Renamed, its time as it was (a rename leaves it).
+        lib.upsert_moving(
+            &[library_file(&root, "A/0.flac", "A", 7)],
+            &[(root.join("A/1.flac"), root.join("A/0.flac"))],
+            None,
+        )
+        .unwrap();
+        let album = lib.album(&job.album_id).unwrap().unwrap();
+        assert_eq!(album.tracks.len(), 1);
+        assert_eq!(album.tracks[0].id, id);
+        assert_eq!(album.tracks[0].rel_path, "A/0.flac");
+        assert_eq!(album.tracks[0].moved_from, ["A/1.flac"]);
+        let changes = lib.library_changes(since).unwrap().unwrap();
+        assert!(changes.removed.is_empty());
+        assert_eq!(changes.tracks[0].path, "A/0.flac");
+        // The cover named the old file: looked at again.
+        let jobs = lib.cover_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].first_track, root.join("A/0.flac"));
+
+        // Two files trading names: the same paths, count and times, but
+        // another file first.
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        let job = lib.cover_jobs().unwrap().remove(0);
+        lib.set_cover(&job.album_id, Some(&cover), &job.signature)
+            .unwrap();
+        assert!(lib.cover_jobs().unwrap().is_empty());
+        lib.upsert_moving(
+            &[
+                library_file(&root, "A/0.flac", "A", 7),
+                library_file(&root, "A/1.flac", "A", 7),
+            ],
+            &[
+                (root.join("A/0.flac"), root.join("A/1.flac")),
+                (root.join("A/1.flac"), root.join("A/0.flac")),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(lib.cover_jobs().unwrap().len(), 1, "looked at again");
     }
 
     #[test]

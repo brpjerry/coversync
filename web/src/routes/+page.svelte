@@ -456,14 +456,26 @@
 	async function close() {
 		const id = openId;
 		if (!id) return;
-		const heroCover = document.querySelector<HTMLElement>('.hero-cover');
+		const hero = document.querySelector<HTMLElement>('.hero-cover');
+		// A cover scrolled out of the window (from the tag editor, say) would fly
+		// in from off screen: then the album just fades in on the grid.
+		const seen = hero?.getBoundingClientRect();
+		const heroCover = seen && seen.bottom > 0 && seen.top < innerHeight ? hero : null;
 		const target = gridCover(id);
 		if (!target || !document.startViewTransition || reducedMotion()) return back();
+		// The sheet names its cover itself (see AlbumDetail): unnamed for this
+		// transition, it fades out with the sheet.
+		const hidden = hero && !heroCover ? hero : null;
+		if (hidden) hidden.style.viewTransitionName = 'none';
 		const vt = document.startViewTransition(async () => {
 			await back();
 			// History can go back to another album, whose sheet stays: then its
-			// cover is the end.
-			if (sheetAlbum) return;
+			// cover (the same element) is the end, named again now that the
+			// old one's snapshot is taken.
+			if (sheetAlbum) {
+				if (hidden) hidden.style.viewTransitionName = 'album-cover';
+				return;
+			}
 			// Back at the grid, the cover lands on its card, and the sheet fading
 			// out leaves its own cover to the moving snapshot (see AlbumDetail).
 			// Now, not on the fade's outrostart, which Svelte sends a frame later.
@@ -472,7 +484,10 @@
 		});
 		heroCover?.style.setProperty('view-transition-name', 'album-cover');
 		follow(vt, () => (sheetAlbum ? document.querySelector<HTMLElement>('.hero-cover') : target));
-		vt.finished.finally(() => (target.style.viewTransitionName = ''));
+		vt.finished.finally(() => {
+			target.style.viewTransitionName = '';
+			if (hidden) hidden.style.viewTransitionName = 'album-cover';
+		});
 	}
 
 	async function playAlbum(album: Album) {
@@ -575,10 +590,14 @@
 		await loadAlbums();
 		dataGeneration++;
 	}
-	/** A scan ended: show what it found. */
-	function scanFinished() {
+	/**
+	 * A scan ended: show what it found. One that stopped short may still have
+	 * indexed some files, but uploads done before it haven't all been scanned.
+	 */
+	function scanEnded(scan: Status['scan']) {
+		if (scan.phase === 'failed') toast('The scan didn’t finish: see coversyncd’s log.', 'error');
 		// Uploads finished before it have their albums in the Inbox now, if any.
-		uploads.scanFinished();
+		else uploads.scanFinished();
 		dataGeneration++;
 		// The Inbox folder may have come or gone; the empty Inbox's message says which.
 		inboxSetup.refresh();
@@ -611,7 +630,8 @@
 			const fresh = await api.status();
 			status = pushedScan && pushedScan !== pushed ? { ...fresh, scan: pushedScan } : fresh;
 			// A scan_finished that came meanwhile has seen to the end itself.
-			if (wasRunning && !status.scan.running && finishes === scanFinishes) await scanFinished();
+			if (wasRunning && !status.scan.running && finishes === scanFinishes)
+				await scanEnded(status.scan);
 			else if (status.scan.running && Date.now() - lastAlbums > SCAN_RELOAD_MS) await loadAlbums();
 		} catch {}
 		// Only one poll waits at a time, even when two ran at once.
@@ -1021,7 +1041,8 @@
 			pushedScan = scan;
 			scanFinishes++;
 			if (status) status = { ...status, scan };
-			scanFinished();
+			scanEnded(scan);
+			if (scan.phase === 'failed') return;
 			// The scan's count is of the Inbox's albums.
 			const found = `${count(scan.albums)} ${scan.albums === 1 ? 'album' : 'albums'} in the Inbox`;
 			const unread = scan.errors

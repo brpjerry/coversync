@@ -52,6 +52,30 @@ used on a home server.
   hold, refuses the save before anything is written.
   `GET /api/albums/{id}/tags` gives each track's values by tag kind and
   those other tags; a save can send any tag kind per track (`kinds`).
+  In the Library, saving puts every file of the album where Library
+  setup's folder structure says with its tags as saved, edited or not: a
+  new title renames a file, a new album title (or a tag the structure
+  names a folder by) moves the album's files to another folder, and an
+  album imported under an older structure moves to the current one. When
+  all of a folder's tracks go to one other folder, its cover images follow
+  them, unless the name is taken there or audio stays behind. Folders left
+  empty go. An album's folder in the Library holds what its import put
+  there, its tracks and its cover: a save that would leave a folder
+  holding anything else is refused. Moved tracks keep their ids and
+  import dates, and a client that knew a track at its old path still
+  finds it. The Library is supported on a local file system where names
+  differ by case (ext4, btrfs, NTFS as Linux mounts it), not on a network
+  share or FAT: a save that would move files is refused where they can't
+  be renamed without risk of replacing one, or names fold. A save the
+  structure couldn't place (a title cleared, two tracks on
+  one path, a file already there or in the way of a folder, a file name
+  starting with a dot, which scans skip, a folder name starting with
+  `.coversync` in any case, a linked folder, another file system, one of
+  those above, or moves before the Library's database exists, which its
+  first import makes) is refused before anything is written; one whose files can't all be moved after the tags are written
+  (a file appearing meanwhile) puts them all back and says so. Moves are
+  recorded in the Library's database before they're made, and ones not
+  yet indexed when coversyncd stops are put back when it next scans.
   A save is refused, and nothing written, if the album changed after the
   editor loaded it: saved from another browser or app, or changed on disk
   and found by a scan, tracks added or removed included. The album then

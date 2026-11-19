@@ -65,6 +65,8 @@ export interface Track {
 	bitrate: number | null;
 	format: string;
 	rel_path: string;
+	/** Paths a tag save moved this Library track from (album details only). */
+	moved_from?: string[];
 }
 
 export interface AlbumDetail extends Album {
@@ -139,6 +141,10 @@ export interface AlbumTags {
 export interface TagWriteResult {
 	album_id: string;
 	files_written: number;
+	/** Files moved to where the folder structure puts them (Library albums), its other files among them. */
+	files_moved: number;
+	/** Saved, but the files couldn't all be moved: why. */
+	warning?: string;
 	album: AlbumDetail | null;
 }
 

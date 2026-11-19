@@ -1,7 +1,7 @@
 //! JSON API, cover thumbnails and audio streaming.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path as FsPath, PathBuf};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -11,15 +11,15 @@ use axum::{Json, Router};
 use base64::Engine;
 use coversync_core::appearance::{self, AppearanceSetup};
 use coversync_core::art::{self, Art};
-use coversync_core::db::{CoverSource, FileStat};
+use coversync_core::db::{CoverSource, FileStat, PreparedCopy};
 use coversync_core::import::{self, ImportPlan, ImportResult};
+use coversync_core::scan;
 use coversync_core::scan::Progress;
-use coversync_core::scan::{self, album_dir_in, album_id_in};
 use coversync_core::sync::SyncSetup;
 use coversync_core::template::{self, Template};
 use coversync_core::{
     AlbumDetail, Collection, HiddenStats, InboxSetup, IndexVersions, LibrarySetup, TagCoverage,
-    TagEdit, inbox, rules, tags, upload,
+    TagEdit, inbox, relocate, rules, tags, upload,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -781,6 +781,13 @@ async fn import_album(
     // Under the jobs lock, in a task of its own: a scan asked for meanwhile
     // waits for the whole import, even if the request is dropped.
     let result = exclusively(&state, move |s| {
+        // Not onto a path a track an earlier save moved has to come back to
+        // (nor while the tag editor reads a file there). The jobs lock keeps
+        // a save from recording moves meanwhile.
+        if !s.lib.recorded_moves()?.is_empty() {
+            let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+            moves_put_back(s, "imported")?;
+        }
         // Keep import bookkeeping out of the scan progress the UI shows.
         let progress = Progress::default();
         let art = req
@@ -854,10 +861,14 @@ async fn cover(
     req: Request,
 ) -> ApiResult<Response> {
     let size = q.size.unwrap_or(512);
+    // A thumbnail not made yet reads the art where the album's files are
+    // (see `AppState::moving`).
+    let moving = state.moving.read().await;
     let (path, current) = blocking(&state, move |s| {
         s.covers.thumbnail(&s.lib, &id, size, q.v.as_deref())
     })
     .await?;
+    drop(moving);
     Ok(serve_file(path, req, cover_caching(current)).await)
 }
 
@@ -868,6 +879,8 @@ async fn full_cover(
     Path(id): Path<String>,
     req: Request,
 ) -> ApiResult<Response> {
+    // Read where the album's files are (see `AppState::moving`).
+    let _moving = state.moving.read().await;
     let source = blocking(&state, move |s| {
         s.lib
             .cover_source(&id)?
@@ -898,6 +911,8 @@ async fn stream(
     Path(id): Path<i64>,
     req: Request,
 ) -> ApiResult<Response> {
+    // Found and opened while no save moves files (see `moving`).
+    let _moving = state.moving.read().await;
     let path = blocking(&state, move |s| {
         s.lib.track_path(id)?.ok_or(coversync_core::Error::NotFound)
     })
@@ -1011,6 +1026,12 @@ struct TagWriteResult {
     /// The album's id after the edit; it changes when the album title does.
     album_id: String,
     files_written: usize,
+    /// Files moved to where the folder structure puts them (Library albums),
+    /// the album's other files among them.
+    files_moved: usize,
+    /// Saved, but the files couldn't all be moved: why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
     album: Option<AlbumDetail>,
 }
 
@@ -1074,10 +1095,10 @@ async fn write_tags(
     // it. The write, once begun, goes on if the request is dropped.
     let allow_writes = state.allow_writes;
     let saved = exclusively(&state, move |s| {
-        // The album the edits are for, as it is now. With none of its tracks
-        // left (a row's path never changes, so the same ids at the same
-        // generations would have been found), the one its id names, whose
-        // version then can't match: other tracks make another digest.
+        // The album the edits are for, as it is now: found by its tracks, at
+        // the paths the editor had them or ones a save moved them from. With
+        // none of them left, the one its id names, whose version then can't
+        // match: other tracks make another digest.
         let current = match (&body.version, &body.base_tracks) {
             (Some(_), Some(tracks)) => {
                 let tracks: Vec<(i64, String)> =
@@ -1147,6 +1168,13 @@ async fn write_tags(
                 tags::validate_kind(id, value)?;
             }
         }
+        // The files are checked, written, moved and indexed before the tag
+        // editor can read them again (see `tag_files`).
+        let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+        reclaim_copies(&s.lib)?;
+        if collection == Collection::Library {
+            moves_put_back(s, "saved")?;
+        }
         // Every file can take its edits, as it is, before any is written: an
         // album of mixed formats or files isn't left half edited.
         for (track, edit, kinds) in &edits {
@@ -1159,59 +1187,244 @@ async fn write_tags(
                 coversync_core::Error::Invalid(format!("{name}: {e}"))
             })?;
         }
-        // The files are written and indexed before the tag editor can read
-        // them again (see `tag_files`).
-        let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
-        // Files written before one fails are indexed all the same, so their
-        // tracks (and the album's version) say they changed.
-        let mut written = Vec::new();
-        let mut failed = None;
+        // A Library album keeps to the folder structure (see `relocate`).
+        let layout = match collection {
+            Collection::Library => {
+                let template = Template::parse(&s.lib.library_setup()?.structure)?;
+                s.lib.library_folder()?.map(|root| (template, root))
+            }
+            Collection::Inbox => None,
+        };
+        let named = |path: &FsPath, e: coversync_core::Error| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            coversync_core::Error::Invalid(format!("{name}: {e}"))
+        };
+        // Each file's edit, written to a copy beside it: what can refuse an
+        // edit does so before any file changes.
+        let mut prepared = Vec::new();
+        let mut recorded = Vec::new();
         for (track, edit, kinds) in &edits {
-            let file = s
+            let (path, root) = s
                 .lib
-                .track_root(*track)
-                .and_then(|found| found.ok_or(coversync_core::Error::NotFound))
-                .and_then(|(path, root)| {
-                    tags::write_with_kinds(&path, edit, kinds).map(|()| (path, root))
-                });
-            match file {
-                Ok(file) => written.push(file),
+                .track_root(*track)?
+                .ok_or(coversync_core::Error::NotFound)?;
+            // Recorded as soon as it exists, so one left by coversyncd
+            // stopping before it's in place or gone is found again.
+            let copy = tags::prepare_owned(&path, edit, kinds, |copy, file| {
+                record_copy(&s.lib, copy, file)?;
+                recorded.extend(copy.to_str().map(String::from));
+                Ok(())
+            })
+                .map_err(|e| named(&path, e))?;
+            prepared.push((*track, root, copy));
+        }
+        // Where the folder structure puts the album's files, with their tags
+        // as saved (the edited ones read from their copies), refused too.
+        let plan = match &layout {
+            Some((template, root)) => {
+                let copies: HashMap<i64, &FsPath> = prepared
+                    .iter()
+                    .map(|(id, _, copy)| (*id, copy.copy.as_path()))
+                    .collect();
+                let mut placed = Vec::new();
+                for t in &ids {
+                    let (path, _) = s
+                        .lib
+                        .track_root(*t)?
+                        .ok_or(coversync_core::Error::NotFound)?;
+                    let saved = copies.get(t).copied().unwrap_or(path.as_path());
+                    let values = tags::read_kinds(saved, false)?.values;
+                    placed.push((path, values));
+                }
+                let plan = relocate::plan(template, root, &placed).map_err(|e| match e {
+                    coversync_core::Error::Invalid(m) => {
+                        coversync_core::Error::Invalid(format!("{m} Nothing was saved."))
+                    }
+                    e => e,
+                })?;
+                // Moves are recorded in the Library folder's own database
+                // (see `relocate::apply`), which its first import makes.
+                if !plan.is_empty() && !s.lib.library_stored()? {
+                    return Err(coversync_core::Error::Invalid(
+                        "These files would move to where the folder structure puts them, which waits for the Library folder's database (its first import makes it). Nothing was saved.".into(),
+                    ));
+                }
+                Some(plan)
+            }
+            None => None,
+        };
+        // Files put in place before one fails are indexed all the same, so
+        // their tracks (and the album's version) say they changed.
+        let mut written: Vec<(i64, PathBuf, PathBuf)> = Vec::new();
+        let mut failed = None;
+        for (track, root, copy) in prepared {
+            let path = copy.path.clone();
+            match copy.commit() {
+                Ok(()) => written.push((track, path, root)),
                 Err(e) => {
-                    failed = Some(e);
+                    failed = Some(named(&path, e));
                     break;
                 }
             }
         }
-        let stats: Vec<FileStat> = written
-            .into_iter()
-            .filter_map(|(path, root)| scan::stat(path, &root, collection))
+        // Every copy is in place or gone (those after a failure with it,
+        // unless removing one failed: its record stays for the next save).
+        // The records only matter to the next save, which checks them
+        // again: one not forgotten now doesn't hold this save up.
+        recorded.retain(|copy| {
+            matches!(std::fs::symlink_metadata(copy), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        });
+        if let Err(e) = s.lib.forget_copies(&recorded) {
+            tracing::warn!("couldn't forget the prepared copies' records: {e}");
+        }
+        let count = written.len();
+        // Then the files go where their tags now put them, and the index
+        // follows, before a stream can look for one (see `moving`).
+        let moving = plan
+            .as_ref()
+            .filter(|p| failed.is_none() && !p.is_empty())
+            .map(|_| s.moving.blocking_write());
+        let mut moved = relocate::Applied::default();
+        let mut warning = None;
+        // Files a failed move couldn't put back: what's at their old paths
+        // now isn't theirs, so those aren't indexed until they're back
+        // (scans and saves wait for that too).
+        let mut pending = HashSet::new();
+        if failed.is_none()
+            && let Some(plan) = &plan
+        {
+            match relocate::apply(&s.lib, plan) {
+                Ok(done) => moved = done,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tags saved, files not moved");
+                    pending = pending_moves(&s.lib)?;
+                    warning = Some(match pending.len() {
+                        0 => format!("Saved, but the files weren't moved: {e}"),
+                        n => format!(
+                            "Saved, but the files weren't moved ({e}), and {n} couldn't be put back: see coversyncd's log."
+                        ),
+                    });
+                }
+            }
+        }
+        let stat_all = |paths: Vec<(PathBuf, PathBuf)>| -> Vec<FileStat> {
+            paths
+                .into_iter()
+                .filter_map(|(path, root)| scan::stat(path, &root, collection))
+                .collect()
+        };
+        let at_first: Vec<(PathBuf, PathBuf)> = written
+            .iter()
+            .map(|(_, path, root)| (path.clone(), root.clone()))
             .collect();
-        let count = stats.len();
-        let first = stats.first().map(|f| (f.path.clone(), f.root.clone()));
+        // The files written, where they are now, and the tracks moved.
+        let now: HashMap<&FsPath, &FsPath> = moved
+            .tracks
+            .iter()
+            .map(|m| (m.from.as_path(), m.to.as_path()))
+            .collect();
+        let mut paths: Vec<(PathBuf, PathBuf)> = written
+            .iter()
+            .map(|(_, path, root)| {
+                let path = now.get(path.as_path()).copied().unwrap_or(path);
+                (path.to_path_buf(), root.clone())
+            })
+            .filter(|(path, _)| !pending.contains(path))
+            .collect();
+        if let Some((_, root)) = &layout {
+            let mut indexed: HashSet<PathBuf> = paths.iter().map(|(p, _)| p.clone()).collect();
+            for m in &moved.tracks {
+                if indexed.insert(m.to.clone()) {
+                    paths.push((m.to.clone(), root.clone()));
+                }
+            }
+        }
+        let pairs: Vec<(PathBuf, PathBuf)> = moved
+            .tracks
+            .iter()
+            .map(|m| (m.from.clone(), m.to.clone()))
+            .collect();
+        let batch = (!moved.batch.is_empty()).then_some(moved.batch.as_str());
         // Publishing the edit invalidates old digests immediately. The hash
         // worker queued by exclusively() rehashes after the save can return.
-        scan::index_files(&s.lib, stats, &s.progress)?;
-        s.lib.remove_paths(&[])?;
+        // Every moved track is found where it went, or none is indexed there.
+        let stats = stat_all(paths);
+        let found: HashSet<&FsPath> = stats.iter().map(|f| f.path.as_path()).collect();
+        let lost = moved
+            .tracks
+            .iter()
+            .find(|m| !found.contains(m.to.as_path()))
+            .map(|m| m.to.clone());
+        let indexed = match lost {
+            Some(to) => Err(coversync_core::Error::Invalid(format!(
+                "{} can't be read where it went",
+                to.display()
+            ))),
+            None => scan::index_moved(&s.lib, stats, &pairs, batch, &s.progress),
+        };
+        if let Err(e) = indexed {
+            if pairs.is_empty() {
+                return Err(e);
+            }
+            // The index can't take the moves: the files go back to where it
+            // has them.
+            tracing::warn!(error = %e, "moved files not indexed, putting them back");
+            let stuck = relocate::recover(&s.lib)?.stuck;
+            warning = Some(match stuck {
+                0 => format!("Saved, but the files weren't moved: {e}"),
+                _ => format!(
+                    "Saved, but the files weren't moved ({e}), and {stuck} couldn't be put back: see coversyncd's log."
+                ),
+            });
+            moved = relocate::Applied::default();
+            // Back where the index has them: indexed as saved, but for any
+            // not back. A new title's album leaves its old cover behind.
+            let pending = pending_moves(&s.lib)?;
+            let back: Vec<(PathBuf, PathBuf)> = at_first
+                .into_iter()
+                .filter(|(path, _)| !pending.contains(path))
+                .collect();
+            scan::index_files(&s.lib, stat_all(back), &s.progress)?;
+            s.lib.forget_orphan_covers()?;
+        }
+        drop(moving);
         drop(files);
         scan::refresh_covers(&s.lib, &s.covers, &s.progress)?;
-        let new_id = match first {
-            Some((p, root)) => album_id_in(
-                collection,
-                &root,
-                &album_dir_in(collection, &root, &p),
-                tags::read(&p)?.album.as_deref(),
-            ),
-            None => current.album.id.clone(),
-        };
-        let album = s.lib.album(&new_id)?;
+        // The albums the tracks are in now (a moved track keeps its id):
+        // the first written track's, which the editor follows, and any other.
         let previous = current.album.id;
+        // With none written (the structure applied anew), the first track's.
+        let followed = written.first().map(|(track, ..)| *track).or(ids.first().copied());
+        let new_id = match followed {
+            Some(track) => s.lib.track_album(track)?,
+            None => None,
+        }
+        .unwrap_or_else(|| previous.clone());
+        let mut albums = vec![new_id.clone()];
+        for track in &ids {
+            if let Some(a) = s.lib.track_album(*track)?
+                && !albums.contains(&a)
+            {
+                albums.push(a);
+            }
+        }
+        let album = s.lib.album(&new_id)?;
         if count > 0 || failed.is_none() {
-            s.events.publish(Notice::AlbumChanged {
-                id: new_id.clone(),
-                previous_id: (new_id != previous).then_some(previous),
-                collection,
-                version: album.as_ref().map(|a| a.version.clone()),
-            });
+            // A rename only when none of the tracks is left in the album the
+            // edits were for: one that keeps some (a genre-led split, say) stays.
+            let renamed = !albums.contains(&previous);
+            for id in albums {
+                let version = match id == new_id {
+                    true => album.as_ref().map(|a| a.version.clone()),
+                    false => s.lib.album(&id)?.map(|a| a.version),
+                };
+                s.events.publish(Notice::AlbumChanged {
+                    previous_id: (renamed && id == new_id).then(|| previous.clone()),
+                    id,
+                    collection,
+                    version,
+                });
+            }
         }
         if let Some(e) = failed {
             return Err(e);
@@ -1219,6 +1432,8 @@ async fn write_tags(
         Ok(Ok(TagWriteResult {
             album_id: new_id,
             files_written: count,
+            files_moved: moved.files,
+            warning,
             album,
         }))
     })
@@ -1227,10 +1442,99 @@ async fn write_tags(
     saved?.map(Json)
 }
 
+/// Put back the moves saves made and never indexed (see `relocate`), before
+/// a file is looked at where the index has it or written where one has to
+/// come back to; refused, nothing `done`, while any can't be.
+fn moves_put_back(s: &crate::AppState, done: &str) -> coversync_core::Result<()> {
+    let _moving = s.moving.blocking_write();
+    match relocate::recover(&s.lib)?.stuck {
+        0 => Ok(()),
+        _ => Err(coversync_core::Error::Invalid(format!(
+            "Files an earlier save moved couldn't all be put back (see coversyncd's log), so nothing was {done}."
+        ))),
+    }
+}
+
+/// The Library paths moves recorded and not yet put back are to come back
+/// to (see `relocate::recover`).
+fn pending_moves(lib: &coversync_core::Library) -> coversync_core::Result<HashSet<PathBuf>> {
+    let Some(root) = lib.library_folder()? else {
+        return Ok(HashSet::new());
+    };
+    Ok(lib
+        .recorded_moves()?
+        .into_iter()
+        .flat_map(|(_, records)| records)
+        .map(|r| root.join(r.from))
+        .collect())
+}
+
+/// Record a copy a save is making, as the file it is (see `PreparedCopy`):
+/// told by the copy itself, open, not looked up again by its name.
+fn record_copy(
+    lib: &coversync_core::Library,
+    copy: &FsPath,
+    file: &std::fs::File,
+) -> coversync_core::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    match copy.to_str() {
+        Some(path) => lib.record_copy(PreparedCopy {
+            path: path.into(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Remove the copies saves recorded and never put in place or took away
+/// (coversyncd stopped meanwhile), each only while it's the file recorded:
+/// nothing else is removed by its name. Saves take turns, so before one
+/// starts, every copy recorded is one of these. A record is forgotten once
+/// its copy is gone or its name is another file's; one that can't be told
+/// or removed (a share away, say) is kept for the next save.
+fn reclaim_copies(lib: &coversync_core::Library) -> coversync_core::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut done = Vec::new();
+    for copy in lib.recorded_copies()? {
+        let path = FsPath::new(&copy.path);
+        let settled = match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_file() && m.dev() == copy.dev && m.ino() == copy.ino => {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        tracing::info!(path = copy.path, "removed a copy a stopped save left");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = copy.path,
+                            "couldn't remove a copy a stopped save left: {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::warn!(
+                    path = copy.path,
+                    "couldn't look for a copy a stopped save left: {e}"
+                );
+                false
+            }
+        };
+        if settled {
+            done.push(copy.path);
+        }
+    }
+    lib.forget_copies(&done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path as FsPath;
     use std::sync::Arc;
 
     /// A FLAC file with these Vorbis comments and a few bytes standing for its audio.
@@ -1521,6 +1825,726 @@ mod tests {
             said.contains(".m4a: ") && said.contains("Publisher"),
             "{said}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_library_save_moves_the_files_where_the_structure_says() {
+        let (state, inbox_id, _dir) = daemon("relocate");
+        let request = serde_json::from_value(serde_json::json!({ "album_id": inbox_id })).unwrap();
+        let Json(imported) = import_album(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        let detail = state.lib.album(&imported.album_id).unwrap().unwrap();
+        let track = detail.tracks[0].id;
+        let (path, root) = state.lib.track_root(track).unwrap().unwrap();
+        assert_eq!(path, root.join("Artist/Record/Song.flac"));
+        // Another file of the album's, which goes with it.
+        std::fs::write(root.join("Artist/Record/cover.jpg"), b"art").unwrap();
+
+        // A new album title: a new folder.
+        let body = TagWrite {
+            kinds: HashMap::from([(
+                track,
+                HashMap::from([("album".to_string(), "Another record".to_string())]),
+            )]),
+            ..Default::default()
+        };
+        let Json(saved) = write_tags(
+            State(state.clone()),
+            Path(imported.album_id.clone()),
+            Json(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.files_moved, 2, "the track and its cover");
+        assert!(saved.warning.is_none());
+        let moved = root.join("Artist/Another record");
+        assert!(moved.join("Song.flac").is_file());
+        assert_eq!(std::fs::read(moved.join("cover.jpg")).unwrap(), b"art");
+        assert!(!root.join("Artist/Record").exists());
+        // The index has the file where it is now, and the album under its new id.
+        let album = saved.album.unwrap();
+        assert_eq!(album.tracks.len(), 1);
+        assert_eq!(album.tracks[0].rel_path, "Artist/Another record/Song.flac");
+        assert!(state.lib.album(&imported.album_id).unwrap().is_none());
+
+        // A title cleared would leave the file without a name: refused, nothing written.
+        let track = album.tracks[0].id;
+        let body = TagWrite {
+            kinds: HashMap::from([(track, HashMap::from([("title".to_string(), String::new())]))]),
+            ..Default::default()
+        };
+        let refused = write_tags(
+            State(state.clone()),
+            Path(saved.album_id.clone()),
+            Json(body),
+        )
+        .await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("would have no Title"), "{said}");
+        assert!(said.ends_with("Nothing was saved."), "{said}");
+        let after = tags::read(&moved.join("Song.flac")).unwrap();
+        assert_eq!(after.title.as_deref(), Some("Song"));
+    }
+
+    #[tokio::test]
+    async fn a_scan_moves_left_stuck_keep_from_starting_is_announced_as_failed() {
+        let (state, _root, _) =
+            library_record("relocate-scan", coversync_core::template::DEFAULT).await;
+        // A record recovery won't act on (not one it made): stuck.
+        let stuck = coversync_core::db::MoveRecord {
+            seq: 0,
+            from: "A/x.flac".into(),
+            staged: Some("not-ours".into()),
+            to: "B/x.flac".into(),
+            dev: 0,
+            ino: 0,
+        };
+        state
+            .lib
+            .record_moves("00000000000000cc", &[stuck])
+            .unwrap();
+        let scanned = |state: &Shared| {
+            let mut heard = state.events.subscribe();
+            crate::spawn_scan(state.clone());
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if let Ok(Notice::ScanFinished(p)) = heard.recv().await {
+                            return p;
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let p = scanned(&state).await;
+        assert_eq!(p.phase, "failed");
+        assert!(!p.running);
+        // Once the record's gone, scans finish again.
+        state.lib.forget_moves("00000000000000cc", None).unwrap();
+        let p = scanned(&state).await;
+        assert_eq!(p.phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_copy_a_stopped_save_left_goes_and_nothing_else_by_its_name() {
+        let (state, inbox) = editing_daemon("copies-left");
+        let album = detail(&state, "Record");
+        // A save that stopped once its copy was made: no cleanup ran.
+        let file = inbox.join("Record/01.flac");
+        let left = tags::prepare_owned(&file, &genre("Rock"), &[], |c, f| {
+            record_copy(&state.lib, c, f)
+        })
+        .unwrap();
+        let copy = left.copy.clone();
+        std::mem::forget(left);
+        assert!(copy.is_file());
+        // A recorded name that's another file now, and one named like a copy.
+        let other = inbox.join("Record/.coversync-tmp-dead-1.flac");
+        std::fs::write(&other, "someone's").unwrap();
+        state
+            .lib
+            .record_copy(PreparedCopy {
+                path: other.to_str().unwrap().into(),
+                dev: 0,
+                ino: 0,
+            })
+            .unwrap();
+        let backup = inbox.join("Record/.coversync-tmp-dead-1.flac.backup");
+        std::fs::write(&backup, "a backup").unwrap();
+        // And one where it can't be looked for now (a share away, say).
+        use std::os::unix::fs::PermissionsExt;
+        let away = inbox.join("Record/Away");
+        std::fs::create_dir_all(&away).unwrap();
+        let far_path = away.join(".coversync-tmp-1-0.flac");
+        let far = std::fs::File::create(&far_path).unwrap();
+        record_copy(&state.lib, &far_path, &far).unwrap();
+        std::fs::set_permissions(&away, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checkable = std::fs::read_dir(&away).is_ok();
+        put(&state, &album.album.id, edit(genre("Jazz")))
+            .await
+            .unwrap();
+        std::fs::set_permissions(&away, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!copy.exists(), "the copy left goes");
+        assert!(other.exists() && backup.exists(), "nothing else does");
+        let kept: Vec<String> = state
+            .lib
+            .recorded_copies()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        // Kept for the next save, which can look (root could all along).
+        if !checkable {
+            assert_eq!(kept, [far_path.to_str().unwrap()]);
+            put(&state, &album.album.id, edit(genre("Pop")))
+                .await
+                .unwrap();
+        }
+        assert!(!far_path.exists());
+        assert!(state.lib.recorded_copies().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_import_waits_for_moves_that_couldnt_be_put_back() {
+        let (state, _root, _) =
+            library_record("relocate-import", coversync_core::template::DEFAULT).await;
+        // A record recovery won't act on (not one it made): stuck.
+        let stuck = coversync_core::db::MoveRecord {
+            seq: 0,
+            from: "A/x.flac".into(),
+            staged: Some("not-ours".into()),
+            to: "B/x.flac".into(),
+            dev: 0,
+            ino: 0,
+        };
+        state
+            .lib
+            .record_moves("00000000000000cd", &[stuck])
+            .unwrap();
+        let request = serde_json::from_value(
+            serde_json::json!({ "album_id": detail(&state, "Other").album.id }),
+        )
+        .unwrap();
+        let refused = import_album(State(state.clone()), Json(request)).await;
+        let Err(ApiError(_, said)) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("nothing was imported"), "{said}");
+        // Once it's settled, the import goes through.
+        state.lib.forget_moves("00000000000000cd", None).unwrap();
+        import_titled(&state, "Other").await;
+    }
+
+    #[tokio::test]
+    async fn a_save_that_would_move_files_waits_for_the_librarys_database() {
+        // A Library folder scanned, never imported into: indexed for now only.
+        let (state, inbox) = editing_daemon("relocate-unstored");
+        with_library(&state, &inbox);
+        let root = state.lib.library_folder().unwrap().unwrap();
+        std::fs::create_dir_all(root.join("Artist/Record")).unwrap();
+        std::fs::copy(
+            inbox.join("Record/01.flac"),
+            root.join("Artist/Record/01 - Song 1.flac"),
+        )
+        .unwrap();
+        state.lib.refresh_library().unwrap();
+        scan::scan(&state.lib, &state.covers, &state.roots(), &state.progress).unwrap();
+        assert!(!state.lib.library_stored().unwrap());
+        let albums = state
+            .lib
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &coversync_core::split::Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap();
+        let album = state.lib.album(&albums[0].id).unwrap().unwrap();
+        let body = TagWrite {
+            kinds: HashMap::from([(
+                album.tracks[0].id,
+                HashMap::from([("album".to_string(), "Renamed".to_string())]),
+            )]),
+            ..Default::default()
+        };
+        let refused = write_tags(
+            State(state.clone()),
+            Path(album.album.id.clone()),
+            Json(body),
+        )
+        .await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("database"), "{said}");
+        let file = root.join("Artist/Record/01 - Song 1.flac");
+        assert_eq!(tags::read(&file).unwrap().album.as_deref(), Some("Record"));
+    }
+
+    /// The "Record" album (three tracks) imported from `editing_daemon`'s
+    /// Inbox into a Library with `structure`: the daemon, the Library
+    /// folder, and the album as imported.
+    async fn library_record(name: &str, structure: &str) -> (Shared, PathBuf, AlbumDetail) {
+        let (state, inbox) = editing_daemon(name);
+        with_library(&state, &inbox);
+        set_structure(&state, structure);
+        let id = import_titled(&state, "Record").await;
+        let root = state.lib.library_folder().unwrap().unwrap();
+        (state.clone(), root, state.lib.album(&id).unwrap().unwrap())
+    }
+
+    fn set_structure(state: &Shared, structure: &str) {
+        let setup = state.lib.library_setup().unwrap();
+        state
+            .lib
+            .set_library_setup(LibrarySetup {
+                structure: structure.into(),
+                ..setup
+            })
+            .unwrap();
+    }
+
+    /// Each Library track row's import time less its row id (the test sets
+    /// them so), by path.
+    fn added_less_id(root: &FsPath) -> Vec<(String, i64)> {
+        let db = rusqlite::Connection::open(root.join(".coversync/library.sqlite3")).unwrap();
+        let mut stmt = db
+            .prepare("SELECT path, added_at - id FROM tracks ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn moved_tracks_keep_their_ids_dates_and_rows_and_a_stale_editor_finds_them() {
+        let (state, root, base) =
+            library_record("relocate-ids", coversync_core::template::DEFAULT).await;
+        // Imported long ago, each track at its own time.
+        rusqlite::Connection::open(root.join(".coversync/library.sqlite3"))
+            .unwrap()
+            .execute("UPDATE tracks SET added_at = 1000 + id", [])
+            .unwrap();
+        let base = state.lib.album(&base.album.id).unwrap().unwrap();
+        let since = state
+            .lib
+            .library_changes(0)
+            .unwrap()
+            .unwrap()
+            .library
+            .generation;
+
+        // Tracks 1 and 2 trade numbers and titles: each file takes the other's path.
+        let (one, two) = (&base.tracks[0], &base.tracks[1]);
+        assert_eq!(one.rel_path, "Artist/Record/01 - Song 1.flac");
+        let swap = |n: &str, title: &str| TagEdit {
+            track_no: Some(n.into()),
+            title: Some(title.into()),
+            ..Default::default()
+        };
+        let body = Json(TagWrite {
+            tracks: HashMap::from([(one.id, swap("2", "Song 2")), (two.id, swap("1", "Song 1"))]),
+            version: Some(base.version.clone()),
+            base_tracks: Some(base_tracks(&base)),
+            ..Default::default()
+        });
+        let saved = put(&state, &base.album.id, body).await.unwrap();
+        assert!(saved.warning.is_none());
+        assert_eq!(saved.files_moved, 2);
+        let album = saved.album.expect("the album is still there");
+        assert_eq!(album.album.id, base.album.id);
+        assert_eq!(album.tracks.len(), 3);
+        let by_id = |id: i64| album.tracks.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(by_id(one.id).rel_path, two.rel_path);
+        assert_eq!(by_id(two.id).rel_path, one.rel_path);
+        assert_eq!(
+            by_id(one.id).moved_from,
+            std::slice::from_ref(&one.rel_path)
+        );
+        let file = tags::read(&root.join(&two.rel_path)).unwrap();
+        assert_eq!(file.title.as_deref(), Some("Song 2"));
+        // No track left: nothing removed for clients, and the dates stayed.
+        let changes = state.lib.library_changes(since).unwrap().unwrap();
+        assert!(changes.removed.is_empty(), "{:?}", changes.removed);
+        assert!(added_less_id(&root).iter().all(|(_, d)| *d == 1000));
+        assert!(state.lib.recorded_moves().unwrap().is_empty());
+
+        // A new title: every file moves, and the album gets a new id.
+        std::fs::write(root.join("Artist/Record/cover.jpg"), b"art").unwrap();
+        let renamed = TagEdit {
+            album: Some("Record 2".into()),
+            ..Default::default()
+        };
+        let saved = put(&state, &album.album.id, save_on(&album, renamed))
+            .await
+            .unwrap();
+        assert_eq!(saved.files_moved, 4, "three tracks and the cover");
+        let now = saved.album.unwrap();
+        assert_ne!(now.album.id, album.album.id);
+        let mut ids: Vec<i64> = now.tracks.iter().map(|t| t.id).collect();
+        let mut before: Vec<i64> = album.tracks.iter().map(|t| t.id).collect();
+        ids.sort();
+        before.sort();
+        assert_eq!(ids, before);
+        assert!(
+            now.tracks
+                .iter()
+                .all(|t| t.rel_path.starts_with("Artist/Record 2/"))
+        );
+        assert_eq!(
+            std::fs::read(root.join("Artist/Record 2/cover.jpg")).unwrap(),
+            b"art"
+        );
+        assert!(!root.join("Artist/Record").exists());
+        assert!(
+            state
+                .lib
+                .library_changes(since)
+                .unwrap()
+                .unwrap()
+                .removed
+                .is_empty()
+        );
+        assert!(added_less_id(&root).iter().all(|(_, d)| *d == 1000));
+
+        // Another editor, still on the album as it was before: its tracks are
+        // found at the paths they had, and the save refused with the album
+        // as it is now.
+        let stale = Json(TagWrite {
+            tracks: HashMap::from([(album.tracks[2].id, genre("Jazz"))]),
+            version: Some(album.version.clone()),
+            base_tracks: Some(base_tracks(&album)),
+            ..Default::default()
+        });
+        let found = conflict(put(&state, &album.album.id, stale).await).expect("found");
+        assert_eq!(found.album.id, now.album.id);
+        let third = found
+            .tracks
+            .iter()
+            .find(|t| t.id == album.tracks[2].id)
+            .unwrap();
+        assert_eq!(
+            third.moved_from,
+            std::slice::from_ref(&album.tracks[2].rel_path)
+        );
+
+        // A scan finds them all where the index has them.
+        rescan_now(&state);
+        let scanned = state.lib.album(&now.album.id).unwrap().unwrap();
+        assert_eq!(scanned.version, now.version);
+        assert!(
+            state
+                .lib
+                .library_changes(since)
+                .unwrap()
+                .unwrap()
+                .removed
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_structure_moves_the_tracks_a_save_left_alone() {
+        let (state, root, base) =
+            library_record("relocate-structure", coversync_core::template::DEFAULT).await;
+        std::fs::write(root.join("Artist/Record/cover.jpg"), b"art").unwrap();
+        set_structure(
+            &state,
+            "{album_artist} - {album}/<{track_number} - >{title}",
+        );
+        // One track edited; the other two move all the same.
+        let body = Json(TagWrite {
+            tracks: HashMap::from([(base.tracks[2].id, genre("Rock"))]),
+            version: Some(base.version.clone()),
+            base_tracks: Some(base_tracks(&base)),
+            ..Default::default()
+        });
+        let saved = put(&state, &base.album.id, body).await.unwrap();
+        assert_eq!(saved.files_written, 1);
+        assert_eq!(saved.files_moved, 4);
+        let now = saved.album.unwrap();
+        let paths: Vec<&str> = now.tracks.iter().map(|t| t.rel_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "Artist - Record/01 - Song 1.flac",
+                "Artist - Record/02 - Song 2.flac",
+                "Artist - Record/03 - Song 3.flac"
+            ]
+        );
+        assert_eq!(
+            std::fs::read(root.join("Artist - Record/cover.jpg")).unwrap(),
+            b"art"
+        );
+        assert!(!root.join("Artist").exists());
+        rescan_now(&state);
+        assert_eq!(
+            state.lib.album(&now.album.id).unwrap().unwrap().version,
+            now.version
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_moved_to_another_album_leaves_the_rest_and_both_are_told() {
+        let structure = "<{genre}>/{album_artist}/{album}/<{track_number} - >{title}";
+        let (state, root, base) = library_record("relocate-split", structure).await;
+        let mut heard = state.events.subscribe();
+        let first = base.tracks[0].id;
+        let body = Json(TagWrite {
+            tracks: HashMap::from([(first, genre("Rock"))]),
+            version: Some(base.version.clone()),
+            base_tracks: Some(base_tracks(&base)),
+            ..Default::default()
+        });
+        let saved = put(&state, &base.album.id, body).await.unwrap();
+        assert!(root.join("Rock/Artist/Record/01 - Song 1.flac").is_file());
+        let moved = saved.album.unwrap();
+        assert_ne!(moved.album.id, base.album.id);
+        assert_eq!(moved.tracks.len(), 1);
+        let stayed = state.lib.album(&base.album.id).unwrap().unwrap();
+        assert_eq!(stayed.tracks.len(), 2);
+        let mut told = Vec::new();
+        while let Ok(n) = heard.try_recv() {
+            if let Notice::AlbumChanged {
+                id,
+                previous_id,
+                version,
+                ..
+            } = n
+            {
+                told.push((id, previous_id, version));
+            }
+        }
+        // Not a rename: the album the edit was for is still there.
+        assert_eq!(
+            told,
+            [
+                (moved.album.id.clone(), None, Some(moved.version.clone())),
+                (base.album.id.clone(), None, Some(stayed.version.clone())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_uses_the_values_the_files_will_hold() {
+        let (state, inbox) = editing_daemon("relocate-values");
+        with_library(&state, &inbox);
+        // An MP3, whose ID3v2 genre 17 reads back as Rock.
+        let mp3 = inbox.join("Tape/song.mp3");
+        std::fs::create_dir_all(mp3.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mp3,
+            include_bytes!("../../coversync-core/tests/fixtures/silence.mp3"),
+        )
+        .unwrap();
+        let tagged = TagEdit {
+            title: Some("Song".into()),
+            artist: Some("Artist".into()),
+            album_artist: Some("Artist".into()),
+            album: Some("Tape".into()),
+            ..Default::default()
+        };
+        tags::write_with_kinds(&mp3, &tagged, &[]).unwrap();
+        // And a FLAC whose disc total is written 02.
+        flac(
+            &inbox.join("Box/01.flac"),
+            &[
+                "TITLE=Song",
+                "ARTIST=Artist",
+                "ALBUMARTIST=Artist",
+                "ALBUM=Box",
+                "DISCNUMBER=1",
+                "DISCTOTAL=02",
+            ],
+        );
+        rescan_now(&state);
+        set_structure(&state, "<{genre}>/{album_artist}/{album}/{title}");
+        let tape = import_titled(&state, "Tape").await;
+        let root = state.lib.library_folder().unwrap().unwrap();
+        assert!(root.join("Artist/Tape/Song.mp3").is_file());
+
+        // A file where the request's text would go doesn't stand in the way:
+        // the tag will read Rock.
+        std::fs::create_dir_all(root.join("17/Artist/Tape")).unwrap();
+        std::fs::write(root.join("17/Artist/Tape/Song.mp3"), b"other").unwrap();
+        let saved = put(&state, &tape, edit(genre("17"))).await.unwrap();
+        assert!(saved.warning.is_none());
+        assert!(root.join("Rock/Artist/Tape/Song.mp3").is_file());
+        assert_eq!(
+            std::fs::read(root.join("17/Artist/Tape/Song.mp3")).unwrap(),
+            b"other"
+        );
+        // A file where the tag's value would go does: refused, nothing written.
+        std::fs::create_dir_all(root.join("Blues/Artist/Tape")).unwrap();
+        std::fs::write(root.join("Blues/Artist/Tape/Song.mp3"), b"other").unwrap();
+        let refused = put(&state, &saved.album_id, edit(genre("0"))).await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(
+            said.contains("Blues/Artist/Tape/Song.mp3 already exists"),
+            "{said}"
+        );
+        assert!(said.ends_with("Nothing was saved."), "{said}");
+        let kept = tags::read(&root.join("Rock/Artist/Tape/Song.mp3")).unwrap();
+        assert_eq!(kept.genre.as_deref(), Some("Rock"));
+
+        // The disc total as written stays in the folder name across a save.
+        set_structure(&state, "{album_artist}/{album}<-{disc_total}>/{title}");
+        let boxed = import_titled(&state, "Box").await;
+        assert!(
+            root.join("Artist/Box-02/Song.flac").is_file(),
+            "imported as written"
+        );
+        let retitled = TagEdit {
+            title: Some("Song!".into()),
+            ..Default::default()
+        };
+        let saved = put(&state, &boxed, edit(retitled)).await.unwrap();
+        assert!(saved.warning.is_none());
+        assert!(root.join("Artist/Box-02/Song!.flac").is_file());
+
+        // The FLAC's vendor string isn't an encoder: a structure that needs
+        // one says the file has none, as the tag editor shows it.
+        set_structure(&state, "{encoder}/{title}");
+        let refused = put(&state, &saved.album_id, edit(genre("Jazz"))).await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("would have no Encoder"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_save_with_no_edits_applies_a_new_structure() {
+        let (state, root, base) =
+            library_record("relocate-empty", coversync_core::template::DEFAULT).await;
+        set_structure(
+            &state,
+            "{album_artist} - {album}/<{track_number} - >{title}",
+        );
+        let mut heard = state.events.subscribe();
+        let saved = put(&state, &base.album.id, Json(TagWrite::default()))
+            .await
+            .unwrap();
+        assert_eq!(saved.files_written, 0);
+        assert_eq!(saved.files_moved, 3);
+        let now = saved.album.expect("the album where it went");
+        assert_eq!(saved.album_id, now.album.id);
+        assert_ne!(now.album.id, base.album.id);
+        assert!(root.join("Artist - Record/01 - Song 1.flac").is_file());
+        match heard.try_recv().unwrap() {
+            Notice::AlbumChanged {
+                id, previous_id, ..
+            } => {
+                assert_eq!(id, now.album.id);
+                assert_eq!(previous_id.as_deref(), Some(base.album.id.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_save_puts_back_unindexed_moves_before_it_reads_a_file() {
+        let (state, root, base) =
+            library_record("relocate-first", coversync_core::template::DEFAULT).await;
+        // Left aside by a save coversyncd didn't finish: where the index has
+        // the track, nothing.
+        let rel = &base.tracks[0].rel_path;
+        let dir = root.join(rel).parent().unwrap().to_path_buf();
+        let staged = coversync_core::db::MoveRecord {
+            seq: 0,
+            from: rel.clone(),
+            staged: Some(".coversync-move-00000000000000aa-0".into()),
+            to: "Elsewhere/01 - Song 1.flac".into(),
+            dev: 0,
+            ino: 0,
+        };
+        let meta = {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(root.join(rel)).unwrap();
+            (m.dev(), m.ino())
+        };
+        std::fs::rename(
+            root.join(rel),
+            dir.join(".coversync-move-00000000000000aa-0"),
+        )
+        .unwrap();
+        state
+            .lib
+            .record_moves(
+                "00000000000000aa",
+                &[coversync_core::db::MoveRecord {
+                    dev: meta.0,
+                    ino: meta.1,
+                    ..staged
+                }],
+            )
+            .unwrap();
+        let body = Json(TagWrite {
+            tracks: HashMap::from([(base.tracks[0].id, genre("Rock"))]),
+            ..Default::default()
+        });
+        let saved = put(&state, &base.album.id, body).await.unwrap();
+        assert_eq!(saved.files_written, 1);
+        let back = tags::read(&root.join(rel)).unwrap();
+        assert_eq!(back.genre.as_deref(), Some("Rock"));
+        assert!(state.lib.recorded_moves().unwrap().is_empty());
+
+        // One that can't be put back (its place taken) stops saves on the
+        // Library, rather than forget the track.
+        std::fs::rename(
+            root.join(rel),
+            dir.join(".coversync-move-00000000000000bb-0"),
+        )
+        .unwrap();
+        std::fs::write(root.join(rel), b"someone else's").unwrap();
+        let meta = {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(dir.join(".coversync-move-00000000000000bb-0")).unwrap();
+            (m.dev(), m.ino())
+        };
+        state
+            .lib
+            .record_moves(
+                "00000000000000bb",
+                &[coversync_core::db::MoveRecord {
+                    seq: 0,
+                    from: rel.clone(),
+                    staged: Some(".coversync-move-00000000000000bb-0".into()),
+                    to: "Elsewhere/01 - Song 1.flac".into(),
+                    dev: meta.0,
+                    ino: meta.1,
+                }],
+            )
+            .unwrap();
+        let refused = put(&state, &base.album.id, edit(genre("Jazz"))).await;
+        let Err(TagWriteError::Api(ApiError(_, said))) = refused else {
+            panic!("not refused");
+        };
+        assert!(said.contains("couldn't all be put back"), "{said}");
+        assert_eq!(state.lib.recorded_moves().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_title_drops_the_old_albums_cover_row() {
+        let (state, _inbox) = editing_daemon("retitle-cover");
+        let base = detail(&state, "Record");
+        scan::refresh_covers(&state.lib, &state.covers, &state.progress).unwrap();
+        assert!(state.lib.cover(&base.album.id).unwrap().is_some());
+        let retitled = TagEdit {
+            album: Some("Record 2".into()),
+            ..Default::default()
+        };
+        let saved = put(&state, &base.album.id, save_on(&base, retitled))
+            .await
+            .unwrap();
+        assert_ne!(saved.album_id, base.album.id);
+        assert!(state.lib.cover(&base.album.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stream_finds_its_file_only_once_moves_are_indexed() {
+        let (state, inbox_id, _dir) = daemon("stream-moving");
+        let track = state.lib.album(&inbox_id).unwrap().unwrap().tracks[0].id;
+        let moving = state.moving.write().await;
+        let request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let served = tokio::spawn(stream(State(state.clone()), Path(track), request));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!served.is_finished(), "waits while files move");
+        drop(moving);
+        let response = served.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2168,6 +3192,10 @@ mod tests {
 
         let (state, inbox) = editing_daemon("hash-queue");
         with_library(&state, &inbox);
+        // Laid out as `track` lays files, so a save doesn't move them.
+        let mut setup = state.lib.library_setup().unwrap();
+        setup.structure = "{album}/{track_number}".into();
+        state.lib.set_library_setup(setup).unwrap();
         let root = std::path::PathBuf::from(state.lib.library_setup().unwrap().folder.unwrap());
         for n in 1..=3 {
             track(&root, "Library album", n);
@@ -2261,11 +3289,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_partly_failed_save_still_changes_the_albums_version() {
+    async fn a_save_one_file_cant_take_changes_no_file() {
         let (state, inbox) = editing_daemon("conflict-partial");
         let base = detail(&state, "Record");
-        // The second file has two icons, which only writing it finds: the
-        // save writes the first, then fails.
+        // The second file has two icons, which only writing it finds: every
+        // file's edit is written to a copy before any file changes, so the
+        // first stays as it was too.
         flac_with_icons(
             &inbox.join(&base.tracks[1].rel_path),
             &[
@@ -2278,35 +3307,31 @@ mod tests {
             2,
         );
         let failed = put(&state, &base.album.id, save_on(&base, genre("Rock"))).await;
-        assert!(matches!(failed, Err(TagWriteError::Api(_))));
+        match failed {
+            Err(TagWriteError::Api(ApiError(_, message))) => {
+                assert!(message.contains("02"), "names the file: {message}")
+            }
+            _ => panic!("saved"),
+        }
         let first = state.lib.track_path(base.tracks[0].id).unwrap().unwrap();
-        assert_eq!(tags::read(&first).unwrap().genre.as_deref(), Some("Rock"));
-        assert_ne!(detail(&state, "Record").version, base.version);
-
-        // A save made on the album as it was, to the file already written: refused.
-        let mine = TagEdit {
-            title: Some("Mine".into()),
-            ..Default::default()
-        };
-        let stale = Json(TagWrite {
-            album: TagEdit::default(),
-            tracks: HashMap::from([(base.tracks[0].id, mine)]),
-            version: Some(base.version.clone()),
-            base_tracks: Some(base_tracks(&base)),
-            kinds: HashMap::new(),
-        });
-        let now = conflict(put(&state, &base.album.id, stale).await).unwrap();
-        assert_eq!(now.album.genre.as_deref(), Some("Rock"));
-        assert_eq!(tags::read(&first).unwrap().title.as_deref(), Some("Song 1"));
+        assert_eq!(tags::read(&first).unwrap().genre, None);
+        assert_eq!(detail(&state, "Record").version, base.version);
+        let copies = std::fs::read_dir(first.parent().unwrap())
+            .unwrap()
+            .filter(|e| {
+                let name = e.as_ref().unwrap().file_name();
+                name.to_string_lossy().starts_with(".coversync")
+            })
+            .count();
+        assert_eq!(copies, 0, "no copy is left behind");
 
         // A file gone (no scan has noticed) is found before anything is
         // written: the album stays as it was.
-        let now = detail(&state, "Record");
-        std::fs::remove_file(inbox.join(&now.tracks[2].rel_path)).unwrap();
-        let failed = put(&state, &now.album.id, save_on(&now, genre("Jazz"))).await;
+        std::fs::remove_file(inbox.join(&base.tracks[2].rel_path)).unwrap();
+        let failed = put(&state, &base.album.id, save_on(&base, genre("Jazz"))).await;
         assert!(matches!(failed, Err(TagWriteError::Api(_))));
-        assert_eq!(tags::read(&first).unwrap().genre.as_deref(), Some("Rock"));
-        assert_eq!(detail(&state, "Record").version, now.version);
+        assert_eq!(tags::read(&first).unwrap().genre, None);
+        assert_eq!(detail(&state, "Record").version, base.version);
     }
 
     #[tokio::test]

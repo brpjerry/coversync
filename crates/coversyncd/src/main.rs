@@ -1,5 +1,9 @@
 //! coversyncd: indexes a music library and serves the coversync web UI.
 
+// A save moves Library files with Linux's own calls (see `relocate`).
+#[cfg(not(target_os = "linux"))]
+compile_error!("coversyncd runs on Linux");
+
 mod api;
 mod auth;
 mod events;
@@ -84,6 +88,12 @@ pub struct AppState {
     /// has written before their album's version says so. Not `jobs`: a scan
     /// holds that for long, and only indexes.
     pub tag_files: RwLock<()>,
+    /// Held while a save moves Library files and indexes them where they
+    /// went (or files are put back): a stream finds its track's file and
+    /// opens it under a read, so it never opens a path another track's
+    /// file has taken, or one emptied for a moment. Not `tag_files`, so
+    /// playback goes on while a save writes tags.
+    pub moving: tokio::sync::RwLock<()>,
     /// A scan is waiting for `jobs`; scans asked for meanwhile join it.
     pub rescan: AtomicBool,
     /// Smart suggestion lookups, by album.
@@ -189,9 +199,27 @@ pub fn spawn_scan(state: Shared) {
         let result = tokio::task::spawn_blocking(move || {
             // The Library folder may have appeared (or gone) since the last scan.
             s.lib.refresh_library()?;
+            // Files a save moved and never indexed (coversyncd stopped
+            // meanwhile, say) go back to where the index has them, before
+            // the scan would miss them under the names they waited under.
+            // Any not back would be forgotten (their ids, dates and history
+            // with them), so then there's no scan until they are.
+            // (Nor while the tag editor reads a file there.)
+            let files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+            let moving = s.moving.blocking_write();
+            let recovered = coversync_core::relocate::recover(&s.lib)?;
+            drop(moving);
+            drop(files);
+            if recovered.stuck > 0 {
+                return Err(coversync_core::Error::Invalid(format!(
+                    "{} files a save moved couldn't be put back where the index has them; no scan until they are",
+                    recovered.stuck
+                )));
+            }
             scan::scan(&s.lib, &s.covers, &s.roots(), &s.progress)
         })
         .await;
+        let finished = matches!(result, Ok(Ok(())));
         match result {
             Ok(Ok(())) => tracing::info!("scan finished"),
             Ok(Err(e)) => tracing::error!("scan failed: {e}"),
@@ -203,6 +231,11 @@ pub fn spawn_scan(state: Shared) {
         let progress = {
             let mut p = state.progress.write().unwrap_or_else(|e| e.into_inner());
             p.running = false;
+            // One that didn't finish (or start: see recovery above) has no
+            // count of its own to give.
+            if !finished {
+                p.phase = "failed".into();
+            }
             p.clone()
         };
         state.events.publish(events::Notice::ScanFinished(progress));
@@ -322,6 +355,7 @@ async fn run() -> anyhow::Result<()> {
         allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
+        moving: tokio::sync::RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth,
@@ -385,6 +419,7 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         allow_writes: false,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
+        moving: tokio::sync::RwLock::new(()),
         rescan: AtomicBool::new(false),
         identify: suggest::Jobs::default(),
         auth: auth::Auth::open(&state_dir).unwrap(),

@@ -21,7 +21,7 @@ pub struct CoverCache {
     dir: PathBuf,
 }
 
-fn is_image(path: &Path) -> bool {
+pub(crate) fn is_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))

@@ -7,6 +7,7 @@
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import { tick, untrack } from 'svelte';
 	import { expoOut } from 'svelte/easing';
 	import { fade, slide } from 'svelte/transition';
 	import {
@@ -21,7 +22,8 @@
 	import { describeIncomplete, unplacedText, withGaps } from '#lib/incomplete.ts';
 	import { player } from '#lib/player.svelte.ts';
 	import { session } from '#lib/session.svelte.ts';
-	import TagEditor, { lostTracks, type Draft, type TagDraft } from './TagEditor.svelte';
+	import { lostTracks } from '#lib/tag-form.ts';
+	import TagEditor, { type Draft, type TagDraft, type TagView } from './TagEditor.svelte';
 
 	interface Props {
 		album: Album;
@@ -67,9 +69,59 @@
 		ondiscard
 	}: Props = $props();
 
+	/**
+	 * What the tag editor has open, kept while it's shown: a new one (made
+	 * when the album changes elsewhere, or a save is refused; one that saved
+	 * reads the album in place) opens the same way.
+	 */
+	let editorView = $state<TagView | null>(null);
+	/**
+	 * While a new editor reads the tags it's short: its box keeps the height
+	 * the editor had, so the page doesn't jump (and the scroll stays put).
+	 * The height is held all along, following the editor's own except while
+	 * one loads, so it's already there the moment an editor is replaced.
+	 */
+	let editorLoading = $state(false);
+	let editorHeight = $state(0);
+	let heldHeight = $state(0);
+	$effect(() => {
+		if (!editorLoading && editorHeight > 0) heldHeight = editorHeight;
+	});
+
+	/**
+	 * The album the tag editor shows. A new version makes it anew (its kept
+	 * edits put on the album as it is, say); the one its own save answers is
+	 * handed to it to read in place, so nothing flashes.
+	 */
+	let editorDetail = $state(untrack(() => detail));
+	let editorKey = $state(0);
+	let ownSave = false;
+	$effect(() => {
+		const next = detail;
+		untrack(() => {
+			if (next === editorDetail) return;
+			// One album's version for another's: a new editor. Across no album
+			// at all, the sheet makes the editor anew itself.
+			if (next && editorDetail && !ownSave) editorKey++;
+			// Another album comes (from the player bar, say): its editor opens
+			// afresh, not as this one's was.
+			if (!next) editorView = null;
+			ownSave = false;
+			editorDetail = next;
+		});
+	});
+	async function saved(result: TagWriteResult, id: string) {
+		ownSave = true;
+		onsaved(result, id);
+		// Answered with the album as saved by now, or not at all.
+		await tick();
+		ownSave = false;
+	}
+
 	/** Leave the tag editor: its edits go, kept ones included. */
 	function showTracks() {
 		if (mode === 'edit') ondiscard?.();
+		editorView = null;
 		mode = 'tracks';
 	}
 
@@ -77,7 +129,7 @@
 	/** The tag editor's edits, for the notice. */
 	let editing = $state<Draft>('none');
 	/** Kept edits for tracks no longer in the album, which couldn't be put back. */
-	let dropped = $derived(kept && detail ? lostTracks(kept, detail) : 0);
+	let dropped = $derived(kept && detail ? lostTracks(kept, detail.tracks) : 0);
 	let closeButton: HTMLButtonElement;
 	let heroLoaded = $state(false);
 
@@ -318,23 +370,31 @@
 					<p class="path" title={detail.dir}>{`\u200e${detail.dir}\u200e`}</p>
 				</div>
 			{:else}
-				<div in:fade={{ duration: 200 }}>
-					{#key detail}
-						<TagEditor
-							{detail}
-							{allowWrites}
-							{onsaved}
-							{onimport}
-							ondraft={(d) => {
-								editing = d;
-								ondraft?.(d);
-							}}
-							{kept}
-							{onrefused}
-							onrevert={() => ondiscard?.()}
-							onretry={onreload && (() => onreload?.(true, detail ?? undefined))}
-							oncancel={showTracks}
-						/>
+				<div
+					in:fade={{ duration: 200 }}
+					style:min-height={heldHeight && editorView ? `${heldHeight}px` : null}
+				>
+					{#key editorKey}
+						<div bind:offsetHeight={editorHeight}>
+							<TagEditor
+								detail={editorDetail ?? detail}
+								{allowWrites}
+								onsaved={saved}
+								restore={editorView}
+								onview={(v) => (editorView = v)}
+								onloading={(l) => (editorLoading = l)}
+								{onimport}
+								ondraft={(d) => {
+									editing = d;
+									ondraft?.(d);
+								}}
+								{kept}
+								{onrefused}
+								onrevert={() => ondiscard?.()}
+								onretry={onreload && (() => onreload?.(true, detail ?? undefined))}
+								oncancel={showTracks}
+							/>
+						</div>
 					{/key}
 				</div>
 			{/if}

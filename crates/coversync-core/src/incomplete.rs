@@ -188,6 +188,7 @@ mod tests {
             format: "FLAC".into(),
             rel_path: String::new(),
             collection: Collection::Inbox,
+            moved_from: Vec::new(),
         }
     }
 

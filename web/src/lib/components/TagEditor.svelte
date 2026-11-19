@@ -5,24 +5,21 @@
 	/** Edits in the editor: none, some not sent yet, or some being saved. */
 	export type Draft = 'none' | 'draft' | 'saving';
 
+	/** What the editor shows open, kept by the sheet across a new editor (see `restore`). */
+	export interface TagView {
+		/** Show all tags is open. */
+		allTags: boolean;
+		/** Fields open per track. */
+		perTrack: string[];
+		/** Other tags in the files whose "Differs per track" is open. */
+		otherTags: string[];
+	}
+
 	/**
 	 * Edits whose save was refused because the album had changed elsewhere,
 	 * kept to put on top of the album as it is now (see tag-form).
 	 */
 	export type TagDraft = Kept;
-
-	/**
-	 * Whether `detail` still has the draft's track `id`: under that id and at
-	 * the same path, as an id freed by a track removed can name a new one.
-	 */
-	export function stillHere(draft: TagDraft, detail: AlbumDetail, id: number): boolean {
-		return detail.tracks.some((t) => t.id === id && t.rel_path === draft.paths[id]);
-	}
-
-	/** How many tracks a draft edited that `detail` no longer has: those edits can't be put back. */
-	export function lostTracks(draft: TagDraft, detail: AlbumDetail): number {
-		return Object.keys(draft.edits).filter((id) => !stillHere(draft, detail, +id)).length;
-	}
 </script>
 
 <script lang="ts">
@@ -31,7 +28,7 @@
 	import Check from '@lucide/svelte/icons/check';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-	import { onDestroy } from 'svelte';
+	import { onDestroy, untrack } from 'svelte';
 	import { fly, slide } from 'svelte/transition';
 	import { SvelteSet } from 'svelte/reactivity';
 	import {
@@ -60,6 +57,7 @@
 		setAll,
 		shared,
 		valueOf,
+		stillHere,
 		withKept,
 		type Values
 	} from '#lib/tag-form.ts';
@@ -71,6 +69,17 @@
 		allowWrites: boolean;
 		/** A save, answered; `id` is the album's id as it was. */
 		onsaved: (result: TagWriteResult, id: string) => void;
+		/**
+		 * Open as this view once the tags are read: what the editor before
+		 * this one had open (one is made anew when the album changes
+		 * elsewhere, or a save here is refused; after its own save, it reads
+		 * the album in place).
+		 */
+		restore?: TagView | null;
+		/** Hears what's open, as it changes. */
+		onview?: (view: TagView) => void;
+		/** Hears whether the tags are being read (the editor is short then). */
+		onloading?: (loading: boolean) => void;
 		oncancel: () => void;
 		/** Inbox albums: import with the current edits applied to the Library copy. */
 		onimport?: (edits: ImportEdits) => void;
@@ -106,7 +115,10 @@
 		kept = null,
 		onrefused,
 		onrevert,
-		onretry
+		onretry,
+		restore = null,
+		onview,
+		onloading
 	}: Props = $props();
 
 	/** The editor's own names for the fields up front. */
@@ -124,11 +136,13 @@
 	const WIDE = new Set(['album', 'album_artist']);
 	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
 
-	// The editor is made anew for each album version (see AlbumDetail).
+	// The editor is made anew for each album version, except after its own
+	// save, when it reads the album as saved in place (see AlbumDetail): the
+	// tracks are the ones whose tags it shows.
 	// svelte-ignore state_referenced_locally
-	const tracks = detail.tracks;
-	const ids = tracks.map((t) => t.id);
-	const here = (id: number) => (kept ? stillHere(kept, detail, id) : true);
+	let tracks = $state(detail.tracks);
+	let ids = $derived(tracks.map((t) => t.id));
+	const here = (id: number) => (kept ? stillHere(kept, detail.tracks, id) : true);
 
 	let loading = $state(true);
 	let failed = $state<string | null>(null);
@@ -143,14 +157,37 @@
 	const added = new SvelteSet<string>();
 	/** Album-wide fields opened to edit each track's value. */
 	const perTrack = new SvelteSet<string>();
+	/** Show all tags is open. */
+	let allTags = $state(false);
+	const otherOpen = new SvelteSet<string>();
 	let saving = $state(false);
+	/**
+	 * The album whose values the form holds: Save and Import wait while a
+	 * newer one is read in place, as the form's tracks are still the older's.
+	 */
+	let showing = $state.raw<AlbumDetail | null>(null);
+	/** Reads started: only the latest one's answer counts. */
+	let reads = 0;
+	/** The last read was in place: Try again reads in place too. */
+	let quietRead = false;
 
-	async function load() {
-		loading = true;
+	/**
+	 * Read the tags of `detail`. `quiet`: the album as just saved here, read
+	 * in place: what's shown stays until the new values replace it (nothing
+	 * flashes), and edits typed meanwhile stay on top.
+	 */
+	async function load(quiet = false) {
+		const read = ++reads;
+		const latest = () => read === reads;
+		if (!quiet) loading = true;
 		failed = null;
 		stale = false;
+		quietRead = quiet;
+		const shown = detail;
 		try {
-			const [tags] = await Promise.all([api.albumTags(detail.id), setup.load()]);
+			const [tags] = await Promise.all([api.albumTags(shown.id), setup.load()]);
+			// A later read (of a newer album, say) answers instead.
+			if (!latest()) return;
 			// The tag list always has kinds once it's loaded.
 			if (!setup.kinds.length) {
 				failed = 'The list of tags could not be read.';
@@ -158,17 +195,41 @@
 			}
 			// Read from the album as it is now: tracks and values from another
 			// version than the one shown (and saved against) can't be paired.
-			if (tags.version !== detail.version) {
+			if (tags.version !== shown.version) {
 				failed = 'This album changed while its tags were read. Try again to load it as it is now.';
 				stale = true;
 				return;
 			}
+			// Another, newer album came while these were read: it's read next.
+			if (shown !== detail) return;
 			const values: Values = {};
-			for (const id of ids) {
-				const read = tags.tracks.find((t) => t.id === id)?.values ?? {};
+			for (const t of shown.tracks) {
+				const read = tags.tracks.find((x) => x.id === t.id)?.values ?? {};
 				// Every field up front exists on every track, so inputs can bind to it.
-				values[id] = { ...Object.fromEntries(CORE.map((k) => [k, ''])), ...read };
+				values[t.id] = { ...Object.fromEntries(CORE.map((k) => [k, ''])), ...read };
 			}
+			if (quiet) {
+				// What was typed since the save, on the album as saved.
+				const typed = edits(form, base, ids);
+				tracks = shown.tracks;
+				base = structuredClone(values);
+				form = structuredClone(values);
+				let gone = 0;
+				for (const [id, fields] of Object.entries(typed))
+					if (form[+id]) Object.assign(form[+id], fields);
+					else gone++;
+				other = tags.tracks;
+				showing = shown;
+				// A track the save moved to another album (a new genre, say).
+				if (gone)
+					toast(
+						`Edits typed meanwhile to ${gone === 1 ? 'a track' : `${gone} tracks`} the save moved to another album weren't kept`,
+						'error',
+						8000
+					);
+				return;
+			}
+			tracks = shown.tracks;
 			base = structuredClone(values);
 			if (kept) {
 				elsewhere = changedElsewhere(kept, values, here);
@@ -178,7 +239,16 @@
 				for (const kind of ALBUM_CORE) if (shared(form, ids, kind) === null) perTrack.add(kind);
 			} else form = structuredClone(values);
 			other = tags.tracks;
+			// As the editor before this one had it (the album changed elsewhere, say); else
+			// open where kept edits (or changes elsewhere) need looking at.
+			if (restore) {
+				allTags = restore.allTags || extraChanged > 0;
+				for (const kind of restore.perTrack) perTrack.add(kind);
+				for (const key of restore.otherTags) otherOpen.add(key);
+			} else allTags = extraChanged > 0;
+			showing = shown;
 		} catch (e) {
+			if (!latest()) return;
 			failed = e instanceof ApiError ? e.message : 'The tags could not be read.';
 			// Gone under this id: renamed (or removed) since; the sheet may
 			// know it by its new one.
@@ -188,10 +258,39 @@
 				stale = true;
 			}
 		} finally {
-			loading = false;
+			if (latest()) loading = false;
 		}
 	}
 	load();
+
+	/**
+	 * Try reading again: the same way, or, the album having changed since it
+	 * was shown, on the album as it is now. Edits typed since a save then go
+	 * on top of it, as a refused save's do.
+	 */
+	async function retry() {
+		if (stale && changes > 0 && onrefused) {
+			const id = detail.id;
+			const rows = tracks;
+			const current = await api.album(id).catch(() => null);
+			onrefused(current, () => (open ? keep(rows) : null), id);
+		} else if (stale && onretry) onretry();
+		else load(quietRead);
+	}
+	// The album as saved here, handed over by the sheet: read in place.
+	let reading = untrack(() => detail);
+	$effect(() => {
+		const next = detail;
+		if (next === reading) return;
+		reading = next;
+		untrack(() => load(true));
+	});
+
+	$effect(() => onloading?.(loading));
+	$effect(() => {
+		if (loading || failed) return;
+		onview?.({ allTags, perTrack: [...perTrack], otherTags: [...otherOpen] });
+	});
 
 	const anyChanged = (kind: string) => ids.some((id) => changed(form, base, id, kind));
 	const anyElsewhere = (kind: string) => ids.some((id) => elsewhere[id]?.[kind] !== undefined);
@@ -299,9 +398,9 @@
 		onrevert?.();
 	}
 
-	/** The edits, kept to put back on the album as it is now. `sent`: the album they were made on. */
-	function keep(sent: AlbumDetail): TagDraft {
-		const paths = Object.fromEntries(sent.tracks.map((t) => [t.id, t.rel_path]));
+	/** The edits, kept to put back on the album as it is now. `rows`: the tracks they were made on. */
+	function keep(rows: AlbumDetail['tracks']): TagDraft {
+		const paths = Object.fromEntries(rows.map((t) => [t.id, t.rel_path]));
 		return { base: $state.snapshot(base), edits: edits(form, base, ids), paths };
 	}
 
@@ -311,18 +410,27 @@
 		// closed, and another album opened).
 		const sent = detail;
 		const id = sent.id;
+		// What's sent: edits typed while it's saved stay edits.
+		const submitted = $state.snapshot(form);
 		try {
 			const result = await api.writeTags(id, {
-				kinds: edits(form, base, ids),
+				kinds: edits(submitted, base, ids),
 				version: sent.version,
 				base_tracks: sent.tracks.map(({ id, rel_path }) => ({ id, rel_path }))
 			});
+			const files = (n: number) => `${n} ${n === 1 ? 'file' : 'files'}`;
 			toast(
-				`Saved tags to ${result.files_written} ${result.files_written === 1 ? 'file' : 'files'}`,
+				`Saved tags to ${files(result.files_written)}` +
+					(result.files_moved
+						? `, and moved ${files(result.files_moved)} to fit the folder structure`
+						: ''),
 				'success'
 			);
-			// Saved: no longer a draft, while the album is reloaded with them.
-			base = structuredClone($state.snapshot(form));
+			if (result.warning) toast(result.warning, 'error', 10000);
+			// Saved: no longer a draft, while the album is reloaded with them;
+			// what was marked as changed elsewhere is settled.
+			base = submitted;
+			elsewhere = {};
 			onsaved(result, id);
 		} catch (e) {
 			if (e instanceof TagConflict) {
@@ -337,7 +445,7 @@
 				);
 				// Read when the refusal is shown, so edits typed till then are kept;
 				// nothing once this editor has closed.
-				onrefused?.(e.album, () => (open ? keep(sent) : null), id);
+				onrefused?.(e.album, () => (open ? keep(sent.tracks) : null), id);
 			} else toast(e instanceof ApiError ? e.message : 'Saving failed', 'error', 6000);
 		} finally {
 			saving = false;
@@ -431,7 +539,7 @@
 	{:else if failed}
 		<p class="status failed">
 			{failed}
-			<button class="link" onclick={stale && onretry ? onretry : load}>Try again</button>
+			<button class="link" onclick={retry}>Try again</button>
 		</p>
 	{:else}
 		<section>
@@ -494,7 +602,7 @@
 			label="Show all tags"
 			count={extra.length + others.length}
 			badge={extraChanged ? `${extraChanged} changed` : undefined}
-			initiallyOpen={extraChanged > 0}
+			bind:open={allTags}
 		>
 			<div class="all-tags">
 				{#each extraGroups as g (g.id)}
@@ -552,7 +660,11 @@
 									{#if o.values !== null}
 										{#each o.values as v, n (n)}<span class="value">{v}</span>{/each}
 									{:else}
-										<details>
+										<details
+											open={otherOpen.has(o.key)}
+											ontoggle={(e) =>
+												e.currentTarget.open ? otherOpen.add(o.key) : otherOpen.delete(o.key)}
+										>
 											<summary>Differs per track</summary>
 											<ul>
 												{#each o.tracks as t (t.id)}
@@ -598,7 +710,7 @@
 					class="btn"
 					class:primary={!onimport}
 					onclick={save}
-					disabled={changes === 0 || errors || saving || loading}
+					disabled={changes === 0 || errors || saving || loading || showing !== detail}
 				>
 					{#if saving}<span class="spin"><LoaderCircle size={15} /></span>{:else}<Check
 							size={15}
@@ -610,7 +722,7 @@
 				<button
 					class="btn primary"
 					onclick={() => onimport(edits(form, base, ids))}
-					disabled={errors || saving || loading || failed !== null}
+					disabled={errors || saving || loading || failed !== null || showing !== detail}
 				>
 					<FolderInput size={15} /> Import
 				</button>

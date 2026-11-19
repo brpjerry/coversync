@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFile};
@@ -57,12 +58,14 @@ pub struct TrackTags {
 /// a file gives changes, so the next scan reads again the files
 /// [`reader_changed`] names. 1: ID3v2 comments and lyrics with a
 /// description (`iTunNORM`) aren't the comment, or the lyrics. 2: the same
-/// for FLACs with an ID3v2 tag, which 1 left out.
-pub const READER: u32 = 2;
+/// for FLACs with an ID3v2 tag, which 1 left out. 4: a FLAC or Ogg file's
+/// vendor string isn't its encoder (see [`drop_vendor_encoder`]); 3 said so
+/// too, but named no file to read again.
+pub const READER: u32 = 4;
 
-/// Whether what reading `path` gives has changed since reader `since`: for
-/// files that can hold ID3v2 tags, since 1 (a FLAC only if it starts with
-/// one, or can't be opened to tell; since 2); Ogg files can't.
+/// Whether what reading `path` gives has changed since reader `since`, by
+/// its extension: FLAC and Ogg files (their Vorbis comments' vendor string)
+/// since 4, which covers a FLAC's ID3v2 tag (2) too; any other since 1.
 pub fn reader_changed(path: &Path, since: u32) -> bool {
     let ext = path
         .extension()
@@ -70,15 +73,8 @@ pub fn reader_changed(path: &Path, since: u32) -> bool {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     match ext.as_str() {
-        "ogg" | "oga" | "opus" | "spx" => false,
-        "flac" => {
-            use std::io::Read;
-            let mut head = [0u8; 3];
-            since < 2
-                && fs::File::open(path)
-                    .and_then(|mut f| f.read_exact(&mut head))
-                    .map_or(true, |()| &head == b"ID3")
-        }
+        "ogg" | "oga" | "opus" | "spx" | "flac" if since < 4 => true,
+        "ogg" | "oga" | "opus" | "spx" | "flac" => false,
         _ => since < 1,
     }
 }
@@ -93,6 +89,40 @@ fn probe(path: &Path, cover_art: bool) -> Result<TaggedFile> {
         .options(ParseOptions::new().read_cover_art(cover_art))
         .read()
         .map_err(tag_err)
+}
+
+/// As [`probe`], without the audio stream's properties: for what only needs
+/// tags (some readers, raw AAC's say, walk the audio for them).
+fn probe_tags(path: &Path, cover_art: bool) -> Result<TaggedFile> {
+    Probe::open(path)
+        .map_err(tag_err)?
+        .options(
+            ParseOptions::new()
+                .read_cover_art(cover_art)
+                .read_properties(false),
+        )
+        .read()
+        .map_err(tag_err)
+}
+
+/// Lofty reads a FLAC or Ogg file's vendor string as its encoder when it
+/// has no ENCODER comment: not a tag the file has (an edit keeps the vendor
+/// string apart), so not a value.
+/// `values` are those of `tag`, the tag read; true when the encoder went.
+fn drop_vendor_encoder(
+    path: &Path,
+    file: &TaggedFile,
+    tag: Option<&Tag>,
+    values: &mut HashMap<&'static str, String>,
+) -> Result<bool> {
+    let vendor_only = values.contains_key("encoder")
+        && tag.is_some_and(|t| t.tag_type() == TagType::VorbisComments)
+        && !vorbis_comments(path, file.file_type())?
+            .is_some_and(|(raw, _)| raw.get("ENCODER").is_some());
+    if vendor_only {
+        values.remove("encoder");
+    }
+    Ok(vendor_only)
 }
 
 fn text(s: Option<std::borrow::Cow<'_, str>>) -> Option<String> {
@@ -167,6 +197,9 @@ pub fn read(path: &Path) -> Result<TrackTags> {
         out.year = year(tag);
         out.tag_keys = crate::rules::present(tag);
         out.values = values_of(tag);
+        if drop_vendor_encoder(path, &file, Some(tag), &mut out.values)? {
+            out.tag_keys.retain(|k| *k != "encoder");
+        }
     }
     Ok(out)
 }
@@ -1002,26 +1035,110 @@ pub fn write(path: &Path, edit: &TagEdit) -> Result<()> {
 /// As [`write`], then set tag kinds (catalog ids) as an import does; an
 /// empty value removes the kind.
 pub fn write_with_kinds(path: &Path, edit: &TagEdit, kinds: &[(&str, String)]) -> Result<()> {
-    // Keep the real extension last: lofty picks the format from it.
-    let name = path.file_name().ok_or(Error::NotFound)?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".coversync-tmp-{name}"));
-    fs::copy(path, &tmp)?;
-    let result = (|| {
-        let mut file = probe(&tmp, true)?;
-        let rest = vorbis_rest(&tmp, file.file_type())?;
-        let tag = primary_tag_mut(&mut file);
-        apply_kinds(tag, &merged(edit, kinds)?)?;
-        let mut edited = edit_kinds(edit);
-        edited.extend(kinds.iter().map(|(id, _)| *id));
-        save(&tmp, file, rest, &[], &edited)?;
-        fs::File::open(&tmp)?.sync_all()?;
-        fs::rename(&tmp, path)?;
+    prepare_with_kinds(path, edit, kinds)?.commit()
+}
+
+/// An edited copy of a file, written beside it and not yet in its place:
+/// read it (its tags as saved) before [`Prepared::commit`] puts it there.
+/// Dropped uncommitted, the copy goes and the file stays as it was.
+#[derive(Debug)]
+pub struct Prepared {
+    /// The file the edit is for.
+    pub path: PathBuf,
+    /// The edited copy.
+    pub copy: PathBuf,
+    done: bool,
+}
+
+impl Prepared {
+    /// Put the edited copy in the file's place (one rename).
+    pub fn commit(mut self) -> Result<()> {
+        fs::rename(&self.copy, &self.path)?;
+        self.done = true;
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
     }
-    result
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = fs::remove_file(&self.copy);
+        }
+    }
+}
+
+/// A new file beside `path`, under a name no file had (made so: never
+/// replacing one, or following a link there), short, and keeping `path`'s
+/// extension last, as lofty picks the format from it. Only its owner can
+/// read it until it has the file's permissions.
+fn new_beside(path: &Path) -> Result<(PathBuf, fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let extension = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{:x}-{n:x}", std::process::id());
+        let copy = path.with_file_name(format!(".coversync-tmp-{id}{extension}"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&copy) {
+            Ok(file) => return Ok((copy, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// [`write_with_kinds`]'s edit, written to a copy beside the file (see
+/// [`Prepared`]): everything that can refuse it does so here.
+pub fn prepare_with_kinds(
+    path: &Path,
+    edit: &TagEdit,
+    kinds: &[(&str, String)],
+) -> Result<Prepared> {
+    prepare_owned(path, edit, kinds, |_, _| Ok(()))
+}
+
+/// [`prepare_with_kinds`], telling `owner` the copy's name and file as soon
+/// as it exists, before any of the file is copied: coversyncd records it,
+/// so a copy left by a coversyncd that stopped meanwhile can be found and
+/// removed (and nothing else by its name). A copy `owner` refuses goes.
+pub fn prepare_owned(
+    path: &Path,
+    edit: &TagEdit,
+    kinds: &[(&str, String)],
+    owner: impl FnOnce(&Path, &fs::File) -> Result<()>,
+) -> Result<Prepared> {
+    let mut source = fs::File::open(path)?;
+    let (copy, mut file) = new_beside(path)?;
+    // Owned now: from here a failure (a full disk, say) takes the copy away.
+    let prepared = Prepared {
+        path: path.to_path_buf(),
+        copy,
+        done: false,
+    };
+    owner(&prepared.copy, &file)?;
+    io::copy(&mut source, &mut file)?;
+    file.set_permissions(source.metadata()?.permissions())?;
+    drop(file);
+    let tmp = &prepared.copy;
+    let mut file = probe_tags(tmp, true)?;
+    let rest = vorbis_rest(tmp, file.file_type())?;
+    let tag = primary_tag_mut(&mut file);
+    apply_kinds(tag, &merged(edit, kinds)?)?;
+    let mut edited = edit_kinds(edit);
+    edited.extend(kinds.iter().map(|(id, _)| *id));
+    save(tmp, file, rest, &[], &edited)?;
+    fs::File::open(tmp)?.sync_all()?;
+    Ok(prepared)
 }
 
 /// The text value of every rule tag kind the file has, keyed by catalog id.
@@ -1039,12 +1156,10 @@ pub struct KindValues {
 }
 
 pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
-    let file = probe(path, pictures)?;
-    let values = file
-        .primary_tag()
-        .or_else(|| file.first_tag())
-        .map(values_of)
-        .unwrap_or_default();
+    let file = probe_tags(path, pictures)?;
+    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let mut values = tag.map(values_of).unwrap_or_default();
+    drop_vendor_encoder(path, &file, tag, &mut values)?;
     Ok(KindValues {
         values,
         has_art: pictures && has_pictures(&file),
@@ -1061,9 +1176,10 @@ pub fn read_kinds_split(
     pictures: bool,
     split: &crate::split::Splitter,
 ) -> Result<KindValues> {
-    let file = probe(path, pictures)?;
+    let file = probe_tags(path, pictures)?;
     let tag = file.primary_tag().or_else(|| file.first_tag());
     let mut values = tag.map(values_of).unwrap_or_default();
+    drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
         for kind in crate::split::PEOPLE.iter().filter_map(|id| rules::kind(id)) {
             let all: Vec<&str> = kind
@@ -2177,6 +2293,43 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_prepared_copy_is_private_and_named_to_its_owner_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("coversync-prepare-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.flac");
+        flac_with_comments(&path, &["TITLE=Song"]);
+        let (copy, _file) = new_beside(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Told before a byte is copied; a copy it refuses goes.
+        let edit = TagEdit {
+            title: Some("New".into()),
+            ..Default::default()
+        };
+        let mut told = None;
+        let prepared = prepare_owned(&path, &edit, &[], |c, _| {
+            told = Some((c.to_path_buf(), fs::metadata(c).unwrap().len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(told, Some((prepared.copy.clone(), 0)));
+        drop(prepared);
+        let mut refused = None;
+        let err = prepare_owned(&path, &edit, &[], |c, _| {
+            refused = Some(c.to_path_buf());
+            Err(Error::Invalid("no".into()))
+        });
+        assert!(err.is_err());
+        assert!(!refused.unwrap().exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     #[cfg(feature = "server")]
     fn flac_pictures_and_kept_tags_go_together() {
         let dir = std::env::temp_dir().join(format!("coversync-flacart-{}", std::process::id()));
@@ -3168,6 +3321,24 @@ mod tests {
             file_tags(&path("enc.flac"), "; ").unwrap().values["encoder"],
             "flac 1.4"
         );
+        // Nor do the index, imports or placement.
+        let indexed = read(&path("plain.flac")).unwrap();
+        assert!(!indexed.values.contains_key("encoder"));
+        assert!(!indexed.tag_keys.contains(&"encoder"));
+        assert!(
+            !read_kinds(&path("plain.flac"), false)
+                .unwrap()
+                .values
+                .contains_key("encoder")
+        );
+        assert_eq!(
+            read(&path("enc.flac")).unwrap().values["encoder"],
+            "flac 1.4"
+        );
+        assert_eq!(
+            read_kinds(&path("enc.flac"), false).unwrap().values["encoder"],
+            "flac 1.4"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3676,18 +3847,19 @@ mod tests {
 
     #[test]
     fn files_read_again_for_a_new_reader_are_those_it_reads_differently() {
-        // Since reader 0: MP3s and M4As, not Ogg; a FLAC only with ID3v2
-        // (or if it can't be opened to tell).
+        // Since reader 0: MP3s and M4As (ID3v2 descriptions), and FLAC and
+        // Ogg (vendor strings).
         assert!(reader_changed(Path::new("/m/a.mp3"), 0));
         assert!(reader_changed(Path::new("/m/a.M4A"), 0));
-        assert!(!reader_changed(Path::new("/m/a.Opus"), 0));
-        // A path under a file can't be opened, wherever this runs.
-        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml/missing.flac");
-        assert!(reader_changed(&missing, 0));
-        // Since 1: only such FLACs.
-        assert!(!reader_changed(Path::new("/m/a.mp3"), 1));
-        assert!(reader_changed(&missing, 1));
-        assert!(!reader_changed(&missing, READER));
+        assert!(reader_changed(Path::new("/m/a.Opus"), 0));
+        // Since 1, 2 and 3: FLAC and Ogg files, every one.
+        for since in 1..=3 {
+            assert!(!reader_changed(Path::new("/m/a.mp3"), since));
+            assert!(reader_changed(Path::new("/m/a.flac"), since));
+            assert!(reader_changed(Path::new("/m/a.ogg"), since));
+        }
+        assert!(!reader_changed(Path::new("/m/a.flac"), READER));
+        assert!(!reader_changed(Path::new("/m/a.mp3"), READER));
     }
 
     #[test]
