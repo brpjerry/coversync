@@ -1665,7 +1665,11 @@ fn track_suggestions(
             let suggestions = values
                 .into_iter()
                 .filter(|(kind, _)| !unsorted.contains(kind))
-                .filter(|(kind, _)| tags::can_store(local.tag_type, kind))
+                // A substitution can make a value the import would refuse.
+                .filter(|(kind, value)| {
+                    tags::can_store(local.tag_type, kind)
+                        && tags::validate_kind(kind, value).is_ok()
+                })
                 .filter_map(|(kind, value)| {
                     let current = ours.get(kind).filter(|v| !v.trim().is_empty());
                     let before = originals
@@ -2265,6 +2269,7 @@ mod tests {
         let split = Splitter::new(";", &[]).substituting(vec![
             sub("s/^drum and bass$/DnB/i", "genre"),
             sub(r"s/ \(Live\)$//", "title"),
+            sub("s/^/Year /", "date"),
         ]);
         let tracks = [
             local(10, &[("track_number", "1"), ("title", "Thaw (Live)")]),
@@ -2275,6 +2280,8 @@ mod tests {
         assert_eq!(find(&out[0], "genre").unwrap().value, "DnB;Ambient");
         // The title as the import would write it: nothing to suggest.
         assert!(find(&out[0], "title").is_none());
+        // Nor a value the import would refuse.
+        assert!(find(&out[0], "date").is_none());
     }
 
     #[test]

@@ -441,8 +441,9 @@
 					every match, <code>i</code> to ignore case. In the replacement, <code>&amp;</code> is the
 					match,
 					<code>\1</code>–<code>\9</code> its groups; <code>\u</code> and <code>\U…\E</code>
-					make them upper case, <code>\l</code> and <code>\L…\E</code> lower. A tag holding several names,
-					split by the separator, has each changed on its own.
+					make them upper case, <code>\l</code> and <code>\L…\E</code> lower. Names, genres and release
+					types, split by the separator, are changed one by one; other tags whole. A rule that would leave
+					a tag empty is skipped.
 				</p>
 			</div>
 		</section>

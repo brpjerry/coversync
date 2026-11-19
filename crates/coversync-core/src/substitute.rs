@@ -121,6 +121,10 @@ impl Substitute {
                 }
                 Piece::Span(case) => {
                     span = *case;
+                    // \E ends a \u still waiting for its character too.
+                    if case.is_none() {
+                        next = None;
+                    }
                     continue;
                 }
             };
@@ -216,6 +220,14 @@ fn push_text(pieces: &mut Vec<Piece>, c: char) {
 /// Library setup's substitutions as saved: trimmed, without blank ones,
 /// each with the tags it changes in catalog order, and each one that runs.
 pub fn normalize(substitutions: Vec<Substitution>) -> Result<Vec<Substitution>> {
+    let typed = substitutions
+        .iter()
+        .filter(|s| !s.expression.trim().is_empty());
+    if typed.count() > MAX_SUBSTITUTIONS {
+        return Err(Error::Invalid(format!(
+            "Library setup can have up to {MAX_SUBSTITUTIONS} substitutions."
+        )));
+    }
     let mut out = Vec::new();
     for s in substitutions {
         let expression = s.expression.trim().to_string();
@@ -248,11 +260,6 @@ pub fn normalize(substitutions: Vec<Substitution>) -> Result<Vec<Substitution>> 
         let s = Substitution { expression, tags };
         Substitute::new(&s)?;
         out.push(s);
-    }
-    if out.len() > MAX_SUBSTITUTIONS {
-        return Err(Error::Invalid(format!(
-            "Library setup can have up to {MAX_SUBSTITUTIONS} substitutions."
-        )));
     }
     Ok(out)
 }
@@ -305,6 +312,8 @@ mod tests {
         // A group that took no part is empty; $ is only a dollar sign.
         assert_eq!(run(r"s/a(x)?/<\1$1>/", "a"), "<$1>");
         assert_eq!(run(r"s/a/\&\\/", "a"), r"&\");
+        // \E ends a \u that had no character to change.
+        assert_eq!(run(r"s/(a)?b/\u\1\Erest/", "b"), "rest");
     }
 
     #[test]
@@ -368,13 +377,19 @@ mod tests {
         assert!(with("s/a/b/", &["rating"]).is_err());
         assert!(with("s/(/b/", &["title"]).is_err());
         assert!(with(&format!("s/{}/b/", "a".repeat(500)), &["title"]).is_err());
+        // Counted before any is compiled.
         let many = vec![
             Substitution {
-                expression: "s/a/b/".into(),
+                expression: "s/(/b/".into(),
                 tags: vec!["title".into()],
             };
             33
         ];
-        assert!(normalize(many).is_err());
+        assert!(
+            normalize(many)
+                .unwrap_err()
+                .to_string()
+                .contains("up to 32")
+        );
     }
 }

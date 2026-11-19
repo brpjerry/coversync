@@ -121,19 +121,20 @@ used on a home server.
   import dialog are written as typed; the dialog says which tags it split. Filters split names at the phrases too, so an artist can be
   picked on its own in the Inbox as well.
 - **Substitutions** (Library setup): regular expressions, each on the tags
-  you pick, written as in vim: `s/pattern/replacement/flags`, any
-  punctuation for the `/`. Patterns are Perl-style, as vim's `\v` (`(a|b)+`,
-  `\d{4}`, `\b`), without look-around or back-references, so matching
-  never slows down whatever the tag. Flags: `g` for every match rather
-  than the first, `i` to ignore case. In the replacement, `&` and `\0` are
-  the match, `\1`–`\9` its groups, `\u`/`\l` change the case of the next
-  character and `\U`/`\L` everything up to `\E`. They run in order, after
-  names are split, on each name of a tag holding several, in what the import
-  writes (the dialog says which tags they changed; typed values stay as
-  typed) and in what MusicBrainz suggests. `s/ \(Live\)$//` on the title
-  turns `Song (Live)` into `Song`; `s/^(.+), The$/The \1/` on the artist
-  turns `Beatles, The` into `The Beatles`. A substitution that would leave
-  a tag empty leaves it as it was.
+  you pick, written as in vim: `s/pattern/replacement/flags`, with any ASCII
+  punctuation but `\` in place of `/`. Patterns are Perl-style, as vim's
+  `\v` (`(a|b)+`, `\d{4}`, `\b`), without look-around or back-references.
+  Flags: `g` for every match rather than the first, `i` to ignore case. In
+  the replacement, `&` and `\0` are the match, `\1`–`\9` its groups,
+  `\u`/`\l` change the case of the next character and `\U`/`\L`
+  everything up to `\E`. They run in order, after names are split, in what
+  the import writes (the dialog says which tags they changed; typed values
+  stay as typed) and in what MusicBrainz suggests. A tag holding several
+  values (names, genres, release types) has each changed on its own; other
+  tags are changed whole. `s/ \(Live\)$//` on the title turns `Song (Live)`
+  into `Song`; `s/^(.+), The$/The \1/` on the artist turns `Beatles, The`
+  into `The Beatles`. A rule that would leave a tag empty is skipped, and
+  suggestions a rule makes invalid (a date that isn't one) aren't offered.
 - **Import** (right-click an Inbox album): checks the rules and the template's
   tags, opens an editor for anything missing, then copies (or moves) the files
   into place with the new tags and art. In Copy mode the original is never

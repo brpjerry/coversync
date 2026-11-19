@@ -1167,11 +1167,11 @@ pub fn read_kinds(path: &Path, pictures: bool) -> Result<KindValues> {
     })
 }
 
-/// As [`read_kinds`], but a tag that the file holds several times (Vorbis
-/// comments `ARTIST=A feat. B` and `ARTIST=C`, say) has them all, joined by
-/// `split`'s separator, when `split` would rewrite one (at a phrase, or by
-/// a substitution): the import then rewrites the tag, and would otherwise
-/// keep only the first.
+/// As [`read_kinds`], but a tag that holds several values that the file
+/// holds several times (Vorbis comments `ARTIST=A feat. B` and `ARTIST=C`,
+/// say) has them all, joined by `split`'s separator, when `split` would
+/// rewrite them (at a phrase, or by a substitution): the import then
+/// rewrites the tag, and would otherwise keep only the first.
 pub fn read_kinds_split(
     path: &Path,
     pictures: bool,
@@ -1182,10 +1182,14 @@ pub fn read_kinds_split(
     let mut values = tag.map(values_of).unwrap_or_default();
     drop_vendor_encoder(path, &file, tag, &mut values)?;
     if let Some(tag) = tag {
-        for kind in rules::CATALOG {
+        for kind in rules::CATALOG
+            .iter()
+            .filter(|k| crate::split::holds_several(k.id))
+        {
             let all: Vec<&str> = texts(tag, kind).collect();
-            if all.len() > 1 && all.iter().any(|v| split.rewrite(kind.id, v).is_some()) {
-                values.insert(kind.id, all.join(split.separator()));
+            let joined = all.join(split.separator());
+            if all.len() > 1 && split.rewrite(kind.id, &joined).is_some() {
+                values.insert(kind.id, joined);
             }
         }
     }
@@ -2189,6 +2193,34 @@ mod tests {
             substitutes.rewrite("genre", &read.values["genre"]).unwrap(),
             "Metal;Pop"
         );
+        // One that goes, wherever it is.
+        let unknown = Substitute::new(&Substitution {
+            expression: "s/^Unknown$//".into(),
+            tags: vec!["genre".into()],
+        })
+        .unwrap();
+        let drops = crate::split::Splitter::new(";", &[]).substituting(vec![unknown]);
+        for comments in [
+            ["GENRE=Rock", "GENRE=Unknown"],
+            ["GENRE=Unknown", "GENRE=Rock"],
+        ] {
+            flac_with_comments(&path, &comments);
+            let read = read_kinds_split(&path, false, &drops).unwrap();
+            assert_eq!(
+                drops.rewrite("genre", &read.values["genre"]).unwrap(),
+                "Rock"
+            );
+        }
+        // A tag holding one value, under two names, is read as one.
+        let year = Substitute::new(&Substitution {
+            expression: "s/2003/2004/".into(),
+            tags: vec!["date".into()],
+        })
+        .unwrap();
+        let year = crate::split::Splitter::new(";", &[]).substituting(vec![year]);
+        flac_with_comments(&path, &["DATE=2003", "YEAR=2003"]);
+        let read = read_kinds_split(&path, false, &year).unwrap();
+        assert_eq!(year.rewrite("date", &read.values["date"]).unwrap(), "2004");
         let _ = fs::remove_dir_all(&dir);
     }
 
