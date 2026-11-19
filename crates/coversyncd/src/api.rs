@@ -1432,7 +1432,7 @@ async fn write_tags(
     saved?.map(Json)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Restructured {
     /// Albums moved, and the files moved with them (tracks and covers).
     albums: usize,
@@ -1444,91 +1444,133 @@ struct Restructured {
 #[derive(Serialize)]
 struct Unmoved {
     title: String,
+    /// Its folder, under the Library folder: albums can share a title.
+    dir: String,
     error: String,
 }
 
 /// Put every Library album where the folder structure says, as saving its
 /// tags with no edits does (see `write_tags`), for a structure changed since
 /// albums were imported. Albums already in place are left alone; one that
-/// can't move stays, with why.
-async fn restructure(State(state): State<Shared>) -> ApiResult<Json<Restructured>> {
-    // The albums with files to move, as they are now: each is saved on
-    // that version, so one changed meanwhile is reported, not moved.
-    let (to_move, mut failed) = blocking(&state, |s| {
-        let (mut to_move, mut failed) = (Vec::new(), Vec::new());
-        let Some(root) = s.lib.library_folder()? else {
-            return Ok((to_move, failed));
-        };
-        let template = Template::parse(&s.lib.library_setup()?.structure)?;
-        let splitter = coversync_core::split::Splitter::default();
-        for album in s
-            .lib
-            .albums(Collection::Library, &[], &[], &splitter, &[], None)?
-        {
-            let Some(detail) = s.lib.album(&album.id)? else {
-                continue;
+/// can't move stays, with why. The body is JSON (`{}`), which a form on
+/// another site can't send. Once begun, the moves go on if the request is
+/// dropped.
+async fn restructure(
+    State(state): State<Shared>,
+    _: Json<serde_json::Value>,
+) -> ApiResult<Json<Restructured>> {
+    Ok(Json(tokio::spawn(restructure_all(state)).await??))
+}
+
+async fn restructure_all(state: Shared) -> ApiResult<Restructured> {
+    let mut done = Restructured::default();
+    // A second pass for albums another one was in the way of.
+    for _ in 0..2 {
+        let moved = done.files;
+        let (to_move, mut failed) = exclusively(&state, misplaced).await?;
+        for (detail, dir) in to_move {
+            // Saved on the version found, so one changed meanwhile is reported, not moved.
+            let body = TagWrite {
+                version: Some(detail.version.clone()),
+                base_tracks: Some(
+                    detail
+                        .tracks
+                        .iter()
+                        .map(|t| BaseTrack {
+                            id: t.id,
+                            rel_path: t.rel_path.clone(),
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
             };
-            let placed = detail
-                .tracks
-                .iter()
-                .map(|t| {
-                    let (path, _) = s
-                        .lib
-                        .track_root(t.id)?
-                        .ok_or(coversync_core::Error::NotFound)?;
-                    let values = tags::read_kinds(&path, false)?.values;
-                    Ok((path, values))
-                })
-                .collect::<coversync_core::Result<Vec<_>>>();
-            match placed.and_then(|placed| relocate::plan(&template, &root, &placed)) {
-                Ok(plan) if plan.is_empty() => {}
-                Ok(_) => to_move.push(detail),
-                Err(e) => failed.push(Unmoved {
-                    title: detail.album.title,
-                    error: e.to_string(),
-                }),
+            let unmoved = |error: String| Unmoved {
+                title: detail.album.title.clone(),
+                dir: dir.clone(),
+                error,
+            };
+            match write_tags(
+                State(state.clone()),
+                Path(detail.album.id.clone()),
+                Json(body),
+            )
+            .await
+            {
+                Ok(Json(saved)) => {
+                    if saved.files_moved > 0 {
+                        done.albums += 1;
+                        done.files += saved.files_moved;
+                    }
+                    if let Some(error) = saved.warning {
+                        failed.push(unmoved(error));
+                    }
+                }
+                Err(TagWriteError::Api(ApiError(_, error))) => failed.push(unmoved(error)),
+                Err(TagWriteError::Conflict(c)) => failed.push(unmoved(c.error.into())),
             }
         }
-        Ok((to_move, failed))
-    })
-    .await?;
-    let (mut albums, mut files) = (0, 0);
-    for detail in to_move {
-        let body = TagWrite {
-            version: Some(detail.version.clone()),
-            base_tracks: Some(
-                detail
-                    .tracks
-                    .iter()
-                    .map(|t| BaseTrack {
-                        id: t.id,
-                        rel_path: t.rel_path.clone(),
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
+        done.failed = failed;
+        if done.files == moved || done.failed.is_empty() {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// Albums with files to move, each with its folder under the Library
+/// folder, and those that can't be placed, with why.
+type Misplaced = (Vec<(AlbumDetail, String)>, Vec<Unmoved>);
+
+/// The Library's albums the folder structure puts elsewhere (see [`Misplaced`]).
+fn misplaced(s: &crate::AppState) -> coversync_core::Result<Misplaced> {
+    let root = s
+        .lib
+        .library_folder()?
+        .filter(|root| root.is_dir())
+        .ok_or_else(|| {
+            coversync_core::Error::Invalid("The Library folder isn't available.".into())
+        })?;
+    // Files a stopped save left moved away are back where the index has them.
+    if !s.lib.recorded_moves()?.is_empty() {
+        let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+        moves_put_back(s, "moved")?;
+    }
+    let template = Template::parse(&s.lib.library_setup()?.structure)?;
+    let splitter = coversync_core::split::Splitter::default();
+    let (mut to_move, mut failed) = (Vec::new(), Vec::new());
+    for album in s
+        .lib
+        .albums(Collection::Library, &[], &[], &splitter, &[], None)?
+    {
+        let Some(detail) = s.lib.album(&album.id)? else {
+            continue;
         };
-        let title = detail.album.title;
-        match write_tags(State(state.clone()), Path(detail.album.id), Json(body)).await {
-            Ok(Json(saved)) => {
-                albums += 1;
-                files += saved.files_moved;
-                if let Some(error) = saved.warning {
-                    failed.push(Unmoved { title, error });
-                }
-            }
-            Err(TagWriteError::Api(ApiError(_, error))) => failed.push(Unmoved { title, error }),
-            Err(TagWriteError::Conflict(c)) => failed.push(Unmoved {
-                title,
-                error: c.error.into(),
+        let placed = detail
+            .tracks
+            .iter()
+            .map(|t| {
+                let (path, _) = s
+                    .lib
+                    .track_root(t.id)?
+                    .ok_or(coversync_core::Error::NotFound)?;
+                let values = tags::kind_values(&path)?;
+                Ok((path, values))
+            })
+            .collect::<coversync_core::Result<Vec<_>>>();
+        let dir = FsPath::new(&detail.dir)
+            .strip_prefix(&root)
+            .map_or_else(|_| detail.dir.clone(), |d| d.display().to_string());
+        match placed.and_then(|placed| relocate::plan(&template, &root, &placed)) {
+            Ok(plan) if plan.is_empty() => {}
+            Ok(_) => to_move.push((detail, dir)),
+            Err(e) => failed.push(Unmoved {
+                title: detail.album.title,
+                dir,
+                error: e.to_string(),
             }),
         }
     }
-    Ok(Json(Restructured {
-        albums,
-        files,
-        failed,
-    }))
+    Ok((to_move, failed))
 }
 
 /// Put back the moves saves made and never indexed (see `relocate`), before
@@ -2364,27 +2406,69 @@ mod tests {
     async fn restructuring_moves_the_albums_a_new_structure_puts_elsewhere() {
         let (state, root, _) =
             library_record("restructure", coversync_core::template::DEFAULT).await;
+        import_titled(&state, "Other").await;
         std::fs::write(root.join("Artist/Record/cover.jpg"), b"art").unwrap();
+        // A folder holding more than an album's tracks and cover stays, and says why.
+        std::fs::write(root.join("Artist/Other/notes.txt"), b"mine").unwrap();
         set_structure(
             &state,
             "{album_artist} - {album}/<{track_number} - >{title}",
         );
-        let Json(done) = restructure(State(state.clone())).await.unwrap();
-        assert_eq!((done.albums, done.files, done.failed.len()), (1, 4, 0));
+        let all = || restructure(State(state.clone()), Json(serde_json::json!({})));
+        let Json(done) = all().await.unwrap();
+        assert_eq!((done.albums, done.files), (1, 4));
         assert!(root.join("Artist - Record/03 - Song 3.flac").is_file());
         assert!(root.join("Artist - Record/cover.jpg").is_file());
+        assert_eq!(done.failed.len(), 1);
+        let other = &done.failed[0];
+        assert_eq!(
+            (other.title.as_str(), other.dir.as_str()),
+            ("Other", "Artist/Other")
+        );
+        assert!(other.error.contains("notes.txt"), "{}", other.error);
+        assert!(root.join("Artist/Other").is_dir());
+        // Once it's moved aside, the rest moves; what's in place is left
+        // alone, unannounced.
+        std::fs::remove_file(root.join("Artist/Other/notes.txt")).unwrap();
+        let mut heard = state.events.subscribe();
+        let Json(rest) = all().await.unwrap();
+        assert_eq!((rest.albums, rest.failed.len()), (1, 0));
         assert!(!root.join("Artist").exists());
-        // Everything's in place: nothing to do.
-        let Json(again) = restructure(State(state.clone())).await.unwrap();
+        let mut told = Vec::new();
+        while let Ok(notice) = heard.try_recv() {
+            if let Notice::AlbumChanged { previous_id, .. } = notice {
+                told.push(previous_id);
+            }
+        }
+        assert_eq!(told.len(), 1, "only the album that moved: {told:?}");
+        let Json(again) = all().await.unwrap();
         assert_eq!((again.albums, again.files, again.failed.len()), (0, 0, 0));
-        // A folder holding more than the album's tracks and cover stays, and says why.
-        std::fs::write(root.join("Artist - Record/notes.txt"), b"mine").unwrap();
-        set_structure(&state, coversync_core::template::DEFAULT);
-        let Json(refused) = restructure(State(state.clone())).await.unwrap();
-        assert_eq!((refused.albums, refused.files), (0, 0));
-        assert_eq!(refused.failed.len(), 1);
-        assert_eq!(refused.failed[0].title, "Record");
-        assert!(root.join("Artist - Record/01 - Song 1.flac").is_file());
+    }
+
+    #[tokio::test]
+    async fn restructuring_moves_an_album_into_a_place_another_one_left() {
+        let (state, root, record) =
+            library_record("restructure-chain", "{album}/<{track_number} - >{title}").await;
+        let other = state
+            .lib
+            .album(&import_titled(&state, "Other").await)
+            .unwrap()
+            .unwrap();
+        // Record's files go where Other's are; Other's go somewhere free.
+        put(&state, &record.album.id, save_on(&record, genre("Other")))
+            .await
+            .unwrap();
+        put(&state, &other.album.id, save_on(&other, genre("Third")))
+            .await
+            .unwrap();
+        set_structure(&state, "{genre}/<{track_number} - >{title}");
+        let Json(done) = restructure(State(state.clone()), Json(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!((done.albums, done.files, done.failed.len()), (2, 5, 0));
+        assert!(root.join("Other/03 - Song 3.flac").is_file());
+        assert!(root.join("Third/02 - Song 2.flac").is_file());
+        assert!(!root.join("Record").exists());
     }
 
     #[tokio::test]

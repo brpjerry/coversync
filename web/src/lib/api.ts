@@ -358,8 +358,8 @@ export interface Restructured {
 	/** Albums moved, and their files (tracks and covers). */
 	albums: number;
 	files: number;
-	/** Albums left where they were, with why. */
-	failed: { title: string; error: string }[];
+	/** Albums left where they were, with why; `dir` is the album's folder. */
+	failed: { title: string; dir: string; error: string }[];
 }
 
 export interface HiddenStats {
@@ -958,7 +958,7 @@ export const api = {
 	checkCa: (path: string) =>
 		request<CaInfo | null>(`/api/pairing/check-ca?path=${encodeURIComponent(path)}`),
 	/** Move every Library album to where the saved folder structure puts it. */
-	restructureLibrary: () => request<Restructured>('/api/library/restructure', { method: 'POST' }),
+	restructureLibrary: () => request<Restructured>('/api/library/restructure', json('POST', {})),
 	unhideAll: () =>
 		request<{ unhidden: number; hidden: HiddenStats }>('/api/inbox/unhide', { method: 'POST' }),
 	uploads: () => request<UploadsInfo>('/api/uploads'),

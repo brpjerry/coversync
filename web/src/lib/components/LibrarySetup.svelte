@@ -24,8 +24,7 @@
 	import FolderSync from '@lucide/svelte/icons/folder-sync';
 	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import Toggle from './Toggle.svelte';
-	import { api, ApiError, type ArtPlacement, type TagKind } from '#lib/api.ts';
-	import { toast } from '#lib/toast.svelte.ts';
+	import type { ArtPlacement, TagKind } from '#lib/api.ts';
 	import { count, fold } from '#lib/format.ts';
 	import { setup } from '#lib/setup.svelte.ts';
 	import SetupPane, { type Back } from './SetupPane.svelte';
@@ -177,42 +176,19 @@
 			: ''
 	);
 
-	// Moving every album to fit the folder structure: asked first.
+	// Moving every album to fit the folder structure (see setup.moveAll): asked first.
 	let confirmingMove = $state(false);
-	let moving = $state(false);
-	/** Why albums can't be moved now, if they can't. */
-	let moveBlocked = $derived(
-		!setup.saved.folder
-			? 'Choose a Library folder first'
-			: setup.structure.trim() !== setup.saved.structure
-				? 'Save the new structure first'
-				: null
-	);
-	async function restructure() {
-		moving = true;
-		const n = (k: number, one: string) => `${count(k)} ${k === 1 ? one : `${one}s`}`;
-		try {
-			const r = await api.restructureLibrary();
-			if (r.albums)
-				toast(
-					`Moved ${n(r.files, 'file')} of ${n(r.albums, 'album')} to fit the folder structure`,
-					'success'
-				);
-			else if (!r.failed.length)
-				toast('Every album is already where the folder structure puts it', 'success');
-			if (r.failed.length)
-				toast(
-					`${n(r.failed.length, 'album')} couldn't be moved: ` +
-						r.failed.map((f) => `${f.title} (${f.error})`).join('; '),
-					'error',
-					12000
-				);
-		} catch (e) {
-			toast(e instanceof ApiError ? e.message : 'Moving the albums failed', 'error', 8000);
-		} finally {
-			moving = false;
-			confirmingMove = false;
-		}
+	/** Why albums can't be moved now, if they can't: only to the saved folder and structure. */
+	let moveBlocked = $derived.by(() => {
+		if (setup.saving) return 'Wait for Library setup to be saved';
+		if (!setup.saved.folder) return 'Choose a Library folder first';
+		if (setup.folder.trim() !== setup.saved.folder) return 'Save the new Library folder first';
+		if (setup.structure.trim() !== setup.saved.structure) return 'Save the new structure first';
+		return null;
+	});
+	async function moveAll() {
+		await setup.moveAll();
+		confirmingMove = false;
 	}
 
 	function groupState(kinds: TagKind[]) {
@@ -295,28 +271,42 @@
 						Albums stay in the folders they were put in until their tags are saved. Move them all to
 						where this structure puts them.
 					</p>
-					{#if confirmingMove}
+					{#if confirmingMove && !setup.moving}
 						<div class="confirm" in:fly={{ x: 12, duration: 220 }}>
 							<span>Move every album that doesn't fit?</span>
-							<button class="btn sm" onclick={() => (confirmingMove = false)} disabled={moving}
-								>Cancel</button
+							<button class="btn sm" onclick={() => (confirmingMove = false)}>Cancel</button>
+							<button
+								class="btn sm primary"
+								onclick={moveAll}
+								disabled={!!moveBlocked}
+								title={moveBlocked ?? undefined}>Move files</button
 							>
-							<button class="btn sm primary" onclick={restructure} disabled={moving}>
-								{#if moving}<span class="spin"><LoaderCircle size={14} /></span>{/if}
-								Move files
-							</button>
 						</div>
 					{:else}
 						<button
 							class="btn"
 							onclick={() => (confirmingMove = true)}
-							disabled={!!moveBlocked}
+							disabled={!!moveBlocked || setup.moving}
 							title={moveBlocked ?? undefined}
 						>
-							<FolderSync size={16} /> Move files to fit
+							{#if setup.moving}<span class="spin"><LoaderCircle size={16} /></span> Moving files…
+							{:else}<FolderSync size={16} /> Move files to fit{/if}
 						</button>
 					{/if}
 				</div>
+				{#if setup.unmoved.length}
+					<div class="unmoved" transition:slide={{ duration: 200 }}>
+						<p>
+							{count(setup.unmoved.length)}
+							{setup.unmoved.length === 1 ? 'album' : 'albums'} couldn't be moved:
+						</p>
+						<ul>
+							{#each setup.unmoved as u (u.dir)}
+								<li><b>{u.title}</b> <span class="dir">{u.dir}</span> {u.error}</li>
+							{/each}
+						</ul>
+					</div>
+				{/if}
 			</div>
 		</section>
 
@@ -752,6 +742,29 @@
 		flex: 1 1 260px;
 		font-size: 13px;
 		color: var(--text-2);
+	}
+	.unmoved {
+		margin-top: 12px;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.unmoved p {
+		margin: 0 0 6px;
+		color: var(--danger);
+	}
+	.unmoved ul {
+		margin: 0;
+		padding-left: 18px;
+		max-height: 220px;
+		overflow-y: auto;
+		display: grid;
+		gap: 4px;
+	}
+	.unmoved .dir {
+		font-family: var(--mono, monospace);
+		font-size: 12px;
+		color: var(--text-3);
+		overflow-wrap: anywhere;
 	}
 	.confirm {
 		display: flex;
