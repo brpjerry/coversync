@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use lofty::tag::TagType;
 use rayon::prelude::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::lookups::{LookupCache, oldest};
@@ -550,26 +551,22 @@ fn audio_candidates(tracks: &[Local], results: &[Vec<AcoustResult>]) -> (Vec<Can
     (candidates, trusted)
 }
 
+/// `v` without the spaces and hyphens codes are often written with.
+fn unspaced(v: &str) -> String {
+    v.chars().filter(|c| !matches!(c, ' ' | '-')).collect()
+}
+
 /// A barcode as MusicBrainz holds it: digits only, 8 (EAN-8) to 14 long.
 fn as_barcode(v: &str) -> Option<String> {
-    let digits: String = v.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
-    let valid = (8..=14).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit());
-    valid.then_some(digits)
+    static BARCODE: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[0-9]{8,14}$").unwrap());
+    Some(unspaced(v)).filter(|code| BARCODE.is_match(code))
 }
 
 /// An ISRC as MusicBrainz holds it, e.g. "JP-U90-26-04206" -> "JPU902604206".
 fn as_isrc(v: &str) -> Option<String> {
-    let code: String = v
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '-'))
-        .collect::<String>()
-        .to_ascii_uppercase();
-    let b = code.as_bytes();
-    let valid = b.len() == 12
-        && b[..2].iter().all(u8::is_ascii_uppercase)
-        && b[2..5].iter().all(u8::is_ascii_alphanumeric)
-        && b[5..].iter().all(u8::is_ascii_digit);
-    valid.then_some(code)
+    static ISRC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$").unwrap());
+    Some(unspaced(v).to_ascii_uppercase()).filter(|code| ISRC.is_match(code))
 }
 
 /// The album's ISRCs, each with the tracks tagged with it.

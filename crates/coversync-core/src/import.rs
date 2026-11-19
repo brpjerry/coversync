@@ -290,7 +290,7 @@ fn disagreeing(
         for track in tracks {
             let value = track.get(kind).map_or("", |v| v.trim());
             let value = if year {
-                value.get(..4).unwrap_or(value)
+                template::year(value).unwrap_or(value)
             } else {
                 value
             };

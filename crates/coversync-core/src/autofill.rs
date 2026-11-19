@@ -4,6 +4,9 @@
 //! rule can be turned off in Inbox setup.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,31 +79,23 @@ pub struct TrackInfo {
 /// Leading `03`, `03.`, `03 -` or disc-track `1-03` / `2.05` in a file name,
 /// and what's left as a title.
 fn parse_stem(stem: &str) -> (Option<u32>, Option<u32>, &str) {
+    // Disc-track first, then a track; each ends the name or a separator.
+    static NUMBERS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:([0-9]{1,2})[-.]([0-9]{1,3})|([0-9]{1,3}))(?:[ ._-]|$)").unwrap()
+    });
     // Some rippers prefix names with "#" ("# 01. Title", "# Title").
     let s = stem.trim().trim_start_matches('#').trim_start();
-    let seps = [' ', '-', '.', '_'];
-    fn rest_title(r: &str) -> &str {
-        r.trim_start_matches([' ', '-', '.', '_']).trim()
-    }
-    let n1 = s.bytes().take_while(u8::is_ascii_digit).count();
-    if n1 == 0 || n1 > 3 {
+    let Some(c) = NUMBERS.captures(s) else {
         return (None, None, s);
+    };
+    let n = |i| c.get(i).and_then(|m| m.as_str().parse().ok());
+    let title = s[c[0].len()..]
+        .trim_start_matches([' ', '-', '.', '_'])
+        .trim();
+    match c.get(3) {
+        Some(_) => (None, n(3), title),
+        None => (n(1), n(2), title),
     }
-    let first: u32 = s[..n1].parse().unwrap_or(0);
-    let rest = &s[n1..];
-    if n1 <= 2
-        && let Some(r) = rest.strip_prefix(['-', '.'])
-    {
-        let n2 = r.bytes().take_while(u8::is_ascii_digit).count();
-        let after = &r[n2..];
-        if (1..=3).contains(&n2) && (after.is_empty() || after.starts_with(seps)) {
-            return (Some(first), r[..n2].parse().ok(), rest_title(after));
-        }
-    }
-    if rest.is_empty() || rest.starts_with(seps) {
-        return (None, Some(first), rest_title(rest));
-    }
-    (None, None, s)
 }
 
 /// "3/12" -> 3.
@@ -110,17 +105,9 @@ fn number(v: &str) -> Option<u32> {
 
 /// A 19xx/20xx year in parentheses or brackets.
 fn folder_year(name: &str) -> Option<String> {
-    let b = name.as_bytes();
-    (0..b.len().saturating_sub(5)).find_map(|i| {
-        let open = b[i] == b'(' || b[i] == b'[';
-        let close = b[i + 5] == b')' || b[i + 5] == b']';
-        let year = &name.get(i + 1..i + 5)?;
-        let ok = open
-            && close
-            && year.bytes().all(|c| c.is_ascii_digit())
-            && (year.starts_with("19") || year.starts_with("20"));
-        ok.then(|| year.to_string())
-    })
+    static YEAR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[(\[]((?:19|20)[0-9]{2})[)\]]").unwrap());
+    Some(YEAR.captures(name)?[1].to_string())
 }
 
 struct Filler<'a> {
@@ -343,6 +330,14 @@ mod tests {
         assert_eq!(parse_stem("7S"), (None, None, "7S"));
         assert_eq!(parse_stem("# 01. ABSOLUTE"), (None, Some(1), "ABSOLUTE"));
         assert_eq!(parse_stem("# Colorful"), (None, None, "Colorful"));
+        // Three digits are a track; four are part of the title.
+        assert_eq!(parse_stem("123-4 Title"), (None, Some(123), "4 Title"));
+        assert_eq!(parse_stem("1234"), (None, None, "1234"));
+        // A disc-track that runs into the title is a track.
+        assert_eq!(parse_stem("1-03abc"), (None, Some(1), "03abc"));
+        assert_eq!(folder_year("Album (2003) [FLAC]").as_deref(), Some("2003"));
+        assert_eq!(folder_year("Album [1999]").as_deref(), Some("1999"));
+        assert_eq!(folder_year("Album (1899) (20034)"), None);
     }
 
     #[test]

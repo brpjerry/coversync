@@ -59,8 +59,9 @@ pub struct TrackTags {
 /// comments and lyrics with a description (`iTunNORM`) aren't the comment,
 /// or the lyrics. 2: the same for FLACs with an ID3v2 tag. 4: a FLAC or Ogg
 /// file's vendor string isn't its encoder (see [`drop_vendor_encoder`]). 5:
-/// the collection, in any format.
-pub const READER: u32 = 5;
+/// the collection, in any format. 6: a date's year is its first four digits
+/// in a row ("05/2003" is 2003).
+pub const READER: u32 = 6;
 
 /// The [collection](rules::COLLECTION)'s name in a file: a Vorbis comment,
 /// an ID3v2 TXXX frame or an iTunes freeform MP4 atom. Lofty
@@ -155,14 +156,9 @@ fn text(s: Option<std::borrow::Cow<'_, str>>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// The first four-digit run in a date-like string, e.g. "2003-04-01" -> 2003.
+/// A date's year, as the folder structure's `{year}` has it.
 fn year_from_str(s: &str) -> Option<i32> {
-    let digits: String = s
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take(4)
-        .collect();
-    (digits.len() == 4).then(|| digits.parse().ok()).flatten()
+    crate::template::year(s)?.parse().ok()
 }
 
 fn year(tag: &Tag) -> Option<i32> {
@@ -2054,6 +2050,8 @@ mod tests {
         assert_eq!(year_from_str("  1999"), Some(1999));
         assert_eq!(year_from_str("199"), None);
         assert_eq!(year_from_str(""), None);
+        // Not the first four characters from the first digit ("05/2").
+        assert_eq!(year_from_str("05/2003"), Some(2003));
     }
 
     #[test]

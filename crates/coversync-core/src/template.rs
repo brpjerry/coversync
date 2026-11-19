@@ -25,6 +25,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use crate::{Error, Result, rules};
 
@@ -42,8 +45,15 @@ pub const SUGGESTIONS: &[&str] = &[
     "{album_artist} - {album}/<{disc_number}-><{track_number} >{artist} - {title}",
 ];
 
-/// `{year}` is the first four digits of the date tag.
+/// `{year}` is the date tag's year (see [`year`]).
 pub const YEAR: &str = "year";
+
+/// A date's year: its first four digits in a row ("2003-04-01",
+/// "05/2003", "20030401").
+pub fn year(date: &str) -> Option<&str> {
+    static FOUR: LazyLock<Regex> = LazyLock::new(|| Regex::new("[0-9]{4}").unwrap());
+    FOUR.find(date).map(|m| m.as_str())
+}
 /// The longest a variable can be limited to; a folder name or a file's
 /// name before its extension is capped at [`MAX_NAME`] bytes anyway.
 pub const MAX_LIMIT: usize = 180;
@@ -447,14 +457,7 @@ pub fn one_disc(values: &HashMap<&'static str, String>) -> bool {
 fn value(values: &HashMap<&'static str, String>, var: &str) -> Option<String> {
     let get = |k: &str| values.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
     match var {
-        YEAR => {
-            let digits: String = get("date")?
-                .chars()
-                .filter(char::is_ascii_digit)
-                .take(4)
-                .collect();
-            (digits.len() == 4).then_some(digits)
-        }
+        YEAR => year(get("date")?).map(str::to_string),
         "track_number" => {
             let v = get(var)?;
             let n = v.split('/').next().unwrap_or(v).trim();
@@ -606,19 +609,12 @@ pub fn split_extension(name: &str) -> (&str, &str) {
 /// CON, NUL, COM1 and the like, which FAT cards and SMB shares can't hold
 /// either. Such a name gets a `_` in front.
 pub(crate) fn reserved(stem: &str) -> bool {
-    let base = stem.split('.').next().unwrap_or_default().trim_end();
-    let upper = base.to_ascii_uppercase();
-    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&upper.as_str()) {
-        return true;
-    }
-    ["COM", "LPT"].iter().any(|port| {
-        upper.strip_prefix(port).is_some_and(|n| {
-            let mut n = n.chars();
-            n.next()
-                .is_some_and(|d| d.is_ascii_digit() || "¹²³".contains(d))
-                && n.next().is_none()
-        })
-    })
+    // As Library setup's cover file name check has it.
+    static DEVICE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])\s*(?:\.|$)")
+            .unwrap()
+    });
+    DEVICE.is_match(stem)
 }
 
 #[cfg(test)]
@@ -820,6 +816,20 @@ mod tests {
             t.render(&v, "mp3").unwrap(),
             PathBuf::from("A/2003 - B/C.mp3")
         );
+        // The year's four digits in a row, wherever they are.
+        assert_eq!(year("05/2003"), Some("2003"));
+        assert_eq!(year("20030401"), Some("2003"));
+        assert_eq!(year("03.05.99"), None);
+    }
+
+    #[test]
+    fn windows_device_names_are_reserved() {
+        for name in ["CON", "con.txt", "Nul ", "COM1", "lpt¹.x", "CONIN$"] {
+            assert!(reserved(name), "{name}");
+        }
+        for name in ["COM10", "CONSOLE", "con2", "Cover"] {
+            assert!(!reserved(name), "{name}");
+        }
     }
 
     #[test]
