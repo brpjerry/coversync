@@ -138,8 +138,6 @@
 	 * CollectionsSetup), never typed; an Inbox album's in the import dialog.
 	 */
 	const COLLECTION = 'collection';
-	/** "Differs per track": the tracks' own collections, as they are. */
-	const MIXED = '\u0000';
 	const WIDE = new Set(['album', 'album_artist']);
 	const NUMERIC = new Set(['track_number', 'disc_number', 'track_total', 'disc_total']);
 
@@ -358,10 +356,12 @@
 					])
 				].filter(Boolean)
 	);
-	/** Every track goes in the collection; None ('') takes them out of theirs; MIXED keeps each one's. */
-	function setCollection(value: string) {
-		for (const id of ids)
-			(form[id] ??= {})[COLLECTION] = value === MIXED ? valueOf(base, id, COLLECTION) : value;
+	/**
+	 * Every track goes in the collection; None ('') takes them out of theirs;
+	 * null ("Differs per track") keeps each one's.
+	 */
+	function setCollection(value: string | null) {
+		for (const id of ids) (form[id] ??= {})[COLLECTION] = value ?? valueOf(base, id, COLLECTION);
 	}
 
 	function addKind(kind: string) {
@@ -599,12 +599,11 @@
 								></i>{/if}{#if anyElsewhere(COLLECTION)}<i class="dot warn"></i>{/if}</span
 						>
 						<select
-							value={value ?? MIXED}
+							bind:value={() => value, setCollection}
 							title={albumNote(COLLECTION)}
 							aria-label="Collection"
-							onchange={(e) => setCollection(e.currentTarget.value)}
 						>
-							{#if value === null || shared(base, ids, COLLECTION) === null}<option value={MIXED}
+							{#if value === null || shared(base, ids, COLLECTION) === null}<option value={null}
 									>Differs per track</option
 								>{/if}
 							<option value="">None</option>
