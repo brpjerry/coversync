@@ -1147,15 +1147,12 @@
 	 * over first even if this page's copy of the setting is out of date.
 	 */
 	async function startImport(album: Album, edits?: ImportEdits) {
-		if (!edits) {
-			// Loaded once at least (a click as the page loads); changes since
-			// come as notices.
-			await inboxSetup.load();
-			if (!inboxSetup.saved.suggestions) {
-				await open(album);
-				sheet?.edit();
-				return;
-			}
+		// Taken as off until Inbox setup has loaded: the editor's Import
+		// still brings suggestions, if they're on, in the dialog.
+		if (!edits && !inboxSetup.saved.suggestions) {
+			await open(album);
+			sheet?.edit();
+			return;
 		}
 		const checking = toast(`Checking “${album.title}”…`, 'progress', 0);
 		let plan: ImportPlan;
