@@ -28,11 +28,13 @@
 	interface Props {
 		album: Album;
 		detail: AlbumDetail | null;
-		allowWrites: boolean;
 		onclose: () => void;
 		/** A save of the album's tags, answered; `id` is the album's id as it was. */
 		onsaved: (result: TagWriteResult, id: string) => void;
-		/** Present for Inbox albums: bring this album into the Library, with any tag edits. */
+		/**
+		 * Present for Inbox albums: bring this album into the Library, with
+		 * any tag edits. Their tags are edited only on the way (see `edit`).
+		 */
 		onimport?: (edits?: ImportEdits) => void;
 		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
 		changed?: boolean;
@@ -57,7 +59,6 @@
 	let {
 		album,
 		detail,
-		allowWrites,
 		onclose,
 		onsaved,
 		onimport,
@@ -126,6 +127,19 @@
 	}
 
 	let mode = $state<'tracks' | 'edit'>('tracks');
+	/** Open the tag editor: where an Inbox album's import can start. */
+	export function edit() {
+		mode = 'edit';
+	}
+	// Another album's editor doesn't stay open for an Inbox album. By id:
+	// the grids' refreshes hand over a new object for the same album.
+	let albumId = $derived(album.id);
+	$effect(() => {
+		void albumId;
+		untrack(() => {
+			if (onimport) mode = 'tracks';
+		});
+	});
 	/** The tag editor's edits, for the notice. */
 	let editing = $state<Draft>('none');
 	/** Kept edits for tracks no longer in the album, which couldn't be put back. */
@@ -245,26 +259,26 @@
 							<FolderInput size={16} /> Import
 						</button>
 					{/if}
-					<div class="mode" role="tablist" aria-label="View">
-						<span class="thumb" class:right={mode === 'edit'}></span>
-						<button
-							role="tab"
-							aria-selected={mode === 'tracks'}
-							class:on={mode === 'tracks'}
-							onclick={showTracks}
-						>
-							<ListMusic size={15} /> Tracks
-						</button>
-						<button
-							role="tab"
-							aria-selected={mode === 'edit'}
-							class:on={mode === 'edit'}
-							onclick={() => (mode = 'edit')}
-							disabled={!detail}
-						>
-							<Pencil size={15} /> Edit tags
-						</button>
-					</div>
+					{#if !onimport}<div class="mode" role="tablist" aria-label="View">
+							<span class="thumb" class:right={mode === 'edit'}></span>
+							<button
+								role="tab"
+								aria-selected={mode === 'tracks'}
+								class:on={mode === 'tracks'}
+								onclick={showTracks}
+							>
+								<ListMusic size={15} /> Tracks
+							</button>
+							<button
+								role="tab"
+								aria-selected={mode === 'edit'}
+								class:on={mode === 'edit'}
+								onclick={() => (mode = 'edit')}
+								disabled={!detail}
+							>
+								<Pencil size={15} /> Edit tags
+							</button>
+						</div>{/if}
 				</div>
 			</div>
 		</header>
@@ -378,7 +392,6 @@
 						<div bind:offsetHeight={editorHeight}>
 							<TagEditor
 								detail={editorDetail ?? detail}
-								{allowWrites}
 								onsaved={saved}
 								restore={editorView}
 								onview={(v) => (editorView = v)}

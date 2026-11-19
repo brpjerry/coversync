@@ -1963,6 +1963,16 @@ pub fn copy_with_tags_hashed(
             fs::copy(src, &tmp)?;
             None
         };
+        // Library files are coversync's to edit: the copy is its owner's to
+        // read and write, though the original (in a read-only Inbox, say)
+        // isn't.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&tmp)?.permissions();
+            permissions.set_mode(permissions.mode() | 0o600);
+            fs::set_permissions(&tmp, permissions)?;
+        }
         let mut embedded = false;
         if !values.is_empty() || art.is_some() {
             let mut file = probe(&tmp, true)?;

@@ -542,6 +542,28 @@ def autofill_flow(d, out, tag, save):
     print("needs attention: autofill on", before, "| off", off, "| on again", d.js(count))
 
 
+def edit_tags(d):
+    """Open the open album's tag editor: a Library album's Edit tags, or an
+    Inbox album's Import, which opens it when Smart suggestions are off."""
+    d.click(".sheet .actions .import, .sheet .mode button:last-child")
+    d.wait("return !!document.querySelector('.editor .album-grid, .dialog')")
+    if d.js("return !!document.querySelector('.dialog')"):
+        raise SystemExit("Smart suggestions are on, so Inbox albums have no tag editor: "
+                         "turn them off, or open a Library album first.")
+
+
+def import_from_menu(d):
+    """Import to Library from the open menu, through the album's tag editor
+    when that opens (Smart suggestions off), with no edits."""
+    d.click_text("*[@role='menu']", "Import to Library")
+    editor = ".sheet .editor .savebar .primary"
+    d.wait("return !!document.querySelector(arguments[0])", 20, f"{editor}, .dialog")
+    if d.js("return !!document.querySelector(arguments[0])", editor):
+        d.wait("return !document.querySelector(arguments[0]).disabled", 20, editor)
+        # A toast can cover the save bar, so not a pointer click.
+        d.js("document.querySelector(arguments[0]).click()", editor)
+
+
 def import_flow(d, out, tag, library_folder):
     """Scratch libraries only: set up a library folder and import two albums."""
     text = "return document.querySelector(arguments[0])?.textContent.replace(/\\s+/g, ' ').trim()"
@@ -569,9 +591,12 @@ def import_flow(d, out, tag, library_folder):
         if i == 1:
             time.sleep(0.3)
             d.shot(out / f"8b-context-menu-{tag}.png")
-        album = d.js(text, "[role=menu] .title")
-        d.click_text("*[@role='menu']", "Import to Library")
-        d.wait("return !!document.querySelector('.dialog') || [...document.querySelectorAll('.toast')].some(t => /Imported|failed|Choose/.test(t.textContent))", 20)
+        # The title as it is (the toast's), not with its spaces collapsed.
+        album = d.js("return document.querySelector('[role=menu]').getAttribute('aria-label')")
+        # This album's toast, not an earlier one's.
+        imported = "[...document.querySelectorAll('.toast')].some(t => t.textContent.includes(`Imported “${arguments[0]}”`))"
+        import_from_menu(d)
+        d.wait(f"return !!document.querySelector('.dialog') || {imported}", 20, album)
         if d.js("return !!document.querySelector('.dialog')"):
             time.sleep(0.8)
             print(f"editor for {album}:", d.js(text, ".status-text"),
@@ -583,7 +608,7 @@ def import_flow(d, out, tag, library_folder):
             print("after filling:", d.js(text, ".status-text"), "| dest:", d.js(text, ".dest-path"))
             d.shot(out / f"8d-import-ready-{tag}.png")
             d.click(".dialog .btn.primary")
-        d.wait("return [...document.querySelectorAll('.toast')].some(t => t.textContent.includes('Imported'))", 20)
+        d.wait(f"return {imported}", 20, album)
         print("toasts:", [t for t in d.toasts() if 'Imported' in t][-1:])
         time.sleep(0.8)
     d.click_text("header", "Library")
@@ -636,7 +661,7 @@ def art_flow(d, out, tag, library_folder):
     index = d.js("return [...document.querySelectorAll('.cell')].findIndex(c => c.querySelector('.title')?.textContent === 'No Art') + 1")
     d.right_click(f".cell:nth-child({index}) .cover")
     d.wait("return !!document.querySelector('[role=menu]')")
-    d.click_text("*[@role='menu']", "Import to Library")
+    import_from_menu(d)
     d.wait("return !!document.querySelector('.art-drop')", 20)
     time.sleep(0.8)
     print("dialog:", d.js(text, ".status-text"), "| import enabled:", d.js("return !document.querySelector('.dialog .btn.primary').disabled"))
@@ -1091,9 +1116,7 @@ def auth_flow(d, out, tag):
     d.click(".cell:first-child .cover")
     d.wait("return !!document.querySelector('.tracks li')")
     time.sleep(1.2)
-    d.click(".mode button:nth-child(3)")
-    # The editor reads the album's tags first.
-    d.wait("return !!document.querySelector('.editor .album-grid')")
+    edit_tags(d)
     field = ".album-grid .field:nth-child(4) input"
     d.type(field, " (edited)")
     time.sleep(0.5)
@@ -1475,17 +1498,14 @@ def main():
             "return p && [p.querySelector('.np-title').textContent, [...p.querySelectorAll('.t')].map(t => t.textContent)]"))
         d.shot(out / f"3-playing-{tag}.png")
 
-        d.click(".mode button:nth-child(3)")
-        # The editor reads the album's tags first.
-        d.wait("return !!document.querySelector('.editor .album-grid')")
+        edit_tags(d)
         d.js("const i = document.querySelector('.album-grid .field:nth-child(4) input'); i.focus();")
         d.type(".album-grid .field:nth-child(4) input", " (edited)")
         d.type(".tr:nth-child(2) .col-title", " — remix")
         time.sleep(0.8)
         print("changes:", d.js("return document.querySelector('.summary').textContent.trim()"))
         d.shot(out / f"4-editor-{tag}.png")
-        # Save is disabled on servers without --allow-writes.
-        # Save appears only where in-place edits are allowed (Library, or --allow-writes).
+        # Save appears only for Library albums: Inbox files are read-only.
         save = "return [...document.querySelectorAll('.editor .savebar button')].find(b => b.textContent.trim() === 'Save' && !b.disabled) ?? null"
         if "--save" in sys.argv and d.js(save):
             d.click_xpath("//div[contains(@class,'editor')]//div[contains(@class,'savebar')]//button[normalize-space(.)='Save']")

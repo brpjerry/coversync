@@ -50,9 +50,6 @@ struct Args {
     /// MusicBrainz lookups are kept (default: $XDG_CACHE_HOME/coversync).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// Allow the tag editor to modify files. Off by default.
-    #[arg(long)]
-    allow_writes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -78,7 +75,6 @@ pub struct AppState {
     pub hash_jobs: Mutex<()>,
     pub hash_pending: AtomicBool,
     pub closing: AtomicBool,
-    pub allow_writes: bool,
     /// Serializes everything that writes tracks or changes which are
     /// shown: scans, tag writes, imports, setup saves (which can switch the
     /// Library or Inbox folder) and showing hidden Inbox files again.
@@ -352,7 +348,6 @@ async fn run() -> anyhow::Result<()> {
         hash_jobs: Mutex::new(()),
         hash_pending: AtomicBool::new(false),
         closing: AtomicBool::new(false),
-        allow_writes: args.allow_writes,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
         moving: tokio::sync::RwLock::new(()),
@@ -364,7 +359,7 @@ async fn run() -> anyhow::Result<()> {
         device_paths: Default::default(),
         sync,
     });
-    tracing::info!(roots = ?state.roots(), writes = state.allow_writes, "starting");
+    tracing::info!(roots = ?state.roots(), "starting");
     uploads::follow_folder(&state);
     sync::spawn_watcher(state.clone());
     spawn_scan(state.clone());
@@ -416,7 +411,6 @@ pub(crate) fn test_state(dir: &std::path::Path) -> Shared {
         hash_jobs: Mutex::new(()),
         hash_pending: AtomicBool::new(false),
         closing: AtomicBool::new(false),
-        allow_writes: false,
         jobs: Mutex::new(()),
         tag_files: RwLock::new(()),
         moving: tokio::sync::RwLock::new(()),

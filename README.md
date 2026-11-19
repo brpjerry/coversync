@@ -34,7 +34,8 @@ used on a home server.
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
   separator, and names at its phrases, see below) offer each.
-- **Tag editor** (an album's Edit tags): album-wide fields (album, album
+- **Tag editor** (a Library album's Edit tags, or an Inbox album's Import
+  without Smart suggestions; see Import): album-wide fields (album, album
   artist, date, genre) and each track's (number, disc, title, artist) up
   front, and **Show all tags** for every other tag the album has, grouped
   as in Library setup, with **Add a tag** for one it doesn't. An album-wide
@@ -147,10 +148,16 @@ used on a home server.
   tag. In the folder structure `{collection}` is always optional:
   `{collection}/{album_artist}/{album}/…` puts albums in none straight under
   `{album_artist}`.
-- **Import** (right-click an Inbox album): checks the rules and the template's
-  tags, opens an editor for anything missing, then copies (or moves) the files
-  into place with the new tags and art. In Copy mode the original is never
-  written and is hidden from the Inbox afterwards. Tags coversync has no name
+- **Import** (an Inbox album's Import, or right-click it): Inbox files are
+  read-only, so an album's tags are edited on its way into the Library. With
+  Smart suggestions off, Import opens the album's tag editor, whose edits go
+  to the Library copy; with them on, the import dialog offers MusicBrainz's
+  tags instead. Then it checks the rules and the template's tags, opens the
+  import dialog for anything missing (and the collection, if there are any),
+  and copies (or moves) the files into place with the new tags and art. The
+  original is never written: in Copy mode it is hidden from the Inbox
+  afterwards, in Move mode deleted. A read-only original makes a copy
+  coversync can still edit. Tags coversync has no name
   for stay as they were (`TITLE_JP`, `CDTOC`, a ripper's own), as do FLAC
   and Ogg ratings and the file's vendor string. Tags it does name are written its usual way:
   `ORGANIZATION` as `LABEL`, `TOTALTRACKS` as `TRACKTOTAL`, `TRACKNUMBER=01/12`
@@ -167,7 +174,7 @@ used on a home server.
   tracks are converted. coversync doesn't write APE tags (lofty can cut a
   file's audio rewriting one): Musepack and hybrid WavPack files (whose
   correction files ffmpeg can't read) can't be imported, and WavPack and
-  Monkey's Audio files can't be edited in place; an MP3's APE tag
+  Monkey's Audio files in the Library can't be edited; an MP3's APE tag
   (ReplayGain from MP3Gain, say) is left as it is.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
@@ -312,11 +319,9 @@ options:
   the Library had its own, `library.sqlite3`, is renamed on first start;
   rename it back before going back to an older release.
   Everything in the cache directory is rebuilt when missing.
-- `--allow-writes` lets the tag editor change Inbox files in place; it is off
-  by default. Library files can always be edited (but no APE tag is
-  written, see Import). Writes go to a copy beside
-  the file that is renamed into place, and every edit is validated before any
-  file is touched.
+- Tag edits are written only to Library files (but no APE tag is written,
+  see Import). Writes go to a copy beside the file that is renamed into
+  place, and every edit is validated before any file is touched.
 
 To serve the UI under a path prefix behind a reverse proxy, build it with that
 prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
@@ -388,8 +393,8 @@ names another. Choose one outside the Inbox folder when coversyncd can't
 write to the Inbox (a synced folder made read-only, say): it is scanned as
 part of the Inbox, and its albums show up there like any other. The first
 upload makes the uploads folder if the folder holding it is there. Uploads
-only add files, never change any, so they need no `--allow-writes`; they
-need a login, like the rest of the API.
+only add files, never change any; they need a login, like the rest of the
+API.
 
 Albums uploaded into a folder that is no longer the uploads folder (after
 it's changed in Inbox setup) stay on disk but leave the Inbox at the next

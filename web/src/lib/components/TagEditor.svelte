@@ -65,8 +65,6 @@
 
 	interface Props {
 		detail: AlbumDetail;
-		/** Whether these files may be saved in place; Save is hidden otherwise. */
-		allowWrites: boolean;
 		/** A save, answered; `id` is the album's id as it was. */
 		onsaved: (result: TagWriteResult, id: string) => void;
 		/**
@@ -81,7 +79,10 @@
 		/** Hears whether the tags are being read (the editor is short then). */
 		onloading?: (loading: boolean) => void;
 		oncancel: () => void;
-		/** Inbox albums: import with the current edits applied to the Library copy. */
+		/**
+		 * Inbox albums, which are read-only (no Save): import with the
+		 * current edits applied to the Library copy.
+		 */
 		onimport?: (edits: ImportEdits) => void;
 		/** Hears what edits there are; a failed save turns them back into a draft. */
 		ondraft?: (draft: Draft) => void;
@@ -107,7 +108,6 @@
 	}
 	let {
 		detail,
-		allowWrites,
 		onsaved,
 		oncancel,
 		onimport,
@@ -437,9 +437,7 @@
 				toast(
 					e.album
 						? 'Not saved: this album was changed elsewhere'
-						: sent.collection === 'inbox'
-							? 'Not saved: this album is no longer in the Inbox. It may have been imported or removed elsewhere.'
-							: 'Not saved: this album is no longer in the Library. It may have been removed elsewhere.',
+						: 'Not saved: this album is no longer in the Library. It may have been removed elsewhere.',
 					'error',
 					8000
 				);
@@ -693,22 +691,19 @@
 		<span class="summary tabular">
 			{#if changes > 0}
 				{#key changes}<b in:fly={{ y: 6, duration: 200 }}>{changes}</b>{/key}
-				{changes === 1 ? 'change' : 'changes'}{allowWrites ? ' not saved' : ''}
-				{#if onimport}<span class="hint"
-						>· {allowWrites ? 'or ' : ''}written to the Library copy on import</span
-					>{/if}
+				{changes === 1 ? 'change' : 'changes'}{onimport ? '' : ' not saved'}
+				{#if onimport}<span class="hint">· written to the Library copy on import</span>{/if}
 			{:else}
 				No changes
 			{/if}
 		</span>
 		<div class="buttons">
 			<button class="btn" onclick={changes ? revert : oncancel}>
-				{#if changes}<Undo2 size={15} /> Revert{:else}Done{/if}
+				{#if changes}<Undo2 size={15} /> Revert{:else if onimport}Cancel{:else}Done{/if}
 			</button>
-			{#if allowWrites}
+			{#if !onimport}
 				<button
-					class="btn"
-					class:primary={!onimport}
+					class="btn primary"
 					onclick={save}
 					disabled={changes === 0 || errors || saving || loading || showing !== detail}
 				>

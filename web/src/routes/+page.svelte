@@ -322,6 +322,7 @@
 			if (held && held.from !== id) held = null;
 		});
 	});
+	let sheet = $state<ReturnType<typeof AlbumDetail>>();
 	/** What the album sheet shows. */
 	let sheetAlbum = $derived(holding?.album ?? openAlbum);
 	let sheetDetail = $derived(
@@ -1125,9 +1126,9 @@
 		return items;
 	});
 
-	// Import: check the album against the library rules; import straight away
-	// when nothing is missing and there's no collection to pick, otherwise
-	// open the editor with the gaps marked.
+	// Import: check the album against the library rules and open the import
+	// dialog with the gaps marked; after the tag editor, only when something
+	// is missing or there's a collection to pick (see startImport).
 	/** The import editor: the plan plus any edits made before it opened. */
 	let importing = $state<{ album: Album; plan: ImportPlan; edits: ImportEdits } | null>(null);
 
@@ -1139,12 +1140,24 @@
 			return { label: 'Inbox setup', run: () => setView('inbox-setup') };
 	}
 
-	/** `edits` come from the album's tag editor, if the import started there. */
-	async function startImport(album: Album, edits: ImportEdits = {}) {
+	/**
+	 * Without MusicBrainz's suggestions an import starts in the album's tag
+	 * editor, whose Import comes back here with its `edits`. One that didn't
+	 * start there always opens the import dialog, so the album is looked
+	 * over first even if this page's copy of the setting is out of date.
+	 */
+	async function startImport(album: Album, edits?: ImportEdits) {
+		// Taken as off until Inbox setup has loaded: the editor's Import
+		// still brings suggestions, if they're on, in the dialog.
+		if (!edits && !inboxSetup.saved.suggestions) {
+			await open(album);
+			sheet?.edit();
+			return;
+		}
 		const checking = toast(`Checking “${album.title}”…`, 'progress', 0);
 		let plan: ImportPlan;
 		try {
-			plan = await api.importPlan(album.id, edits);
+			plan = await api.importPlan(album.id, edits ?? {});
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'Could not check the album', 'error', 6000);
 			return;
@@ -1154,8 +1167,8 @@
 		// The editor needs the tag catalog (labels, album-wide kinds) up front.
 		await setup.load();
 		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
-		if (asks || setup.saved.collections.length) {
-			importing = { album, plan, edits };
+		if (!edits || asks || setup.saved.collections.length) {
+			importing = { album, plan, edits: edits ?? {} };
 		} else if (plan.problems.length) {
 			toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));
 		} else {
@@ -1619,9 +1632,9 @@
 
 {#if sheetAlbum}
 	<AlbumDetail
+		bind:this={sheet}
 		album={sheetAlbum}
 		detail={sheetDetail}
-		allowWrites={sheetAlbum.collection === 'library' || (status?.allow_writes ?? false)}
 		onclose={close}
 		{onsaved}
 		onimport={sheetAlbum.collection === 'inbox'
