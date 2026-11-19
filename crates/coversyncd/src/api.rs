@@ -782,8 +782,9 @@ async fn import_album(
     // waits for the whole import, even if the request is dropped.
     let result = exclusively(&state, move |s| {
         // Not onto a path a track an earlier save moved has to come back to
-        // (nor while the tag editor reads a file there).
-        {
+        // (nor while the tag editor reads a file there). The jobs lock keeps
+        // a save from recording moves meanwhile.
+        if !s.lib.recorded_moves()?.is_empty() {
             let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
             moves_put_back(s, "imported")?;
         }
