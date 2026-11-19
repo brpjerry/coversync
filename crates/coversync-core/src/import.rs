@@ -363,9 +363,11 @@ pub fn plan(
         &splitter,
     )?;
     // Their APE tags can't be written safely (see `tags::apply_kinds`).
-    if read.iter().any(|t| t.tag_type == lofty::tag::TagType::Ape) {
+    let ape = lofty::tag::TagType::Ape;
+    let has_ape = read.iter().any(|t| t.tag_type == ape);
+    if has_ape {
         problems.push(
-            "WavPack, Monkey's Audio and Musepack files can't go in the Library, which keeps no APE tags."
+            "WavPack, Monkey's Audio and Musepack files can't be imported: coversync can't safely write their APE tags."
                 .into(),
         );
     }
@@ -424,6 +426,7 @@ pub fn plan(
         // than fail the import part way through the copies.
         let to_write = written_values(&autofilled, edits.get(&track.id));
         if typed_ok
+            && read.tag_type != ape
             && !to_write.is_empty()
             && let Err(e) = tags::check_kinds(&path, &crate::model::TagEdit::default(), &to_write)
         {
@@ -593,7 +596,7 @@ pub fn plan(
         split,
         substituted,
         added: (inbox.keep_added && detail.album.added_at > 0).then_some(detail.album.added_at),
-        suggest: inbox.suggestions.enabled,
+        suggest: inbox.suggestions.enabled && !has_ape,
         album_id: album_id.to_string(),
         mode: inbox.ingest,
         library_folder: folder,

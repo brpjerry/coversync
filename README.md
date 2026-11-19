@@ -304,7 +304,8 @@ options:
   rename it back before going back to an older release.
   Everything in the cache directory is rebuilt when missing.
 - `--allow-writes` lets the tag editor change Inbox files in place; it is off
-  by default. Library files can always be edited. Writes go to a copy beside
+  by default. Library files can always be edited (but no APE tag is
+  written, see Import). Writes go to a copy beside
   the file that is renamed into place, and every edit is validated before any
   file is touched.
 

@@ -624,9 +624,9 @@ enum Native {
 /// `tag`, a primary tag other than Vorbis comments after an edit, in its
 /// format as it will be written, through lofty's owned conversion
 /// (refused, as the save is, where it can't be): unlike its writer for a borrowed
-/// generic tag, it puts back what the generic tag couldn't hold (custom
-/// APE items and covers, unknown ID3v2 frames, freeform MP4 atoms, URL
-/// frames) and joins repeated values as the format wants. `collection`: the
+/// generic tag, it puts back what the generic tag couldn't hold (unknown
+/// ID3v2 frames, freeform MP4 atoms, URL frames) and joins repeated values
+/// as the format wants. `collection`: the
 /// collection set (or cleared, if empty), which it has no key for.
 fn native(tag: Tag, collection: Option<&str>) -> Result<Native> {
     let mut native = native_of(tag)?;
@@ -1295,11 +1295,15 @@ pub fn upc(path: &Path) -> Option<String> {
 }
 
 /// Whether a `tag_type` tag can hold `kind` as text (numbers and dates
-/// always fit; some formats have no place for, say, MusicBrainz ids).
+/// always fit; some formats have no place for, say, MusicBrainz ids). No
+/// APE tag is written (see [`apply_kinds`]).
 pub fn can_store(tag_type: TagType, kind: &str) -> bool {
     let Some(k) = rules::kind(kind) else {
         return false;
     };
+    if tag_type == TagType::Ape {
+        return false;
+    }
     if kind == rules::COLLECTION {
         return matches!(
             tag_type,
@@ -2707,20 +2711,17 @@ mod tests {
         ));
         ape.insert(item("Ripper", ItemValue::Text("kept".into())));
         ape.save_to_path(&src, WriteOptions::default()).unwrap();
-        let before = lofty::mpeg::MpegFile::read_from(
-            &mut fs::File::open(&src).unwrap(),
-            ParseOptions::new(),
-        )
-        .unwrap()
-        .ape()
-        .cloned()
-        .unwrap();
         let new = cover(8);
         assert!(copy_with_tags(&src, &dest, &[("title", "New".into())], Some(&new), true).unwrap());
         assert_eq!(embedded_cover(&dest).unwrap().unwrap(), new.data());
-        let mut f = fs::File::open(&dest).unwrap();
-        let mpeg = lofty::mpeg::MpegFile::read_from(&mut f, ParseOptions::new()).unwrap();
-        assert_eq!(mpeg.ape(), Some(&before));
+        // Only the ID3v2 tag before the audio changed: the audio and the
+        // APE tag after it are as they were, byte for byte.
+        let after_id3v2 = |path: &Path| {
+            let b = fs::read(path).unwrap();
+            let size = b[6..10].iter().fold(0, |n, x| n << 7 | usize::from(*x));
+            b[10 + size..].to_vec()
+        };
+        assert_eq!(after_id3v2(&dest), after_id3v2(&src));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2830,15 +2831,12 @@ mod tests {
 
     #[test]
     fn ape_tags_arent_written() {
-        use lofty::ape::{ApeItem, ApeTag};
         let dir = std::env::temp_dir().join(format!("coversync-ape-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (src, dest) = (dir.join("in.wv"), dir.join("out.wv"));
+        // Untagged: refused for its format, not for a tag it has.
         fs::write(&src, include_bytes!("../tests/fixtures/silence.wv")).unwrap();
-        let mut ape = ApeTag::default();
-        ape.insert(ApeItem::new("Title".into(), ItemValue::Text("Song".into())).unwrap());
-        ape.save_to_path(&src, WriteOptions::default()).unwrap();
         let before = fs::read(&src).unwrap();
         let title = [("title", "New".to_string())];
         let refused = |r: Result<()>| assert!(r.unwrap_err().to_string().contains("APE tag"));
