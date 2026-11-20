@@ -212,8 +212,11 @@
 		padding: 6px;
 		transition: background 160ms;
 	}
-	.np:hover {
+	.np:hover:not(:disabled) {
 		background: var(--surface);
+	}
+	.np:disabled {
+		cursor: default;
 	}
 	.art {
 		flex: none;

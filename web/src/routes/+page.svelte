@@ -1567,7 +1567,6 @@
 
 	/** Open an album an upload became. */
 	async function showUploaded(id: string) {
-		if (batchShown) return;
 		await setView('inbox');
 		await tick();
 		const album = byId.get(id);
@@ -2030,7 +2029,7 @@
 	</div>
 {/if}
 
-<UploadsPanel onshow={showUploaded} />
+<UploadsPanel onshow={batchShown ? undefined : showUploaded} />
 <Toasts />
 
 <style>
