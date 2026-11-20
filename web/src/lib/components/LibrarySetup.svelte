@@ -21,6 +21,8 @@
 	import X from '@lucide/svelte/icons/x';
 	import Replace from '@lucide/svelte/icons/replace';
 	import Plus from '@lucide/svelte/icons/plus';
+	import FolderSync from '@lucide/svelte/icons/folder-sync';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
 	import Toggle from './Toggle.svelte';
 	import type { ArtPlacement, TagKind } from '#lib/api.ts';
 	import { count, fold } from '#lib/format.ts';
@@ -174,6 +176,21 @@
 			: ''
 	);
 
+	// Moving every album to fit the folder structure (see setup.moveAll): asked first.
+	let confirmingMove = $state(false);
+	/** Why albums can't be moved now, if they can't: only to the saved folder and structure. */
+	let moveBlocked = $derived.by(() => {
+		if (setup.saving) return 'Wait for Library setup to be saved';
+		if (!setup.saved.folder) return 'Choose a Library folder first';
+		if (setup.folder.trim() !== setup.saved.folder) return 'Save the new Library folder first';
+		if (setup.structure.trim() !== setup.saved.structure) return 'Save the new structure first';
+		return null;
+	});
+	async function moveAll() {
+		await setup.moveAll();
+		confirmingMove = false;
+	}
+
 	function groupState(kinds: TagKind[]) {
 		const on = kinds.filter((k) => setup.required.has(k.id)).length;
 		return { on, all: on === kinds.length, some: on > 0 && on < kinds.length };
@@ -249,6 +266,47 @@
 					variables={setup.variables}
 					label={(id) => setup.label(id)}
 				/>
+				<div class="restructure">
+					<p>
+						Albums stay in the folders they were put in until their tags are saved. Move them all to
+						where this structure puts them.
+					</p>
+					{#if confirmingMove && !setup.moving}
+						<div class="confirm" in:fly={{ x: 12, duration: 220 }}>
+							<span>Move every album that doesn't fit?</span>
+							<button class="btn sm" onclick={() => (confirmingMove = false)}>Cancel</button>
+							<button
+								class="btn sm primary"
+								onclick={moveAll}
+								disabled={!!moveBlocked}
+								title={moveBlocked ?? undefined}>Move files</button
+							>
+						</div>
+					{:else}
+						<button
+							class="btn"
+							onclick={() => (confirmingMove = true)}
+							disabled={!!moveBlocked || setup.moving}
+							title={moveBlocked ?? undefined}
+						>
+							{#if setup.moving}<span class="spin"><LoaderCircle size={16} /></span> Moving files…
+							{:else}<FolderSync size={16} /> Move files to fit{/if}
+						</button>
+					{/if}
+				</div>
+				{#if setup.unmoved.length}
+					<div class="unmoved" transition:slide={{ duration: 200 }}>
+						<p>
+							{count(setup.unmoved.length)}
+							{setup.unmoved.length === 1 ? 'album' : 'albums'} couldn't be moved:
+						</p>
+						<ul>
+							{#each setup.unmoved as u (u)}
+								<li><b>{u.title}</b> <span class="dir">{u.dir}</span> {u.error}</li>
+							{/each}
+						</ul>
+					</div>
+				{/if}
 			</div>
 		</section>
 
@@ -671,6 +729,59 @@
 </SetupPane>
 
 <style>
+	.restructure {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px 16px;
+		flex-wrap: wrap;
+		margin-top: 16px;
+	}
+	.restructure p {
+		margin: 0;
+		flex: 1 1 260px;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.unmoved {
+		margin-top: 12px;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.unmoved p {
+		margin: 0 0 6px;
+		color: var(--danger);
+	}
+	.unmoved ul {
+		margin: 0;
+		padding-left: 18px;
+		max-height: 220px;
+		overflow-y: auto;
+		display: grid;
+		gap: 4px;
+	}
+	.unmoved .dir {
+		font-family: var(--mono, monospace);
+		font-size: 12px;
+		color: var(--text-3);
+		overflow-wrap: anywhere;
+	}
+	.confirm {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 13.5px;
+		color: var(--text-2);
+	}
+	.spin {
+		display: inline-grid;
+		animation: spin 900ms linear infinite;
+	}
+	@keyframes spin {
+		to {
+			rotate: 360deg;
+		}
+	}
 	.rule-text p {
 		margin: 2px 0 0;
 		color: var(--text-2);

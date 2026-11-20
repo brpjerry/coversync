@@ -8,12 +8,14 @@ import {
 	ART,
 	type ArtRules,
 	type FolderStatus,
+	type Restructured,
 	type SetupResponse,
 	type Substitution,
 	type TagCoverage,
 	type TagGroup,
 	type TagKind
 } from './api';
+import { count } from './format';
 import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
@@ -63,6 +65,10 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 	libraryProblem = $state<string | null>(null);
 	/** Bumped on every save, so album flags can be refreshed. */
 	version = $state(0);
+	/** Moving every album to fit the folder structure (see `moveAll`). */
+	moving = $state(false);
+	/** The albums the last move couldn't place, with why. */
+	unmoved = $state<Restructured['failed']>([]);
 
 	/** Tags added or removed, plus a changed folder, structure, art rule, separator, phrases, substitutions or collections. */
 	changes = $derived(
@@ -123,6 +129,9 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			substitutions: s.rules.substitutions,
 			collections: s.rules.collections
 		};
+		// A report on albums in another folder or structure goes.
+		if (this.saved.folder !== was.folder || this.saved.structure !== was.structure)
+			this.unmoved = [];
 		const requiredKept =
 			this.required.size === was.required.length &&
 			was.required.every((id) => this.required.has(id));
@@ -183,6 +192,38 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		this.splitAt = [...this.saved.splitAt];
 		this.substitutions = copySubs(this.saved.substitutions);
 		this.collections = [...this.saved.collections];
+	}
+
+	/** Move every album the saved folder structure puts elsewhere, and say what moved. */
+	async moveAll() {
+		if (this.moving) return;
+		this.moving = true;
+		const n = (k: number, one: string) => `${count(k)} ${k === 1 ? one : `${one}s`}`;
+		const { folder, structure } = this.saved;
+		try {
+			const r = await api.restructureLibrary();
+			// Kept only while it's about the folder and structure it was made in.
+			const kept = this.saved.folder === folder && this.saved.structure === structure;
+			if (kept) this.unmoved = r.failed;
+			if (r.albums)
+				toast(
+					`Moved ${n(r.files, 'file')} of ${n(r.albums, 'album')} to fit the folder structure`,
+					'success'
+				);
+			else if (!r.failed.length)
+				toast('Every album is already where the folder structure puts it', 'success');
+			if (r.failed.length)
+				toast(
+					`${n(r.failed.length, 'album')} couldn't be moved: ` +
+						(kept ? 'see Library setup' : 'the Library folder or structure changed meanwhile'),
+					'error',
+					8000
+				);
+		} catch (e) {
+			toast(e instanceof ApiError ? e.message : 'Moving the albums failed', 'error', 8000);
+		} finally {
+			this.moving = false;
+		}
 	}
 
 	save() {

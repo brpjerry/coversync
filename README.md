@@ -58,7 +58,11 @@ used on a home server.
   setup's folder structure says with its tags as saved, edited or not: a
   new title renames a file, a new album title (or a tag the structure
   names a folder by) moves the album's files to another folder, and an
-  album imported under an older structure moves to the current one. When
+  album imported under an older structure moves to the current one.
+  Saving a new structure moves nothing by itself: **Move files to fit**,
+  under it in Library setup, moves every album that doesn't fit, as a save
+  of each would (`POST /api/library/restructure` with `{}`), and lists
+  which it couldn't move and why. When
   all of a folder's tracks go to one other folder, its cover images follow
   them, unless the name is taken there or audio stays behind. Folders left
   empty go. An album's folder in the Library holds what its import put

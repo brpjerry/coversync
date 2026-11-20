@@ -2340,10 +2340,17 @@ impl Library {
             }
         }
         sort_tracks(&mut tracks);
-        let covers = self.covers()?;
+        let cover: Option<CoverRow> = self
+            .conn()
+            .query_row(
+                "SELECT source, color, version FROM covers WHERE album_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
         let refs: Vec<&Track> = tracks.iter().collect();
         let added = album_added(collection, added.into_iter());
-        let album = summarize(id, &refs, added, covers.get(id));
+        let album = summarize(id, &refs, added, cover.as_ref());
         Ok(Some(AlbumDetail {
             album,
             dir,
