@@ -33,7 +33,9 @@
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { session } from '#lib/session.svelte.ts';
+	import type { BatchControls } from '#lib/batch.svelte.ts';
 	import SuggestPanel, { type ChosenArt } from './SuggestPanel.svelte';
+	import BatchStrip from './BatchStrip.svelte';
 
 	interface Props {
 		album: Album;
@@ -62,6 +64,10 @@
 			suggested?: number,
 			musicbrainzArt?: string
 		) => Promise<string | null>;
+		/** One of several albums imported in a row: their strip, Skip and Stop, and picks carried over. */
+		batch?: BatchControls;
+		/** Kept, out of sight, while another album of the batch is shown. */
+		hidden?: boolean;
 	}
 	let {
 		album,
@@ -74,8 +80,20 @@
 		coreKinds,
 		kindOrder,
 		onclose,
-		onimport
+		onimport,
+		batch,
+		hidden = false
 	}: Props = $props();
+	/** Imported, or being imported: what it was is shown instead of the form. */
+	let done = $derived(!!batch && !batch.item.open);
+	/** Each dialog of a batch stays, so its heading's id is its own. */
+	const uid = $props.id();
+	/** The suggestions' quick choice used on the album before, as it was when this one opened. */
+	let preset = $state(untrack(() => batch?.batch.preset));
+	/** A batch's later albums replace the one before at once rather than fading in over the grid. */
+	const motion = untrack(() =>
+		batch?.batch.items.some((i) => i.opened && i !== batch.item) ? 0 : 1
+	);
 
 	// The columns are the kinds that failed when the dialog opened, so a
 	// field doesn't vanish the moment it's filled in.
@@ -118,11 +136,22 @@
 	);
 	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
 	const hadCollection = consensus('collection');
-	/** Library setup's, and any the tracks have. */
+	/** In a batch, an album without a collection starts on the one picked last. */
+	const carried = untrack(() => (!hadCollection && batch?.batch.collection) || '');
+	/** Library setup's, any the tracks have, and the one carried over. */
 	let collectionChoices = $derived([
-		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
+		...new Set(
+			[...collections, ...tracks.map((t) => t.values.collection ?? ''), carried].filter(Boolean)
+		)
 	]);
-	let collection = $state(hadCollection);
+	let collection = $state(hadCollection || carried);
+	// A collection picked here is the batch's next album's as soon as it's picked.
+	let picks = 0;
+	$effect(() => {
+		const picked = collection;
+		// Not the value it starts with; every change after, back to it too.
+		if (batch && picks++) untrack(() => (batch.batch.collection = picked));
+	});
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
@@ -130,6 +159,15 @@
 			tracks.map((t) => [t.id, Object.fromEntries(trackCols.map((k) => [k, t.values[k] ?? '']))])
 		)
 	);
+
+	// What the fields held when the dialog opened (a field added since, its prefill).
+	const startAlbum = untrack(() => ({ ...albumValues }));
+	const startTrack = untrack(() => $state.snapshot(trackValues));
+	/** A field still holds what the dialog put in it: nothing has been typed there. */
+	const pristine = (id: number | null, k: string) =>
+		id === null
+			? (albumValues[k] ?? '') === (startAlbum[k] ?? consensus(k))
+			: (trackValues[id]?.[k] ?? '') === (startTrack[id]?.[k] ?? '');
 
 	/** Suggestions accepted for tags without a field here, and accepted values in all. */
 	let accepted = $state<ImportEdits>({});
@@ -286,13 +324,26 @@
 		return out;
 	});
 
+	/** Bumped each time a batch shows it again. */
+	let shown = $state(0);
+	let wasHidden = untrack(() => hidden);
+	$effect(() => {
+		if (wasHidden && !hidden) untrack(() => shown++);
+		wasHidden = hidden;
+	});
+
 	// Re-plan as values change, for the destination preview and server-side
-	// checks, and again after signing back in (a plan asked for meanwhile failed).
+	// checks, again after signing back in (a plan asked for meanwhile failed),
+	// and when a batch comes back to it (the setup may have changed meanwhile).
 	let live = $state<ImportPlan>(initial);
 	let planning = $state(false);
 	let seq = 0;
 	$effect(() => {
 		void session.generation;
+		// Shown again, it checks afresh (hiding leaves a check under way be).
+		void shown;
+		// Imported, or on its way: there's nothing left to check.
+		if (done) return;
 		const e = $state.snapshot(edits) as ImportEdits;
 		const mine = ++seq;
 		planning = true;
@@ -335,6 +386,11 @@
 	let outstanding = $derived(missing + (artMissing ? 1 : 0));
 	let ready = $derived(outstanding === 0 && live.problems.length === 0 && !busy);
 
+	// The batch's strip says what this album still needs, as it's edited here.
+	$effect(() => {
+		if (batch) batch.item.needs = outstanding ? statusText() : (live.problems[0] ?? null);
+	});
+
 	function statusText() {
 		const values = `${missing} ${missing === 1 ? 'value' : 'values'}`;
 		if (missing && artMissing) return `${values} and the album art are missing.`;
@@ -343,7 +399,8 @@
 	}
 
 	async function submit() {
-		if (!ready) return;
+		if (!ready || done) return;
+		if (batch) batch.batch.collection = collection;
 		busy = true;
 		error = null;
 		error = await onimport(
@@ -370,14 +427,31 @@
 			onclose();
 		} else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
 			submit();
+		} else if (batch && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+			// Another album of the batch, without importing or skipping this one.
+			e.preventDefault();
+			e.stopPropagation();
+			const to = batch.batch.index + (e.key === 'ArrowRight' ? 1 : -1);
+			if (to >= 0 && to < batch.batch.items.length) batch.onjump(to);
 		}
 	}
+	/** The next album of the batch still to decide on, after an imported one. */
+	let next = $derived(batch && done ? batch.batch.nextWaiting() : null);
 
 	let dialog = $state<HTMLElement>();
+	// When it opens, and when a batch comes back to it.
 	$effect(() => {
+		if (hidden) return;
+		// The first of these that can take the focus: shown and not disabled.
+		const usable = (sel: string) =>
+			[...(dialog?.querySelectorAll<HTMLElement>(sel) ?? [])].find(
+				(el) => el.offsetParent !== null && !(el as HTMLButtonElement).disabled
+			);
 		const field =
-			dialog?.querySelector<HTMLElement>('input.missing, .art-choose') ??
-			dialog?.querySelector<HTMLElement>('.collection select');
+			usable('input.missing, .art-choose') ??
+			usable('.collection select') ??
+			usable('.foot .btn.primary') ??
+			dialog;
 		field?.focus({ preventScroll: true });
 	});
 </script>
@@ -388,18 +462,27 @@
 	onclick={(e) => e.target === e.currentTarget && onclose()}
 	{onkeydown}
 	{onpaste}
-	transition:fade={{ duration: 200 }}
+	style:display={hidden ? 'none' : undefined}
+	transition:fade={{ duration: 200 * motion }}
 >
 	<div
 		class="dialog"
+		class:batched={!!batch}
+		class:done
 		role="dialog"
 		aria-modal="true"
-		aria-labelledby="import-title"
+		aria-labelledby="import-title-{uid}"
+		tabindex="-1"
 		bind:this={dialog}
 		style:--accent={accent(album.color)}
 		style:--tint={shade(album.color, 16)}
-		transition:fly={{ y: 24, duration: 360, easing: cubicOut }}
+		transition:fly={{ y: 24, duration: 360 * motion, easing: cubicOut }}
 	>
+		{#if batch && !hidden}
+			<div class="batch-row">
+				<BatchStrip batch={batch.batch} onjump={batch.onjump} {label} />
+			</div>
+		{/if}
 		<header class="head">
 			<span class="art">
 				{#if upload}<img src={upload.url} alt="" in:fade={{ duration: 240 }} />{:else if mbArt}<img
@@ -413,328 +496,369 @@
 			</span>
 			<div class="head-text">
 				<span class="eyebrow"><FolderInput size={14} /> Import into Library</span>
-				<h2 id="import-title">{album.title}</h2>
+				<h2 id="import-title-{uid}">{album.title}</h2>
 				<p>{album.artist}</p>
 			</div>
 			<button class="icon-btn close" onclick={onclose} aria-label="Close"><X size={19} /></button>
 		</header>
 
-		<div class="status" class:done={outstanding === 0}>
-			<span class="status-icon">
-				{#if outstanding === 0}<CircleCheck size={18} />{:else}<CircleAlert size={18} />{/if}
-			</span>
-			<span class="status-text">
-				{#if outstanding === 0}
-					{artNeeded
-						? 'Every required tag has a value, and the album has art.'
-						: 'Every required tag has a value.'}
+		{#if done && batch}
+			<div class="body finished" in:fade={{ duration: 200 }}>
+				{#if batch.item.status === 'importing'}
+					<span class="finished-icon spin"><LoaderCircle size={28} /></span>
+					<p><b>Importing…</b> It carries on while you go through the other albums.</p>
 				{:else}
-					{#key outstanding}<b in:fly={{ y: -6, duration: 200 }}>{statusText()}</b>{/key}
-					The library rules{trackCols.length || albumCols.length ? ' and folder structure' : ''} need
-					{outstanding === 1 ? 'it' : 'them'} before this album can be imported.
+					<span class="finished-icon ok"><CircleCheck size={28} /></span>
+					<p><b>Imported</b> to <span class="finished-path">{batch.item.dest}</span></p>
 				{/if}
-			</span>
-			<span class="meter"
-				><span style:transform="scaleX({total ? 1 - outstanding / total : 1})"></span></span
-			>
-		</div>
-
-		<div class="body">
-			{#if initial.suggest}
-				<SuggestPanel
-					albumId={album.id}
-					{tracks}
-					{base}
-					{label}
-					order={kindOrder}
-					{albumKinds}
-					{coreKinds}
-					fields={{ track: trackCols, album: albumCols }}
-					{getField}
-					{setField}
-					onaccept={(e, n) => {
-						accepted = e;
-						suggested = n;
-					}}
-					original={initial.art.source
-						? {
-								thumb: coverUrl(album, 256),
-								full: fullCoverUrl(album.id),
-								width: initial.art.width,
-								height: initial.art.height,
-								source: initial.art.source
-							}
-						: null}
-					artChosen={mbArt?.release ?? null}
-					onart={(art, auto) => {
-						// Ticked by default, it never replaces an image chosen by hand.
-						if (art && auto && upload) return;
-						mbArt = art;
-						if (art) upload = null;
-					}}
-				/>
-			{/if}
-			{#if live.autofilled.length}
-				<p class="autofilled">
-					<WandSparkles size={14} />
-					<span>
-						Filled in automatically:
-						{live.autofilled.map((k) => label(k)).join(', ')}. Change it in Inbox setup.
-					</span>
-				</p>
-			{/if}
-			{#if live.split.length}
-				<p class="autofilled">
-					<Split size={14} />
-					<span>
-						Split into one name each:
-						{live.split.map((k) => label(k)).join(', ')}. Change the phrases in Library setup.
-					</span>
-				</p>
-			{/if}
-			{#if live.substituted.length}
-				<p class="autofilled">
-					<Replace size={14} />
-					<span>
-						Changed by substitutions:
-						{live.substituted.map((k) => label(k)).join(', ')}. Change them in Library setup.
-					</span>
-				</p>
-			{/if}
-			{#if live.tracks.some((t) => t.to_flac)}
-				{@const converted = live.tracks.filter((t) => t.to_flac)}
-				<p class="autofilled">
-					<AudioWaveform size={14} />
-					<span>
-						Converted to FLAC: {converted.length === live.tracks.length
-							? 'every track'
-							: converted.map((t) => t.file_name).join(', ')}, as the Library keeps lossless audio
-						as FLAC only.
-					</span>
-				</p>
-			{/if}
-			{#if artNote}
-				<p class="autofilled">
-					<ImageIcon size={14} />
-					<span>{artNote} Change it in Library setup.</span>
-				</p>
-			{/if}
-			{#if live.problems.length}
-				<ul class="problems" transition:fly={{ y: -6, duration: 200 }}>
-					{#each live.problems as p (p)}<li><TriangleAlert size={15} /> {p}</li>{/each}
-				</ul>
-			{/if}
-
-			{#if collectionChoices.length || collectionRequired}
-				<label class="field collection">
-					<span class="field-label">Collection</span>
-					<select bind:value={collection} class:missing={collectionRequired && !collection}>
-						<option value="">None</option>
-						{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
-					</select>
-					{#if collectionRequired && !collectionChoices.length}
-						<span class="note bad">Add one in Library › Collections to import this album.</span>
+			</div>
+		{/if}
+		<!-- While the import runs the form stays, out of sight, so a failed one comes back as
+		     it was; once the album is in the Library it goes. -->
+		{#if batch?.item.status !== 'imported'}
+			<div class="status" class:done={outstanding === 0} style:display={done ? 'none' : undefined}>
+				<span class="status-icon">
+					{#if outstanding === 0}<CircleCheck size={18} />{:else}<CircleAlert size={18} />{/if}
+				</span>
+				<span class="status-text">
+					{#if outstanding === 0}
+						{artNeeded
+							? 'Every required tag has a value, and the album has art.'
+							: 'Every required tag has a value.'}
+					{:else}
+						{#key outstanding}<b in:fly={{ y: -6, duration: 200 }}>{statusText()}</b>{/key}
+						The library rules{trackCols.length || albumCols.length ? ' and folder structure' : ''} need
+						{outstanding === 1 ? 'it' : 'them'} before this album can be imported.
 					{/if}
-				</label>
-			{/if}
+				</span>
+				<span class="meter"
+					><span style:transform="scaleX({total ? 1 - outstanding / total : 1})"></span></span
+				>
+			</div>
 
-			{#if artNeeded}
-				<section>
-					<h3>Album art</h3>
-					<div
-						class="art-drop"
-						class:missing={artMissing}
-						class:over={dragging}
-						role="group"
-						aria-label="Album art"
-						ondragover={(e) => {
-							e.preventDefault();
-							dragging = true;
+			<div class="body" style:display={done ? 'none' : undefined}>
+				{#if initial.suggest}
+					<SuggestPanel
+						albumId={album.id}
+						{tracks}
+						{base}
+						{label}
+						order={kindOrder}
+						{albumKinds}
+						{coreKinds}
+						fields={{ track: trackCols, album: albumCols }}
+						{getField}
+						{setField}
+						onaccept={(e, n) => {
+							accepted = e;
+							suggested = n;
 						}}
-						ondragleave={() => (dragging = false)}
-						{ondrop}
-					>
-						{#if upload}
-							<img class="art-preview" src={upload.url} alt="Chosen album art" in:fade />
-							<span class="art-text">
-								<b>{upload.name}</b>
-								<span class="tabular">{upload.width} × {upload.height}</span>
-							</span>
-							<span class="art-actions">
-								<button class="btn art-choose" onclick={() => picker?.click()}>
-									<ImagePlus size={14} /> Choose another
-								</button>
-								<button
-									class="icon-btn"
-									onclick={() => (upload = null)}
-									aria-label="Remove the chosen image"><Trash2 size={16} /></button
-								>
-							</span>
-						{:else if mbArt}
-							<img
-								class="art-preview"
-								src={musicbrainzArtUrl(mbArt.release)}
-								alt="MusicBrainz's cover"
-								in:fade
-							/>
-							<span class="art-text">
-								<b>MusicBrainz's cover</b>
-								<span class="tabular">{mbArt.width} × {mbArt.height}</span>
-							</span>
-							<span class="art-actions">
-								<button class="btn art-choose" onclick={() => picker?.click()}>
-									<ImagePlus size={14} /> Choose another
-								</button>
-								<button
-									class="icon-btn"
-									onclick={() => (mbArt = null)}
-									aria-label="Don't use MusicBrainz's cover"><Trash2 size={16} /></button
-								>
-							</span>
-						{:else}
-							<span class="art-empty"><ImagePlus size={24} strokeWidth={1.6} /></span>
-							<span class="art-text">
-								<b>This album has no cover art.</b>
-								<span
-									>The library rules require it. Drop or paste an image here, or choose one.</span
-								>
-								{#if artError}<span class="art-error" transition:fade>{artError}</span>{/if}
-							</span>
-							<span class="art-actions">
-								<button class="btn art-choose" onclick={() => picker?.click()}>
-									<ImagePlus size={14} /> Choose image
-								</button>
-							</span>
+						original={initial.art.source
+							? {
+									thumb: coverUrl(album, 256),
+									full: fullCoverUrl(album.id),
+									width: initial.art.width,
+									height: initial.art.height,
+									source: initial.art.source
+								}
+							: null}
+						artChosen={mbArt?.release ?? null}
+						{preset}
+						onlookup={batch
+							? (running) => (batch.item.lookup = running ? 'running' : 'done')
+							: undefined}
+						onpreset={batch
+							? (p) => {
+									preset = p;
+									batch.batch.preset = p;
+								}
+							: undefined}
+						{pristine}
+						onart={(art, auto) => {
+							// Ticked by default, it never replaces an image chosen by hand.
+							if (art && auto && upload) return;
+							mbArt = art;
+							if (art) upload = null;
+						}}
+					/>
+				{/if}
+				{#if live.autofilled.length}
+					<p class="autofilled">
+						<WandSparkles size={14} />
+						<span>
+							Filled in automatically:
+							{live.autofilled.map((k) => label(k)).join(', ')}. Change it in Inbox setup.
+						</span>
+					</p>
+				{/if}
+				{#if live.split.length}
+					<p class="autofilled">
+						<Split size={14} />
+						<span>
+							Split into one name each:
+							{live.split.map((k) => label(k)).join(', ')}. Change the phrases in Library setup.
+						</span>
+					</p>
+				{/if}
+				{#if live.substituted.length}
+					<p class="autofilled">
+						<Replace size={14} />
+						<span>
+							Changed by substitutions:
+							{live.substituted.map((k) => label(k)).join(', ')}. Change them in Library setup.
+						</span>
+					</p>
+				{/if}
+				{#if live.tracks.some((t) => t.to_flac)}
+					{@const converted = live.tracks.filter((t) => t.to_flac)}
+					<p class="autofilled">
+						<AudioWaveform size={14} />
+						<span>
+							Converted to FLAC: {converted.length === live.tracks.length
+								? 'every track'
+								: converted.map((t) => t.file_name).join(', ')}, as the Library keeps lossless audio
+							as FLAC only.
+						</span>
+					</p>
+				{/if}
+				{#if artNote}
+					<p class="autofilled">
+						<ImageIcon size={14} />
+						<span>{artNote} Change it in Library setup.</span>
+					</p>
+				{/if}
+				{#if live.problems.length}
+					<ul class="problems" transition:fly={{ y: -6, duration: 200 }}>
+						{#each live.problems as p (p)}<li><TriangleAlert size={15} /> {p}</li>{/each}
+					</ul>
+				{/if}
+
+				{#if collectionChoices.length || collectionRequired}
+					<label class="field collection">
+						<span class="field-label">Collection</span>
+						<select bind:value={collection} class:missing={collectionRequired && !collection}>
+							<option value="">None</option>
+							{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
+						</select>
+						{#if collectionRequired && !collectionChoices.length}
+							<span class="note bad">Add one in Library › Collections to import this album.</span>
 						{/if}
-						<input
-							bind:this={picker}
-							type="file"
-							accept={ART_TYPES.join(',')}
-							hidden
-							onchange={(e) => {
-								choose(e.currentTarget.files?.[0]);
-								e.currentTarget.value = '';
+						{#if carried && collection === carried}
+							<span class="note">Same as the last album</span>
+						{/if}
+					</label>
+				{/if}
+
+				{#if artNeeded}
+					<section>
+						<h3>Album art</h3>
+						<div
+							class="art-drop"
+							class:missing={artMissing}
+							class:over={dragging}
+							role="group"
+							aria-label="Album art"
+							ondragover={(e) => {
+								e.preventDefault();
+								dragging = true;
 							}}
-						/>
-					</div>
-				</section>
-			{/if}
-
-			{#if albumCols.length}
-				<section>
-					<h3>Album</h3>
-					<div class="album-fields">
-						{#each albumCols as k (k)}
-							{@const differs = disagree.includes(k)}
-							{@const empty = added(k)
-								? needsValue(k)
-								: !albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
-							<label class="field">
-								<span class="field-label">
-									{label(k)}
-									<span class="note" class:bad={empty}>
-										{#if empty && differs}
-											differs between tracks; the folder structure needs one value
-										{:else if empty}
-											missing on {missingOnTracks(k)} of {tracks.length}
-										{:else if differs && albumValues[k] === consensus(k)}
-											differs between tracks; this is what most have
-										{:else if prefilled.has(k) && albumValues[k] === consensus(k)}
-											filled in from the other tracks
-										{/if}
-									</span>
+							ondragleave={() => (dragging = false)}
+							{ondrop}
+						>
+							{#if upload}
+								<img class="art-preview" src={upload.url} alt="Chosen album art" in:fade />
+								<span class="art-text">
+									<b>{upload.name}</b>
+									<span class="tabular">{upload.width} × {upload.height}</span>
 								</span>
-								<input
-									class:missing={empty}
-									bind:value={albumValues[k]}
-									disabled={notEditable.includes(k)}
-									placeholder={notEditable.includes(k)
-										? "Can't be typed in"
-										: `Applies to all ${tracks.length} tracks`}
-									spellcheck="false"
+								<span class="art-actions">
+									<button class="btn art-choose" onclick={() => picker?.click()}>
+										<ImagePlus size={14} /> Choose another
+									</button>
+									<button
+										class="icon-btn"
+										onclick={() => (upload = null)}
+										aria-label="Remove the chosen image"><Trash2 size={16} /></button
+									>
+								</span>
+							{:else if mbArt}
+								<img
+									class="art-preview"
+									src={musicbrainzArtUrl(mbArt.release)}
+									alt="MusicBrainz's cover"
+									in:fade
 								/>
-							</label>
-						{/each}
-					</div>
-				</section>
-			{/if}
-
-			{#if trackCols.length}
-				<section>
-					<h3>Tracks</h3>
-					<div class="table" style:--cols={trackCols.length}>
-						<div class="thead">
-							<span class="file-col">File</span>
-							{#each trackCols as k (k)}
-								<span class="col-head">
-									{label(k)}
-									{#if k === 'track_number'}
-										<button
-											class="mini"
-											onclick={numberTracks}
-											title="Number the tracks 1 to {tracks.length}"
-										>
-											<ListOrdered size={13} /> 1–{tracks.length}
-										</button>
-									{:else}
-										<button
-											class="mini"
-											onclick={() => fillBlanks(k)}
-											title="Copy the first value into empty cells"
-										>
-											<ArrowDownToLine size={13} /> Fill blanks
-										</button>
-									{/if}
+								<span class="art-text">
+									<b>MusicBrainz's cover</b>
+									<span class="tabular">{mbArt.width} × {mbArt.height}</span>
 								</span>
-							{/each}
+								<span class="art-actions">
+									<button class="btn art-choose" onclick={() => picker?.click()}>
+										<ImagePlus size={14} /> Choose another
+									</button>
+									<button
+										class="icon-btn"
+										onclick={() => (mbArt = null)}
+										aria-label="Don't use MusicBrainz's cover"><Trash2 size={16} /></button
+									>
+								</span>
+							{:else}
+								<span class="art-empty"><ImagePlus size={24} strokeWidth={1.6} /></span>
+								<span class="art-text">
+									<b>This album has no cover art.</b>
+									<span
+										>The library rules require it. Drop or paste an image here, or choose one.</span
+									>
+									{#if artError}<span class="art-error" transition:fade>{artError}</span>{/if}
+								</span>
+								<span class="art-actions">
+									<button class="btn art-choose" onclick={() => picker?.click()}>
+										<ImagePlus size={14} /> Choose image
+									</button>
+								</span>
+							{/if}
+							<input
+								bind:this={picker}
+								type="file"
+								accept={ART_TYPES.join(',')}
+								hidden
+								onchange={(e) => {
+									choose(e.currentTarget.files?.[0]);
+									e.currentTarget.value = '';
+								}}
+							/>
 						</div>
-						{#each tracks as t, i (t.id)}
-							<div class="tr" style:--i={Math.min(i, 20)}>
-								<span class="file-col">
-									<span class="file-title">{t.title}</span>
-									<span class="file-name">{t.file_name}</span>
-								</span>
-								{#each trackCols as k (k)}
+					</section>
+				{/if}
+
+				{#if albumCols.length}
+					<section>
+						<h3>Album</h3>
+						<div class="album-fields">
+							{#each albumCols as k (k)}
+								{@const differs = disagree.includes(k)}
+								{@const empty = added(k)
+									? needsValue(k)
+									: !albumValues[k].trim() && (differs || tracks.some((t) => !original(t.id, k)))}
+								<label class="field">
+									<span class="field-label">
+										{label(k)}
+										<span class="note" class:bad={empty}>
+											{#if empty && differs}
+												differs between tracks; the folder structure needs one value
+											{:else if empty}
+												missing on {missingOnTracks(k)} of {tracks.length}
+											{:else if differs && albumValues[k] === consensus(k)}
+												differs between tracks; this is what most have
+											{:else if prefilled.has(k) && albumValues[k] === consensus(k)}
+												filled in from the other tracks
+											{/if}
+										</span>
+									</span>
 									<input
-										class:missing={!trackValues[t.id][k].trim()}
-										bind:value={trackValues[t.id][k]}
+										class:missing={empty}
+										bind:value={albumValues[k]}
 										disabled={notEditable.includes(k)}
-										placeholder={notEditable.includes(k) ? "Can't be typed in" : 'Required'}
-										aria-label="{label(k)}, {t.title}"
-										inputmode={k.endsWith('_number') || k.endsWith('_total')
-											? 'numeric'
-											: undefined}
+										placeholder={notEditable.includes(k)
+											? "Can't be typed in"
+											: `Applies to all ${tracks.length} tracks`}
 										spellcheck="false"
 									/>
+								</label>
+							{/each}
+						</div>
+					</section>
+				{/if}
+
+				{#if trackCols.length}
+					<section>
+						<h3>Tracks</h3>
+						<div class="table" style:--cols={trackCols.length}>
+							<div class="thead">
+								<span class="file-col">File</span>
+								{#each trackCols as k (k)}
+									<span class="col-head">
+										{label(k)}
+										{#if k === 'track_number'}
+											<button
+												class="mini"
+												onclick={numberTracks}
+												title="Number the tracks 1 to {tracks.length}"
+											>
+												<ListOrdered size={13} /> 1–{tracks.length}
+											</button>
+										{:else}
+											<button
+												class="mini"
+												onclick={() => fillBlanks(k)}
+												title="Copy the first value into empty cells"
+											>
+												<ArrowDownToLine size={13} /> Fill blanks
+											</button>
+										{/if}
+									</span>
 								{/each}
 							</div>
-						{/each}
-					</div>
-				</section>
-			{/if}
-		</div>
+							{#each tracks as t, i (t.id)}
+								<div class="tr" style:--i={Math.min(i, 20)}>
+									<span class="file-col">
+										<span class="file-title">{t.title}</span>
+										<span class="file-name">{t.file_name}</span>
+									</span>
+									{#each trackCols as k (k)}
+										<input
+											class:missing={!trackValues[t.id][k].trim()}
+											bind:value={trackValues[t.id][k]}
+											disabled={notEditable.includes(k)}
+											placeholder={notEditable.includes(k) ? "Can't be typed in" : 'Required'}
+											aria-label="{label(k)}, {t.title}"
+											inputmode={k.endsWith('_number') || k.endsWith('_total')
+												? 'numeric'
+												: undefined}
+											spellcheck="false"
+										/>
+									{/each}
+								</div>
+							{/each}
+						</div>
+					</section>
+				{/if}
+			</div>
+		{/if}
 
 		<footer class="foot">
-			<div class="dest">
-				<span class="mode">
-					{#if live.mode === 'copy'}<Copy size={13} /> Copy · the original stays untouched{:else}<Move
-							size={13}
-						/> Move · the original leaves the Inbox{/if}{#if live.added}{` · keeps its Inbox date, ${addedDate(live.added)}`}{/if}
-				</span>
-				<span class="dest-path" title={destDir ?? ''}>
-					{#if planning}<span class="spin"><LoaderCircle size={13} /></span>{/if}
-					{destDir ?? 'Destination appears once the folder-structure tags are filled in'}
-				</span>
-				{#if error}<span class="error" transition:fade>{error}</span>{/if}
-			</div>
+			{#if !done}<div class="dest">
+					<span class="mode">
+						{#if live.mode === 'copy'}<Copy size={13} /> Copy · the original stays untouched{:else}<Move
+								size={13}
+							/> Move · the original leaves the Inbox{/if}{#if live.added}{` · keeps its Inbox date, ${addedDate(live.added)}`}{/if}
+					</span>
+					<span class="dest-path" title={destDir ?? ''}>
+						{#if planning}<span class="spin"><LoaderCircle size={13} /></span>{/if}
+						{destDir ?? 'Destination appears once the folder-structure tags are filled in'}
+					</span>
+					{#if error}<span class="error" transition:fade>{error}</span>{/if}
+					{#if batch?.item.error}<span class="error">{batch.item.error}</span>{/if}
+				</div>{/if}
 			<div class="buttons">
-				<button class="btn" onclick={onclose}>Cancel</button>
-				<button class="btn primary" onclick={submit} disabled={!ready}>
-					{#if busy}<span class="spin"><LoaderCircle size={15} /></span>{:else}<FolderInput
-							size={15}
-						/>{/if}
-					Import
-				</button>
+				{#if batch}
+					<button class="btn" onclick={batch.onstop}>Stop</button>
+					{#if !done}
+						<button class="btn" onclick={batch.onskip}>Skip</button>
+					{/if}
+				{:else}
+					<button class="btn" onclick={onclose}>Cancel</button>
+				{/if}
+				{#if !done}
+					<button class="btn primary" onclick={submit} disabled={!ready}>
+						{#if busy}<span class="spin"><LoaderCircle size={15} /></span>{:else}<FolderInput
+								size={15}
+							/>{/if}
+						{batch && !batch.batch.last ? 'Import & next' : 'Import'}
+					</button>
+				{:else if next !== null && batch}
+					<button class="btn primary" onclick={() => batch.onjump(next!)}>Next album</button>
+				{/if}
 			</div>
 		</footer>
 	</div>
@@ -766,6 +890,44 @@
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 40px 120px -30px rgb(0 0 0 / 0.75);
 		overflow: hidden auto;
+	}
+	/* A batch's strip above the head; an album already imported has no status or form. */
+	.dialog.batched {
+		grid-template-rows: auto auto auto minmax(6rem, 1fr) auto;
+	}
+	.dialog.batched.done {
+		grid-template-rows: auto auto minmax(6rem, 1fr) auto;
+	}
+	.batch-row {
+		padding: 14px 22px 0;
+		min-width: 0;
+	}
+	.finished {
+		display: grid;
+		justify-items: center;
+		align-content: center;
+		gap: 12px;
+		text-align: center;
+	}
+	.finished p {
+		margin: 0;
+		max-width: 52ch;
+		color: var(--text-2);
+	}
+	.finished b {
+		color: var(--text);
+	}
+	.finished-icon {
+		display: grid;
+		color: var(--accent);
+	}
+	.finished-icon.ok {
+		color: var(--success);
+	}
+	.finished-path {
+		font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', monospace;
+		font-size: 12.5px;
+		overflow-wrap: anywhere;
 	}
 	.head {
 		display: flex;

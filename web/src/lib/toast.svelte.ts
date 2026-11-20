@@ -31,3 +31,9 @@ export function dismiss(id: number) {
 	const i = toasts.findIndex((t) => t.id === id);
 	if (i >= 0) toasts.splice(i, 1);
 }
+
+/** Change what a toast still showing says. */
+export function update(id: number, message: string) {
+	const t = toasts.find((t) => t.id === id);
+	if (t) t.message = message;
+}

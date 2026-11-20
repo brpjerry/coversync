@@ -13,8 +13,24 @@
 		onmenu: (album: Album, x: number, y: number) => void;
 		/** A warning badge for a card, if any: short text plus a tooltip. */
 		flag?: (album: Album) => { text: string; title: string } | null;
+		/** Albums are being selected (see AlbumCard). */
+		selecting?: boolean;
+		/** The ids of those selected. */
+		selected?: ReadonlySet<string>;
+		/** Where albums can be selected. */
+		onselect?: (album: Album, e: MouseEvent) => void;
 	}
-	let { albums, size, onopen, onplay, onmenu, flag }: Props = $props();
+	let {
+		albums,
+		size,
+		onopen,
+		onplay,
+		onmenu,
+		flag,
+		selecting = false,
+		selected,
+		onselect
+	}: Props = $props();
 
 	// Only the rows near the viewport are in the DOM, each card placed by
 	// transform. Reordering then touches a few dozen elements instead of every
@@ -138,6 +154,9 @@
 				{onmenu}
 				flag={f?.text}
 				flagTitle={f?.title}
+				{selecting}
+				checked={selected?.has(album.id) ?? false}
+				{onselect}
 			/>
 		</div>
 	{/each}

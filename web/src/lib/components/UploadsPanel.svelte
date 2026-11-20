@@ -11,8 +11,8 @@
 	import { bytes, count, timeLeft } from '#lib/format.ts';
 
 	interface Props {
-		/** Open an Inbox album an upload became. */
-		onshow: (id: string) => void;
+		/** Open an Inbox album an upload became; absent while that can't be done (a batch import is up). */
+		onshow?: (id: string) => void;
 	}
 	let { onshow }: Props = $props();
 
@@ -163,7 +163,7 @@
 								<button class="act" onclick={() => uploads.retry(item.key)}>Retry now</button>
 							{:else if item.phase === 'failed'}
 								<button class="act" onclick={() => uploads.retry(item.key)}>Try again</button>
-							{:else if item.phase === 'done' && item.albums.length}
+							{:else if item.phase === 'done' && item.albums.length && onshow}
 								<button class="act" onclick={() => onshow(item.albums[0])}>Show</button>
 							{/if}
 						</div>

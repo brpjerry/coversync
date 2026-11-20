@@ -73,6 +73,7 @@
 		type MbArt
 	} from '#lib/api.ts';
 	import { duration } from '#lib/format.ts';
+	import { presetPick, type TickPreset } from '#lib/batch.svelte.ts';
 	import ShowAll from './ShowAll.svelte';
 	import ArtViewer, { type ViewedArt } from './ArtViewer.svelte';
 
@@ -91,6 +92,8 @@
 		/** A field's value; `id` null for an album field. */
 		getField: (id: number | null, kind: string) => string;
 		setField: (id: number | null, kind: string, value: string) => void;
+		/** A field still holds what the dialog put in it (nothing was typed there). */
+		pristine?: (id: number | null, kind: string) => boolean;
 		/** Accepted suggestions for tags without fields, and how many values are accepted in all. */
 		onaccept: (edits: ImportEdits, count: number) => void;
 		/** The album's own art; null if it has none. */
@@ -99,6 +102,16 @@
 		artChosen: string | null;
 		/** `auto`: ticked by default rather than by hand. */
 		onart: (art: ChosenArt | null, auto: boolean) => void;
+		/**
+		 * In a batch: the quick choice used on the album before, applied once
+		 * the lookup is back (only to a release that's surely the album, as the
+		 * default ticks are).
+		 */
+		preset?: TickPreset;
+		/** A quick choice was used: the batch's next album starts with it. */
+		onpreset?: (preset: TickPreset) => void;
+		/** Its lookup started or ended, for the batch's strip. */
+		onlookup?: (running: boolean) => void;
 	}
 	let {
 		albumId,
@@ -111,12 +124,18 @@
 		fields,
 		getField,
 		setField,
+		pristine = () => true,
 		onaccept,
 		original,
 		artChosen,
-		onart
+		onart,
+		preset,
+		onpreset,
+		onlookup
 	}: Props = $props();
+	$effect(() => onlookup?.(lookup === null || lookup.state === 'running'));
 
+	const uid = $props.id();
 	let lookup = $state<IdentifyState | null>(null);
 	let result = $derived(lookup?.state === 'done' ? lookup.result : null);
 	let rows = $state<Row[]>([]);
@@ -175,8 +194,10 @@
 			const art = await api.musicbrainzArt(release.id, release.release_group, release.front_art);
 			if (mine !== seq) return;
 			cover = { release: release.id, art };
-			// Like an empty tag: filled in when the release is surely the album.
-			if (art && !original && complete) toggleArt(true, true);
+			// Like an empty tag: filled in when the release is surely the album;
+			// in a batch, as the quick choice used before says.
+			const tick = preset ? presetPick[preset]({ fill: !original }) && !artSmaller : !original;
+			if (art && complete && tick) toggleArt(true, true);
 		} catch (e) {
 			if (mine !== seq) return;
 			cover = {
@@ -423,15 +444,21 @@
 			!!r.release && r.release.track_count === tracks.length && r.tracks.every((t) => t.via);
 		if (!whole) return;
 		for (const row of rows) {
-			// Never over what was typed in a field.
-			const untouched = (v: string) => !v.trim() || (row.romanizes && v.trim() === row.current);
+			// Never over what was typed in a field. A quick choice carried from the
+			// batch's album before may replace what the files have, though.
+			const untouched = (id: number | null) => {
+				const v = getField(id, row.kind);
+				if (preset) return pristine(id, row.kind);
+				return !v.trim() || (row.romanizes && v.trim() === row.current);
+			};
 			const free =
 				row.field === 'album'
-					? untouched(getField(null, row.kind))
+					? untouched(null)
 					: row.field === 'track'
-						? row.ids.every((id) => untouched(getField(id, row.kind)))
+						? row.ids.every((id) => untouched(id))
 						: true;
-			if ((row.fill || row.romanizes) && free) toggle(row, true);
+			const want = preset ? presetPick[preset](row) : row.fill || row.romanizes;
+			if (want && free) toggle(row, true);
 		}
 	}
 
@@ -786,13 +813,17 @@
 	{/if}
 {/snippet}
 
-<section class="suggest" aria-labelledby="suggest-title" aria-busy={lookup?.state === 'running'}>
+<section
+	class="suggest"
+	aria-labelledby="suggest-title-{uid}"
+	aria-busy={lookup?.state === 'running'}
+>
 	<header class="suggest-head">
 		<span class="badge" class:busy={!lookup || lookup.state === 'running'}
 			><Sparkles size={16} /></span
 		>
 		<div class="head-main">
-			<h3 id="suggest-title">Suggestions from MusicBrainz</h3>
+			<h3 id="suggest-title-{uid}">Suggestions from MusicBrainz</h3>
 			{#if !lookup || lookup.state === 'running'}
 				{@const s = lookup?.state === 'running' ? lookup : null}
 				<p class="stage">
@@ -991,9 +1022,15 @@
 					><b>{on.length + (artOn ? 1 : 0)}</b> of {offered}
 					{offered === 1 ? 'suggestion' : 'suggestions'} ticked</span
 				>
-				<button class="link" onclick={() => setAll(() => true)}>Tick all</button>
-				<button class="link" onclick={() => setAll((r) => r.fill)}>Only empty tags</button>
-				<button class="link" onclick={() => setAll(() => false)}>None</button>
+				{#each [['all', 'Tick all'], ['fill', 'Only empty tags'], ['none', 'None']] as const as [p, name] (p)}
+					<button
+						class="link"
+						onclick={() => {
+							setAll(presetPick[p]);
+							onpreset?.(p);
+						}}>{name}</button
+					>
+				{/each}
 			</div>
 
 			{#if albumRows.length || artRow}
