@@ -176,7 +176,7 @@
 		{/if}
 		{@render actions?.()}
 		<button
-			class="icon-btn"
+			class="icon-btn rescan"
 			onclick={onrescan}
 			aria-label={scan?.running ? 'Scanning' : 'Rescan the Inbox and Library'}
 			title={scan?.running ? 'Scanning…' : 'Rescan the Inbox and Library'}
@@ -502,8 +502,8 @@
 		.right {
 			gap: 4px;
 		}
-		/* Rescan's spinning icon says a scan is running; its ring would take the room. */
-		.scan {
+		/* While a scan runs, its progress ring stands in for Rescan, which waits. */
+		.rescan:disabled {
 			display: none;
 		}
 	}

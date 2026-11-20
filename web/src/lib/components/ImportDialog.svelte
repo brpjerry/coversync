@@ -758,12 +758,14 @@
 		max-height: calc(100dvh - 48px);
 		display: grid;
 		grid-template-columns: minmax(0, 1fr);
-		grid-template-rows: auto auto minmax(0, 1fr) auto;
+		/* On a screen too short for it all (a phone held sideways), the
+		   editing area keeps some room and the whole dialog scrolls. */
+		grid-template-rows: auto auto minmax(6rem, 1fr) auto;
 		border-radius: 24px;
 		background: var(--bg-raised);
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 40px 120px -30px rgb(0 0 0 / 0.75);
-		overflow: hidden;
+		overflow: hidden auto;
 	}
 	.head {
 		display: flex;
@@ -1187,14 +1189,10 @@
 		.scrim {
 			padding: 0;
 		}
-		/* On a screen too short for it all (a phone held sideways), the
-		   editing area keeps some room and the whole dialog scrolls. */
 		.dialog {
 			max-height: 100dvh;
 			height: 100dvh;
 			border-radius: 0;
-			grid-template-rows: auto auto minmax(6rem, 1fr) auto;
-			overflow-y: auto;
 		}
 		.foot {
 			flex-direction: column;
@@ -1213,6 +1211,7 @@
 			white-space: normal;
 		}
 		.dest-path {
+			align-items: flex-start;
 			max-height: 4.5em;
 			overflow-y: auto;
 			white-space: normal;
