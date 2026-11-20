@@ -324,6 +324,14 @@
 		return out;
 	});
 
+	/** Bumped each time a batch shows it again. */
+	let shown = $state(0);
+	let wasHidden = untrack(() => hidden);
+	$effect(() => {
+		if (wasHidden && !hidden) untrack(() => shown++);
+		wasHidden = hidden;
+	});
+
 	// Re-plan as values change, for the destination preview and server-side
 	// checks, again after signing back in (a plan asked for meanwhile failed),
 	// and when a batch comes back to it (the setup may have changed meanwhile).
@@ -332,8 +340,8 @@
 	let seq = 0;
 	$effect(() => {
 		void session.generation;
-		// Shown again, it checks afresh; hidden, a check of its last edit still runs.
-		void hidden;
+		// Shown again, it checks afresh (hiding leaves a check under way be).
+		void shown;
 		// Imported, or on its way: there's nothing left to check.
 		if (done) return;
 		const e = $state.snapshot(edits) as ImportEdits;

@@ -463,7 +463,6 @@
 
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
-		moves++;
 		await morph(
 			cover,
 			async () => {
@@ -490,7 +489,6 @@
 	async function close() {
 		const id = openId;
 		if (!id) return;
-		moves++;
 		const hero = document.querySelector<HTMLElement>('.hero-cover');
 		// A cover scrolled out of the window (from the tag editor, say) would fly
 		// in from off screen: then the album just fades in on the grid.
@@ -1231,6 +1229,8 @@
 
 	/** The Inbox albums this page is importing, whose sheets it closes itself. */
 	const importingHere = new Set<string>();
+	/** Import requests on their way: leaving the page could stop those not sent yet. */
+	let importRequests = 0;
 	/** Returns an error message, or null when the album was imported. */
 	/** `autofilled`: kinds autofill sets, mentioned in the success toast. */
 	async function runImport(
@@ -1244,7 +1244,10 @@
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
 		importingHere.add(album.id);
 		try {
-			const r = await api.importAlbum(album.id, edits, art, musicbrainzArt);
+			importRequests++;
+			const r = await api
+				.importAlbum(album.id, edits, art, musicbrainzArt)
+				.finally(() => importRequests--);
 			importing = null;
 			// The album leaves the Inbox; close its sheet first so history stays tidy.
 			if (openId === album.id) await close();
@@ -1298,9 +1301,8 @@
 
 	/** Returns whether the batch started. */
 	async function startBatch(list: Album[]): Promise<boolean> {
-		if (batch && !batch.ended) return false;
-		// The tag catalog for the labels and fields, and whether Smart suggestions are on.
-		await Promise.all([setup.load(), inboxSetup.load()]);
+		// Setup was read first (see importSelected): the catalog for the
+		// labels and fields, and whether Smart suggestions are on.
 		if (batch && !batch.ended) return false;
 		if (!setup.loaded || !inboxSetup.loaded) {
 			toast("Couldn't read the Library or Inbox setup, so nothing was imported.", 'error', 6000);
@@ -1319,7 +1321,7 @@
 	onMount(() => {
 		const leaving = (e: BeforeUnloadEvent) => {
 			// Any batch's: a summary closed early leaves its imports going.
-			if (importingHere.size) e.preventDefault();
+			if (importRequests) e.preventDefault();
 		};
 		addEventListener('beforeunload', leaving);
 		return () => removeEventListener('beforeunload', leaving);
@@ -1348,6 +1350,11 @@
 			return advanceBatch();
 		}
 		if (mine !== visit || b !== batch || b.ended) return;
+		// Its plan failed before and came back since: it's an album like any other now.
+		if (!item.opened) {
+			item.error = null;
+			if (item.status === 'failed') item.status = 'waiting';
+		}
 		item.opened = true;
 		void b.prefetch();
 	}
@@ -1363,7 +1370,9 @@
 		if (!item.open || b.ended) return Promise.resolve(null);
 		const id = item.album.id;
 		importingHere.add(id);
+		importRequests++;
 		void b.import(item, edits, art, musicbrainzArt).then(async () => {
+			importRequests--;
 			importingHere.delete(id);
 			await loadAlbums();
 			dataGeneration++;
@@ -1465,17 +1474,17 @@
 		if (batch === b) batch = null;
 	}
 
-	/** Bumped by every album opened or closed, and every Show. */
-	let moves = 0;
+	let shows = 0;
 	async function showInLibrary(id: string) {
-		const mine = ++moves;
+		const mine = ++shows;
 		await setView('library');
-		const before = openId;
+		const seen = openings;
 		// Just imported, the Library's list may not have it yet; if another
-		// view or album is opened meanwhile (Back and Forward too), that stays.
+		// view or album is opened or closed meanwhile (Back and Forward too),
+		// that stays.
 		if (!byId.get(id)) {
 			await loadAlbums();
-			if (mine !== moves || view !== 'library' || openId !== before) return;
+			if (mine !== shows || view !== 'library' || openings !== seen) return;
 		}
 		await tick();
 		const album = byId.get(id);
@@ -1558,6 +1567,7 @@
 
 	/** Open an album an upload became. */
 	async function showUploaded(id: string) {
+		if (batchShown) return;
 		await setView('inbox');
 		await tick();
 		const album = byId.get(id);
@@ -1912,7 +1922,7 @@
 {/if}
 
 <!-- Not while a batch is up: an album opened under it would have an Import of its own. -->
-<PlayerBar onopen={(id) => !batchShown && byId.get(id) && open(byId.get(id)!)} />
+<PlayerBar onopen={batchShown ? undefined : (id) => byId.get(id) && open(byId.get(id)!)} />
 {#if menu}
 	<!-- Keyed so a right-click on another card places a fresh menu. -->
 	{#key menu}

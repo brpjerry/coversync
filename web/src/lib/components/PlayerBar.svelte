@@ -13,7 +13,8 @@
 	import { player } from '#lib/player.svelte.ts';
 
 	interface Props {
-		onopen: (albumId: string) => void;
+		/** Absent while the album can't be opened (a batch import is up): the button is off. */
+		onopen?: (albumId: string) => void;
 	}
 	let { onopen }: Props = $props();
 
@@ -54,7 +55,12 @@
 		role="region"
 		aria-label="Player"
 	>
-		<button class="np" onclick={() => onopen(track.album_id)} aria-label="Open album">
+		<button
+			class="np"
+			onclick={() => onopen?.(track.album_id)}
+			disabled={!onopen}
+			aria-label="Open album"
+		>
 			{#key track.album_id}
 				<span class="art" in:scale={{ start: 0.85, duration: 380 }}>
 					{#if player.album?.has_cover}
