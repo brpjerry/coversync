@@ -17,8 +17,19 @@ used on a home server.
   files first in the Inbox, and most recently imported first in the Library
   (the import time is kept in the Library's database, so tag edits and moves
   don't change it), or, with Inbox setup's Preserve modification date, in
-  the Inbox's order. "Needs attention" lists albums missing tags or art the
-  rules require, and albums **Incomplete** by their own numbering: track
+  the Inbox's order. The sidebar filters albums by tag:
+  pick a tag such as Genre from its dropdown, search its values, and tick the
+  ones to show. Ticked values of one tag widen the choice, values of several
+  tags narrow it, and tags holding several values (split by Library setup's
+  separator, and names at its phrases, see below) offer each. **None**, last,
+  ticks the albums with no value to list (Album artist and Year list the
+  grid's, so an album without an album artist tag is under its artist).
+  Besides tags, it filters by Collection and by **Needs attention**, which
+  lists what albums lack: each tag the rules or folder structure require
+  (in the Inbox, after autofill) or art they require, by name, and
+  **Incomplete** for albums missing tracks by their own numbering (None is
+  the albums that lack nothing). While one of these is ticked, cards say what their
+  album lacks. Incomplete counts track
   numbers below the last one (or up to the track total) that no track has,
   and discs below the last one there that no track is on. Discs past the
   last one aren't counted missing, since a disc total often counts a DVD or
@@ -29,13 +40,7 @@ used on a home server.
   discs, when the numbering runs straight through them and the tags don't
   say which disc a gap is on). This needs no
   MusicBrainz; Smart suggestions (below) list what a release has that the
-  album doesn't. The sidebar filters albums by tag:
-  pick a tag such as Genre from its dropdown, search its values, and tick the
-  ones to show. Ticked values of one tag widen the choice, values of several
-  tags narrow it, and tags holding several values (split by Library setup's
-  separator, and names at its phrases, see below) offer each. **None**, last,
-  ticks the albums with no value to list (Album artist and Year list the
-  grid's, so an album without an album artist tag is under its artist).
+  album doesn't.
 - **Tag editor** (a Library album's Edit tags, or an Inbox album's Import
   without Smart suggestions; see Import): album-wide fields (album, album
   artist, date, genre) and each track's (number, disc, title, artist) up
@@ -217,9 +222,9 @@ used on a home server.
   again** asks both services afresh. Answers that found nothing aren't
   saved, so those are asked again each time. With **Save lookups** off,
   every album is looked up afresh, and no answer is read or saved.
-- **Appearance**: which sorts the sort menu offers (its Library group:
-  Recently added, Needs attention and Collection), which tags the sidebar
-  filters by, and the cover size.
+- **Appearance**: which sorts the sort menu offers, which tags the sidebar
+  filters by (its Library group: Needs attention and Collection), and the
+  cover size. Settings saved when those two were sorts have them as filters.
 - **Sync** (the server, the engine every device runs, and the
   [sync agent](#sync-agent) for desktops and laptops; the other device apps
   come next): devices pair with the

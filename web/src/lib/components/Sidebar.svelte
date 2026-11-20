@@ -163,16 +163,17 @@
 					transition:slide={{ duration: 220, easing: cubicOut }}
 				>
 					{#each active as p (`${p.kind}\n${p.value}`)}
-						{@const none = `No ${label(p.kind).toLowerCase()}`}
-						{@const name = p.value === NONE ? none : `${label(p.kind)}: ${p.value}`}
+						{@const name = `${label(p.kind)}: ${valueLabel(p.value)}`}
+						<!-- Apart from a value named None, as the checklist says. -->
+						{@const full = p.value === NONE ? `${name} (no value)` : name}
 						<li transition:fade={{ duration: 150 }}>
 							<button
 								class="chip"
-								title={name}
-								aria-label="Remove {name}"
+								title={full}
+								aria-label="Remove {full}"
 								onclick={() => pick(p.kind, p.value)}
 							>
-								<span class="chip-text">{p.value === NONE ? none : p.value}</span>
+								<span class="chip-text">{p.value === NONE ? name : p.value}</span>
 								<X size={12} strokeWidth={2.4} />
 							</button>
 						</li>
@@ -236,8 +237,7 @@
 							<span class="name" class:blank={t.value === NONE} title={valueLabel(t.value)}
 								>{valueLabel(t.value)}</span
 							>
-							{#if t.value === NONE}<span class="sr-only">(no {label(kind).toLowerCase()})</span
-								>{/if}
+							{#if t.value === NONE}<span class="sr-only">(no value)</span>{/if}
 							<span class="n tabular">{count(t.count)}</span>
 						</button>
 					{/each}
@@ -247,9 +247,9 @@
 						</button>
 					{/if}
 					{#if !values.length}
-						<p class="empty">No {label(kind).toLowerCase()} on these albums.</p>
+						<p class="empty">No values on these albums.</p>
 					{:else if !found.length}
-						<p class="empty">No {label(kind).toLowerCase()} matches “{find}”.</p>
+						<p class="empty">No values match “{find}”.</p>
 					{/if}
 				</div>
 			{/if}

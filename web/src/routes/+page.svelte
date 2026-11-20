@@ -1,12 +1,10 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
-	import { fade, fly, slide } from 'svelte/transition';
+	import { fade, fly } from 'svelte/transition';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
-	import CircleAlert from '@lucide/svelte/icons/circle-alert';
-	import CircleCheck from '@lucide/svelte/icons/circle-check';
 	import FolderCog from '@lucide/svelte/icons/folder-cog';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Inbox from '@lucide/svelte/icons/inbox';
@@ -215,30 +213,9 @@
 		if (!out) orders.set(by, (out = list.slice().sort(comparator(by))));
 		return out;
 	}
-	/** "Needs attention" filters rather than sorts: flagged albums, A to Z by artist. */
-	let attentionView = $derived(activeSort === 'attention');
-	/** Flagged: missing tags the rules need, or tracks by its own numbering. */
-	const needsAttention = (a: Album) => !!(a.attention || a.incomplete);
-	let flagged = $derived(source.filter(needsAttention));
-	/** The sort in use before Needs attention, to go back to. */
-	let lastPlain = $state<Sort>();
-	$effect(() => {
-		if (sort !== 'attention') lastPlain = sort;
-	});
-	/** Where "Show all albums" leads: the sort before, else the menu's first plain one; none if there isn't one. */
-	let plainSort = $derived(
-		lastPlain && appearance.sorts.saved.includes(lastPlain)
-			? lastPlain
-			: appearance.sorts.saved.find((s) => s !== 'attention')
-	);
-	function showAll() {
-		if (plainSort) sort = plainSort;
-	}
 	/** Albums the sort and search leave, in order; the sidebar's tag filters narrow them. */
 	let searched = $derived.by(() => {
-		const list = attentionView
-			? sorted(source, 'album_artist').filter(needsAttention)
-			: sorted(source, activeSort);
+		const list = sorted(source, activeSort);
 		// Setup screens use the search field for their own lists.
 		const terms = isSetup(view) ? [] : fold(query).split(/\s+/).filter(Boolean);
 		return terms.length
@@ -252,6 +229,10 @@
 	let visible = $derived(
 		filtered ? searched.filter(matcher(filters[browsing], filterKinds)) : searched
 	);
+	/** Filtering by what albums need: their cards say what. */
+	let attentionView = $derived(
+		filterKinds.includes('attention') && !!filters[browsing].attention?.length
+	);
 
 	/** The album grid's width, for the Appearance screen's cover size preview. */
 	let mainBox = $state<DOMRectReadOnly>();
@@ -261,10 +242,10 @@
 	/** The top of the grid last browsed, for previewing cover sizes with real covers. */
 	let previewAlbums = $derived.by(() => {
 		const list = browsing === 'library' && library.length ? library : albums;
-		return sorted(list, activeSort === 'attention' ? 'album_artist' : activeSort).slice(0, 12);
+		return sorted(list, activeSort).slice(0, 12);
 	});
 
-	/** Card badge in the attention view: what's missing, and on how many tracks; or which tracks. */
+	/** Card badge while filtering by Needs attention: what's missing, and on how many tracks; or which tracks. */
 	function attentionFlag(a: Album) {
 		const at = a.attention;
 		const names = at?.missing.map((k) => setup.label(k)) ?? [];
@@ -1444,7 +1425,6 @@
 				sorts={appearance.sorts.saved}
 				active={activeSort}
 				label={(id) => appearance.label(id)}
-				counts={{ attention: flagged.length }}
 				onsort={(id) => (sort = id)}
 				disabled={isSetup(view)}
 			/>
@@ -1473,19 +1453,6 @@
 		<main bind:contentRect={mainBox}>
 			{#key view}
 				<div class="view" in:fly={{ x: 28 * direction, duration: 420, easing: cubicOut }}>
-					{#if attentionView && !isSetup(view) && loaded && appearance.settled && source.length}
-						<!-- A filter kept across visits, so it's always on show while it applies. -->
-						<div class="attention-note" transition:slide={{ duration: 220 }}>
-							<CircleAlert size={15} strokeWidth={2.2} />
-							<span>
-								Only albums that need attention: <b class="tabular">{count(flagged.length)}</b> of
-								{count(source.length)}
-							</span>
-							{#if plainSort}
-								<button class="link" onclick={showAll}>Show all albums</button>
-							{/if}
-						</div>
-					{/if}
 					{#if view === 'library-setup'}
 						<LibrarySetup
 							{query}
@@ -1577,19 +1544,9 @@
 								</div>
 							{/if}
 						</div>
-					{:else if visible.length === 0 && attentionView && !query.trim() && !filtered}
-						<div class="empty">
-							<span class="empty-ok"><CircleCheck size={44} strokeWidth={1.4} /></span>
-							<h2>Nothing needs attention</h2>
-							<p>Every album here has the tags the library rules and folder structure need.</p>
-						</div>
 					{:else if visible.length === 0 && filtered}
 						<div class="empty">
-							<h2>
-								{attentionView
-									? 'No albums needing attention match these filters'
-									: 'No albums match these filters'}
-							</h2>
+							<h2>No albums match these filters</h2>
 							<p>
 								{query.trim() ? `Nothing with these tags matches “${query}”.` : 'Try fewer tags.'}
 							</p>
@@ -1601,11 +1558,7 @@
 						</div>
 					{:else if visible.length === 0}
 						<div class="empty">
-							<h2>
-								{attentionView
-									? `Nothing that needs attention matches “${query}”`
-									: `Nothing matches “${query}”`}
-							</h2>
+							<h2>Nothing matches “{query}”</h2>
 							<p>Try an artist, album title, genre or year.</p>
 						</div>
 					{:else}
@@ -1724,44 +1677,6 @@
 		min-width: 0;
 		/* Clear of the player while it's showing (--dock). */
 		padding: 28px 28px calc(var(--dock, 0px) + 56px);
-	}
-	/* The attention view is a filter: say so above the grid, with the way out. */
-	.attention-note {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		max-width: 1800px;
-		margin: 0 auto 22px;
-		padding: 8px 8px 8px 14px;
-		border-radius: 12px;
-		font-size: 13.5px;
-		color: var(--text-2);
-		background: var(--warn-surface);
-		border: 1px solid var(--warn-border);
-	}
-	.attention-note :global(svg) {
-		flex: none;
-		color: var(--warn);
-	}
-	.attention-note span {
-		min-width: 0;
-	}
-	.attention-note b {
-		color: var(--text);
-		font-weight: 600;
-	}
-	.attention-note .link {
-		margin-left: auto;
-		padding: 4px 10px;
-		border-radius: 999px;
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--accent);
-		white-space: nowrap;
-		transition: background 140ms;
-	}
-	.attention-note .link:hover {
-		background: color-mix(in oklab, var(--accent) 14%, transparent);
 	}
 	.scrim {
 		position: fixed;
@@ -1945,16 +1860,6 @@
 			transform: translateY(-8px);
 		}
 	}
-	.empty-ok {
-		color: var(--success);
-		animation: pop 600ms var(--ease-spring) both;
-	}
-	@keyframes pop {
-		from {
-			opacity: 0;
-			transform: scale(0.6);
-		}
-	}
 	.empty-icon {
 		color: var(--text-3);
 		animation: spin 6s linear infinite;
@@ -1970,9 +1875,6 @@
 		}
 		.grid {
 			gap: 22px 14px;
-		}
-		.attention-note {
-			margin-bottom: 16px;
 		}
 	}
 </style>
