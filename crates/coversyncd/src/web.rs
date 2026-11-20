@@ -188,6 +188,17 @@ mod tests {
                 );
             }
         }
+        // Not even another site's page is told anything else.
+        let mut req = Request::post("/__coversync-app/v1/capabilities")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let peer: std::net::SocketAddr = "192.168.1.20:40000".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
         // Next to it, a path of the UI's still gets the UI's shell (or, in a
         // build without the UI, its plain 404): GET is allowed there.
         assert_ne!(

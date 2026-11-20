@@ -165,6 +165,8 @@ fn app(state: Shared) -> Router {
             state.clone(),
             auth::guard,
         ))
+        // Before the guard: another site's page can't act with the cookie.
+        .layer(axum::middleware::from_fn(auth::refuse_cross_site))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

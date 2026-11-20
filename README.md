@@ -335,7 +335,8 @@ To serve the UI under a path prefix behind a reverse proxy, build it with that
 prefix: `(cd web && BASE_PATH=/coversync pnpm build)`. The prefix is written
 as it appears in the URL: ASCII, with anything else percent-encoded
 (`/m%C3%BCsik`, not `/müsik`). The session cookie is then limited to that
-prefix, so other sites on the same host never get it. The proxy has to pass
+prefix, so requests to the host's other paths don't carry it (cookies
+don't tell ports apart, though). The proxy has to pass
 `/api/events` on as it comes rather than buffer it: Caddy does by itself, and
 the stream asks nginx to with `X-Accel-Buffering: no`.
 
@@ -365,7 +366,15 @@ until the command is run on the server.
   `coversync_session`: HttpOnly, SameSite=Lax, and Secure when the proxy
   reports HTTPS (`X-Forwarded-Proto: https`). It is limited to the UI's path,
   and the session ends after 90 days without use, or with **Sign out** in the
-  sidebar. Covers and audio streams work with the cookie alone.
+  sidebar. Covers and audio streams work with the cookie alone. An API
+  request that changes something (but the pairing exchange, `POST
+  /api/pair`, which its code authenticates) is refused (403, `cross_site`) when the
+  browser says a page of another site or origin sent it (`Sec-Fetch-Site:
+  cross-site` or `same-site`), another service on the host's other port,
+  say. Browsers send that header only to https (or localhost) addresses, so
+  serve coversync over https. A page of the same origin (another app at a
+  sibling path behind the same proxy) counts as coversync's own: give
+  services you don't trust a hostname of their own.
 - **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
   (see [Pairing devices](#pairing-devices)), one per device, each with a
   scope: `manage` (everything a browser can do, except managing devices) or

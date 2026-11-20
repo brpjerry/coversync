@@ -452,6 +452,24 @@ async fn plain_http_is_refused_except_on_loopback_or_when_allowed() {
     paired(app.pair_from("100.64.0.7:5000", pair(&code)).await).await;
 }
 
+#[tokio::test]
+async fn a_code_another_origins_page_sends_in_the_clear_is_cancelled_too() {
+    let app = App::with_password("http-cross-site");
+    let cookie = app.cookie().await;
+    let (id, code) = app.new_code(&cookie, phone()).await;
+    let mut req = pair(&code);
+    req.headers_mut().insert(
+        "sec-fetch-site",
+        axum::http::HeaderValue::from_static("same-site"),
+    );
+    let res = app.pair_from(LAN, req).await;
+    assert_eq!(
+        code_of(res).await,
+        (StatusCode::FORBIDDEN, "https_required".into())
+    );
+    assert_eq!(app.pairing(&cookie, &id).await["why"], "insecure");
+}
+
 /// `POST /api/pair` with a body as it is, of the type given.
 fn raw_pair(content_type: Option<&str>, body: String) -> Request<Body> {
     let mut req = Request::post("/api/pair");
