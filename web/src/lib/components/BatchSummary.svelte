@@ -93,7 +93,7 @@
 							{:else if item.status === 'skipped'}
 								Skipped: it stays in the Inbox
 							{:else}
-								Not imported: it stays in the Inbox, selected
+								Not imported
 							{/if}
 						</span>
 					</span>

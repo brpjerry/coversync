@@ -36,8 +36,6 @@
 		 * any tag edits. Their tags are edited only on the way (see `edit`).
 		 */
 		onimport?: (edits?: ImportEdits) => void;
-		/** What the tag editor's Import says: "Import & next" in a batch. */
-		importLabel?: string;
 		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
 		changed?: boolean;
 		/**
@@ -64,7 +62,6 @@
 		onclose,
 		onsaved,
 		onimport,
-		importLabel,
 		changed = false,
 		onreload,
 		ondraft,
@@ -400,7 +397,6 @@
 								onview={(v) => (editorView = v)}
 								onloading={(l) => (editorLoading = l)}
 								{onimport}
-								{importLabel}
 								ondraft={(d) => {
 									editing = d;
 									ondraft?.(d);

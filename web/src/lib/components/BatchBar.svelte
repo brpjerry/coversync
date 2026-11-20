@@ -4,9 +4,7 @@
 	import type { ImportBatch } from '#lib/batch.svelte.ts';
 	import BatchStrip from './BatchStrip.svelte';
 
-	// A batch with Smart suggestions off goes through each album's tag editor:
-	// this bar over the album sheet is its strip, Skip and Stop. The editor's
-	// own Import is the batch's Import & next.
+	// The batch's strip, Skip and Stop while the album's dialog waits for its plan.
 
 	interface Props {
 		batch: ImportBatch;
@@ -16,8 +14,6 @@
 		label: (kind: string) => string;
 	}
 	let { batch, onjump, onskip, onstop, label }: Props = $props();
-
-	let item = $derived(batch.current);
 </script>
 
 <div
@@ -27,14 +23,9 @@
 	transition:fly={{ y: -16, duration: 280, easing: cubicOut }}
 >
 	<BatchStrip {batch} {onjump} {label} />
-	{#if item.status === 'importing'}
-		<span class="note">Importing “{item.album.title}”…</span>
-	{:else if item.status === 'imported'}
-		<span class="note">Imported to {item.dest}</span>
-	{/if}
 	<div class="buttons">
 		<button class="btn" onclick={onstop}>Stop</button>
-		{#if item.open}<button class="btn" onclick={onskip}>Skip</button>{/if}
+		<button class="btn" onclick={onskip}>Skip</button>
 	</div>
 </div>
 
@@ -43,7 +34,7 @@
 		position: fixed;
 		top: 8px;
 		left: 50%;
-		/* Over the album sheet (30), under the import dialog (45). */
+		/* Over the grid, under the import dialog (45). */
 		z-index: 35;
 		translate: -50% 0;
 		width: max-content;
@@ -63,23 +54,11 @@
 		padding: 0 12px;
 		font-size: 13px;
 	}
-	.note {
-		min-width: 0;
-		font-size: 13px;
-		color: var(--text-2);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
 	.buttons {
 		flex: none;
 		display: flex;
 		gap: 6px;
 		margin-left: auto;
-	}
-	/* Room above the sheet for the bar. */
-	:global(body:has(.batch-bar) .sheet-wrap) {
-		padding-top: 64px;
 	}
 	@media (max-width: 600px) {
 		.batch-bar {
@@ -92,9 +71,6 @@
 			border-radius: 0;
 			border-width: 0 0 1px;
 			padding: 8px 12px;
-		}
-		:global(body:has(.batch-bar) .sheet-wrap) {
-			padding-top: 52px;
 		}
 	}
 </style>

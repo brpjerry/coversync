@@ -92,6 +92,8 @@
 		/** A field's value; `id` null for an album field. */
 		getField: (id: number | null, kind: string) => string;
 		setField: (id: number | null, kind: string, value: string) => void;
+		/** A field still holds what the dialog put in it (nothing was typed there). */
+		pristine?: (id: number | null, kind: string) => boolean;
 		/** Accepted suggestions for tags without fields, and how many values are accepted in all. */
 		onaccept: (edits: ImportEdits, count: number) => void;
 		/** The album's own art; null if it has none. */
@@ -120,6 +122,7 @@
 		fields,
 		getField,
 		setField,
+		pristine = () => true,
 		onaccept,
 		original,
 		artChosen,
@@ -439,16 +442,16 @@
 		for (const row of rows) {
 			// Never over what was typed in a field. A quick choice carried from the
 			// batch's album before may replace what the files have, though.
-			const untouched = (v: string) =>
-				!v.trim() ||
-				(preset
-					? v.trim() === (row.current ?? '').trim()
-					: row.romanizes && v.trim() === row.current);
+			const untouched = (id: number | null) => {
+				const v = getField(id, row.kind);
+				if (preset) return pristine(id, row.kind);
+				return !v.trim() || (row.romanizes && v.trim() === row.current);
+			};
 			const free =
 				row.field === 'album'
-					? untouched(getField(null, row.kind))
+					? untouched(null)
 					: row.field === 'track'
-						? row.ids.every((id) => untouched(getField(id, row.kind)))
+						? row.ids.every((id) => untouched(id))
 						: true;
 			const want = preset ? presetPick[preset](row) : row.fill || row.romanizes;
 			if (want && free) toggle(row, true);

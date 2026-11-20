@@ -1,6 +1,6 @@
 // Importing several Inbox albums in a row: each still gets its own import
-// dialog (or, with Smart suggestions off, its tag editor), one after another,
-// and each import runs in the background while the next album is reviewed.
+// dialog, one after another, and each import runs in the background while
+// the next album is reviewed.
 
 import { api, ApiError, type Album, type ImportEdits, type ImportPlan } from './api';
 
@@ -42,19 +42,11 @@ export class BatchItem {
 	lookup = $state<'idle' | 'running' | 'done'>('idle');
 	/** Shown once: its dialog is kept, hidden, while the batch lasts, with what was done in it. */
 	opened = $state(false);
-	/** Edits from its tag editor (Smart suggestions off). */
-	edits = $state<ImportEdits>({});
-	/** Smart suggestions off: its plan asked for the import dialog over the tag editor. */
-	dialog = $state(false);
-	/** Bumped when the tag editor asks for the dialog again, so it starts from the new plan. */
-	round = $state(0);
 	/**
 	 * What its dialog, once shown, says it still needs, as it's edited
 	 * there; null when it's ready. Until then the strip goes by its plan.
 	 */
 	needs = $state<string | null | undefined>(undefined);
-	/** Its tag editor's Import is being checked (Smart suggestions off). */
-	checking = false;
 	/** Its first plan, while it's on its way: asked for once. */
 	pending: Promise<ImportPlan | null> | null = null;
 
@@ -70,7 +62,7 @@ export class BatchItem {
 
 export class ImportBatch {
 	readonly items: BatchItem[];
-	/** Smart suggestions were on when it started: the albums' steps are their import dialogs. */
+	/** Smart suggestions were on when it started: its albums are looked up ahead. */
 	readonly suggest: boolean;
 	index = $state(0);
 	/** The collection last picked, for the next album without one; null until one is. */
@@ -83,6 +75,8 @@ export class ImportBatch {
 	dismissed = $state(false);
 	/** Its progress toast, while imports run. */
 	toast: number | null = null;
+	/** The toast saying how its imports went is out. */
+	announced = false;
 	/** Let go of: plans and lookups fetched ahead stop. */
 	#closed = false;
 	#fetching = false;
@@ -120,18 +114,6 @@ export class ImportBatch {
 		return this.items.every((i) => i === this.current || i.status !== 'waiting');
 	}
 
-	/** The plan for `item` with `edits`, or null with `item.error` saying why there's none. */
-	async loadPlan(item: BatchItem, edits: ImportEdits): Promise<ImportPlan | null> {
-		try {
-			item.plan = await api.importPlan(item.album.id, edits);
-			if (item.status === 'waiting') item.error = null;
-			return item.plan;
-		} catch (e) {
-			item.error = message(e, 'Could not check the album');
-			return null;
-		}
-	}
-
 	/**
 	 * Its plan before any edits: the one it has, or the one on its way (asked
 	 * for once, whoever asks first). One made since, with edits, isn't replaced.
@@ -140,10 +122,16 @@ export class ImportBatch {
 		if (item.plan) return Promise.resolve(item.plan);
 		item.pending ??= api.importPlan(item.album.id, {}).then(
 			(plan) => {
-				item.plan ??= plan;
+				if (!item.plan) {
+					item.plan = plan;
+					// It's been checked after all.
+					if (item.status === 'waiting') item.error = null;
+				}
 				return item.plan;
 			},
 			(e) => {
+				// One made since, with edits, stands.
+				if (item.plan) return item.plan;
 				item.error = message(e, 'Could not check the album');
 				return null;
 			}
@@ -192,13 +180,20 @@ export class ImportBatch {
 		}
 	}
 
-	/** The next album to look up: the current one first, then the next in order, once its plan says it uses suggestions. */
+	/**
+	 * The next album to look up: the current one first, then the next in
+	 * order. One whose plan isn't back yet is waited for (its plan wakes the
+	 * worker) rather than passed over; one whose plan says it doesn't use
+	 * suggestions, or failed, is.
+	 */
 	#nextLookup(): BatchItem | undefined {
 		if (this.#closed || this.ended) return;
 		const n = this.items.length;
 		for (let k = 0; k < n; k++) {
 			const item = this.items[(this.index + k) % n];
-			if (item.lookup === 'idle' && item.status === 'waiting' && item.plan?.suggest) return item;
+			if (item.lookup !== 'idle' || item.status !== 'waiting') continue;
+			if (!item.plan && !item.error) return;
+			if (item.plan?.suggest) return item;
 		}
 	}
 

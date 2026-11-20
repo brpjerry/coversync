@@ -89,7 +89,7 @@
 	/** Each dialog of a batch stays, so its heading's id is its own. */
 	const uid = $props.id();
 	/** The suggestions' quick choice used on the album before, as it was when this one opened. */
-	const preset = untrack(() => batch?.batch.preset);
+	let preset = $state(untrack(() => batch?.batch.preset));
 	/** A batch's later albums replace the one before at once rather than fading in over the grid. */
 	const motion = untrack(() =>
 		batch?.batch.items.some((i) => i.opened && i !== batch.item) ? 0 : 1
@@ -152,6 +152,15 @@
 			tracks.map((t) => [t.id, Object.fromEntries(trackCols.map((k) => [k, t.values[k] ?? '']))])
 		)
 	);
+
+	// What the fields held when the dialog opened (a field added since, its prefill).
+	const startAlbum = untrack(() => ({ ...albumValues }));
+	const startTrack = untrack(() => $state.snapshot(trackValues));
+	/** A field still holds what the dialog put in it: nothing has been typed there. */
+	const pristine = (id: number | null, k: string) =>
+		id === null
+			? (albumValues[k] ?? '') === (startAlbum[k] ?? consensus(k))
+			: (trackValues[id]?.[k] ?? '') === (startTrack[id]?.[k] ?? '');
 
 	/** Suggestions accepted for tags without a field here, and accepted values in all. */
 	let accepted = $state<ImportEdits>({});
@@ -401,6 +410,7 @@
 		} else if (batch && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
 			// Another album of the batch, without importing or skipping this one.
 			e.preventDefault();
+			e.stopPropagation();
 			const to = batch.batch.index + (e.key === 'ArrowRight' ? 1 : -1);
 			if (to >= 0 && to < batch.batch.items.length) batch.onjump(to);
 		}
@@ -412,10 +422,15 @@
 	// When it opens, and when a batch comes back to it.
 	$effect(() => {
 		if (hidden) return;
+		// The first of these that can take the focus: shown and not disabled.
+		const usable = (sel: string) =>
+			[...(dialog?.querySelectorAll<HTMLElement>(sel) ?? [])].find(
+				(el) => el.offsetParent !== null && !(el as HTMLButtonElement).disabled
+			);
 		const field =
-			dialog?.querySelector<HTMLElement>('input.missing, .art-choose') ??
-			dialog?.querySelector<HTMLElement>('.collection select') ??
-			dialog?.querySelector<HTMLElement>('.foot .btn.primary') ??
+			usable('input.missing, .art-choose') ??
+			usable('.collection select') ??
+			usable('.foot .btn.primary') ??
 			dialog;
 		field?.focus({ preventScroll: true });
 	});
@@ -529,7 +544,13 @@
 							: null}
 						artChosen={mbArt?.release ?? null}
 						{preset}
-						onpreset={batch ? (p) => (batch.batch.preset = p) : undefined}
+						onpreset={batch
+							? (p) => {
+									preset = p;
+									batch.batch.preset = p;
+								}
+							: undefined}
+						{pristine}
 						onart={(art, auto) => {
 							// Ticked by default, it never replaces an image chosen by hand.
 							if (art && auto && upload) return;

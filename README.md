@@ -196,7 +196,8 @@ used on a home server.
   every album shown, and Esc stops. A bar counts them, including any the
   search or filters hide, and **Import N** goes through each one in the
   Inbox's order. Each gets its import dialog (with Smart suggestions off, its
-  tag editor), with a strip of the batch's covers marking each album's
+  fields for missing tags, collection and art: import an album on its own to
+  edit all its tags), with a strip of the batch's covers marking each album's
   progress: looking up, needs something, importing, imported, skipped or
   failed. **Import & next** imports in the background and moves on, **Skip**
   leaves the album in the Inbox, and Alt+←/→ moves between albums without

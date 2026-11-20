@@ -521,9 +521,6 @@
 			target.style.viewTransitionName = '';
 			if (hidden) hidden.style.viewTransitionName = 'album-cover';
 		});
-		// Done once history is back and the page shows it, as open's morph is:
-		// what comes next (another album's sheet, say) mustn't race the back.
-		await vt.updateCallbackDone.catch(() => {});
 	}
 
 	async function playAlbum(album: Album) {
@@ -1198,11 +1195,6 @@
 	 * over first even if this page's copy of the setting is out of date.
 	 */
 	async function startImport(album: Album, edits?: ImportEdits) {
-		// The tag editor's Import, for the album a batch is on.
-		const b = batch;
-		const item = b && !b.ended && edits ? b.items.find((i) => i.album.id === album.id) : null;
-		// Another of the batch's albums, its sheet still closing: not imported on its own.
-		if (b && item) return item === b.current ? importFromEditor(b, item, edits!) : undefined;
 		// Taken as off until Inbox setup has loaded: the editor's Import
 		// still brings suggestions, if they're on, in the dialog.
 		if (!edits && !inboxSetup.saved.suggestions) {
@@ -1284,17 +1276,13 @@
 	}
 
 	// Several Inbox albums imported one after another: each one's import
-	// dialog in turn (or, with Smart suggestions off, its tag editor), each
-	// import running in the background while the next album is looked at.
+	// dialog in turn, each import running in the background while the next
+	// album is looked at.
 	let batch = $state<ImportBatch | null>(null);
-	/**
-	 * Bumped by every move between the batch's albums, and by Stop: a move
-	 * (or a check of the tag editor's Import) still on its way gives way to it.
-	 */
+	/** Bumped by every move between the batch's albums, and by Stop: a move still on its way gives way to it. */
 	let visit = 0;
-	let stopping = false;
 	/** The batch's dialog or summary is up, over the page. */
-	let batchShown = $derived(!!batch && (batch.ended ? !batch.dismissed : batch.suggest));
+	let batchShown = $derived(!!batch && (batch.ended ? !batch.dismissed : batch.current.opened));
 
 	/** Import the albums selected, in the Inbox's order. */
 	function importSelected() {
@@ -1309,6 +1297,10 @@
 		// The tag catalog for the labels, and whether Smart suggestions are on.
 		await Promise.all([setup.load(), inboxSetup.load()]);
 		if (batch && !batch.ended) return;
+		if (!inboxSetup.loaded) {
+			toast("Couldn't read Inbox setup, so the albums weren't imported.", 'error', 6000);
+			return;
+		}
 		batch?.close();
 		const b = new ImportBatch(list, inboxSetup.saved.suggestions);
 		batch = b;
@@ -1316,94 +1308,31 @@
 		await showBatchItem(0);
 	}
 
-	/**
-	 * The strip, or Alt+←/→: another album of the batch. With Smart
-	 * suggestions off, after asking if its tag editor has edits.
-	 */
+	/** The strip, or Alt+←/→: another album of the batch. */
 	function jumpBatch(index: number) {
 		const b = batch;
-		if (!b || b.ended || index < 0 || index >= b.items.length) return;
-		const here = !b.suggest && openId === b.current.album.id;
-		if (index === b.index && (b.suggest || here)) return;
-		const title = b.current.album.title;
-		if (
-			here &&
-			draft !== 'none' &&
-			!confirm(`Leave “${title}”? Its tag editor's edits aren't kept.`)
-		)
-			return;
+		if (!b || b.ended || index < 0 || index >= b.items.length || index === b.index) return;
 		void showBatchItem(index);
 	}
 
-	/** Go to the batch's album at `index`: its dialog, or with Smart suggestions off, its tag editor. */
+	/** Go to the batch's album at `index`: its dialog, once its plan is in. */
 	async function showBatchItem(index: number): Promise<void> {
 		const b = batch;
 		if (!b || b.ended) return;
 		const mine = ++visit;
-		const current = () => mine === visit && b === batch && !b.ended;
-		// Smart suggestions off: an album left goes back to its editor next time.
-		if (!b.suggest && index !== b.index) b.current.dialog = false;
 		b.index = index;
 		const item = b.current;
-		if (!item.open) {
-			// Imported, or on its way: its dialog (or the bar) says where to.
-			if (!b.suggest && openId) await close();
-			return;
-		}
+		// Imported, or on its way: its dialog says where to.
+		if (!item.open) return;
 		if (!item.plan && !(await b.firstPlan(item))) {
-			if (!current()) return;
+			if (mine !== visit || b !== batch || b.ended) return;
 			// Its dialog can't open: it's listed as failed, with why, and Retry.
 			item.status = 'failed';
 			return advanceBatch();
 		}
-		if (!current()) return;
-		if (b.suggest) {
-			item.opened = true;
-			void b.prefetch();
-			return;
-		}
-		// Retried: its dialog, with the edits it was imported with.
-		if (item.dialog) return;
-		if (openId !== item.album.id) {
-			if (openId) await close();
-			if (!current()) return;
-			await open(item.album);
-			if (!current()) return;
-		}
-		sheet?.edit();
-	}
-
-	/** Smart suggestions off: the tag editor's Import, in a batch; its dialog only when the plan asks. */
-	async function importFromEditor(b: ImportBatch, item: BatchItem, edits: ImportEdits) {
-		if (item.checking) return;
-		item.checking = true;
-		const mine = visit;
-		try {
-			item.edits = edits;
-			const plan = await b.loadPlan(item, edits);
-			// Skipped, stopped or left meanwhile: there's nothing more to do.
-			if (mine !== visit || b !== batch || b.ended || b.current !== item) return;
-			if (!plan) {
-				toast(item.error ?? 'Could not check the album', 'error', 6000);
-				return;
-			}
-			const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
-			// A collection to pick: Library setup's, one the files have, or the one picked before.
-			const collection =
-				setup.saved.collections.length ||
-				plan.tracks.some((t) => t.values.collection) ||
-				!!b.collection;
-			if (asks || collection) {
-				item.round++;
-				item.dialog = item.opened = true;
-			} else if (plan.problems.length) {
-				toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));
-			} else {
-				batchImport(b, item, edits);
-			}
-		} finally {
-			item.checking = false;
-		}
+		if (mine !== visit || b !== batch || b.ended) return;
+		item.opened = true;
+		void b.prefetch();
 	}
 
 	/** Import the batch's `item` in the background, and go on to the next album. */
@@ -1433,10 +1362,8 @@
 		if (!b || b.ended) return;
 		const next = b.nextWaiting();
 		if (next !== null) return showBatchItem(next);
-		const mine = ++visit;
-		// The album sheet goes before the summary comes.
-		if (!b.suggest && openId) await close();
-		if (mine === visit && b === batch) b.ended = true;
+		++visit;
+		b.ended = true;
 	}
 
 	function skipBatchItem() {
@@ -1444,9 +1371,9 @@
 		void advanceBatch();
 	}
 
-	async function stopBatch() {
+	function stopBatch() {
 		const b = batch;
-		if (!b || b.ended || stopping) return;
+		if (!b || b.ended) return;
 		const left = b.waiting;
 		const albumsLeft = left === 1 ? "1 album hasn't" : `${left} albums haven't`;
 		if (
@@ -1454,14 +1381,7 @@
 			!confirm(`Stop importing? ${albumsLeft} been imported. Imports already started will finish.`)
 		)
 			return;
-		stopping = true;
 		++visit;
-		try {
-			if (!b.suggest && openId) await close();
-		} finally {
-			stopping = false;
-		}
-		if (b !== batch) return;
 		b.ended = true;
 		// The albums left, those still in the Inbox, stay selected to pick the batch up again.
 		const inbox = new Set(albums.map((a) => a.id));
@@ -1480,12 +1400,9 @@
 		const b = batch;
 		if (!b) return;
 		item.status = 'waiting';
-		// Smart suggestions off: its dialog, with the edits it was imported with.
-		if (!b.suggest) {
-			item.round++;
-			item.dialog = item.opened = true;
-		}
 		b.ended = false;
+		// Plans fetched ahead stopped with the batch.
+		void b.loadPlans();
 		void showBatchItem(b.items.indexOf(item));
 	}
 
@@ -1515,7 +1432,8 @@
 		}
 		if (b.toast !== null) dismiss(b.toast);
 		b.toast = null;
-		if (!b.ended || !b.dismissed) return;
+		if (!b.ended || !b.dismissed || b.announced) return;
+		b.announced = true;
 		const imported = b.count('imported');
 		const failed = b.count('failed');
 		toast(
@@ -1530,8 +1448,12 @@
 
 	async function showInLibrary(id: string) {
 		await setView('library');
-		// Just imported, the Library's list may not have it yet.
-		if (!byId.get(id)) await loadAlbums();
+		// Just imported, the Library's list may not have it yet; meanwhile
+		// another view or album opened is left as it is.
+		if (!byId.get(id)) {
+			await loadAlbums();
+			if (view !== 'library' || openId) return;
+		}
 		await tick();
 		const album = byId.get(id);
 		if (album) open(album);
@@ -1636,19 +1558,6 @@
 		// The login view is up: keys are its own, and Escape mustn't close the
 		// album (and its unsaved edits) under it.
 		if (session.state === 'out') return;
-		// A batch going through tag editors: Esc stops it rather than closing
-		// the sheet, and Alt+←/→ move between its albums (its dialog has its own).
-		const editors = batch && !batch.ended && !batch.suggest && !batch.current.dialog;
-		if (editors && e.key === 'Escape') {
-			e.preventDefault();
-			stopBatch();
-			return;
-		}
-		if (editors && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-			e.preventDefault();
-			jumpBatch(batch!.index + (e.key === 'ArrowRight' ? 1 : -1));
-			return;
-		}
 		if (e.key === 'Escape' && openId) {
 			e.preventDefault();
 			close();
@@ -1955,15 +1864,10 @@
 		bind:this={sheet}
 		album={sheetAlbum}
 		detail={sheetDetail}
-		onclose={batch && !batch.ended && !batch.suggest ? stopBatch : close}
+		onclose={close}
 		{onsaved}
 		onimport={sheetAlbum.collection === 'inbox'
 			? (edits) => startImport(sheetAlbum!, edits)
-			: undefined}
-		importLabel={batch && !batch.ended && batch.current.album.id === sheetAlbum.id
-			? batch.last
-				? 'Import'
-				: 'Import & next'
 			: undefined}
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
@@ -2022,33 +1926,31 @@
 	{@const b = batch}
 	<!-- Each album's dialog stays once shown, hidden while another is, with what was done in it. -->
 	{#each b.items as item, i (item.album.id)}
-		{#if item.opened && item.plan && (b.suggest || item.dialog)}
-			{#key item.round}
-				<ImportDialog
-					hidden={b.ended || i !== b.index}
-					album={item.album}
-					plan={item.plan}
-					baseEdits={item.edits}
-					label={(id) => setup.label(id)}
-					albumKinds={setup.albumKinds}
-					collections={setup.saved.collections}
-					notEditable={setup.notEditable}
-					coreKinds={setup.kinds.filter((k) => k.group === 'core').map((k) => k.id)}
-					kindOrder={setup.kinds.map((k) => k.id)}
-					onclose={b.suggest ? stopBatch : () => (item.dialog = false)}
-					onimport={(edits, art, _suggested, mbArt) => batchImport(b, item, edits, art, mbArt)}
-					batch={{
-						batch: b,
-						item,
-						onjump: jumpBatch,
-						onskip: skipBatchItem,
-						onstop: stopBatch
-					}}
-				/>
-			{/key}
+		{#if item.opened && item.plan}
+			<ImportDialog
+				hidden={b.ended || i !== b.index}
+				album={item.album}
+				plan={item.plan}
+				label={(id) => setup.label(id)}
+				albumKinds={setup.albumKinds}
+				collections={setup.saved.collections}
+				notEditable={setup.notEditable}
+				coreKinds={setup.kinds.filter((k) => k.group === 'core').map((k) => k.id)}
+				kindOrder={setup.kinds.map((k) => k.id)}
+				onclose={stopBatch}
+				onimport={(edits, art, _suggested, mbArt) => batchImport(b, item, edits, art, mbArt)}
+				batch={{
+					batch: b,
+					item,
+					onjump: jumpBatch,
+					onskip: skipBatchItem,
+					onstop: stopBatch
+				}}
+			/>
 		{/if}
 	{/each}
-	{#if !b.suggest && !b.ended && !(b.current.dialog && b.current.open)}
+	<!-- While the album's dialog waits for its plan: the strip, Skip and Stop. -->
+	{#if !b.ended && !b.current.opened}
 		<BatchBar
 			batch={b}
 			onjump={jumpBatch}

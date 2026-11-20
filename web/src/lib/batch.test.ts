@@ -94,6 +94,17 @@ describe('a batch', () => {
 		expect(asked).toEqual([]);
 	});
 
+	it('waits for the current album’s plan rather than looking up a later one first', async () => {
+		asked.length = 0;
+		const b = new ImportBatch(albums('a', 'b'), true);
+		await b.firstPlan(b.items[1]);
+		await b.prefetch(noWait);
+		expect(asked).toEqual([]);
+		await b.firstPlan(b.items[0]);
+		await b.prefetch(noWait);
+		expect(asked).toEqual(['a', 'b']);
+	});
+
 	it('stops planning and looking up once it ends', async () => {
 		asked.length = 0;
 		planned.length = 0;
