@@ -2247,10 +2247,9 @@ impl Library {
                     }
                 }
                 for key in filter_keys {
+                    // Empty too: the page tells no value from a key not asked for.
                     let found = filter_values(key, &album, idx.iter().map(|i| &values[*i]), split);
-                    if !found.is_empty() {
-                        album.filter_values.insert(key.to_string(), found);
-                    }
+                    album.filter_values.insert(key.to_string(), found);
                 }
                 if !required.is_empty() {
                     let mut have = after_autofill(&rows, &idx, &values, &present, autofill);
@@ -3189,9 +3188,12 @@ mod tests {
         // Album artist and year are the ones the grid shows.
         assert_eq!(values("a", "album_artist"), ["Kano"]);
         assert_eq!(values("a", "date"), ["2003"]);
-        // An untagged album only has the artist the grid shows for it.
+        // An untagged album only has the artist the grid shows for it; the
+        // other keys asked for are there, empty.
         assert_eq!(values("b", "album_artist"), ["Unknown Artist"]);
-        assert_eq!(get("b").len(), 1);
+        for key in ["genre", "artist", "date"] {
+            assert!(get("b")[key].is_empty(), "{key}");
+        }
         // Names are split at the phrases too; other tags only at the separator.
         assert_eq!(values("d", "artist"), ["Ado", "Eve"]);
         assert_eq!(values("d", "album_artist"), ["Ado", "Eve"]);

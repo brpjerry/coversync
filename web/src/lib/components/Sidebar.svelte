@@ -22,6 +22,8 @@
 		same,
 		tagValues,
 		toggled,
+		valueLabel,
+		NONE,
 		type Filters,
 		type TagValue
 	} from '#lib/filters.ts';
@@ -103,7 +105,9 @@
 	});
 	let terms = $derived(fold(find).split(/\s+/).filter(Boolean));
 	let found = $derived(
-		terms.length ? values.filter((t) => terms.every((w) => fold(t.value).includes(w))) : values
+		terms.length
+			? values.filter((t) => terms.every((w) => fold(valueLabel(t.value)).includes(w)))
+			: values
 	);
 	let shown = $derived(found.slice(0, limit));
 	/** Every picked value, across tags. */
@@ -159,14 +163,16 @@
 					transition:slide={{ duration: 220, easing: cubicOut }}
 				>
 					{#each active as p (`${p.kind}\n${p.value}`)}
+						{@const none = `No ${label(p.kind).toLowerCase()}`}
+						{@const name = p.value === NONE ? none : `${label(p.kind)}: ${p.value}`}
 						<li transition:fade={{ duration: 150 }}>
 							<button
 								class="chip"
-								title="{label(p.kind)}: {p.value}"
-								aria-label="Remove {label(p.kind)}: {p.value}"
+								title={name}
+								aria-label="Remove {name}"
 								onclick={() => pick(p.kind, p.value)}
 							>
-								<span class="chip-text">{p.value}</span>
+								<span class="chip-text">{p.value === NONE ? none : p.value}</span>
 								<X size={12} strokeWidth={2.4} />
 							</button>
 						</li>
@@ -227,7 +233,11 @@
 										><Check size={12} strokeWidth={3} /></span
 									>{/if}
 							</span>
-							<span class="name" title={t.value}>{t.value}</span>
+							<span class="name" class:blank={t.value === NONE} title={valueLabel(t.value)}
+								>{valueLabel(t.value)}</span
+							>
+							{#if t.value === NONE}<span class="sr-only">(no {label(kind).toLowerCase()})</span
+								>{/if}
 							<span class="n tabular">{count(t.count)}</span>
 						</button>
 					{/each}
@@ -589,6 +599,10 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	/* Not a value of the tag: albums without one. */
+	.blank {
+		font-style: italic;
 	}
 	.n {
 		font-size: 12px;

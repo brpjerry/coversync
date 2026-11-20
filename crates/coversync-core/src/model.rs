@@ -53,7 +53,8 @@ pub struct Album {
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub sort_values: std::collections::HashMap<String, String>,
     /// Every value of the sidebar's filter tags on any of the album's tracks
-    /// (see `appearance`), with tags that hold several split apart.
+    /// (see `appearance`), with tags that hold several split apart; each
+    /// one asked for is here, empty if the album has none.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub filter_values: std::collections::HashMap<String, Vec<String>>,
     /// Set when tracks lack tags the library rules or folder structure need.

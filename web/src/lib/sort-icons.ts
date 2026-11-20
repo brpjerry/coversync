@@ -10,6 +10,7 @@ import Clock from '@lucide/svelte/icons/clock';
 import Disc from '@lucide/svelte/icons/disc';
 import DiscAlbum from '@lucide/svelte/icons/disc-album';
 import Feather from '@lucide/svelte/icons/feather';
+import Folders from '@lucide/svelte/icons/folders';
 import Globe from '@lucide/svelte/icons/globe';
 import Hash from '@lucide/svelte/icons/hash';
 import Languages from '@lucide/svelte/icons/languages';
@@ -33,6 +34,7 @@ const ICONS: Record<string, Icon> = {
 	date: CalendarDays,
 	release_date: CalendarDays,
 	original_date: CalendarDays,
+	collection: Folders,
 	genre: Tag,
 	mood: Tag,
 	label: Disc,

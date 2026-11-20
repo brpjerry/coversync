@@ -13,7 +13,15 @@ export type Filters = Record<string, string[]>;
 const key = (v: string) => v.normalize('NFC').toLowerCase();
 export const same = (a: string, b: string) => key(a) === key(b);
 
-const values = (a: Album, kind: string) => a.filter_values?.[kind] ?? [];
+/** An album with no value of a kind has this one, listed as "None". */
+export const NONE = '';
+export const valueLabel = (v: string) => (v === NONE ? 'None' : v);
+
+/** A kind the album list wasn't loaded with (it's older than the filter) has none yet. */
+const values = (a: Album, kind: string) => {
+	const found = a.filter_values?.[kind];
+	return found && !found.length ? [NONE] : (found ?? []);
+};
 
 /** How many values are picked across `kinds`. */
 export const picked = (filters: Filters, kinds: string[]) =>
@@ -50,6 +58,7 @@ const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: tr
 /**
  * The values of `kind` on `albums`, with how many albums have each, labelled
  * by their most common spelling. Years run newest first, everything else A to Z.
+ * Albums without one count towards None.
  */
 export function tagValues(albums: Album[], kind: string): TagValue[] {
 	const found = new Map<string, { count: number; spellings: Map<string, number> }>();
@@ -71,9 +80,12 @@ export function tagValues(albums: Album[], kind: string): TagValue[] {
 	return out.sort(order(kind));
 }
 
-/** How values of `kind` are listed. */
+/** How values of `kind` are listed; None goes last. */
 export function order(kind: string) {
-	return kind === 'date'
-		? (a: TagValue, b: TagValue) => Number(b.value) - Number(a.value)
-		: (a: TagValue, b: TagValue) => collator.compare(a.value, b.value);
+	const by =
+		kind === 'date'
+			? (a: TagValue, b: TagValue) => Number(b.value) - Number(a.value)
+			: (a: TagValue, b: TagValue) => collator.compare(a.value, b.value);
+	return (a: TagValue, b: TagValue) =>
+		Number(a.value === NONE) - Number(b.value === NONE) || by(a, b);
 }

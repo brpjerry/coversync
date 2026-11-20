@@ -22,7 +22,7 @@ export interface Album {
 	collection: Collection;
 	/** Album-wide values for sorts beyond the built-in fields. */
 	sort_values?: Record<string, string>;
-	/** Every value of each sidebar filter tag on any track, several in one tag split apart. */
+	/** Every value of each sidebar filter tag on any track, several in one tag split apart; empty for none. */
 	filter_values?: Record<string, string[]>;
 	/** Present when tracks lack tags the library rules or folder structure need. */
 	attention?: { missing: string[]; tracks: number };

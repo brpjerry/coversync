@@ -33,7 +33,9 @@ used on a home server.
   pick a tag such as Genre from its dropdown, search its values, and tick the
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
-  separator, and names at its phrases, see below) offer each.
+  separator, and names at its phrases, see below) offer each. **None**, last,
+  ticks the albums with no value to list (Album artist and Year list the
+  grid's, so an album without an album artist tag is under its artist).
 - **Tag editor** (a Library album's Edit tags, or an Inbox album's Import
   without Smart suggestions; see Import): album-wide fields (album, album
   artist, date, genre) and each track's (number, disc, title, artist) up
@@ -215,7 +217,8 @@ used on a home server.
   again** asks both services afresh. Answers that found nothing aren't
   saved, so those are asked again each time. With **Save lookups** off,
   every album is looked up afresh, and no answer is read or saved.
-- **Appearance**: which sorts the sort menu offers, which tags the sidebar
+- **Appearance**: which sorts the sort menu offers (its Library group:
+  Recently added, Needs attention and Collection), which tags the sidebar
   filters by, and the cover size.
 - **Sync** (the server, the engine every device runs, and the
   [sync agent](#sync-agent) for desktops and laptops; the other device apps

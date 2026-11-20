@@ -63,44 +63,55 @@ pub struct SortGroup {
     pub label: &'static str,
 }
 
-/// Everything the sort menu can offer: text tag kinds plus "Recently added".
+/// The group of what only coversync knows about an album.
+const LIBRARY: &str = "library";
+
+/// The text tag kinds, in their groups.
+fn tags() -> impl Iterator<Item = Sortable> {
+    rules::CATALOG
+        .iter()
+        .filter(|k| !rules::NOT_EDITABLE.contains(&k.id))
+        .map(|k| Sortable {
+            id: k.id,
+            label: k.label,
+            group: k.group,
+        })
+}
+
+/// Everything the sort menu can offer: "Recently added", "Needs attention"
+/// and the text tag kinds. Collection, coversync's own tag, sits with the
+/// first two.
 pub fn sortable() -> Vec<Sortable> {
     let mut out = vec![
         Sortable {
             id: ADDED,
             label: "Recently added",
-            group: "library",
+            group: LIBRARY,
         },
         Sortable {
             id: ATTENTION,
             label: "Needs attention",
-            group: "library",
+            group: LIBRARY,
         },
     ];
-    out.extend(
-        rules::CATALOG
-            .iter()
-            .filter(|k| !rules::NOT_EDITABLE.contains(&k.id))
-            .map(|k| Sortable {
-                id: k.id,
-                label: k.label,
-                group: k.group,
-            }),
-    );
+    out.extend(tags().map(|s| match s.id {
+        rules::COLLECTION => Sortable {
+            group: LIBRARY,
+            ..s
+        },
+        _ => s,
+    }));
     out
 }
 
 /// Everything the sidebar can filter by: the text tag kinds, less long free text.
 pub fn filterable() -> Vec<Sortable> {
-    sortable()
-        .into_iter()
-        .filter(|s| s.group != "library" && !NOT_FILTERABLE.contains(&s.id))
-        .collect()
+    tags().filter(|s| !NOT_FILTERABLE.contains(&s.id)).collect()
 }
 
 pub fn groups() -> Vec<SortGroup> {
     let mut out = vec![SortGroup {
-        id: "library",
+        id: LIBRARY,
         label: "Library",
     }];
     out.extend(rules::GROUPS.iter().map(|g| SortGroup {
@@ -246,6 +257,14 @@ mod tests {
                 .iter()
                 .all(|f| sortable().iter().any(|s| s.id == f.id))
         );
+        // Collection sorts with the Library's own; it filters among the tags.
+        let group = |list: Vec<Sortable>| {
+            list.into_iter()
+                .find(|s| s.id == "collection")
+                .unwrap()
+                .group
+        };
+        assert_eq!((group(sortable()), group(filterable())), (LIBRARY, "work"));
         // Settings saved before tag filters existed get the defaults.
         let old: AppearanceSetup = serde_json::from_str(r#"{"sort_tabs":["genre"]}"#).unwrap();
         assert_eq!(old.filter_tags, DEFAULT_FILTERS);
