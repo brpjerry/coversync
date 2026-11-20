@@ -128,6 +128,7 @@
 		onpreset
 	}: Props = $props();
 
+	const uid = $props.id();
 	let lookup = $state<IdentifyState | null>(null);
 	let result = $derived(lookup?.state === 'done' ? lookup.result : null);
 	let rows = $state<Row[]>([]);
@@ -436,17 +437,22 @@
 			!!r.release && r.release.track_count === tracks.length && r.tracks.every((t) => t.via);
 		if (!whole) return;
 		for (const row of rows) {
-			// Never over what was typed in a field.
-			const untouched = (v: string) => !v.trim() || (row.romanizes && v.trim() === row.current);
+			// Never over what was typed in a field. A quick choice carried from the
+			// batch's album before may replace what the files have, though.
+			const untouched = (v: string) =>
+				!v.trim() ||
+				(preset
+					? v.trim() === (row.current ?? '').trim()
+					: row.romanizes && v.trim() === row.current);
 			const free =
 				row.field === 'album'
 					? untouched(getField(null, row.kind))
 					: row.field === 'track'
 						? row.ids.every((id) => untouched(getField(id, row.kind)))
 						: true;
-			if ((row.fill || row.romanizes) && free) toggle(row, true);
+			const want = preset ? presetPick[preset](row) : row.fill || row.romanizes;
+			if (want && free) toggle(row, true);
 		}
-		if (preset) setAll(presetPick[preset]);
 	}
 
 	/**
@@ -800,13 +806,17 @@
 	{/if}
 {/snippet}
 
-<section class="suggest" aria-labelledby="suggest-title" aria-busy={lookup?.state === 'running'}>
+<section
+	class="suggest"
+	aria-labelledby="suggest-title-{uid}"
+	aria-busy={lookup?.state === 'running'}
+>
 	<header class="suggest-head">
 		<span class="badge" class:busy={!lookup || lookup.state === 'running'}
 			><Sparkles size={16} /></span
 		>
 		<div class="head-main">
-			<h3 id="suggest-title">Suggestions from MusicBrainz</h3>
+			<h3 id="suggest-title-{uid}">Suggestions from MusicBrainz</h3>
 			{#if !lookup || lookup.state === 'running'}
 				{@const s = lookup?.state === 'running' ? lookup : null}
 				<p class="stage">

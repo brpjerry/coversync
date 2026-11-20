@@ -35,6 +35,10 @@
 			.join(' · ')
 	);
 
+	// Keys go to the summary, not the page under it.
+	let done = $state<HTMLButtonElement>();
+	$effect(() => done?.focus({ preventScroll: true }));
+
 	function onkeydown(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
 			e.stopPropagation();
@@ -103,7 +107,7 @@
 		</ol>
 		<footer>
 			<button class="btn" onclick={onlibrary}><LibraryBig size={15} /> Show in Library</button>
-			<button class="btn primary" onclick={ondone}>Done</button>
+			<button class="btn primary" bind:this={done} onclick={ondone}>Done</button>
 		</footer>
 	</div>
 </div>

@@ -48,6 +48,15 @@ export class BatchItem {
 	dialog = $state(false);
 	/** Bumped when the tag editor asks for the dialog again, so it starts from the new plan. */
 	round = $state(0);
+	/**
+	 * What its dialog, once shown, says it still needs, as it's edited
+	 * there; null when it's ready. Until then the strip goes by its plan.
+	 */
+	needs = $state<string | null | undefined>(undefined);
+	/** Its tag editor's Import is being checked (Smart suggestions off). */
+	checking = false;
+	/** Its first plan, while it's on its way: asked for once. */
+	pending: Promise<ImportPlan | null> | null = null;
 
 	constructor(album: Album) {
 		this.album = album;
@@ -70,7 +79,11 @@ export class ImportBatch {
 	preset = $state<TickPreset | undefined>();
 	/** Stopped, or every album was imported or skipped: the summary shows. */
 	ended = $state(false);
-	/** Let go of: lookups fetched ahead stop. */
+	/** Its summary was closed while imports still ran: a toast tells how they went. */
+	dismissed = $state(false);
+	/** Its progress toast, while imports run. */
+	toast: number | null = null;
+	/** Let go of: plans and lookups fetched ahead stop. */
 	#closed = false;
 	#fetching = false;
 
@@ -108,7 +121,7 @@ export class ImportBatch {
 	}
 
 	/** The plan for `item` with `edits`, or null with `item.error` saying why there's none. */
-	async loadPlan(item: BatchItem, edits: ImportEdits = {}): Promise<ImportPlan | null> {
+	async loadPlan(item: BatchItem, edits: ImportEdits): Promise<ImportPlan | null> {
 		try {
 			item.plan = await api.importPlan(item.album.id, edits);
 			if (item.status === 'waiting') item.error = null;
@@ -119,13 +132,33 @@ export class ImportBatch {
 		}
 	}
 
+	/**
+	 * Its plan before any edits: the one it has, or the one on its way (asked
+	 * for once, whoever asks first). One made since, with edits, isn't replaced.
+	 */
+	firstPlan(item: BatchItem): Promise<ImportPlan | null> {
+		if (item.plan) return Promise.resolve(item.plan);
+		item.pending ??= api.importPlan(item.album.id, {}).then(
+			(plan) => {
+				item.plan ??= plan;
+				return item.plan;
+			},
+			(e) => {
+				item.error = message(e, 'Could not check the album');
+				return null;
+			}
+		);
+		return item.pending.finally(() => (item.pending = null));
+	}
+
 	/** Plans for every album, a few at a time, so the strip can say what each needs. */
 	async loadPlans(limit = 4) {
 		let next = 0;
 		const work = async () => {
-			while (next < this.items.length && !this.#closed) {
-				const item = this.items[next++];
-				if (!item.plan) await this.loadPlan(item);
+			while (next < this.items.length && !this.#closed && !this.ended) {
+				await this.firstPlan(this.items[next++]);
+				// Lookups wait for an album's plan to say it uses them.
+				void this.prefetch();
 			}
 		};
 		await Promise.all(Array.from({ length: Math.min(limit, this.items.length) }, work));
@@ -145,7 +178,7 @@ export class ImportBatch {
 				item.lookup = 'running';
 				try {
 					let s = await api.identify(item.album.id);
-					while (s.state === 'running' && !this.#closed) {
+					while (s.state === 'running' && !this.#closed && !this.ended) {
 						await sleep(500);
 						s = await api.identifyStatus(item.album.id);
 					}
@@ -159,12 +192,13 @@ export class ImportBatch {
 		}
 	}
 
+	/** The next album to look up: the current one first, then the next in order, once its plan says it uses suggestions. */
 	#nextLookup(): BatchItem | undefined {
 		if (this.#closed || this.ended) return;
 		const n = this.items.length;
 		for (let k = 0; k < n; k++) {
 			const item = this.items[(this.index + k) % n];
-			if (item.lookup === 'idle' && item.status === 'waiting') return item;
+			if (item.lookup === 'idle' && item.status === 'waiting' && item.plan?.suggest) return item;
 		}
 	}
 
@@ -188,13 +222,6 @@ export class ImportBatch {
 		if (this.current.status === 'waiting' || this.current.status === 'failed') {
 			this.current.status = 'skipped';
 		}
-	}
-
-	/** Move on to the next album still waiting, or end the batch. */
-	advance() {
-		const next = this.nextWaiting();
-		if (next === null) this.ended = true;
-		else this.index = next;
 	}
 
 	close() {

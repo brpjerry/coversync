@@ -31,9 +31,16 @@
 		}
 		if (item.error) return { mark: 'failed', text: item.error };
 		if (item.lookup === 'running') return { mark: 'looking', text: 'Looking up…' };
+		// Once its dialog has been shown, it says, as the album is edited there.
+		if (item.needs !== undefined) {
+			return item.needs ? { mark: 'needs', text: item.needs } : { mark: null, text: 'Ready' };
+		}
 		const p = item.plan;
 		if (!p) return { mark: null, text: 'Waiting' };
-		const needs = [...p.failing.map((k) => label(k)), ...(p.art.missing ? [label(ART)] : [])];
+		const needs = [
+			...[...p.failing, ...p.disagree].map((k) => label(k)),
+			...(p.art.missing ? [label(ART)] : [])
+		];
 		if (needs.length) return { mark: 'needs', text: `Needs ${needs.join(', ')}` };
 		if (p.problems.length) return { mark: 'needs', text: p.problems[0] };
 		return { mark: null, text: 'Ready' };

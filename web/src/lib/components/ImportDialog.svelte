@@ -86,6 +86,10 @@
 	}: Props = $props();
 	/** Imported, or being imported: what it was is shown instead of the form. */
 	let done = $derived(!!batch && !batch.item.open);
+	/** Each dialog of a batch stays, so its heading's id is its own. */
+	const uid = $props.id();
+	/** The suggestions' quick choice used on the album before, as it was when this one opened. */
+	const preset = untrack(() => batch?.batch.preset);
 	/** A batch's later albums replace the one before at once rather than fading in over the grid. */
 	const motion = untrack(() =>
 		batch?.batch.items.some((i) => i.opened && i !== batch.item) ? 0 : 1
@@ -132,12 +136,14 @@
 	);
 	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
 	const hadCollection = consensus('collection');
-	/** Library setup's, and any the tracks have. */
-	let collectionChoices = $derived([
-		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
-	]);
 	/** In a batch, an album without a collection starts on the one picked last. */
 	const carried = untrack(() => (!hadCollection && batch?.batch.collection) || '');
+	/** Library setup's, any the tracks have, and the one carried over. */
+	let collectionChoices = $derived([
+		...new Set(
+			[...collections, ...tracks.map((t) => t.values.collection ?? ''), carried].filter(Boolean)
+		)
+	]);
 	let collection = $state(hadCollection || carried);
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
@@ -351,6 +357,11 @@
 	let outstanding = $derived(missing + (artMissing ? 1 : 0));
 	let ready = $derived(outstanding === 0 && live.problems.length === 0 && !busy);
 
+	// The batch's strip says what this album still needs, as it's edited here.
+	$effect(() => {
+		if (batch) batch.item.needs = outstanding ? statusText() : (live.problems[0] ?? null);
+	});
+
 	function statusText() {
 		const values = `${missing} ${missing === 1 ? 'value' : 'values'}`;
 		if (missing && artMissing) return `${values} and the album art are missing.`;
@@ -359,7 +370,7 @@
 	}
 
 	async function submit() {
-		if (!ready) return;
+		if (!ready || done) return;
 		if (batch) batch.batch.collection = collection;
 		busy = true;
 		error = null;
@@ -403,7 +414,9 @@
 		if (hidden) return;
 		const field =
 			dialog?.querySelector<HTMLElement>('input.missing, .art-choose') ??
-			dialog?.querySelector<HTMLElement>('.collection select');
+			dialog?.querySelector<HTMLElement>('.collection select') ??
+			dialog?.querySelector<HTMLElement>('.foot .btn.primary') ??
+			dialog;
 		field?.focus({ preventScroll: true });
 	});
 </script>
@@ -423,13 +436,14 @@
 		class:done
 		role="dialog"
 		aria-modal="true"
-		aria-labelledby="import-title"
+		aria-labelledby="import-title-{uid}"
+		tabindex="-1"
 		bind:this={dialog}
 		style:--accent={accent(album.color)}
 		style:--tint={shade(album.color, 16)}
 		transition:fly={{ y: 24, duration: 360 * motion, easing: cubicOut }}
 	>
-		{#if batch}
+		{#if batch && !hidden}
 			<div class="batch-row">
 				<BatchStrip batch={batch.batch} onjump={batch.onjump} {label} />
 			</div>
@@ -447,7 +461,7 @@
 			</span>
 			<div class="head-text">
 				<span class="eyebrow"><FolderInput size={14} /> Import into Library</span>
-				<h2 id="import-title">{album.title}</h2>
+				<h2 id="import-title-{uid}">{album.title}</h2>
 				<p>{album.artist}</p>
 			</div>
 			<button class="icon-btn close" onclick={onclose} aria-label="Close"><X size={19} /></button>
@@ -463,8 +477,11 @@
 					<p><b>Imported</b> to <span class="finished-path">{batch.item.dest}</span></p>
 				{/if}
 			</div>
-		{:else}
-			<div class="status" class:done={outstanding === 0}>
+		{/if}
+		<!-- While the import runs the form stays, out of sight, so a failed one comes back as
+		     it was; once the album is in the Library it goes. -->
+		{#if batch?.item.status !== 'imported'}
+			<div class="status" class:done={outstanding === 0} style:display={done ? 'none' : undefined}>
 				<span class="status-icon">
 					{#if outstanding === 0}<CircleCheck size={18} />{:else}<CircleAlert size={18} />{/if}
 				</span>
@@ -484,7 +501,7 @@
 				>
 			</div>
 
-			<div class="body">
+			<div class="body" style:display={done ? 'none' : undefined}>
 				{#if initial.suggest}
 					<SuggestPanel
 						albumId={album.id}
@@ -511,7 +528,7 @@
 								}
 							: null}
 						artChosen={mbArt?.release ?? null}
-						preset={batch?.batch.preset}
+						{preset}
 						onpreset={batch ? (p) => (batch.batch.preset = p) : undefined}
 						onart={(art, auto) => {
 							// Ticked by default, it never replaces an image chosen by hand.
