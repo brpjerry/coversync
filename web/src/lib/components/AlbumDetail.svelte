@@ -546,17 +546,24 @@
 		color: var(--text);
 		opacity: 0.85;
 	}
+	/* Each fact's dot sits in the gap before it; one that starts a line is
+	   cut off at the edge rather than left hanging there. */
 	.facts {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0 14px;
 		margin: 10px 0 0;
+		overflow: clip;
 		color: var(--text-2);
 		font-size: 13.5px;
 	}
-	.facts span + span::before {
+	.facts span {
+		position: relative;
+	}
+	.facts span::before {
 		content: '·';
-		margin-right: 14px;
+		position: absolute;
+		left: -9px;
 		color: var(--text-3);
 	}
 	.actions {

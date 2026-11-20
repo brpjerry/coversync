@@ -486,9 +486,27 @@
 			display: none;
 		}
 	}
-	/* Phones have no keyboard shortcut to show, and the search field needs the room. */
+	/* Phones have no keyboard shortcut to show, and the search field needs the room:
+	   tighter gaps leave it enough for its placeholder on a 360 px screen. */
 	@media (max-width: 600px) {
 		kbd {
+			display: none;
+		}
+		.bar {
+			column-gap: 10px;
+		}
+		.search {
+			gap: 7px;
+			padding: 0 10px 0 12px;
+		}
+		.right {
+			gap: 4px;
+		}
+	}
+	/* Small phones: the logo too, so the search field keeps its placeholder
+	   while uploads and a scan add their buttons. */
+	@media (max-width: 420px) {
+		.brand {
 			display: none;
 		}
 	}

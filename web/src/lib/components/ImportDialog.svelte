@@ -746,6 +746,8 @@
 		inset: 0;
 		z-index: 45;
 		display: grid;
+		/* The screen's width, however wide the album's title (which doesn't wrap). */
+		grid-template-columns: minmax(0, 1fr);
 		place-items: center;
 		padding: 24px;
 		background: rgb(0 0 0 / 0.5);
@@ -755,6 +757,7 @@
 		width: min(960px, 100%);
 		max-height: calc(100dvh - 48px);
 		display: grid;
+		grid-template-columns: minmax(0, 1fr);
 		grid-template-rows: auto auto minmax(0, 1fr) auto;
 		border-radius: 24px;
 		background: var(--bg-raised);
@@ -1194,6 +1197,19 @@
 		}
 		.table {
 			overflow-x: auto;
+		}
+		/* Too narrow to cut short: the title on two lines, the path in full. */
+		h2 {
+			display: -webkit-box;
+			-webkit-box-orient: vertical;
+			-webkit-line-clamp: 2;
+			line-clamp: 2;
+			white-space: normal;
+			overflow-wrap: anywhere;
+		}
+		.dest-path {
+			white-space: normal;
+			overflow-wrap: anywhere;
 		}
 	}
 </style>
