@@ -551,7 +551,7 @@
 	.facts {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 0 14px;
+		gap: 0 32px;
 		margin: 10px 0 0;
 		overflow: clip;
 		color: var(--text-2);
@@ -559,11 +559,12 @@
 	}
 	.facts span {
 		position: relative;
+		overflow-wrap: anywhere;
 	}
 	.facts span::before {
 		content: '·';
 		position: absolute;
-		left: -9px;
+		left: -18px;
 		color: var(--text-3);
 	}
 	.actions {

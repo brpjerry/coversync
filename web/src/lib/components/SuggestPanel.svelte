@@ -1619,6 +1619,9 @@
 		.head-actions {
 			margin-left: 46px;
 		}
+		.head-actions:empty {
+			display: none;
+		}
 		/* What the tag is now on a line of its own, in full, then what it'd be. */
 		.diff {
 			flex-wrap: wrap;
@@ -1628,6 +1631,10 @@
 			flex-basis: 100%;
 			white-space: normal;
 			overflow-wrap: anywhere;
+		}
+		/* The album's cover keeps its size beside it. */
+		.thumb + .was {
+			flex-basis: calc(100% - 48px - 7px);
 		}
 		/* The rest of the second line, beside the arrow. */
 		.now {

@@ -502,12 +502,27 @@
 		.right {
 			gap: 4px;
 		}
+		/* Rescan's spinning icon says a scan is running; its ring would take the room. */
+		.scan {
+			display: none;
+		}
 	}
 	/* Small phones: the logo too, so the search field keeps its placeholder
 	   while uploads and a scan add their buttons. */
 	@media (max-width: 420px) {
 		.brand {
 			display: none;
+		}
+	}
+	/* The smallest: tighter still, for a query beside the clear button. */
+	@media (max-width: 360px) {
+		.bar {
+			padding-inline: 10px;
+			column-gap: 6px;
+		}
+		.search {
+			gap: 5px;
+			padding: 0 8px;
 		}
 	}
 </style>
