@@ -25,7 +25,8 @@ used on a home server.
   ticks the albums with no value to list (Album artist and Year list the
   grid's, so an album without an album artist tag is under its artist).
   Besides tags, it filters by Collection and by **Needs attention**, which
-  lists what albums lack: each tag or art the rules require, by name, and
+  lists what albums lack: each tag the rules or folder structure require
+  (in the Inbox, after autofill) or art they require, by name, and
   **Incomplete** for albums missing tracks by their own numbering (None is
   the albums that lack nothing). While one of these is ticked, cards say what their
   album lacks. Incomplete counts track

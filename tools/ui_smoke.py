@@ -162,11 +162,16 @@ class Driver:
 
     def filter_by(self, kind, value=None):
         """Show a tag's values in the sidebar's filter, and tick `value` if given."""
+        self.wait("return [...document.querySelectorAll('aside select option')].some(o => o.value === arguments[0])",
+                  15, kind)
         self.js("const s = document.querySelector('aside select'); s.value = arguments[0];"
                 "s.dispatchEvent(new Event('change', {bubbles: true}))", kind)
-        time.sleep(0.4)
-        if value:
-            self.click_xpath(f"//aside//button[contains(concat(' ', @class, ' '), ' value ')][.//span[contains(concat(' ', @class, ' '), ' name ')][normalize-space(.)='{value}']]")
+        # The first value, or the one asked for once the albums have it.
+        row = ("return [...document.querySelectorAll('aside button.value')].find(b => "
+               "arguments[0] === null || b.querySelector('.name').textContent.trim() === arguments[0])")
+        self.wait(row, 15, value)
+        if value is not None:
+            self._click(self.js(row, value))
 
     def open_setup(self, label):
         """Open a setup screen (Inbox setup, Library setup, Appearance, Sync setup) from the sidebar."""
@@ -515,7 +520,7 @@ def requests_json(d, path):
 
 def autofill_flow(d, out, tag, save):
     """Inbox setup's autofill card, and its effect on the Needs attention count."""
-    # The sort menu shows the count, but it's out of reach on setup screens: ask the daemon.
+    # Albums still missing required tags or art after autofill, from the daemon.
     attention = ("const r = new XMLHttpRequest(); r.open('GET', new URL('api/albums?collection=inbox', document.baseURI), false);"
                  "r.send(); const n = String(JSON.parse(r.responseText).filter(a => a.attention).length);")
     count = attention + " return n"

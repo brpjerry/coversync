@@ -29,7 +29,9 @@ pub const DEFAULT_FILTERS: &[&str] = &["genre", "album_artist", "date", ATTENTIO
 /// Long free text, of no use for picking albums by.
 const NOT_FILTERABLE: &[&str] = &["lyrics", "acoustid_fingerprint"];
 
-const MAX_FILTERS: usize = 16;
+/// Sixteen tags, and Needs attention and Collection (which settings saved
+/// when they were sorts add to as many).
+const MAX_FILTERS: usize = 18;
 
 /// The narrowest an album grid cover may be, in CSS pixels.
 pub const MIN_COVER_SIZE: u32 = 120;
@@ -161,12 +163,20 @@ impl AppearanceSetup {
     /// Keep known keys once, in the order given, and the cover size in range.
     pub fn normalize(mut self) -> Result<Self> {
         self.cover_size = self.cover_size.clamp(MIN_COVER_SIZE, MAX_COVER_SIZE);
-        // These were sorts before they were filters.
-        for id in [ATTENTION, rules::COLLECTION] {
-            if self.sort_tabs.iter().any(|t| t == id) {
-                self.sort_tabs.retain(|t| t != id);
-                self.filter_tags.push(id.to_string());
+        if self.sort_tabs.is_empty() {
+            return Err(Error::Invalid("Keep at least one sort.".into()));
+        }
+        // These were sorts before they were filters; moved in their order.
+        self.sort_tabs.retain(|t| match t.as_str() {
+            ATTENTION | rules::COLLECTION => {
+                self.filter_tags.push(t.clone());
+                false
             }
+            _ => true,
+        });
+        // Sorts that were only those leave the default ones.
+        if self.sort_tabs.is_empty() {
+            self.sort_tabs = default_tabs();
         }
         let known = sortable();
         if let Some(bad) = self
@@ -178,9 +188,6 @@ impl AppearanceSetup {
         }
         let mut seen = HashSet::new();
         self.sort_tabs.retain(|t| seen.insert(t.clone()));
-        if self.sort_tabs.is_empty() {
-            return Err(Error::Invalid("Keep at least one sort.".into()));
-        }
         if self.sort_tabs.len() > MAX_TABS {
             return Err(Error::Invalid(format!(
                 "Up to {MAX_TABS} sorts fit in the sort menu."
@@ -198,7 +205,7 @@ impl AppearanceSetup {
         self.filter_tags.retain(|t| seen.insert(t.clone()));
         if self.filter_tags.len() > MAX_FILTERS {
             return Err(Error::Invalid(format!(
-                "Up to {MAX_FILTERS} tags fit in the sidebar's filter."
+                "Up to {MAX_FILTERS} filters fit in the sidebar."
             )));
         }
         Ok(self)
@@ -248,6 +255,26 @@ mod tests {
         .unwrap();
         assert_eq!(moved.sort_tabs, ["label"]);
         assert_eq!(moved.filter_tags, ["genre", "collection", "attention"]);
+        // In their order, sorts that were only those leave the default ones,
+        // a full list of filters takes them, and the rest is kept.
+        let full: Vec<String> = filterable()
+            .iter()
+            .filter(|f| f.group != LIBRARY)
+            .take(MAX_FILTERS - 2)
+            .map(|f| f.id.to_string())
+            .collect();
+        let only = AppearanceSetup {
+            filter_tags: full.clone(),
+            cover_size: 240,
+            ..tabs(&["collection", "attention"])
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(only.sort_tabs, DEFAULT_TABS);
+        assert_eq!(only.filter_tags[..full.len()], full);
+        assert_eq!(only.filter_tags[full.len()..], ["collection", "attention"]);
+        assert_eq!(only.cover_size, 240);
+        assert_eq!(only.clone().normalize().unwrap(), only);
         let parsed: AppearanceSetup = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, d);
     }

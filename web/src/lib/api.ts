@@ -508,7 +508,7 @@ export interface AppearanceResponse {
 	defaults: string[];
 	filter_defaults: string[];
 	sortable: Sortable[];
-	/** Tags the sidebar can filter by, a subset of `sortable`. */
+	/** What the sidebar can filter by: Needs attention, Collection, and tags of `sortable`. */
 	filterable: Sortable[];
 	groups: { id: string; label: string }[];
 	cover_sizes: CoverSizes;

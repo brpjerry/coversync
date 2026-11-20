@@ -1208,11 +1208,7 @@ fn needs(album: &Album) -> Vec<String> {
     let mut out: Vec<String> = missing
         .map(|id| match id.as_str() {
             crate::art::ART => "Album art".to_string(),
-            id => rules::CATALOG
-                .iter()
-                .find(|k| k.id == id)
-                .map_or(id, |k| k.label)
-                .to_string(),
+            id => rules::kind(id).map_or(id, |k| k.label).to_string(),
         })
         .collect();
     if album.incomplete.is_some() {
