@@ -1609,6 +1609,37 @@
 	}
 
 	@media (max-width: 640px) {
+		/* The buttons go under the release, which gets the width. */
+		.suggest-head {
+			flex-wrap: wrap;
+		}
+		.head-main {
+			flex-basis: calc(100% - 46px);
+		}
+		.head-actions {
+			margin-left: 46px;
+		}
+		.head-actions:empty {
+			display: none;
+		}
+		/* What the tag is now on a line of its own, in full, then what it'd be. */
+		.diff {
+			flex-wrap: wrap;
+			row-gap: 2px;
+		}
+		.was {
+			flex-basis: 100%;
+			white-space: normal;
+			overflow-wrap: anywhere;
+		}
+		/* The album's cover keeps its size beside it. */
+		.thumb + .was {
+			flex-basis: calc(100% - 48px - 7px);
+		}
+		/* The rest of the second line, beside the arrow. */
+		.now {
+			flex: 1 1 0;
+		}
 		.sugg {
 			grid-template-columns: auto minmax(0, 1fr);
 		}

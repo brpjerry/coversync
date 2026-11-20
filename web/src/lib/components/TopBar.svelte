@@ -178,11 +178,16 @@
 		<button
 			class="icon-btn"
 			onclick={onrescan}
-			aria-label={scan?.running ? 'Scanning' : 'Rescan the Inbox and Library'}
-			title={scan?.running ? 'Scanning…' : 'Rescan the Inbox and Library'}
+			aria-label={label || 'Rescan the Inbox and Library'}
+			title={label || 'Rescan the Inbox and Library'}
 			disabled={scan?.running}
 		>
-			<span class:spin={scan?.running}><RefreshCw size={17} /></span>
+			<!-- Phones have no room for the scan's own ring: Rescan shows its progress. -->
+			{#if phone.current && scan?.running && scan.phase !== 'walking'}
+				<span class="ring" style:--p={pct}></span>
+			{:else}
+				<span class:spin={scan?.running}><RefreshCw size={17} /></span>
+			{/if}
 		</button>
 		{@render sorts()}
 	</div>
@@ -486,10 +491,43 @@
 			display: none;
 		}
 	}
-	/* Phones have no keyboard shortcut to show, and the search field needs the room. */
+	/* Phones have no keyboard shortcut to show, and the search field needs the room:
+	   tighter gaps leave it enough for its placeholder on a 360 px screen. */
 	@media (max-width: 600px) {
 		kbd {
 			display: none;
+		}
+		.bar {
+			column-gap: 10px;
+		}
+		.search {
+			gap: 7px;
+			padding: 0 10px 0 12px;
+		}
+		.right {
+			gap: 4px;
+		}
+		/* Rescan shows the scan's progress instead. */
+		.scan {
+			display: none;
+		}
+	}
+	/* Small phones: the logo too, so the search field keeps its placeholder
+	   while uploads and a scan add their buttons. */
+	@media (max-width: 420px) {
+		.brand {
+			display: none;
+		}
+	}
+	/* The smallest: tighter still, for a query beside the clear button. */
+	@media (max-width: 360px) {
+		.bar {
+			padding-inline: 10px;
+			column-gap: 6px;
+		}
+		.search {
+			gap: 5px;
+			padding: 0 8px;
 		}
 	}
 </style>

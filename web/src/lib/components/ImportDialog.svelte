@@ -746,6 +746,8 @@
 		inset: 0;
 		z-index: 45;
 		display: grid;
+		/* Keep long album titles from widening the dialog beyond the scrim. */
+		grid-template-columns: minmax(0, 1fr);
 		place-items: center;
 		padding: 24px;
 		background: rgb(0 0 0 / 0.5);
@@ -755,12 +757,15 @@
 		width: min(960px, 100%);
 		max-height: calc(100dvh - 48px);
 		display: grid;
-		grid-template-rows: auto auto minmax(0, 1fr) auto;
+		grid-template-columns: minmax(0, 1fr);
+		/* On a screen too short for it all (a phone held sideways), the
+		   editing area keeps some room and the whole dialog scrolls. */
+		grid-template-rows: auto auto minmax(6rem, 1fr) auto;
 		border-radius: 24px;
 		background: var(--bg-raised);
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 40px 120px -30px rgb(0 0 0 / 0.75);
-		overflow: hidden;
+		overflow: hidden auto;
 	}
 	.head {
 		display: flex;
@@ -789,6 +794,7 @@
 	.head-text {
 		flex: 1;
 		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 	.eyebrow {
 		display: inline-flex;
@@ -1194,6 +1200,22 @@
 		}
 		.table {
 			overflow-x: auto;
+		}
+		/* Too narrow to cut short: the title on two lines, the path in full,
+		   scrolling past three lines so the buttons stay on screen. */
+		h2 {
+			display: -webkit-box;
+			-webkit-box-orient: vertical;
+			-webkit-line-clamp: 2;
+			line-clamp: 2;
+			white-space: normal;
+		}
+		.dest-path {
+			align-items: flex-start;
+			max-height: 4.5em;
+			overflow-y: auto;
+			white-space: normal;
+			overflow-wrap: anywhere;
 		}
 	}
 </style>
