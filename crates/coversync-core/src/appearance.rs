@@ -260,7 +260,8 @@ mod tests {
         let full: Vec<String> = filterable()
             .iter()
             .filter(|f| f.group != LIBRARY)
-            .take(MAX_FILTERS - 2)
+            // The limit when settings had these as sorts.
+            .take(16)
             .map(|f| f.id.to_string())
             .collect();
         let only = AppearanceSetup {
