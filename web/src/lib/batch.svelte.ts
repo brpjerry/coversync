@@ -120,8 +120,9 @@ export class ImportBatch {
 	 */
 	firstPlan(item: BatchItem): Promise<ImportPlan | null> {
 		if (item.plan) return Promise.resolve(item.plan);
-		// Asked again: its earlier failure no longer says how it stands.
-		if (!item.pending) item.error = null;
+		// Asked again: its earlier failure no longer says how it stands. One
+		// listed as failed keeps its reason until it's opened again.
+		if (!item.pending && item.status === 'waiting') item.error = null;
 		item.pending ??= api.importPlan(item.album.id, {}).then(
 			(plan) => {
 				if (!item.plan) {

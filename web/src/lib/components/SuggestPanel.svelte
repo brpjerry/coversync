@@ -110,6 +110,8 @@
 		preset?: TickPreset;
 		/** A quick choice was used: the batch's next album starts with it. */
 		onpreset?: (preset: TickPreset) => void;
+		/** Its lookup started or ended, for the batch's strip. */
+		onlookup?: (running: boolean) => void;
 	}
 	let {
 		albumId,
@@ -128,8 +130,10 @@
 		artChosen,
 		onart,
 		preset,
-		onpreset
+		onpreset,
+		onlookup
 	}: Props = $props();
+	$effect(() => onlookup?.(lookup === null || lookup.state === 'running'));
 
 	const uid = $props.id();
 	let lookup = $state<IdentifyState | null>(null);

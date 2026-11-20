@@ -115,10 +115,12 @@ describe('a batch', () => {
 	});
 
 	it('plans with one set of workers, however often it’s asked', async () => {
-		planned.length = 0;
-		const b = new ImportBatch(albums('a', 'b', 'c'), true);
+		// Without suggestions, so no lookups start meanwhile.
+		const b = new ImportBatch(albums('a', 'b', 'c'), false);
+		const visits = vi.spyOn(b, 'firstPlan');
 		await Promise.all([b.loadPlans(1), b.loadPlans(1)]);
-		expect(planned).toEqual(['a', 'b', 'c']);
+		// A second set of workers would go through the albums again.
+		expect(visits).toHaveBeenCalledTimes(3);
 	});
 
 	it('stops planning and looking up once it ends', async () => {

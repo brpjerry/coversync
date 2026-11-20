@@ -146,10 +146,11 @@
 	]);
 	let collection = $state(hadCollection || carried);
 	// A collection picked here is the batch's next album's as soon as it's picked.
-	const startCollection = untrack(() => collection);
+	let picks = 0;
 	$effect(() => {
 		const picked = collection;
-		if (batch && picked !== startCollection) untrack(() => (batch.batch.collection = picked));
+		// Not the value it starts with; every change after, back to it too.
+		if (batch && picks++) untrack(() => (batch.batch.collection = picked));
 	});
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
@@ -331,7 +332,10 @@
 	let seq = 0;
 	$effect(() => {
 		void session.generation;
-		if (hidden) return;
+		// Shown again, it checks afresh; hidden, a check of its last edit still runs.
+		void hidden;
+		// Imported, or on its way: there's nothing left to check.
+		if (done) return;
 		const e = $state.snapshot(edits) as ImportEdits;
 		const mine = ++seq;
 		planning = true;
@@ -552,6 +556,9 @@
 							: null}
 						artChosen={mbArt?.release ?? null}
 						{preset}
+						onlookup={batch
+							? (running) => (batch.item.lookup = running ? 'running' : 'done')
+							: undefined}
 						onpreset={batch
 							? (p) => {
 									preset = p;

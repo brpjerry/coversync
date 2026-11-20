@@ -1288,8 +1288,11 @@
 
 	/** Import the albums selected, in the Inbox's order. */
 	async function importSelected() {
+		// The selection as it is once setup is read (picks can change meanwhile),
+		// kept until the batch is under way.
+		await Promise.all([setup.load(), inboxSetup.load()]);
+		if (!selecting) return;
 		const list = sorted(albums, activeSort).filter((a) => selected.has(a.id));
-		// The selection stays until the batch is under way.
 		if (list.length && (await startBatch(list))) stopSelecting();
 	}
 
@@ -1315,7 +1318,8 @@
 	// the browser hasn't sent yet: ask first.
 	onMount(() => {
 		const leaving = (e: BeforeUnloadEvent) => {
-			if (batch?.count('importing')) e.preventDefault();
+			// Any batch's: a summary closed early leaves its imports going.
+			if (importingHere.size) e.preventDefault();
 		};
 		addEventListener('beforeunload', leaving);
 		return () => removeEventListener('beforeunload', leaving);
@@ -1466,11 +1470,12 @@
 	async function showInLibrary(id: string) {
 		const mine = ++moves;
 		await setView('library');
+		const before = openId;
 		// Just imported, the Library's list may not have it yet; if another
-		// view or album is opened meanwhile, that stays.
+		// view or album is opened meanwhile (Back and Forward too), that stays.
 		if (!byId.get(id)) {
 			await loadAlbums();
-			if (mine !== moves || view !== 'library') return;
+			if (mine !== moves || view !== 'library' || openId !== before) return;
 		}
 		await tick();
 		const album = byId.get(id);
@@ -1906,7 +1911,8 @@
 	/>
 {/if}
 
-<PlayerBar onopen={(id) => byId.get(id) && open(byId.get(id)!)} />
+<!-- Not while a batch is up: an album opened under it would have an Import of its own. -->
+<PlayerBar onopen={(id) => !batchShown && byId.get(id) && open(byId.get(id)!)} />
 {#if menu}
 	<!-- Keyed so a right-click on another card places a fresh menu. -->
 	{#key menu}
@@ -1954,7 +1960,7 @@
 	{@const b = batch}
 	<!-- Each album's dialog stays once shown, hidden while another is, with what was done in it. -->
 	{#each b.items as item, i (item.album.id)}
-		{#if item.opened && item.plan && (item.status !== 'imported' || i === b.index)}
+		{#if item.opened && item.plan && (item.status !== 'imported' || (i === b.index && !b.ended))}
 			<ImportDialog
 				hidden={b.ended || i !== b.index}
 				album={item.album}
