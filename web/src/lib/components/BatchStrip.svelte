@@ -88,7 +88,13 @@
 					aria-label="{i + 1}: {item.album.title}, {s.text}"
 				>
 					{#if item.album.has_cover}
-						<img src={coverUrl(item.album, 256)} alt="" loading="lazy" />
+						<!-- Gone with a moved album: the box stays, empty. -->
+						<img
+							src={coverUrl(item.album, 256)}
+							alt=""
+							loading="lazy"
+							onerror={(e) => ((e.currentTarget as HTMLImageElement).hidden = true)}
+						/>
 					{:else}
 						<Disc3 size={16} strokeWidth={1.5} />
 					{/if}

@@ -105,6 +105,22 @@ describe('a batch', () => {
 		expect(asked).toEqual(['a', 'b']);
 	});
 
+	it('leaves an album whose dialog is open to look itself up', async () => {
+		asked.length = 0;
+		const b = new ImportBatch(albums('a', 'b'), true);
+		await Promise.all(b.items.map((i) => b.firstPlan(i)));
+		b.items[0].opened = true;
+		await b.prefetch(noWait);
+		expect(asked).toEqual(['b']);
+	});
+
+	it('plans with one set of workers, however often it’s asked', async () => {
+		planned.length = 0;
+		const b = new ImportBatch(albums('a', 'b', 'c'), true);
+		await Promise.all([b.loadPlans(1), b.loadPlans(1)]);
+		expect(planned).toEqual(['a', 'b', 'c']);
+	});
+
 	it('stops planning and looking up once it ends', async () => {
 		asked.length = 0;
 		planned.length = 0;

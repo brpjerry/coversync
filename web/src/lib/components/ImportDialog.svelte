@@ -145,6 +145,12 @@
 		)
 	]);
 	let collection = $state(hadCollection || carried);
+	// A collection picked here is the batch's next album's as soon as it's picked.
+	const startCollection = untrack(() => collection);
+	$effect(() => {
+		const picked = collection;
+		if (batch && picked !== startCollection) untrack(() => (batch.batch.collection = picked));
+	});
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
@@ -318,12 +324,14 @@
 	});
 
 	// Re-plan as values change, for the destination preview and server-side
-	// checks, and again after signing back in (a plan asked for meanwhile failed).
+	// checks, again after signing back in (a plan asked for meanwhile failed),
+	// and when a batch comes back to it (the setup may have changed meanwhile).
 	let live = $state<ImportPlan>(initial);
 	let planning = $state(false);
 	let seq = 0;
 	$effect(() => {
 		void session.generation;
+		if (hidden) return;
 		const e = $state.snapshot(edits) as ImportEdits;
 		const mine = ++seq;
 		planning = true;

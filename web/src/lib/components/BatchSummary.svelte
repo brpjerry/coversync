@@ -12,7 +12,7 @@
 
 	interface Props {
 		batch: ImportBatch;
-		/** Go through a failed album's dialog again, on its own. */
+		/** Back to a failed album's dialog, in this batch. */
 		onretry: (item: BatchItem) => void;
 		/** Open an imported album in the Library. */
 		onshow: (item: BatchItem) => void;
@@ -76,10 +76,11 @@
 			{#each batch.items as item (item.album.id)}
 				<li class={item.status}>
 					<span class="art">
-						{#if item.album.has_cover}<img src={coverUrl(item.album, 256)} alt="" />{:else}<Disc3
-								size={18}
-								strokeWidth={1.4}
-							/>{/if}
+						{#if item.album.has_cover}<img
+								src={coverUrl(item.album, 256)}
+								alt=""
+								onerror={(e) => ((e.currentTarget as HTMLImageElement).hidden = true)}
+							/>{:else}<Disc3 size={18} strokeWidth={1.4} />{/if}
 					</span>
 					<span class="what">
 						<b>{item.album.title}</b>

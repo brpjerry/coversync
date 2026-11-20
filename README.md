@@ -199,7 +199,8 @@ used on a home server.
   fields for missing tags, collection and art: import an album on its own to
   edit all its tags), with a strip of the batch's covers marking each album's
   progress: looking up, needs something, importing, imported, skipped or
-  failed. **Import & next** imports in the background and moves on, **Skip**
+  failed. **Import & next** imports in the background (the page asks before
+  you leave it with imports on their way) and moves on, **Skip**
   leaves the album in the Inbox, and Alt+←/→ moves between albums without
   deciding. Lookups run ahead, one at a time, the current album's first. The
   collection picked, and the suggestions' quick choice (Tick all, Only empty

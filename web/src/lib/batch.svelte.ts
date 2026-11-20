@@ -30,7 +30,7 @@ export interface BatchControls {
 
 export class BatchItem {
 	readonly album: Album;
-	/** The import plan for what's been edited so far; null until it's made. */
+	/** Its plan as it was before its dialog opened (the dialog re-plans as it's edited); null until it's made. */
 	plan = $state<ImportPlan | null>(null);
 	status = $state<BatchStatus>('waiting');
 	/** Why its plan or its import failed. */
@@ -120,6 +120,8 @@ export class ImportBatch {
 	 */
 	firstPlan(item: BatchItem): Promise<ImportPlan | null> {
 		if (item.plan) return Promise.resolve(item.plan);
+		// Asked again: its earlier failure no longer says how it stands.
+		if (!item.pending) item.error = null;
 		item.pending ??= api.importPlan(item.album.id, {}).then(
 			(plan) => {
 				if (!item.plan) {
@@ -139,8 +141,15 @@ export class ImportBatch {
 		return item.pending.finally(() => (item.pending = null));
 	}
 
-	/** Plans for every album, a few at a time, so the strip can say what each needs. */
+	#planning = false;
+
+	/**
+	 * Plans for every album, a few at a time, so the strip can say what each
+	 * needs. Asked again while it's at it (a Retry, say), it carries on as it is.
+	 */
 	async loadPlans(limit = 4) {
+		if (this.#planning) return;
+		this.#planning = true;
 		let next = 0;
 		const work = async () => {
 			while (next < this.items.length && !this.#closed && !this.ended) {
@@ -149,7 +158,11 @@ export class ImportBatch {
 				void this.prefetch();
 			}
 		};
-		await Promise.all(Array.from({ length: Math.min(limit, this.items.length) }, work));
+		try {
+			await Promise.all(Array.from({ length: Math.min(limit, this.items.length) }, work));
+		} finally {
+			this.#planning = false;
+		}
 	}
 
 	/**
@@ -191,7 +204,9 @@ export class ImportBatch {
 		const n = this.items.length;
 		for (let k = 0; k < n; k++) {
 			const item = this.items[(this.index + k) % n];
-			if (item.lookup !== 'idle' || item.status !== 'waiting') continue;
+			// An album whose dialog is open looks itself up, its own way (another
+			// release, say): a default lookup now would replace it.
+			if (item.lookup !== 'idle' || item.status !== 'waiting' || item.opened) continue;
 			if (!item.plan && !item.error) return;
 			if (item.plan?.suggest) return item;
 		}

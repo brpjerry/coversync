@@ -463,6 +463,7 @@
 
 	async function open(album: Album, cover: HTMLElement | null = gridCover(album.id)) {
 		if (openId === album.id) return;
+		moves++;
 		await morph(
 			cover,
 			async () => {
@@ -489,6 +490,7 @@
 	async function close() {
 		const id = openId;
 		if (!id) return;
+		moves++;
 		const hero = document.querySelector<HTMLElement>('.hero-cover');
 		// A cover scrolled out of the window (from the tag editor, say) would fly
 		// in from off screen: then the album just fades in on the grid.
@@ -1281,32 +1283,43 @@
 	let batch = $state<ImportBatch | null>(null);
 	/** Bumped by every move between the batch's albums, and by Stop: a move still on its way gives way to it. */
 	let visit = 0;
-	/** The batch's dialog or summary is up, over the page. */
-	let batchShown = $derived(!!batch && (batch.ended ? !batch.dismissed : batch.current.opened));
+	/** The batch, or its summary, is up: the page under it waits (its bar is outside it). */
+	let batchShown = $derived(!!batch && (batch.ended ? !batch.dismissed : true));
 
 	/** Import the albums selected, in the Inbox's order. */
-	function importSelected() {
+	async function importSelected() {
 		const list = sorted(albums, activeSort).filter((a) => selected.has(a.id));
-		if (!list.length) return;
-		stopSelecting();
-		void startBatch(list);
+		// The selection stays until the batch is under way.
+		if (list.length && (await startBatch(list))) stopSelecting();
 	}
 
-	async function startBatch(list: Album[]) {
-		if (batch && !batch.ended) return;
-		// The tag catalog for the labels, and whether Smart suggestions are on.
+	/** Returns whether the batch started. */
+	async function startBatch(list: Album[]): Promise<boolean> {
+		if (batch && !batch.ended) return false;
+		// The tag catalog for the labels and fields, and whether Smart suggestions are on.
 		await Promise.all([setup.load(), inboxSetup.load()]);
-		if (batch && !batch.ended) return;
-		if (!inboxSetup.loaded) {
-			toast("Couldn't read Inbox setup, so the albums weren't imported.", 'error', 6000);
-			return;
+		if (batch && !batch.ended) return false;
+		if (!setup.loaded || !inboxSetup.loaded) {
+			toast("Couldn't read the Library or Inbox setup, so nothing was imported.", 'error', 6000);
+			return false;
 		}
 		batch?.close();
 		const b = new ImportBatch(list, inboxSetup.saved.suggestions);
 		batch = b;
 		void b.loadPlans();
-		await showBatchItem(0);
+		void showBatchItem(0);
+		return true;
 	}
+
+	// Leaving the page while a batch's imports are on their way can stop those
+	// the browser hasn't sent yet: ask first.
+	onMount(() => {
+		const leaving = (e: BeforeUnloadEvent) => {
+			if (batch?.count('importing')) e.preventDefault();
+		};
+		addEventListener('beforeunload', leaving);
+		return () => removeEventListener('beforeunload', leaving);
+	});
 
 	/** The strip, or Alt+←/→: another album of the batch. */
 	function jumpBatch(index: number) {
@@ -1401,6 +1414,8 @@
 		if (!b) return;
 		item.status = 'waiting';
 		b.ended = false;
+		// Stop's selection of the albums left: the batch has them again.
+		stopSelecting();
 		// Plans fetched ahead stopped with the batch.
 		void b.loadPlans();
 		void showBatchItem(b.items.indexOf(item));
@@ -1446,13 +1461,16 @@
 		if (batch === b) batch = null;
 	}
 
+	/** Bumped by every album opened or closed, and every Show. */
+	let moves = 0;
 	async function showInLibrary(id: string) {
+		const mine = ++moves;
 		await setView('library');
-		// Just imported, the Library's list may not have it yet; meanwhile
-		// another view or album opened is left as it is.
+		// Just imported, the Library's list may not have it yet; if another
+		// view or album is opened meanwhile, that stays.
 		if (!byId.get(id)) {
 			await loadAlbums();
-			if (view !== 'library' || openId) return;
+			if (mine !== moves || view !== 'library') return;
 		}
 		await tick();
 		const album = byId.get(id);
@@ -1565,11 +1583,21 @@
 			drawerOpen = false;
 		} else if (e.key === 'Escape' && batch && !batch.ended) {
 			stopBatch();
-		} else if (e.key === 'Escape' && selecting && view === 'inbox' && !typing(e)) {
+		} else if (
+			batch &&
+			!batch.ended &&
+			e.altKey &&
+			(e.key === 'ArrowLeft' || e.key === 'ArrowRight')
+		) {
+			// Its dialog moves on its own keys; while one waits for its plan, the batch does.
+			e.preventDefault();
+			jumpBatch(batch.index + (e.key === 'ArrowRight' ? 1 : -1));
+		} else if (e.key === 'Escape' && selecting && view === 'inbox' && !batchShown && !typing(e)) {
 			stopSelecting();
 		} else if (
 			selecting &&
 			view === 'inbox' &&
+			!batchShown &&
 			(e.ctrlKey || e.metaKey) &&
 			e.key.toLowerCase() === 'a' &&
 			!typing(e)
@@ -1909,7 +1937,7 @@
 	/>
 {/if}
 
-{#if selecting && view === 'inbox' && !sheetAlbum && (!batch || batch.ended)}
+{#if selecting && view === 'inbox' && !sheetAlbum && !batchShown}
 	<SelectionBar
 		selected={selected.size}
 		hidden={selectedHidden}
@@ -1926,7 +1954,7 @@
 	{@const b = batch}
 	<!-- Each album's dialog stays once shown, hidden while another is, with what was done in it. -->
 	{#each b.items as item, i (item.album.id)}
-		{#if item.opened && item.plan}
+		{#if item.opened && item.plan && (item.status !== 'imported' || i === b.index)}
 			<ImportDialog
 				hidden={b.ended || i !== b.index}
 				album={item.album}
