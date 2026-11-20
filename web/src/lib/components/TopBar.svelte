@@ -176,13 +176,18 @@
 		{/if}
 		{@render actions?.()}
 		<button
-			class="icon-btn rescan"
+			class="icon-btn"
 			onclick={onrescan}
-			aria-label={scan?.running ? 'Scanning' : 'Rescan the Inbox and Library'}
-			title={scan?.running ? 'Scanning…' : 'Rescan the Inbox and Library'}
+			aria-label={label || 'Rescan the Inbox and Library'}
+			title={label || 'Rescan the Inbox and Library'}
 			disabled={scan?.running}
 		>
-			<span class:spin={scan?.running}><RefreshCw size={17} /></span>
+			<!-- Phones have no room for the scan's own ring: Rescan shows its progress. -->
+			{#if phone.current && scan?.running && scan.phase !== 'walking'}
+				<span class="ring" style:--p={pct}></span>
+			{:else}
+				<span class:spin={scan?.running}><RefreshCw size={17} /></span>
+			{/if}
 		</button>
 		{@render sorts()}
 	</div>
@@ -502,8 +507,8 @@
 		.right {
 			gap: 4px;
 		}
-		/* While a scan runs, its progress ring stands in for Rescan, which waits. */
-		.rescan:disabled {
+		/* Rescan shows the scan's progress instead. */
+		.scan {
 			display: none;
 		}
 	}
