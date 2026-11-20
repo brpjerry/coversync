@@ -317,6 +317,42 @@ async fn cookie_paths_are_checked() {
 }
 
 #[tokio::test]
+async fn another_sites_page_cant_act_with_the_cookie() {
+    let app = App::with_password("cross-site");
+    let cookie = app.cookie().await;
+    let rescan = |site: Option<&str>| {
+        let mut req = Request::post("/api/rescan").header(header::COOKIE, &cookie);
+        if let Some(site) = site {
+            req = req.header("sec-fetch-site", site);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    // Another site, or another origin of this one (a service on another port).
+    for site in ["cross-site", "same-site"] {
+        assert_eq!(
+            code(app.send(rescan(Some(site))).await).await,
+            (StatusCode::FORBIDDEN, "cross_site".into()),
+            "{site}"
+        );
+    }
+    // Its own pages, what's typed, and clients that aren't browsers.
+    for site in [Some("same-origin"), Some("none"), None] {
+        assert_eq!(
+            app.send(rescan(site)).await.status(),
+            StatusCode::ACCEPTED,
+            "{site:?}"
+        );
+    }
+    // Reading is fine from anywhere: a link to the app, say.
+    let req = Request::get("/api/status")
+        .header(header::COOKIE, &cookie)
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.send(req).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn logging_out_ends_the_session() {
     let app = App::with_password("logout");
     let cookie = app.cookie().await;

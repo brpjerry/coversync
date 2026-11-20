@@ -365,7 +365,11 @@ until the command is run on the server.
   `coversync_session`: HttpOnly, SameSite=Lax, and Secure when the proxy
   reports HTTPS (`X-Forwarded-Proto: https`). It is limited to the UI's path,
   and the session ends after 90 days without use, or with **Sign out** in the
-  sidebar. Covers and audio streams work with the cookie alone.
+  sidebar. Covers and audio streams work with the cookie alone. A request
+  that changes something is refused (403, `cross_site`) when the browser
+  says a page of another site or origin sent it (`Sec-Fetch-Site:
+  cross-site` or `same-site`), so another service on the same host can't
+  act with the cookie.
 - **Apps** send a token, `Authorization: Bearer cst_…`, which pairing issues
   (see [Pairing devices](#pairing-devices)), one per device, each with a
   scope: `manage` (everything a browser can do, except managing devices) or
