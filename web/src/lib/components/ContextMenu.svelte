@@ -9,10 +9,6 @@
 		primary?: boolean;
 		/** Set on every item of a menu that picks one of them, e.g. a sort; true on the one picked. */
 		checked?: boolean;
-		/** A count after the label, e.g. how many albums need attention; shown unless 0. */
-		count?: number;
-		/** The count is a warning. */
-		warn?: boolean;
 	}
 	export type MenuEntry = MenuItem | 'separator';
 </script>
@@ -149,7 +145,6 @@
 			>
 				{#if item.icon}<item.icon size={16} />{/if}
 				<span class="label">{item.label}</span>
-				{#if item.count}<span class="count tabular" class:warn={item.warn}>{item.count}</span>{/if}
 				{#if item.checked !== undefined}
 					<span class="check">
 						{#if item.checked}<Check size={15} strokeWidth={2.4} />{/if}
@@ -224,27 +219,11 @@
 	button.checked {
 		font-weight: 600;
 	}
-	.count {
-		margin-left: auto;
-		padding: 0 7px;
-		border-radius: 999px;
-		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--text-3);
-		background: var(--surface-hover);
-	}
-	.count.warn {
-		color: var(--warn-text);
-		background: var(--warn-surface);
-	}
 	/* Radio items keep the tick at the far end. */
 	.check {
 		display: grid;
 		width: 15px;
 		margin-left: auto;
-	}
-	.count + .check {
-		margin-left: 0;
 	}
 	button.primary:hover,
 	button.primary:focus-visible {

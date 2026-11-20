@@ -1171,8 +1171,9 @@ fn summarize(id: &str, tracks: &[&Track], added: i64, cover: Option<&CoverRow>) 
 }
 
 /// Filter keys whose values come from the album summary, as the grid shows
-/// it: the album artist (or the artist it falls back to) and the year.
-const SUMMARY_FILTERS: &[&str] = &["album_artist", "date"];
+/// it: the album artist (or the artist it falls back to) and the year; and
+/// what the album needs.
+const SUMMARY_FILTERS: &[&str] = &["album_artist", "date", crate::appearance::ATTENTION];
 
 /// Every value of `key` an album has, in the order found and without repeats;
 /// a value holding several is split as `split` says (names at its phrases
@@ -1186,6 +1187,7 @@ fn filter_values<'a>(
     let found: Vec<String> = match key {
         "album_artist" => vec![album.artist.clone()],
         "date" => album.year.map(|y| y.to_string()).into_iter().collect(),
+        crate::appearance::ATTENTION => return needs(album),
         _ => tracks.filter_map(|v| v.get(key).cloned()).collect(),
     };
     let mut out: Vec<String> = Vec::new();
@@ -1195,6 +1197,26 @@ fn filter_values<'a>(
                 out.push(part);
             }
         }
+    }
+    out
+}
+
+/// What an album needs, as the Needs attention filter lists it: the labels
+/// of the tags the rules want that its tracks miss, and Incomplete.
+fn needs(album: &Album) -> Vec<String> {
+    let missing = album.attention.iter().flat_map(|a| &a.missing);
+    let mut out: Vec<String> = missing
+        .map(|id| match id.as_str() {
+            crate::art::ART => "Album art".to_string(),
+            id => rules::CATALOG
+                .iter()
+                .find(|k| k.id == id)
+                .map_or(id, |k| k.label)
+                .to_string(),
+        })
+        .collect();
+    if album.incomplete.is_some() {
+        out.push("Incomplete".into());
     }
     out
 }
@@ -2246,11 +2268,6 @@ impl Library {
                         album.sort_values.insert(key.to_string(), v.to_string());
                     }
                 }
-                for key in filter_keys {
-                    // Empty too: the page tells no value from a key not asked for.
-                    let found = filter_values(key, &album, idx.iter().map(|i| &values[*i]), split);
-                    album.filter_values.insert(key.to_string(), found);
-                }
                 if !required.is_empty() {
                     let mut have = after_autofill(&rows, &idx, &values, &present, autofill);
                     if album.has_cover {
@@ -2259,6 +2276,11 @@ impl Library {
                         }
                     }
                     album.attention = attention(&have, required);
+                }
+                for key in filter_keys {
+                    // Empty too: the page tells no value from a key not asked for.
+                    let found = filter_values(key, &album, idx.iter().map(|i| &values[*i]), split);
+                    album.filter_values.insert(key.to_string(), found);
                 }
                 album
             })
@@ -3288,11 +3310,11 @@ mod tests {
     #[cfg(feature = "server")]
     fn albums_without_art_need_attention_when_art_is_required() {
         let lib = Library::open(&temp_db("art")).unwrap();
-        lib.upsert(&[
-            file("/m/a/1.flac", "a", &["title"]),
-            file("/m/b/1.flac", "b", &[]),
-        ])
-        .unwrap();
+        // Track 2 alone: track 1 is missing.
+        let mut b = file("/m/b/1.flac", "b", &[]);
+        b.3.track_no = Some(2);
+        lib.upsert(&[file("/m/a/1.flac", "a", &["title"]), b])
+            .unwrap();
         let cover = found(CoverSource::File("/m/a/folder.jpg".into()), "1");
         lib.set_cover("a", Some(&cover), "sig").unwrap();
         lib.set_cover("b", None, "sig").unwrap();
@@ -3300,7 +3322,7 @@ mod tests {
             .albums(
                 Collection::Inbox,
                 &[],
-                &[],
+                &[crate::appearance::ATTENTION],
                 &Splitter::default(),
                 &["title", crate::art::ART],
                 None,
@@ -3322,6 +3344,13 @@ mod tests {
                 tracks: 1
             })
         );
+        // The Needs attention filter lists what each needs, by its label.
+        let needs = |id: &str| {
+            let album = albums.iter().find(|x| x.id == id).unwrap();
+            album.filter_values[crate::appearance::ATTENTION].clone()
+        };
+        assert!(needs("a").is_empty());
+        assert_eq!(needs("b"), ["Title", "Album art", "Incomplete"]);
         assert_eq!(lib.tag_coverage(None).unwrap().without_art, 1);
     }
 

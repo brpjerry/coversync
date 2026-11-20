@@ -12,12 +12,10 @@
 		active: Sort;
 		label: (id: Sort) => string;
 		onsort: (id: Sort) => void;
-		/** Counts shown beside sorts, e.g. how many albums need attention. */
-		counts?: Partial<Record<Sort, number>>;
 		/** Sorting doesn't apply here (setup screens). */
 		disabled: boolean;
 	}
-	let { sorts, active, label, onsort, counts = {}, disabled }: Props = $props();
+	let { sorts, active, label, onsort, disabled }: Props = $props();
 
 	let button = $state<HTMLButtonElement>();
 	/** Where the menu opens, while it's open. */
@@ -27,9 +25,7 @@
 			label: label(id),
 			icon: sortIcon(id),
 			run: () => onsort(id),
-			checked: active === id,
-			count: counts[id],
-			warn: id === 'attention'
+			checked: active === id
 		}))
 	);
 
@@ -46,7 +42,6 @@
 <button
 	bind:this={button}
 	class="sort-btn"
-	class:warn={active === 'attention'}
 	onclick={toggle}
 	aria-label="Sort by {label(active)}"
 	aria-haspopup="menu"
@@ -109,9 +104,6 @@
 		max-width: 150px;
 		overflow: hidden;
 		text-overflow: ellipsis;
-	}
-	.warn .active {
-		color: var(--warn);
 	}
 	.chev {
 		display: grid;

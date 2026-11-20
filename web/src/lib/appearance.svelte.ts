@@ -7,8 +7,8 @@ import { SetupStore } from './setup-store.svelte';
 import { toast } from './toast.svelte';
 
 /** Match the daemon's defaults, so the top bar and sidebar are right before it answers. */
-const DEFAULT_SORTS = ['album_artist', 'album', 'date', 'added', 'attention'];
-const DEFAULT_FILTERS = ['genre', 'album_artist', 'date'];
+const DEFAULT_SORTS = ['album_artist', 'album', 'date', 'added'];
+const DEFAULT_FILTERS = ['genre', 'album_artist', 'date', 'attention'];
 const DEFAULT_LABELS: Record<string, string> = {
 	album_artist: 'Album artist',
 	album: 'Album',
@@ -138,7 +138,9 @@ class AppearanceStore extends SetupStore<AppearanceResponse> {
 	}
 
 	label(id: string) {
-		return this.sortable.find((s) => s.id === id)?.label ?? DEFAULT_LABELS[id] ?? id;
+		const found =
+			this.sortable.find((s) => s.id === id) ?? this.filterable.find((s) => s.id === id);
+		return found?.label ?? DEFAULT_LABELS[id] ?? id;
 	}
 
 	revert() {

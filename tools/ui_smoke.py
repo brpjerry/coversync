@@ -160,6 +160,14 @@ class Driver:
         self.wait("return !!document.querySelector('[role=menu]')")
         self.click_xpath(f"//div[@role='menu']//button[@role='menuitemradio'][.//span[contains(concat(' ', normalize-space(@class), ' '), ' label ')][normalize-space(.)='{label}']]")
 
+    def filter_by(self, kind, value=None):
+        """Show a tag's values in the sidebar's filter, and tick `value` if given."""
+        self.js("const s = document.querySelector('aside select'); s.value = arguments[0];"
+                "s.dispatchEvent(new Event('change', {bubbles: true}))", kind)
+        time.sleep(0.4)
+        if value:
+            self.click_xpath(f"//aside//button[contains(concat(' ', @class, ' '), ' value ')][.//span[contains(concat(' ', @class, ' '), ' name ')][normalize-space(.)='{value}']]")
+
     def open_setup(self, label):
         """Open a setup screen (Inbox setup, Library setup, Appearance, Sync setup) from the sidebar."""
         if self.js("return document.querySelector('.sidebar').classList.contains('collapsed')"):
@@ -457,21 +465,19 @@ def cover_size_flow(d, out, tag, save):
 
 
 def attention_flow(d, out, tag):
-    """The Needs attention view: its banner, and "Show all albums" going back to the sort before."""
-    before = d.js("return document.querySelector('.sort-btn .label').textContent.trim()")
-    d.click_sort("Needs attention")
-    d.wait("return !!document.querySelector('.attention-note')")
+    """The sidebar's Needs attention filter: what albums need, and their cards saying it."""
+    d.filter_by("attention")
+    print("needs attention:", d.js("return [...document.querySelectorAll('aside .value')]"
+                                   ".map(v => v.querySelector('.name').textContent + ' ' + v.querySelector('.n').textContent)"))
+    d.click("aside .value")
     time.sleep(0.8)
-    print("attention banner:", d.js("return document.querySelector('.attention-note').textContent.replace(/\\s+/g, ' ').trim()"),
-          "| cards:", d.js("return document.querySelectorAll('.card').length"),
-          "| sort button:", d.js("return document.querySelector('.sort-btn').textContent.replace(/\\s+/g, ' ').trim()"))
+    print("picked:", d.js("return document.querySelectorAll('.card').length"), "cards | flags:",
+          d.js("return [...document.querySelectorAll('.card .flag')].slice(0, 6).map(f => f.textContent.trim())"))
     d.shot(out / f"1g-attention-{tag}.png")
-    d.click_text("main", "Show all albums")
-    d.wait("return !document.querySelector('.attention-note')")
+    d.click("aside .clear-all")
     time.sleep(0.6)
-    after = d.js("return document.querySelector('.sort-btn .label').textContent.trim()")
-    print("show all albums:", d.js("return document.querySelectorAll('.card').length"), "cards | sort back to:", after,
-          "" if after == before else f"(expected {before})")
+    print("cleared:", d.js("return document.querySelectorAll('.card').length"), "cards | flags:",
+          d.js("return document.querySelectorAll('.card .flag').length"))
 
 
 def phone_flow(d, out, tag):
@@ -652,7 +658,7 @@ def art_flow(d, out, tag, library_folder):
 
     d.click_text("header", "Inbox")
     d.wait("return document.querySelectorAll('.card').length > 0")
-    d.click_sort("Needs attention")
+    d.filter_by("attention", "Album art")
     d.wait("return !!document.querySelector('.card .flag')")
     time.sleep(0.8)
     print("needs attention:", d.js("return [...document.querySelectorAll('.card')].map(c => c.querySelector('.title').textContent + ' [' + c.querySelector('.flag')?.textContent.trim() + ']')"))

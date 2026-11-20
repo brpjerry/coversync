@@ -10,20 +10,21 @@ use crate::{Error, Result, rules};
 
 /// Sort by when an album's files appeared in their folder.
 pub const ADDED: &str = "added";
-/// Not a sort: shows only albums whose tracks miss tags the rules need.
+/// Not a tag: filters by what albums need, the tags the rules want that
+/// their tracks miss, and tracks or discs their own numbering says are missing.
 pub const ATTENTION: &str = "attention";
 
-pub const DEFAULT_TABS: &[&str] = &["album_artist", "album", "date", ADDED, ATTENTION];
+pub const DEFAULT_TABS: &[&str] = &["album_artist", "album", "date", ADDED];
 
 /// Keys the album list fills from its own summary fields; any other sort
 /// key needs a per-album value from the index (`Album::sort_values`).
-pub const BUILT_IN: &[&str] = &["album_artist", "album", "date", "genre", ADDED, ATTENTION];
+pub const BUILT_IN: &[&str] = &["album_artist", "album", "date", "genre", ADDED];
 
 const MAX_TABS: usize = 16;
 
 /// Tags the sidebar filters by until Appearance says otherwise; the first is
 /// the one its dropdown starts on.
-pub const DEFAULT_FILTERS: &[&str] = &["genre", "album_artist", "date"];
+pub const DEFAULT_FILTERS: &[&str] = &["genre", "album_artist", "date", ATTENTION];
 
 /// Long free text, of no use for picking albums by.
 const NOT_FILTERABLE: &[&str] = &["lyrics", "acoustid_fingerprint"];
@@ -66,11 +67,12 @@ pub struct SortGroup {
 /// The group of what only coversync knows about an album.
 const LIBRARY: &str = "library";
 
-/// The text tag kinds, in their groups.
+/// The text tag kinds, in their groups, but for Collection (a filter of the
+/// Library's own).
 fn tags() -> impl Iterator<Item = Sortable> {
     rules::CATALOG
         .iter()
-        .filter(|k| !rules::NOT_EDITABLE.contains(&k.id))
+        .filter(|k| !rules::NOT_EDITABLE.contains(&k.id) && k.id != rules::COLLECTION)
         .map(|k| Sortable {
             id: k.id,
             label: k.label,
@@ -78,35 +80,33 @@ fn tags() -> impl Iterator<Item = Sortable> {
         })
 }
 
-/// Everything the sort menu can offer: "Recently added", "Needs attention"
-/// and the text tag kinds. Collection, coversync's own tag, sits with the
-/// first two.
+/// Everything the sort menu can offer: "Recently added" and the text tag kinds.
 pub fn sortable() -> Vec<Sortable> {
-    let mut out = vec![
-        Sortable {
-            id: ADDED,
-            label: "Recently added",
-            group: LIBRARY,
-        },
+    let added = Sortable {
+        id: ADDED,
+        label: "Recently added",
+        group: LIBRARY,
+    };
+    std::iter::once(added).chain(tags()).collect()
+}
+
+/// Everything the sidebar can filter by: what albums need and their
+/// collection, then the text tag kinds, less long free text.
+pub fn filterable() -> Vec<Sortable> {
+    let own = [
         Sortable {
             id: ATTENTION,
             label: "Needs attention",
             group: LIBRARY,
         },
-    ];
-    out.extend(tags().map(|s| match s.id {
-        rules::COLLECTION => Sortable {
+        Sortable {
+            id: rules::COLLECTION,
+            label: "Collection",
             group: LIBRARY,
-            ..s
         },
-        _ => s,
-    }));
-    out
-}
-
-/// Everything the sidebar can filter by: the text tag kinds, less long free text.
-pub fn filterable() -> Vec<Sortable> {
-    tags().filter(|s| !NOT_FILTERABLE.contains(&s.id)).collect()
+    ];
+    let tags = tags().filter(|s| !NOT_FILTERABLE.contains(&s.id));
+    own.into_iter().chain(tags).collect()
 }
 
 pub fn groups() -> Vec<SortGroup> {
@@ -161,6 +161,13 @@ impl AppearanceSetup {
     /// Keep known keys once, in the order given, and the cover size in range.
     pub fn normalize(mut self) -> Result<Self> {
         self.cover_size = self.cover_size.clamp(MIN_COVER_SIZE, MAX_COVER_SIZE);
+        // These were sorts before they were filters.
+        for id in [ATTENTION, rules::COLLECTION] {
+            if self.sort_tabs.iter().any(|t| t == id) {
+                self.sort_tabs.retain(|t| t != id);
+                self.filter_tags.push(id.to_string());
+            }
+        }
         let known = sortable();
         if let Some(bad) = self
             .sort_tabs
@@ -220,7 +227,6 @@ mod tests {
     fn defaults_and_validation() {
         let d = AppearanceSetup::default();
         assert_eq!(d.sort_tabs, DEFAULT_TABS);
-        assert!(d.sort_tabs.iter().any(|t| t == ATTENTION));
         assert!(d.extra_sort_keys().is_empty());
         let tabs = |t: &[&str]| AppearanceSetup {
             sort_tabs: t.iter().map(|s| s.to_string()).collect(),
@@ -232,6 +238,16 @@ mod tests {
         assert!(tabs(&[]).normalize().is_err());
         assert!(tabs(&["rating"]).normalize().is_err());
         assert!(tabs(&["nope"]).normalize().is_err());
+        // Needs attention and Collection, sorts once, move to the filters
+        // (kept once, after those there).
+        let moved = AppearanceSetup {
+            filter_tags: vec!["genre".into(), "collection".into()],
+            ..tabs(&["attention", "label", "collection"])
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(moved.sort_tabs, ["label"]);
+        assert_eq!(moved.filter_tags, ["genre", "collection", "attention"]);
         let parsed: AppearanceSetup = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, d);
     }
@@ -249,22 +265,22 @@ mod tests {
         assert_eq!(s.filter_tags, ["label", "genre"]);
         // The sidebar can go without filters, unlike the sort menu without sorts.
         assert!(filters(&[]).normalize().unwrap().filter_tags.is_empty());
-        for bad in ["added", "attention", "lyrics", "rating", "nope"] {
+        for bad in ["added", "lyrics", "rating", "nope"] {
             assert!(filters(&[bad]).normalize().is_err(), "{bad}");
         }
+        // Needs attention and Collection filter, with the Library's own, and don't sort.
+        let own: Vec<_> = filterable()
+            .into_iter()
+            .filter(|f| f.group == LIBRARY)
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(own, [ATTENTION, "collection"]);
+        assert!(!sortable().iter().any(|s| own.contains(&s.id)));
         assert!(
             filterable()
                 .iter()
-                .all(|f| sortable().iter().any(|s| s.id == f.id))
+                .all(|f| own.contains(&f.id) || sortable().iter().any(|s| s.id == f.id))
         );
-        // Collection sorts with the Library's own; it filters among the tags.
-        let group = |list: Vec<Sortable>| {
-            list.into_iter()
-                .find(|s| s.id == "collection")
-                .unwrap()
-                .group
-        };
-        assert_eq!((group(sortable()), group(filterable())), (LIBRARY, "work"));
         // Settings saved before tag filters existed get the defaults.
         let old: AppearanceSetup = serde_json::from_str(r#"{"sort_tabs":["genre"]}"#).unwrap();
         assert_eq!(old.filter_tags, DEFAULT_FILTERS);
