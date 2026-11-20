@@ -73,6 +73,7 @@
 		type MbArt
 	} from '#lib/api.ts';
 	import { duration } from '#lib/format.ts';
+	import { presetPick, type TickPreset } from '#lib/batch.svelte.ts';
 	import ShowAll from './ShowAll.svelte';
 	import ArtViewer, { type ViewedArt } from './ArtViewer.svelte';
 
@@ -99,6 +100,14 @@
 		artChosen: string | null;
 		/** `auto`: ticked by default rather than by hand. */
 		onart: (art: ChosenArt | null, auto: boolean) => void;
+		/**
+		 * In a batch: the quick choice used on the album before, applied once
+		 * the lookup is back (only to a release that's surely the album, as the
+		 * default ticks are).
+		 */
+		preset?: TickPreset;
+		/** A quick choice was used: the batch's next album starts with it. */
+		onpreset?: (preset: TickPreset) => void;
 	}
 	let {
 		albumId,
@@ -114,7 +123,9 @@
 		onaccept,
 		original,
 		artChosen,
-		onart
+		onart,
+		preset,
+		onpreset
 	}: Props = $props();
 
 	let lookup = $state<IdentifyState | null>(null);
@@ -175,8 +186,10 @@
 			const art = await api.musicbrainzArt(release.id, release.release_group, release.front_art);
 			if (mine !== seq) return;
 			cover = { release: release.id, art };
-			// Like an empty tag: filled in when the release is surely the album.
-			if (art && !original && complete) toggleArt(true, true);
+			// Like an empty tag: filled in when the release is surely the album;
+			// in a batch, as the quick choice used before says.
+			const tick = preset ? presetPick[preset]({ fill: !original }) && !artSmaller : !original;
+			if (art && complete && tick) toggleArt(true, true);
 		} catch (e) {
 			if (mine !== seq) return;
 			cover = {
@@ -433,6 +446,7 @@
 						: true;
 			if ((row.fill || row.romanizes) && free) toggle(row, true);
 		}
+		if (preset) setAll(presetPick[preset]);
 	}
 
 	/**
@@ -991,9 +1005,15 @@
 					><b>{on.length + (artOn ? 1 : 0)}</b> of {offered}
 					{offered === 1 ? 'suggestion' : 'suggestions'} ticked</span
 				>
-				<button class="link" onclick={() => setAll(() => true)}>Tick all</button>
-				<button class="link" onclick={() => setAll((r) => r.fill)}>Only empty tags</button>
-				<button class="link" onclick={() => setAll(() => false)}>None</button>
+				{#each [['all', 'Tick all'], ['fill', 'Only empty tags'], ['none', 'None']] as const as [p, name] (p)}
+					<button
+						class="link"
+						onclick={() => {
+							setAll(presetPick[p]);
+							onpreset?.(p);
+						}}>{name}</button
+					>
+				{/each}
 			</div>
 
 			{#if albumRows.length || artRow}

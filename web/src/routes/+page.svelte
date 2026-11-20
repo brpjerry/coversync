@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { cubicOut } from 'svelte/easing';
 	import { fade, fly } from 'svelte/transition';
 	import { goto } from '$app/navigation';
@@ -15,6 +16,9 @@
 	import Play from '@lucide/svelte/icons/play';
 	import FilterX from '@lucide/svelte/icons/funnel-x';
 	import Upload from '@lucide/svelte/icons/upload';
+	import ListChecks from '@lucide/svelte/icons/list-checks';
+	import SquareCheck from '@lucide/svelte/icons/square-check';
+	import Square from '@lucide/svelte/icons/square';
 	import {
 		api,
 		ApiError,
@@ -50,7 +54,8 @@
 	import { session } from '#lib/session.svelte.ts';
 	import { desktopApp } from '#lib/desktop.svelte.ts';
 	import { notify } from '#lib/notify.ts';
-	import { dismiss, toast, type ToastAction } from '#lib/toast.svelte.ts';
+	import { dismiss, toast, update, type ToastAction } from '#lib/toast.svelte.ts';
+	import { ImportBatch, type BatchItem } from '#lib/batch.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
 	import SortMenu from '#lib/components/SortMenu.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
@@ -65,6 +70,9 @@
 	import Toasts from '#lib/components/Toasts.svelte';
 	import ContextMenu, { type MenuEntry } from '#lib/components/ContextMenu.svelte';
 	import ImportDialog from '#lib/components/ImportDialog.svelte';
+	import SelectionBar from '#lib/components/SelectionBar.svelte';
+	import BatchBar from '#lib/components/BatchBar.svelte';
+	import BatchSummary from '#lib/components/BatchSummary.svelte';
 	import UploadButton from '#lib/components/UploadButton.svelte';
 	import UploadsPanel from '#lib/components/UploadsPanel.svelte';
 	import { uploads, UploadsUnavailable } from '#lib/uploads.svelte.ts';
@@ -233,6 +241,48 @@
 	let attentionView = $derived(
 		filterKinds.includes('attention') && !!filters[browsing].attention?.length
 	);
+
+	// Selecting Inbox albums, to import them one after another (see ImportBatch).
+	let selecting = $state(false);
+	/** The ids of the Inbox albums selected, those the search and filters hide included. */
+	const selected = new SvelteSet<string>();
+	/** The album a Shift-click selects from. */
+	let anchor: string | null = null;
+	// Albums that leave the Inbox (imported, hidden, gone in a rescan) leave the selection.
+	$effect(() => {
+		const inbox = new Set(albums.map((a) => a.id));
+		untrack(() => {
+			for (const id of selected) if (!inbox.has(id)) selected.delete(id);
+		});
+	});
+	/** Inbox albums the search and filters leave. */
+	let shownInbox = $derived(browsing === 'inbox' ? visible : []);
+	let selectedHidden = $derived.by(() => {
+		const shown = new Set(shownInbox.map((a) => a.id));
+		return [...selected].filter((id) => !shown.has(id)).length;
+	});
+
+	/** Select or deselect `album`; with Shift, select those between it and the last one picked. */
+	function select(album: Album, e: MouseEvent | null) {
+		selecting = true;
+		if (e?.shiftKey && anchor && anchor !== album.id) {
+			const ids = shownInbox.map((a) => a.id);
+			const [from, to] = [ids.indexOf(anchor), ids.indexOf(album.id)];
+			if (from >= 0 && to >= 0) {
+				for (const id of ids.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(id);
+				anchor = album.id;
+				return;
+			}
+		}
+		if (!selected.delete(album.id)) selected.add(album.id);
+		anchor = album.id;
+	}
+
+	function stopSelecting() {
+		selecting = false;
+		selected.clear();
+		anchor = null;
+	}
 
 	/** The album grid's width, for the Appearance screen's cover size preview. */
 	let mainBox = $state<DOMRectReadOnly>();
@@ -532,7 +582,7 @@
 				openId &&
 				(draft !== 'none' || moving) &&
 				!holding &&
-				openId !== importingHere &&
+				!importingHere.has(openId) &&
 				gone(openId)
 			)
 				hold(null, draft === 'draft');
@@ -1056,7 +1106,7 @@
 			enqueue({
 				kind: 'notice',
 				id: album_id,
-				previous: inbox_id === importingHere ? null : inbox_id
+				previous: importingHere.has(inbox_id) ? null : inbox_id
 			});
 		},
 		album_changed: albumChanged,
@@ -1097,13 +1147,30 @@
 			{ label: 'Open', icon: PanelTopOpen, run: () => open(a) },
 			{ label: 'Play', icon: Play, run: () => playAlbum(a) }
 		];
-		if (a.collection === 'inbox')
-			items.push('separator', {
-				label: 'Import to Library',
-				icon: FolderInput,
-				primary: true,
-				run: () => startImport(a)
-			});
+		if (a.collection === 'inbox') {
+			const chosen = selected.has(a.id);
+			items.push(
+				{
+					label: chosen ? 'Deselect' : 'Select',
+					icon: chosen ? Square : SquareCheck,
+					run: () => select(a, null)
+				},
+				'separator',
+				chosen && selected.size > 1
+					? {
+							label: `Import ${selected.size} selected`,
+							icon: FolderInput,
+							primary: true,
+							run: importSelected
+						}
+					: {
+							label: 'Import to Library',
+							icon: FolderInput,
+							primary: true,
+							run: () => startImport(a)
+						}
+			);
+		}
 		return items;
 	});
 
@@ -1128,6 +1195,10 @@
 	 * over first even if this page's copy of the setting is out of date.
 	 */
 	async function startImport(album: Album, edits?: ImportEdits) {
+		// The tag editor's Import, for the album a batch is on.
+		const b = batch;
+		if (b && !b.ended && edits && b.current.album.id === album.id)
+			return importFromEditor(b, b.current, edits);
 		// Taken as off until Inbox setup has loaded: the editor's Import
 		// still brings suggestions, if they're on, in the dialog.
 		if (!edits && !inboxSetup.saved.suggestions) {
@@ -1160,8 +1231,8 @@
 		}
 	}
 
-	/** The Inbox album this page is importing, whose sheet it closes itself. */
-	let importingHere: string | null = null;
+	/** The Inbox albums this page is importing, whose sheets it closes itself. */
+	const importingHere = new Set<string>();
 	/** Returns an error message, or null when the album was imported. */
 	/** `autofilled`: kinds autofill sets, mentioned in the success toast. */
 	async function runImport(
@@ -1173,7 +1244,7 @@
 		musicbrainzArt?: string
 	): Promise<string | null> {
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
-		importingHere = album.id;
+		importingHere.add(album.id);
 		try {
 			const r = await api.importAlbum(album.id, edits, art, musicbrainzArt);
 			importing = null;
@@ -1203,9 +1274,197 @@
 			if (!importing) toast(message, 'error', 8000, fixAction(message));
 			return message;
 		} finally {
-			importingHere = null;
+			importingHere.delete(album.id);
 			dismiss(working);
 		}
+	}
+
+	// Several Inbox albums imported one after another: each one's import
+	// dialog in turn (or, with Smart suggestions off, its tag editor), each
+	// import running in the background while the next album is looked at.
+	let batch = $state<ImportBatch | null>(null);
+	/** The summary was closed while imports still ran: a toast says how they went. */
+	let batchClosed = $state(false);
+	let batchToast: number | null = null;
+
+	/** Import the albums selected, in the Inbox's order. */
+	function importSelected() {
+		const list = sorted(albums, activeSort).filter((a) => selected.has(a.id));
+		if (!list.length) return;
+		stopSelecting();
+		void startBatch(list);
+	}
+
+	async function startBatch(list: Album[]) {
+		if (batch && !batch.ended) return;
+		batch?.close();
+		// The tag catalog, for the dialogs' and the strip's labels.
+		await setup.load();
+		const b = new ImportBatch(list, inboxSetup.saved.suggestions);
+		batch = b;
+		batchClosed = false;
+		void b.loadPlans();
+		await showBatchItem(0);
+	}
+
+	/** Go to the batch's album at `index`: its dialog, or with Smart suggestions off, its tag editor. */
+	async function showBatchItem(index: number): Promise<void> {
+		const b = batch;
+		if (!b) return;
+		// Smart suggestions off: an album left goes back to its editor next time.
+		if (!b.suggest && index !== b.index) b.current.dialog = false;
+		b.index = index;
+		const item = b.current;
+		if (!item.open) {
+			// Imported, or on its way: its dialog (or the bar) says where to.
+			if (!b.suggest && openId) await close();
+			return;
+		}
+		if (!item.plan && !(await b.loadPlan(item, item.edits))) {
+			if (b !== batch || b.index !== index) return;
+			// Its dialog can't open: it's listed as failed, with why, and Retry.
+			item.status = 'failed';
+			return advanceBatch();
+		}
+		if (b !== batch || b.index !== index) return;
+		if (b.suggest) {
+			item.opened = true;
+			void b.prefetch();
+		} else {
+			if (openId !== item.album.id) {
+				if (openId) await close();
+				await open(item.album);
+			}
+			sheet?.edit();
+		}
+	}
+
+	/** Smart suggestions off: the tag editor's Import, in a batch; its dialog only when the plan asks. */
+	async function importFromEditor(b: ImportBatch, item: BatchItem, edits: ImportEdits) {
+		item.edits = edits;
+		const plan = await b.loadPlan(item, edits);
+		if (b !== batch) return;
+		if (!plan) {
+			toast(item.error ?? 'Could not check the album', 'error', 6000);
+			return;
+		}
+		const asks = plan.failing.length || plan.disagree.length || plan.art.missing || plan.suggest;
+		const collection =
+			setup.saved.collections.length || plan.tracks.some((t) => t.values.collection);
+		if (asks || collection) {
+			item.round++;
+			item.dialog = item.opened = true;
+		} else if (plan.problems.length) {
+			toast(plan.problems.join(' '), 'error', 8000, fixAction(plan.problems[0]));
+		} else {
+			batchImport(item, edits);
+		}
+	}
+
+	/** Import the batch's `item` in the background, and go on to the next album. */
+	function batchImport(
+		item: BatchItem,
+		edits: ImportEdits,
+		art?: string,
+		musicbrainzArt?: string
+	): Promise<string | null> {
+		const b = batch!;
+		const id = item.album.id;
+		importingHere.add(id);
+		void b.import(item, edits, art, musicbrainzArt).then(async () => {
+			importingHere.delete(id);
+			await loadAlbums();
+			dataGeneration++;
+			batchProgress(b);
+		});
+		batchProgress(b);
+		void advanceBatch();
+		return Promise.resolve(null);
+	}
+
+	async function advanceBatch(): Promise<void> {
+		const b = batch;
+		if (!b) return;
+		const next = b.nextWaiting();
+		if (next !== null) return showBatchItem(next);
+		// The album sheet goes before the summary comes.
+		if (!b.suggest && openId) await close();
+		b.ended = true;
+	}
+
+	function skipBatchItem() {
+		batch?.skip();
+		void advanceBatch();
+	}
+
+	async function stopBatch() {
+		const b = batch;
+		if (!b || b.ended) return;
+		const left = b.waiting;
+		const albumsLeft = left === 1 ? "1 album hasn't" : `${left} albums haven't`;
+		if (
+			left &&
+			!confirm(`Stop importing? ${albumsLeft} been imported. Imports already started will finish.`)
+		)
+			return;
+		if (!b.suggest && openId) await close();
+		b.ended = true;
+		// The albums left stay selected, to pick the batch up again.
+		const remaining = b.items.filter((i) => i.status === 'waiting' || i.status === 'failed');
+		if (remaining.length) {
+			selected.clear();
+			for (const i of remaining) selected.add(i.album.id);
+			selecting = true;
+		}
+	}
+
+	/** Back to a failed album's dialog, as it was. */
+	function retryBatchItem(item: BatchItem) {
+		const b = batch;
+		if (!b) return;
+		// Its dialog still says why it failed, until the next try.
+		item.status = 'waiting';
+		b.ended = false;
+		void showBatchItem(b.items.indexOf(item));
+	}
+
+	/** Done with the summary: the batch goes once its imports have. */
+	function closeSummary() {
+		const b = batch;
+		if (!b) return;
+		if (b.count('importing')) batchClosed = true;
+		else {
+			b.close();
+			batch = null;
+		}
+	}
+
+	/**
+	 * One toast for a batch's imports while they run; when they're done and
+	 * the summary was closed, one saying how they went.
+	 */
+	function batchProgress(b: ImportBatch) {
+		const running = b.count('importing');
+		const finished = b.count('imported') + b.count('failed');
+		if (running) {
+			const text = `Importing ${finished + 1} of ${finished + running}…`;
+			if (batchToast === null) batchToast = toast(text, 'progress', 0);
+			else update(batchToast, text);
+			return;
+		}
+		if (batchToast !== null) dismiss(batchToast);
+		batchToast = null;
+		if (b !== batch || !b.ended || !batchClosed) return;
+		const imported = b.count('imported');
+		const failed = b.count('failed');
+		toast(
+			`Imported ${imported} ${imported === 1 ? 'album' : 'albums'}${failed ? ` · ${failed} failed` : ''}`,
+			failed ? 'error' : 'success',
+			7000,
+			{ label: 'Show', run: () => setView('library') }
+		);
+		b.close();
+		batch = null;
 	}
 
 	async function showInLibrary(id: string) {
@@ -1318,6 +1577,19 @@
 			close();
 		} else if (e.key === 'Escape' && narrow && drawerOpen) {
 			drawerOpen = false;
+		} else if (e.key === 'Escape' && batch && !batch.ended) {
+			stopBatch();
+		} else if (e.key === 'Escape' && selecting && view === 'inbox' && !typing(e)) {
+			stopSelecting();
+		} else if (
+			selecting &&
+			view === 'inbox' &&
+			(e.ctrlKey || e.metaKey) &&
+			e.key.toLowerCase() === 'a' &&
+			!typing(e)
+		) {
+			e.preventDefault();
+			for (const a of shownInbox) selected.add(a.id);
 		} else if (e.key === 'Escape' && isSetup(view) && !typing(e)) {
 			setView(browsing);
 		} else if (typing(e) || e.ctrlKey || e.metaKey || e.altKey) {
@@ -1418,6 +1690,16 @@
 		{#snippet actions()}
 			{#if view === 'inbox'}
 				<UploadButton onpick={(files) => startUploads(() => uploads.pick(files))} />
+				<button
+					class="icon-btn select-btn"
+					class:on={selecting}
+					onclick={() => (selecting ? stopSelecting() : (selecting = true))}
+					aria-pressed={selecting}
+					aria-label="Select albums"
+					title="Select albums to import"
+				>
+					<ListChecks size={18} />
+				</button>
 			{/if}
 		{/snippet}
 		{#snippet sorts()}
@@ -1569,7 +1851,12 @@
 							onplay={playAlbum}
 							onmenu={(a, x, y) => (menu = { album: a, x, y })}
 							flag={attentionView ? attentionFlag : undefined}
+							selecting={selecting && view === 'inbox'}
+							{selected}
+							onselect={view === 'inbox' ? select : undefined}
 						/>
+						<!-- Keeps the last row clear of the selection bar. -->
+						{#if selecting && view === 'inbox'}<div class="select-space"></div>{/if}
 					{/if}
 				</div>
 			{/key}
@@ -1595,6 +1882,11 @@
 		{onsaved}
 		onimport={sheetAlbum.collection === 'inbox'
 			? (edits) => startImport(sheetAlbum!, edits)
+			: undefined}
+		importLabel={batch && !batch.ended && batch.current.album.id === sheetAlbum.id
+			? batch.last
+				? 'Import'
+				: 'Import & next'
 			: undefined}
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
@@ -1634,6 +1926,75 @@
 		onimport={(edits, art, suggested, mbArt) =>
 			runImport(importing!.album, edits, importing!.plan.autofilled, art, suggested, mbArt)}
 	/>
+{/if}
+
+{#if selecting && view === 'inbox' && !sheetAlbum && (!batch || batch.ended)}
+	<SelectionBar
+		selected={selected.size}
+		hidden={selectedHidden}
+		shown={shownInbox.length}
+		allShown={shownInbox.every((a) => selected.has(a.id))}
+		onclose={stopSelecting}
+		onall={() => shownInbox.forEach((a) => selected.add(a.id))}
+		onclear={() => selected.clear()}
+		onimport={importSelected}
+	/>
+{/if}
+
+{#if batch}
+	{@const b = batch}
+	<!-- Each album's dialog stays once shown, hidden while another is, with what was done in it. -->
+	{#each b.items as item, i (item.album.id)}
+		{#if item.opened && item.plan && (b.suggest || item.dialog)}
+			{#key item.round}
+				<ImportDialog
+					hidden={b.ended || i !== b.index}
+					album={item.album}
+					plan={item.plan}
+					baseEdits={item.edits}
+					label={(id) => setup.label(id)}
+					albumKinds={setup.albumKinds}
+					collections={setup.saved.collections}
+					notEditable={setup.notEditable}
+					coreKinds={setup.kinds.filter((k) => k.group === 'core').map((k) => k.id)}
+					kindOrder={setup.kinds.map((k) => k.id)}
+					onclose={b.suggest ? stopBatch : () => (item.dialog = false)}
+					onimport={(edits, art, _suggested, mbArt) => batchImport(item, edits, art, mbArt)}
+					batch={{
+						batch: b,
+						item,
+						onjump: showBatchItem,
+						onskip: skipBatchItem,
+						onstop: stopBatch
+					}}
+				/>
+			{/key}
+		{/if}
+	{/each}
+	{#if !b.suggest && !b.ended && !(b.current.dialog && b.current.open)}
+		<BatchBar
+			batch={b}
+			onjump={showBatchItem}
+			onskip={skipBatchItem}
+			onstop={stopBatch}
+			label={(id) => setup.label(id)}
+		/>
+	{/if}
+	{#if b.ended && !batchClosed}
+		<BatchSummary
+			batch={b}
+			onretry={retryBatchItem}
+			onshow={(item) => {
+				closeSummary();
+				if (item.libraryId) showInLibrary(item.libraryId);
+			}}
+			onlibrary={() => {
+				closeSummary();
+				setView('library');
+			}}
+			ondone={closeSummary}
+		/>
+	{/if}
 {/if}
 
 {#if dragging && canDrop}
@@ -1686,6 +2047,14 @@
 		backdrop-filter: blur(2px);
 	}
 	/* Over the Inbox while files are dragged over it. Events pass through to the window. */
+	/* Select in the top bar, while albums are being selected. */
+	.select-btn.on {
+		color: var(--accent);
+		background: color-mix(in oklab, var(--accent) 16%, transparent);
+	}
+	.select-space {
+		height: 84px;
+	}
 	.drop {
 		position: fixed;
 		inset: var(--topbar-h) 0 var(--dock, 0px) 0;

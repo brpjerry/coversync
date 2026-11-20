@@ -84,6 +84,8 @@
 		 * current edits applied to the Library copy.
 		 */
 		onimport?: (edits: ImportEdits) => void;
+		/** What Import says: "Import & next" in a batch. */
+		importLabel?: string;
 		/** Hears what edits there are; a failed save turns them back into a draft. */
 		ondraft?: (draft: Draft) => void;
 		/**
@@ -111,6 +113,7 @@
 		onsaved,
 		oncancel,
 		onimport,
+		importLabel = 'Import',
 		ondraft,
 		kept = null,
 		onrefused,
@@ -771,7 +774,8 @@
 					onclick={() => onimport(edits(form, base, ids))}
 					disabled={errors || saving || loading || failed !== null || showing !== detail}
 				>
-					<FolderInput size={15} /> Import
+					<FolderInput size={15} />
+					{importLabel}
 				</button>
 			{/if}
 		</div>

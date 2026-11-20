@@ -2,6 +2,7 @@
 	import Play from '@lucide/svelte/icons/play';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
+	import Check from '@lucide/svelte/icons/check';
 	import { scale } from 'svelte/transition';
 	import { coverUrl, type Album } from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
@@ -19,8 +20,37 @@
 		/** Shown as a warning badge, e.g. "Genre" or "3 missing", with `flagTitle` as tooltip. */
 		flag?: string | null;
 		flagTitle?: string;
+		/** Albums are being selected: a click selects this one rather than opening it. */
+		selecting?: boolean;
+		/** Selected. */
+		checked?: boolean;
+		/**
+		 * Select or deselect it, on a click while selecting, or a Ctrl, ⌘ or
+		 * Shift click (which starts selecting); none where albums can't be.
+		 */
+		onselect?: (album: Album, e: MouseEvent) => void;
 	}
-	let { album, width, onopen, onplay, onmenu, flag = null, flagTitle }: Props = $props();
+	let {
+		album,
+		width,
+		onopen,
+		onplay,
+		onmenu,
+		flag = null,
+		flagTitle,
+		selecting = false,
+		checked = false,
+		onselect
+	}: Props = $props();
+
+	function click(e: MouseEvent) {
+		if (onselect && (selecting || e.ctrlKey || e.metaKey || e.shiftKey)) {
+			e.preventDefault();
+			onselect(album, e);
+		} else {
+			onopen(album, cover);
+		}
+	}
 
 	function menuKey(e: KeyboardEvent) {
 		if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
@@ -43,6 +73,8 @@
 
 <article
 	class="card"
+	class:selecting
+	class:checked
 	data-album={album.id}
 	style:--tint={shade(album.color, 16)}
 	style:--glow={accent(album.color)}
@@ -57,9 +89,10 @@
 			class:loaded
 			class:cached
 			bind:this={cover}
-			onclick={() => onopen(album, cover)}
+			onclick={click}
 			onkeydown={menuKey}
-			aria-label="Open {album.title} by {album.artist}"
+			aria-label="{selecting ? 'Select' : 'Open'} {album.title} by {album.artist}"
+			aria-pressed={selecting ? checked : undefined}
 			aria-haspopup="menu"
 		>
 			{#if album.has_cover && !failed}
@@ -101,6 +134,11 @@
 			{#if playing}
 				<span class="now" aria-hidden="true"><i></i><i></i><i></i></span>
 			{/if}
+			{#if selecting}
+				<span class="check" aria-hidden="true" transition:scale={{ start: 0.5, duration: 180 }}>
+					{#if checked}<Check size={14} strokeWidth={3} />{/if}
+				</span>
+			{/if}
 		</button>
 		<button
 			class="play"
@@ -112,7 +150,7 @@
 		</button>
 	</div>
 	<div class="meta">
-		<button class="title" onclick={() => onopen(album, cover)} tabindex="-1">{album.title}</button>
+		<button class="title" onclick={click} tabindex="-1">{album.title}</button>
 		<div class="artist">
 			{album.artist}{#if album.year}<span class="year">{` · ${album.year}`}</span>{/if}
 		</div>
@@ -141,7 +179,9 @@
 		overflow: hidden;
 		background: var(--tint);
 		box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
-		transition: box-shadow 380ms var(--ease-out);
+		transition:
+			box-shadow 380ms var(--ease-out),
+			scale 220ms var(--ease-out);
 	}
 	.cover::after {
 		content: '';
@@ -222,6 +262,40 @@
 	}
 	.card .play:hover {
 		transform: scale(1.08);
+	}
+	/* While selecting, a click selects: no play button, and a tick box over the cover. */
+	.selecting .play {
+		display: none;
+	}
+	.check {
+		position: absolute;
+		top: 8px;
+		left: 8px;
+		display: grid;
+		place-items: center;
+		width: 24px;
+		height: 24px;
+		border-radius: 999px;
+		border: 2px solid rgb(255 255 255 / 0.92);
+		background: rgb(0 0 0 / 0.3);
+		color: var(--accent-ink);
+		box-shadow: 0 2px 8px rgb(0 0 0 / 0.4);
+		transition:
+			background 160ms,
+			border-color 160ms;
+	}
+	.checked .check {
+		background: var(--accent);
+		border-color: var(--accent);
+	}
+	.checked .cover {
+		scale: 0.92;
+		outline: 3px solid var(--accent);
+		outline-offset: 3px;
+	}
+	.selecting .flag {
+		left: 40px;
+		max-width: calc(100% - 48px);
 	}
 
 	.flag {

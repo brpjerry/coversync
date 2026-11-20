@@ -191,6 +191,21 @@ used on a home server.
   correction files ffmpeg can't read) can't be imported, and WavPack and
   Monkey's Audio files in the Library can't be edited; an MP3's APE tag
   (ReplayGain from MP3Gain, say) is left as it is.
+- **Importing several albums**: **Select** in the Inbox's top bar (or an
+  album's menu, or a Ctrl/⌘- or Shift-click) ticks albums. Ctrl/⌘+A ticks
+  every album shown, and Esc stops. A bar counts them, including any the
+  search or filters hide, and **Import N** goes through each one in the
+  Inbox's order. Each gets its import dialog (with Smart suggestions off, its
+  tag editor), with a strip of the batch's covers marking each album's
+  progress: looking up, needs something, importing, imported, skipped or
+  failed. **Import & next** imports in the background and moves on, **Skip**
+  leaves the album in the Inbox, and Alt+←/→ moves between albums without
+  deciding. Lookups run ahead, one at a time, the current album's first. The
+  collection picked, and the suggestions' quick choice (Tick all, Only empty
+  tags, None), carry to the next album. The quick choice applies only to a
+  release with exactly the album's tracks, like the default ticks. **Stop**
+  ends the batch, and the albums left stay selected. A summary lists each
+  album's outcome, with **Retry** for a failed one.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added
