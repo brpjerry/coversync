@@ -17,9 +17,10 @@ export const same = (a: string, b: string) => key(a) === key(b);
 export const NONE = '';
 export const valueLabel = (v: string) => (v === NONE ? 'None' : v);
 
+/** A kind the album list wasn't loaded with (it's older than the filter) has none yet. */
 const values = (a: Album, kind: string) => {
 	const found = a.filter_values?.[kind];
-	return found?.length ? found : [NONE];
+	return found && !found.length ? [NONE] : (found ?? []);
 };
 
 /** How many values are picked across `kinds`. */

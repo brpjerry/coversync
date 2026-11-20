@@ -163,16 +163,16 @@
 					transition:slide={{ duration: 220, easing: cubicOut }}
 				>
 					{#each active as p (`${p.kind}\n${p.value}`)}
+						{@const none = `No ${label(p.kind).toLowerCase()}`}
+						{@const name = p.value === NONE ? none : `${label(p.kind)}: ${p.value}`}
 						<li transition:fade={{ duration: 150 }}>
 							<button
 								class="chip"
-								title="{label(p.kind)}: {valueLabel(p.value)}"
-								aria-label="Remove {label(p.kind)}: {valueLabel(p.value)}"
+								title={name}
+								aria-label="Remove {name}"
 								onclick={() => pick(p.kind, p.value)}
 							>
-								<span class="chip-text"
-									>{p.value === NONE ? `No ${label(p.kind).toLowerCase()}` : p.value}</span
-								>
+								<span class="chip-text">{p.value === NONE ? none : p.value}</span>
 								<X size={12} strokeWidth={2.4} />
 							</button>
 						</li>
@@ -236,6 +236,8 @@
 							<span class="name" class:blank={t.value === NONE} title={valueLabel(t.value)}
 								>{valueLabel(t.value)}</span
 							>
+							{#if t.value === NONE}<span class="sr-only">(no {label(kind).toLowerCase()})</span
+								>{/if}
 							<span class="n tabular">{count(t.count)}</span>
 						</button>
 					{/each}

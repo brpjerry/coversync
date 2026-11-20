@@ -34,7 +34,8 @@ used on a home server.
   ones to show. Ticked values of one tag widen the choice, values of several
   tags narrow it, and tags holding several values (split by Library setup's
   separator, and names at its phrases, see below) offer each. **None**, last,
-  ticks the albums without the tag.
+  ticks the albums with no value to list (Album artist and Year list the
+  grid's, so an album without an album artist tag is under its artist).
 - **Tag editor** (a Library album's Edit tags, or an Inbox album's Import
   without Smart suggestions; see Import): album-wide fields (album, album
   artist, date, genre) and each track's (number, disc, title, artist) up
