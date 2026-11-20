@@ -280,16 +280,21 @@ struct ErrorBody<'a> {
     retry_after: Option<u64>,
 }
 
-/// Refuse a request that changes something when the browser says a page of
-/// another site or origin sent it (`Sec-Fetch-Site`, which a page can't
-/// set): a form or script elsewhere, another service on this host say,
-/// would otherwise act with the browser's session cookie. The browser's own
-/// pages (`same-origin`), what's typed or bookmarked (`none`) and clients
-/// that aren't browsers (no header) pass; so does reading.
+/// Refuse an API request that changes something when the browser says a
+/// page of another site or origin sent it (`Sec-Fetch-Site`, which a page
+/// can't set): a form or script elsewhere, another service on this host's
+/// other port say, would otherwise act with the browser's session cookie.
+/// The browser's own pages (`same-origin`), what's typed or bookmarked
+/// (`none`) and clients that aren't browsers (no header) pass; so does
+/// reading. Browsers send the header only to https (or loopback) addresses.
+/// The pairing exchange goes on to its own checks: a code is what it's
+/// sent with, and one that came in the clear has to be seen to be cancelled.
 pub async fn refuse_cross_site(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let checked = path.starts_with("/api/") && path != "/api/pair";
     let reading = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let site = req.headers().get("sec-fetch-site");
-    if !reading && site.is_some_and(|site| site != "same-origin" && site != "none") {
+    if checked && !reading && site.is_some_and(|site| site != "same-origin" && site != "none") {
         return error(
             StatusCode::FORBIDDEN,
             "cross_site",
