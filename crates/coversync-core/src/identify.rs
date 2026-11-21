@@ -24,7 +24,7 @@ use crate::lookups::{LookupCache, oldest};
 use crate::musicbrainz::{self as mb, AcoustResult, Medium, Release};
 use crate::romanize::{self, sorts_az};
 use crate::split::Splitter;
-use crate::{Error, Library, Result, import, tags};
+use crate::{Error, Library, Result, autofill, import, tags};
 
 /// Kinds suggested only for empty tags: genre is a matter of taste, and a
 /// differing language or AcoustID id isn't a correction.
@@ -540,25 +540,29 @@ struct Tally<'a> {
     scores: BTreeMap<usize, f64>,
     /// As AcoustID credits the first recording found on it.
     credit: Option<String>,
-    /// Local tracks whose recording on it is credited to their own artist.
-    same: BTreeSet<usize>,
+    /// The best score of a local track's recordings on it credited to its
+    /// own artist, by track.
+    same: BTreeMap<usize, f64>,
 }
 
 impl Tally<'_> {
     /// `recognized`: tracks AcoustID linked to recordings at all.
     fn rank(&self, tracks: &[Local], recognized: usize) -> f64 {
         let n = tracks.len() as f64;
-        let mut score: f64 = self.scores.values().sum();
-        // A track whose recording here is credited to its own artist counts
-        // more (see [`SAME_ARTIST`]); on a release holding at least half the
+        // A recording here credited to its track's own artist counts more
+        // (see [`SAME_ARTIST`]); on a release holding at least half the
         // recognized tracks, in the track count bonus's units, so however
         // few were recognized, agreeing ones outweigh an exact count.
-        let per = if self.scores.len() * 2 >= recognized {
-            n / recognized.max(1) as f64
+        let bonus = if self.scores.len() * 2 >= recognized {
+            SAME_ARTIST * n / recognized.max(1) as f64
         } else {
-            1.0
+            SAME_ARTIST
         };
-        score += SAME_ARTIST * per * self.same.len() as f64;
+        let mut score: f64 = self
+            .scores
+            .iter()
+            .map(|(i, best)| self.same.get(i).map_or(*best, |s| best.max(s + bonus)))
+            .sum();
         match self.release.track_count {
             Some(c) if c as f64 == n => score += 0.5 * n,
             Some(c) => score -= (c as f64 - n).abs().min(n) * 0.1,
@@ -629,10 +633,11 @@ fn audio_candidates(
                         release,
                         scores: BTreeMap::new(),
                         credit: None,
-                        same: BTreeSet::new(),
+                        same: BTreeMap::new(),
                     });
                     if same {
-                        tally.same.insert(i);
+                        let best = tally.same.entry(i).or_default();
+                        *best = best.max(result.score);
                     }
                     // The release's own artists when AcoustID gives them (a
                     // compilation's), else its recording's.
@@ -1088,7 +1093,7 @@ pub fn identify(
             // release with just the album's tracks, so failing leaves theirs.
             Err(e) if trusted => {
                 tracing::warn!("search: {e}");
-                notes.push("MusicBrainz couldn't be searched for a release with just the album's tracks, so only the releases their fingerprints point to are listed.".into());
+                notes.push("MusicBrainz couldn't be searched for a release with just the album's tracks, so its suggestions come from their fingerprints alone.".into());
                 None
             }
             Err(e) => return Err(e),
@@ -1317,20 +1322,26 @@ fn other_artist(
 ) -> Option<String> {
     // "Various Artists" stays a credit, one no album's names agree with
     // (they leave it out), so a compilation credited to it alone is flagged;
-    // its entity's aliases ("VA") aren't taken.
+    // whatever it's printed as ("VA") isn't taken, nor its aliases. A sort
+    // name ("Bush, Kate") is taken whole: its comma doesn't part names.
     let names = |credits: &[mb::Credit], out: &mut Vec<String>| {
+        let (various, credits): (Vec<&mb::Credit>, Vec<&mb::Credit>) = credits
+            .iter()
+            .partition(|c| c.artist.id == mb::VARIOUS_ARTISTS);
+        if !various.is_empty() {
+            out.push(autofill::VARIOUS_ARTISTS.to_string());
+        }
         let each = credits.iter().flat_map(|c| {
-            let other = (c.artist.id != mb::VARIOUS_ARTISTS).then_some(&c.artist);
             std::iter::once(c.name.as_str())
-                .chain(other.and_then(|a| a.name.as_deref()))
-                .chain(other.and_then(|a| a.sort_name.as_deref()))
-                .chain(
-                    other
-                        .into_iter()
-                        .flat_map(|a| a.aliases.iter().map(|a| a.name.as_str())),
-                )
+                .chain(c.artist.name.as_deref())
+                .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
         });
-        out.extend(credited_names(each, &mb::credit_name(credits), split));
+        let printed: String = credits
+            .iter()
+            .map(|c| format!("{}{}", c.name, c.joinphrase))
+            .collect();
+        out.extend(credited_names(each, &printed, split));
+        out.extend(credits.iter().filter_map(|c| c.artist.sort_name.clone()));
     };
     let releases: Vec<&Release> = std::iter::once(release).chain(shown.as_ref()).collect();
     // Who the release credits, for the note: its artist, else (for a
@@ -2823,6 +2834,26 @@ mod tests {
     }
 
     #[test]
+    fn an_artist_bonus_stays_with_the_recording_that_earned_it() {
+        // On "mixed", the track's best match is someone else's recording;
+        // its own artist's there matches less well than on "own".
+        let lookup: Vec<AcoustResult> = serde_json::from_str(
+            r#"[
+                {"id": "a1", "score": 0.99, "recordings": [{"id": "r1", "artists": [{"name": "Someone"}],
+                    "releases": [{"id": "mixed", "title": "M", "track_count": 1}]}]},
+                {"id": "a2", "score": 0.55, "recordings": [{"id": "r2", "artists": [{"name": "4ikai"}],
+                    "releases": [{"id": "mixed", "title": "M", "track_count": 1}]}]},
+                {"id": "a3", "score": 0.9, "recordings": [{"id": "r3", "artists": [{"name": "4ikai"}],
+                    "releases": [{"id": "own", "title": "O", "track_count": 1}]}]}
+            ]"#,
+        )
+        .unwrap();
+        let tracks = [local(1, &[("artist", "4ikai")])];
+        let (candidates, _) = audio_candidates(&tracks, &[lookup], &Splitter::default());
+        assert_eq!(candidates[0].id, "own");
+    }
+
+    #[test]
     fn one_agreeing_track_doesnt_outweigh_a_release_with_all_of_them() {
         // Twelve tracks, three recognized: "all" holds the three under
         // another spelling of the artist; "one" holds one, as tagged.
@@ -2951,6 +2982,30 @@ mod tests {
             flag(&various, &[va[0], ("artist", "AmaLee")]).as_deref(),
             alone
         );
+        // Nor is it printed as "VA" when the files say "VA" too.
+        various.artist_credit[0].name = "VA".into();
+        let vs = [("album_artist", "VA"), ("artist", "AmaLee")];
+        assert_eq!(flag(&various, &vs).as_deref(), Some("VA"));
+
+        // A sort name is one name, whatever parts names: "Bush, Kate" isn't
+        // the band "Bush".
+        let mut kate = release.clone();
+        let credit: Vec<mb::Credit> = serde_json::from_str(
+            r#"[{"name": "Kate Bush", "artist": {"id": "k", "sort-name": "Bush, Kate"}}]"#,
+        )
+        .unwrap();
+        kate.artist_credit = credit.clone();
+        kate.media[0].tracks[0].artist_credit = credit;
+        let commas = Splitter::new(",", &[]);
+        let by = |artist: &str| {
+            let mut track = local(1, &[("artist", artist)]);
+            track.recordings = vec![("rec-1".into(), "a1".into(), 1.0)];
+            let tracks = [track];
+            let mapped = map_tracks(&tracks, &kate, None);
+            other_artist(&tracks, &kate, &None, &mapped, &commas)
+        };
+        assert_eq!(by("Bush").as_deref(), Some("Kate Bush"));
+        assert_eq!(by("Kate Bush"), None);
 
         // No credit on either the release or the track: nothing to compare.
         let mut bare = release.clone();
