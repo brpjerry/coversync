@@ -397,25 +397,57 @@ fn title_key(v: &str) -> String {
 /// Suzuki").
 fn name_keys(name: &str) -> [String; 2] {
     let reversed: Vec<&str> = name.split_whitespace().rev().collect();
-    [title_key(name), title_key(&reversed.join(" "))]
+    [name_key(name), name_key(&reversed.join(" "))]
+}
+
+/// A name as compared: its letters and digits, lowercased; one with none
+/// ("!!!") as it is, lowercased.
+fn name_key(name: &str) -> String {
+    let key = title_key(name);
+    if key.is_empty() {
+        name.split_whitespace().collect::<String>().to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// The generic credit of a compilation, which says nothing of who's on it.
+fn various(name: &str) -> bool {
+    title_key(name) == "variousartists"
 }
 
 /// The names a track's artist and album artist tags give, split as the
-/// rules split names.
+/// rules split names; "Various Artists" (autofill's, often) isn't one.
 fn own_artists(track: &Local, split: &Splitter) -> Vec<String> {
     ["artist", "album_artist"]
         .iter()
         .filter_map(|k| track.values.get(k))
         .flat_map(|v| split.parts("artist", v))
+        .filter(|name| !various(name))
         .collect()
 }
 
+/// The names a credit gives: each artist's, and the whole credit as printed
+/// ("4ikai & Friend") split as the rules split names ("Rin (CV. Riho)").
+fn credited_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    printed: &str,
+    split: &Splitter,
+) -> Vec<String> {
+    let mut out: Vec<String> = names.into_iter().map(str::to_string).collect();
+    if !printed.trim().is_empty() {
+        out.push(printed.to_string());
+        out.extend(split.parts("artist", printed));
+    }
+    out
+}
+
 /// Whether one of `credited` is one of the album's `own` names.
-fn credited_to(own: &[String], credited: &[&str]) -> bool {
+fn credited_to(own: &[String], credited: &[String]) -> bool {
     credited.iter().any(|c| {
         let keys = name_keys(c);
         own.iter().any(|o| {
-            let key = title_key(o);
+            let key = name_key(o);
             !key.is_empty() && keys.contains(&key)
         })
     })
@@ -554,26 +586,43 @@ fn audio_candidates(
     split: &Splitter,
 ) -> (Vec<Candidate>, bool) {
     let own: Vec<Vec<String>> = tracks.iter().map(|t| own_artists(t, split)).collect();
+    let printed = |artists: &[mb::AcoustArtist]| -> String {
+        artists
+            .iter()
+            .map(|a| format!("{}{}", a.name, a.joinphrase))
+            .collect()
+    };
+    // In the track count bonus's units: an album whose recognized tracks all
+    // agree gets as much, however few of its tracks were recognized.
+    let recognized = results
+        .iter()
+        .filter(|r| r.iter().any(|x| x.score >= MIN_SCORE))
+        .count();
+    let same_artist = SAME_ARTIST * tracks.len() as f64 / recognized.max(1) as f64;
     let mut tallies: HashMap<&str, Tally> = HashMap::new();
     for (i, found) in results.iter().enumerate() {
         for result in found.iter().filter(|r| r.score >= MIN_SCORE) {
             for rec in &result.recordings {
-                let names: Vec<&str> = rec.artists.iter().map(|a| a.name.as_str()).collect();
+                let credit = printed(&rec.artists);
+                let names =
+                    credited_names(rec.artists.iter().map(|a| a.name.as_str()), &credit, split);
                 let same = own.get(i).is_some_and(|own| credited_to(own, &names));
-                let score = result.score + if same { SAME_ARTIST } else { 0.0 };
-                let credit: String = rec
-                    .artists
-                    .iter()
-                    .map(|a| format!("{}{}", a.name, a.joinphrase))
-                    .collect();
+                let score = result.score + if same { same_artist } else { 0.0 };
                 for release in &rec.releases {
                     let tally = tallies.entry(release.id.as_str()).or_insert(Tally {
                         release,
                         scores: BTreeMap::new(),
                         credit: None,
                     });
-                    if tally.credit.is_none() && !credit.is_empty() {
-                        tally.credit = Some(credit.clone());
+                    // The release's own artists when AcoustID gives them (a
+                    // compilation's), else its recording's.
+                    let label = if release.artists.is_empty() {
+                        credit.clone()
+                    } else {
+                        printed(&release.artists)
+                    };
+                    if tally.credit.is_none() && !label.is_empty() {
+                        tally.credit = Some(label);
                     }
                     let best = tally.scores.entry(i).or_default();
                     *best = best.max(score);
@@ -595,10 +644,6 @@ fn audio_candidates(
             })
             .then_with(|| a.1.release.id.cmp(&b.1.release.id))
     });
-    let recognized = results
-        .iter()
-        .filter(|r| r.iter().any(|x| x.score >= MIN_SCORE))
-        .count();
     let trusted = ranked
         .first()
         .is_some_and(|(_, t)| !t.scores.is_empty() && t.scores.len() * 2 >= recognized);
@@ -1014,49 +1059,61 @@ pub fn identify(
                     .as_deref()
                     .and_then(as_barcode)
             });
-        let search = tag_candidates(client, &tracks, barcode.as_deref())?;
-        saved = oldest(saved, search.saved);
-        let Searched {
-            method: found_by,
-            found: tagged,
-            by,
-        } = search.value;
-        searched = by;
-        let exact = tagged
-            .iter()
-            .position(|(score, c)| *score == 100 && complete(c));
-        if !trusted && !tagged.is_empty() {
-            let how = found_by.by();
-            if fingerprinted > 0 {
-                notes.push(if recognized == 0 {
-                    format!("AcoustID doesn't know these recordings, so the album was matched by its {how}.")
-                } else {
-                    format!("AcoustID recognized only {recognized} of {n} tracks, and they don't agree on a release, so the album was matched by its {how}.")
-                });
+        let search = match tag_candidates(client, &tracks, barcode.as_deref()) {
+            Ok(search) => Some(search),
+            // Trusted fingerprints settle it; this search only looks for a
+            // release with just the album's tracks, so failing leaves theirs.
+            Err(e) if trusted => {
+                tracing::warn!("search: {e}");
+                notes.push("MusicBrainz couldn't be searched for a release with just the album's tracks, so this is the one their fingerprints point to.".into());
+                None
             }
-            method = found_by;
-            let audio = std::mem::take(&mut candidates);
-            candidates = tagged.into_iter().map(|(_, c)| c).chain(audio).collect();
-        } else if let (true, Some(i)) = (trusted, exact) {
-            let bigger = candidates
-                .first()
-                .map(|c| c.title.clone())
-                .unwrap_or_default();
-            let why = match found_by {
-                Method::Barcode => "has the album's barcode and track count",
-                Method::Isrc => "has the album's ISRCs and track count",
-                _ => "matches the album's title, artist and track count",
-            };
-            notes.push(format!(
-                "The recordings are also on “{bigger}”, a release with more tracks; this one {why}."
-            ));
-            method = found_by;
-            let mut tagged: Vec<Candidate> = tagged.into_iter().map(|(_, c)| c).collect();
-            let picked = tagged.remove(i);
-            let audio = std::mem::take(&mut candidates);
-            candidates = std::iter::once(picked).chain(audio).chain(tagged).collect();
-        } else {
-            candidates.extend(tagged.into_iter().map(|(_, c)| c));
+            Err(e) => return Err(e),
+        };
+        if let Some(search) = search {
+            saved = oldest(saved, search.saved);
+            let Searched {
+                method: found_by,
+                found: tagged,
+                by,
+            } = search.value;
+            searched = by;
+            let exact = tagged
+                .iter()
+                .position(|(score, c)| *score == 100 && complete(c));
+            if !trusted && !tagged.is_empty() {
+                let how = found_by.by();
+                if fingerprinted > 0 {
+                    notes.push(if recognized == 0 {
+                        format!("AcoustID doesn't know these recordings, so the album was matched by its {how}.")
+                    } else {
+                        format!("AcoustID recognized only {recognized} of {n} tracks, and they don't agree on a release, so the album was matched by its {how}.")
+                    });
+                }
+                method = found_by;
+                let audio = std::mem::take(&mut candidates);
+                candidates = tagged.into_iter().map(|(_, c)| c).chain(audio).collect();
+            } else if let (true, Some(i)) = (trusted, exact) {
+                let bigger = candidates
+                    .first()
+                    .map(|c| c.title.clone())
+                    .unwrap_or_default();
+                let why = match found_by {
+                    Method::Barcode => "has the album's barcode and track count",
+                    Method::Isrc => "has the album's ISRCs and track count",
+                    _ => "matches the album's title, artist and track count",
+                };
+                notes.push(format!(
+                    "The recordings are also on “{bigger}”, a release with more tracks; this one {why}."
+                ));
+                method = found_by;
+                let mut tagged: Vec<Candidate> = tagged.into_iter().map(|(_, c)| c).collect();
+                let picked = tagged.remove(i);
+                let audio = std::mem::take(&mut candidates);
+                candidates = std::iter::once(picked).chain(audio).chain(tagged).collect();
+            } else {
+                candidates.extend(tagged.into_iter().map(|(_, c)| c));
+            }
         }
     }
     if candidates.is_empty() {
@@ -1196,6 +1253,7 @@ pub fn suggest(
     let mut notes = evidence.notes.clone();
     if let Some(by) = &other_artist {
         let own = consensus(&evidence.tracks, "album_artist")
+            .filter(|a| !various(a))
             .or_else(|| consensus(&evidence.tracks, "artist"))
             .unwrap_or_default();
         notes.push(format!(
@@ -1235,22 +1293,21 @@ fn other_artist(
     split: &Splitter,
 ) -> Option<String> {
     let names = |credits: &[mb::Credit], out: &mut Vec<String>| {
-        for c in credits {
-            out.push(c.name.clone());
-            out.extend(c.artist.name.clone());
-            out.extend(c.artist.sort_name.clone());
-            out.extend(c.artist.aliases.iter().map(|a| a.name.clone()));
-        }
+        let each = credits.iter().flat_map(|c| {
+            std::iter::once(c.name.as_str())
+                .chain(c.artist.name.as_deref())
+                .chain(c.artist.sort_name.as_deref())
+                .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
+        });
+        out.extend(credited_names(each, &mb::credit_name(credits), split));
     };
     let releases: Vec<&Release> = std::iter::once(release).chain(shown.as_ref()).collect();
-    let mut compared = false;
+    // Who the release is by, for the note: its credit, else a track's.
+    let mut by = mb::credit_name(&release.artist_credit);
+    let mut flagged = false;
     for (track, hit) in tracks.iter().zip(mapped) {
         let Some((m, t, _)) = hit else { continue };
         let own = own_artists(track, split);
-        if own.is_empty() {
-            continue;
-        }
-        compared = true;
         let mut credited = Vec::new();
         for r in &releases {
             names(&r.artist_credit, &mut credited);
@@ -1258,12 +1315,25 @@ fn other_artist(
                 names(&track.artist_credit, &mut credited);
             }
         }
-        let credited: Vec<&str> = credited.iter().map(String::as_str).collect();
+        credited.retain(|n| !n.trim().is_empty() && !various(n));
+        // Nothing to compare on this track: no name on either side.
+        if own.is_empty() || credited.is_empty() {
+            continue;
+        }
         if credited_to(&own, &credited) {
             return None;
         }
+        if (by.trim().is_empty() || various(&by))
+            && let Some(track) = release.media.get(*m).and_then(|m| m.tracks.get(*t))
+        {
+            by = mb::credit_name(&track.artist_credit);
+        }
+        if by.trim().is_empty() {
+            by = credited[0].clone();
+        }
+        flagged = true;
     }
-    compared.then(|| mb::credit_name(&release.artist_credit))
+    flagged.then_some(by)
 }
 
 fn summary(r: &Release) -> ReleaseSummary {
@@ -2682,34 +2752,131 @@ mod tests {
 
     #[test]
     fn names_compare_loosely_and_either_way_round() {
-        let own = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        assert!(credited_to(&own(&["鈴木 雅之"]), &["鈴木雅之"]));
-        assert!(credited_to(
-            &own(&["Suzuki Masayuki"]),
-            &["Masayuki Suzuki"]
-        ));
-        assert!(credited_to(&own(&["Ushio Reira"]), &["Ushio, Reira"]));
-        assert!(!credited_to(&own(&["鈴木 雅之"]), &["AmaLee"]));
-        assert!(!credited_to(&own(&[""]), &[""]));
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let same = |own: &[&str], credited: &[&str]| credited_to(&names(own), &names(credited));
+        assert!(same(&["鈴木 雅之"], &["鈴木雅之"]));
+        assert!(same(&["Suzuki Masayuki"], &["Masayuki Suzuki"]));
+        assert!(same(&["Ushio Reira"], &["Ushio, Reira"]));
+        assert!(same(&["!!!"], &["!!!"]));
+        assert!(!same(&["!!!"], &["???"]));
+        assert!(!same(&["鈴木 雅之"], &["AmaLee"]));
+        assert!(!same(&[""], &[""]));
+    }
+
+    #[test]
+    fn a_partly_recognized_album_still_goes_by_its_artist() {
+        // Two tracks of a 5-track EP, one recognized: its recording is also
+        // on a 2-track cover single, whose count matches the album's.
+        let lookup: Vec<AcoustResult> = serde_json::from_str(
+            r#"[{"id": "a1", "score": 0.998, "recordings": [
+                {"id": "rec-own", "artists": [{"name": "4ikai"}], "releases": [
+                    {"id": "ep", "title": "Thaw EP", "track_count": 5}]},
+                {"id": "rec-cover", "artists": [{"name": "Someone"}], "releases": [
+                    {"id": "cover", "title": "Thaw", "track_count": 2}]}
+            ]}]"#,
+        )
+        .unwrap();
+        let tracks = [
+            local(1, &[("artist", "4ikai")]),
+            local(2, &[("artist", "4ikai")]),
+        ];
+        let (candidates, _) =
+            audio_candidates(&tracks, &[lookup, Vec::new()], &Splitter::default());
+        assert_eq!(candidates[0].id, "ep");
+    }
+
+    #[test]
+    fn a_credit_is_compared_whole_and_split_too() {
+        let lookup = |artists: &str| -> Vec<AcoustResult> {
+            serde_json::from_str(&format!(
+                r#"[{{"id": "a1", "score": 0.99, "recordings": [
+                    {{"id": "rec-own", "artists": {artists}, "releases": [{{"id": "album", "title": "A", "track_count": 3}}]}},
+                    {{"id": "rec-cover", "artists": [{{"name": "Someone"}}], "releases": [{{"id": "cover", "title": "A", "track_count": 1}}]}}
+                ]}}]"#
+            ))
+            .unwrap()
+        };
+        let first = |artist: &str, artists: &str, split: &Splitter| {
+            let (c, _) = audio_candidates(
+                &[local(1, &[("artist", artist)])],
+                &[lookup(artists)],
+                split,
+            );
+            c[0].id.clone()
+        };
+        // A joint credit the rules don't split, as printed.
+        let plain = Splitter::new(";", &[]);
+        let joint = r#"[{"name": "4ikai", "joinphrase": " & "}, {"name": "Friend"}]"#;
+        assert_eq!(first("4ikai & Friend", joint, &plain), "album");
+        // One name of a credit the rules split: the featured singer alone.
+        let feat = Splitter::new(";", &["feat.".into(), "(CV".into()]);
+        assert_eq!(
+            first(
+                "伊原六花",
+                r#"[{"name": "鈴木雅之", "joinphrase": " feat. "}, {"name": "伊原六花"}]"#,
+                &feat
+            ),
+            "album"
+        );
+        assert_eq!(
+            first("Riho", r#"[{"name": "Rin (CV. Riho)"}]"#, &feat),
+            "album"
+        );
+        // And the release a compilation is listed as is by its own artists.
+        let compilation: Vec<AcoustResult> = serde_json::from_str(
+            r#"[{"id": "a1", "score": 0.99, "recordings": [{"id": "r", "artists": [{"name": "4ikai"}], "releases": [
+                {"id": "best", "title": "Best", "track_count": 20, "artists": [{"name": "Various Artists"}]}]}]}]"#,
+        )
+        .unwrap();
+        let (c, _) = audio_candidates(&[local(1, &[])], &[compilation], &plain);
+        assert_eq!(c[0].artist.as_deref(), Some("Various Artists"));
     }
 
     #[test]
     fn a_release_by_someone_else_is_flagged() {
         let release = release();
         let split = Splitter::new(";", &[]);
-        let flag = |artist: Option<&str>| {
-            let mut track = local(1, &artist.map(|a| vec![("artist", a)]).unwrap_or_default());
+        let flag = |release: &Release, values: &[(&'static str, &str)]| {
+            let mut track = local(1, values);
             track.recordings = vec![("rec-1".into(), "a1".into(), 1.0)];
             let tracks = [track];
-            let mapped = map_tracks(&tracks, &release, None);
-            other_artist(&tracks, &release, &None, &mapped, &split)
+            let mapped = map_tracks(&tracks, release, None);
+            other_artist(&tracks, release, &None, &mapped, &split)
         };
         // As credited, or by its sort name: the album's own.
-        assert_eq!(flag(Some("4ikai")), None);
-        assert_eq!(flag(Some("Aikai")), None);
+        assert_eq!(flag(&release, &[("artist", "4ikai")]), None);
+        assert_eq!(flag(&release, &[("artist", "Aikai")]), None);
         // Someone else's, then; and with no artist tag, nothing to go by.
-        assert_eq!(flag(Some("AmaLee")).as_deref(), Some("4ikai"));
-        assert_eq!(flag(None), None);
+        assert_eq!(
+            flag(&release, &[("artist", "AmaLee")]).as_deref(),
+            Some("4ikai")
+        );
+        assert_eq!(flag(&release, &[]), None);
+
+        // A compilation: "Various Artists" on both sides says nothing; the
+        // track's credit (an alias of its artist, here) decides.
+        let mut various: Release = release.clone();
+        various.artist_credit = serde_json::from_str(
+            r#"[{"name": "Various Artists", "artist": {"id": "89ad4ac3-39f7-470e-963a-56509c546377"}}]"#,
+        )
+        .unwrap();
+        various.media[0].tracks[0].artist_credit = serde_json::from_str(
+            r#"[{"name": "汐れいら", "artist": {"id": "c9c4b066", "sort-name": "Ushio, Reira", "aliases": [{"name": "Reira Ushio"}]}}]"#,
+        )
+        .unwrap();
+        let va = [("album_artist", "Various Artists")];
+        assert_eq!(flag(&various, &[va[0], ("artist", "Reira Ushio")]), None);
+        assert_eq!(
+            flag(&various, &[va[0], ("artist", "AmaLee")]).as_deref(),
+            Some("汐れいら")
+        );
+        assert_eq!(flag(&various, &va), None);
+
+        // No credit on either the release or the track: nothing to compare.
+        let mut bare = release.clone();
+        bare.artist_credit.clear();
+        bare.media[0].tracks[0].artist_credit.clear();
+        assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
     }
 
     /// The release's tracks and discs `tracks` lack, paired as identify pairs them.

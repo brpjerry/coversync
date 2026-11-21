@@ -965,7 +965,8 @@
 				<span class="script-note">{scriptNote}</span>
 			</div>
 		{/if}
-		{#if result.release && !complete}
+		<!-- Not for a release that's only by someone else: its own note says so. -->
+		{#if result.release && (result.release.track_count !== tracks.length || unpaired.length)}
 			<p class="note warn" transition:slide={{ duration: 200 }}>
 				<TriangleAlert size={14} />
 				<span>

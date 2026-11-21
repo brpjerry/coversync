@@ -147,6 +147,9 @@ pub struct AcoustArtist {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcoustRelease {
     pub id: String,
+    /// Given only when they aren't the recording's.
+    #[serde(default)]
+    pub artists: Vec<AcoustArtist>,
     pub title: Option<String>,
     pub country: Option<String>,
     pub date: Option<PartialDate>,
