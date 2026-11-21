@@ -129,8 +129,18 @@ pub struct AcoustResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcoustRecording {
     pub id: String,
+    /// As the recording is credited.
+    #[serde(default)]
+    pub artists: Vec<AcoustArtist>,
     #[serde(default)]
     pub releases: Vec<AcoustRelease>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcoustArtist {
+    pub name: String,
+    #[serde(default)]
+    pub joinphrase: String,
 }
 
 /// A release a recording appears on, as AcoustID summarizes it.
@@ -554,6 +564,8 @@ pub struct Credit {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditArtist {
     pub id: String,
+    /// Its own name, which the credit may give otherwise.
+    pub name: Option<String>,
     #[serde(rename = "sort-name")]
     pub sort_name: Option<String>,
     /// "Person", "Group", "Character"…

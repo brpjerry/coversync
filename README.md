@@ -226,7 +226,12 @@ used on a home server.
   MusicBrainz, by Chromaprint fingerprints on AcoustID where it can, and
   otherwise by the barcode (or UPC) and ISRCs its files are tagged with, or
   its title and artist. An artist MusicBrainz credits under another name
-  (汐れいら for "Ushio Reira") is found by its sort name or aliases. It
+  (汐れいら for "Ushio Reira") is found by its sort name or aliases. Among
+  the releases a fingerprint points to, those whose recording is credited
+  to the album's own artist come first, so another artist's cover that
+  AcoustID has merged with the song doesn't win for having the album's
+  track count. A release credited to none of the album's artists is
+  flagged in the dialog, and nothing of it is ticked by default. It
   offers MusicBrainz's tags to tick: values for empty tags and corrections
   for differing ones, and lists the release's tracks that none of the
   album's were paired with (a disc with none paired, such as a DVD, as one
