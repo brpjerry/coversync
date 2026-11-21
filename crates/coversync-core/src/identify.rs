@@ -1295,9 +1295,10 @@ pub fn suggest(
         let own = consensus(&evidence.tracks, "album_artist")
             .filter(|a| !various(a))
             .or_else(|| consensus(&evidence.tracks, "artist"))
+            .map(|own| format!("; the album's tags say {own}"))
             .unwrap_or_default();
         notes.push(format!(
-            "This release credits {by}; the album's tags say {own}. Make sure it's the album (a cover, say, isn't) before ticking its tags."
+            "This release credits {by}{own}. Make sure it's the album (a cover, say, isn't) before ticking its tags."
         ));
     }
     Ok(Identification {
@@ -1332,10 +1333,9 @@ fn other_artist(
     mapped: &[Option<(usize, usize, Via)>],
     split: &Splitter,
 ) -> Option<String> {
-    // The names a credit gives, and whether there's a credit at all. The
-    // Various Artists entity gives none, however it's printed ("VA"): it
-    // agrees with no album's names, but a compilation credited to it alone
-    // is flagged. A sort name ("Bush, Kate") is taken whole: its comma
+    // The names a credit gives, and whether it credits the Various Artists
+    // entity, which gives none, however it's printed ("VA"): it agrees with
+    // no album's names, but a compilation credited to it alone is flagged. A sort name ("Bush, Kate") is taken whole: its comma
     // doesn't part names.
     let names = |all: &[mb::Credit], out: &mut Vec<String>| -> bool {
         let credits: Vec<&mb::Credit> = all
@@ -1355,7 +1355,7 @@ fn other_artist(
         };
         out.extend(credited_names(each, &printed, split));
         out.extend(credits.iter().filter_map(|c| c.artist.sort_name.clone()));
-        !all.is_empty()
+        credits.len() < all.len()
     };
     let releases: Vec<&Release> = std::iter::once(release).chain(shown.as_ref()).collect();
     // Who the release credits, for the note: its artist, else (for a
@@ -1366,16 +1366,16 @@ fn other_artist(
         let Some((m, t, _)) = hit else { continue };
         let own = own_artists(track, split);
         let mut credited = Vec::new();
-        let mut any = false;
+        let mut generic = false;
         for r in &releases {
-            any |= names(&r.artist_credit, &mut credited);
+            generic |= names(&r.artist_credit, &mut credited);
             if let Some(track) = r.media.get(*m).and_then(|m| m.tracks.get(*t)) {
-                any |= names(&track.artist_credit, &mut credited);
+                generic |= names(&track.artist_credit, &mut credited);
             }
         }
         credited.retain(|n| !n.trim().is_empty());
         // Nothing to compare on this track: no artist tag, or no credit.
-        if own.is_empty() || !any {
+        if own.is_empty() || credited.is_empty() && !generic {
             continue;
         }
         if credited_to(&own, &credited) {
@@ -1388,12 +1388,20 @@ fn other_artist(
                 by = performer;
             }
         }
-        if by.trim().is_empty() {
-            by = credited.first().cloned().unwrap_or("another artist".into());
+        if by.trim().is_empty()
+            && let Some(name) = credited.first()
+        {
+            by = name.clone();
         }
         flagged = true;
     }
-    flagged.then_some(by)
+    flagged.then(|| {
+        if by.trim().is_empty() {
+            "another artist".into()
+        } else {
+            by
+        }
+    })
 }
 
 fn summary(r: &Release) -> ReleaseSummary {
@@ -3066,6 +3074,10 @@ mod tests {
         let mut bare = release.clone();
         bare.artist_credit.clear();
         bare.media[0].tracks[0].artist_credit.clear();
+        assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
+        // Nor with an artist credited by no name at all.
+        bare.artist_credit =
+            serde_json::from_str(r#"[{"name": "", "artist": {"id": "x"}}]"#).unwrap();
         assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
     }
 
