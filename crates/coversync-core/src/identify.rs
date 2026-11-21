@@ -413,16 +413,16 @@ fn name_key(name: &str) -> String {
 
 /// The generic credit of a compilation, which says nothing of who's on it.
 fn various(name: &str) -> bool {
-    title_key(name) == "variousartists"
+    name_keys(name).iter().any(|k| k == "variousartists")
 }
 
-/// The names a track's artist and album artist tags give, split as the
-/// rules split names; "Various Artists" (autofill's, often) isn't one.
+/// The names a track's artist and album artist tags give, whole and split
+/// as the rules split names; "Various Artists" (autofill's, often) isn't one.
 fn own_artists(track: &Local, split: &Splitter) -> Vec<String> {
     ["artist", "album_artist"]
         .iter()
         .filter_map(|k| track.values.get(k))
-        .flat_map(|v| split.parts("artist", v))
+        .flat_map(|v| std::iter::once(v.clone()).chain(split.parts("artist", v)))
         .filter(|name| !various(name))
         .collect()
 }
@@ -558,11 +558,20 @@ impl Tally<'_> {
         } else {
             SAME_ARTIST
         };
-        let mut score: f64 = self
-            .scores
-            .iter()
-            .map(|(i, best)| self.same.get(i).map_or(*best, |s| best.max(s + bonus)))
-            .sum();
+        // Each track by its best recording here, counting the bonus; the
+        // bonuses added after, so equal releases still add up exactly alike.
+        let mut agreeing = 0;
+        let mut score = 0.0;
+        for (i, best) in &self.scores {
+            match self.same.get(i) {
+                Some(s) if s + bonus > *best => {
+                    score += s;
+                    agreeing += 1;
+                }
+                _ => score += best,
+            }
+        }
+        score += bonus * agreeing as f64;
         match self.release.track_count {
             Some(c) if c as f64 == n => score += 0.5 * n,
             Some(c) => score -= (c as f64 - n).abs().min(n) * 0.1,
@@ -1324,10 +1333,9 @@ fn other_artist(
     // (they leave it out), so a compilation credited to it alone is flagged;
     // whatever it's printed as ("VA") isn't taken, nor its aliases. A sort
     // name ("Bush, Kate") is taken whole: its comma doesn't part names.
-    let names = |credits: &[mb::Credit], out: &mut Vec<String>| {
-        let (various, credits): (Vec<&mb::Credit>, Vec<&mb::Credit>) = credits
-            .iter()
-            .partition(|c| c.artist.id == mb::VARIOUS_ARTISTS);
+    let names = |all: &[mb::Credit], out: &mut Vec<String>| {
+        let (various, credits): (Vec<&mb::Credit>, Vec<&mb::Credit>) =
+            all.iter().partition(|c| c.artist.id == mb::VARIOUS_ARTISTS);
         if !various.is_empty() {
             out.push(autofill::VARIOUS_ARTISTS.to_string());
         }
@@ -1336,11 +1344,15 @@ fn other_artist(
                 .chain(c.artist.name.as_deref())
                 .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
         });
-        let printed: String = credits
-            .iter()
-            .map(|c| format!("{}{}", c.name, c.joinphrase))
-            .collect();
-        out.extend(credited_names(each, &printed, split));
+        // A joint credit as printed, but no part of it that's the entity's.
+        let printed = if credits.is_empty() {
+            String::new()
+        } else {
+            mb::credit_name(all)
+        };
+        let mut found = credited_names(each, &printed, split);
+        found.retain(|n| !various.iter().any(|c| title_key(&c.name) == title_key(n)));
+        out.extend(found);
         out.extend(credits.iter().filter_map(|c| c.artist.sort_name.clone()));
     };
     let releases: Vec<&Release> = std::iter::once(release).chain(shown.as_ref()).collect();
@@ -2834,6 +2846,20 @@ mod tests {
     }
 
     #[test]
+    fn releases_alike_but_for_which_track_agrees_tie() {
+        let release: mb::AcoustRelease =
+            serde_json::from_str(r#"{"id": "r", "track_count": 2}"#).unwrap();
+        let tally = |agrees: usize| Tally {
+            release: &release,
+            scores: BTreeMap::from([(0, 0.9), (1, 0.95)]),
+            credit: None,
+            same: BTreeMap::from([(agrees, [0.9, 0.95][agrees])]),
+        };
+        let tracks = [local(1, &[]), local(2, &[])];
+        assert_eq!(tally(0).rank(&tracks, 2), tally(1).rank(&tracks, 2));
+    }
+
+    #[test]
     fn an_artist_bonus_stays_with_the_recording_that_earned_it() {
         // On "mixed", the track's best match is someone else's recording;
         // its own artist's there matches less well than on "own".
@@ -2986,6 +3012,17 @@ mod tests {
         various.artist_credit[0].name = "VA".into();
         let vs = [("album_artist", "VA"), ("artist", "AmaLee")];
         assert_eq!(flag(&various, &vs).as_deref(), Some("VA"));
+        let reordered = [("album_artist", "Artists, Various"), ("artist", "AmaLee")];
+        assert_eq!(flag(&various, &reordered).as_deref(), Some("VA"));
+        // Credited jointly, as the files say it.
+        let joint: Vec<mb::Credit> = serde_json::from_str(&format!(
+            r#"[{{"name": "DJ X", "joinphrase": " & ", "artist": {{"id": "d"}}}},
+                {{"name": "VA", "artist": {{"id": "{}"}}}}]"#,
+            mb::VARIOUS_ARTISTS
+        ))
+        .unwrap();
+        various.artist_credit = joint;
+        assert_eq!(flag(&various, &[("artist", "DJ X & VA")]), None);
 
         // A sort name is one name, whatever parts names: "Bush, Kate" isn't
         // the band "Bush".
@@ -3006,6 +3043,7 @@ mod tests {
         };
         assert_eq!(by("Bush").as_deref(), Some("Kate Bush"));
         assert_eq!(by("Kate Bush"), None);
+        assert_eq!(by("Bush, Kate"), None);
 
         // No credit on either the release or the track: nothing to compare.
         let mut bare = release.clone();
