@@ -1347,8 +1347,10 @@ fn other_artist(
                 .chain(c.artist.name.as_deref())
                 .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
         });
-        // A joint credit as printed, unless that's partly the entity's.
-        let printed = if credits.len() == all.len() {
+        // A joint credit as printed, unless that's partly the entity's, or
+        // just its join phrases.
+        let named = credits.iter().any(|c| !c.name.trim().is_empty());
+        let printed = if credits.len() == all.len() && named {
             mb::credit_name(all)
         } else {
             String::new()
@@ -3075,9 +3077,14 @@ mod tests {
         bare.artist_credit.clear();
         bare.media[0].tracks[0].artist_credit.clear();
         assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
-        // Nor with an artist credited by no name at all.
+        // Nor with artists credited by no name at all.
         bare.artist_credit =
             serde_json::from_str(r#"[{"name": "", "artist": {"id": "x"}}]"#).unwrap();
+        assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
+        bare.artist_credit = serde_json::from_str(
+            r#"[{"name": "", "joinphrase": " & ", "artist": {"id": "x"}}, {"name": "", "artist": {"id": "y"}}]"#,
+        )
+        .unwrap();
         assert_eq!(flag(&bare, &[("artist", "4ikai")]), None);
     }
 
