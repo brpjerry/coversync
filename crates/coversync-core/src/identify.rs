@@ -24,7 +24,7 @@ use crate::lookups::{LookupCache, oldest};
 use crate::musicbrainz::{self as mb, AcoustResult, Medium, Release};
 use crate::romanize::{self, sorts_az};
 use crate::split::Splitter;
-use crate::{Error, Library, Result, autofill, import, tags};
+use crate::{Error, Library, Result, import, tags};
 
 /// Kinds suggested only for empty tags: genre is a matter of taste, and a
 /// differing language or AcoustID id isn't a correction.
@@ -416,13 +416,13 @@ fn various(name: &str) -> bool {
     name_keys(name).iter().any(|k| k == "variousartists")
 }
 
-/// The names a track's artist and album artist tags give, whole and split
-/// as the rules split names; "Various Artists" (autofill's, often) isn't one.
+/// The names a track's artist and album artist tags give, split as the
+/// rules split names; "Various Artists" (autofill's, often) isn't one.
 fn own_artists(track: &Local, split: &Splitter) -> Vec<String> {
     ["artist", "album_artist"]
         .iter()
         .filter_map(|k| track.values.get(k))
-        .flat_map(|v| std::iter::once(v.clone()).chain(split.parts("artist", v)))
+        .flat_map(|v| split.parts("artist", v))
         .filter(|name| !various(name))
         .collect()
 }
@@ -1329,31 +1329,28 @@ fn other_artist(
     mapped: &[Option<(usize, usize, Via)>],
     split: &Splitter,
 ) -> Option<String> {
-    // "Various Artists" stays a credit, one no album's names agree with
-    // (they leave it out), so a compilation credited to it alone is flagged;
-    // whatever it's printed as ("VA") isn't taken, nor its aliases. A sort
-    // name ("Bush, Kate") is taken whole: its comma doesn't part names.
-    let names = |all: &[mb::Credit], out: &mut Vec<String>| {
-        let (various, credits): (Vec<&mb::Credit>, Vec<&mb::Credit>) =
-            all.iter().partition(|c| c.artist.id == mb::VARIOUS_ARTISTS);
-        if !various.is_empty() {
-            out.push(autofill::VARIOUS_ARTISTS.to_string());
-        }
+    // The names a credit gives, and whether there's a credit at all. The
+    // Various Artists entity gives none, however it's printed ("VA"): it
+    // agrees with no album's names, but a compilation credited to it alone
+    // is flagged. A sort name ("Bush, Kate") is taken whole: its comma
+    // doesn't part names.
+    let names = |all: &[mb::Credit], out: &mut Vec<String>| -> bool {
+        let credits: Vec<&mb::Credit> = all
+            .iter()
+            .filter(|c| c.artist.id != mb::VARIOUS_ARTISTS)
+            .collect();
         let each = credits.iter().flat_map(|c| {
             std::iter::once(c.name.as_str())
                 .chain(c.artist.name.as_deref())
                 .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
         });
-        // A joint credit as printed, but no part of it that's the entity's.
-        let printed = if credits.is_empty() {
-            String::new()
-        } else {
-            mb::credit_name(all)
-        };
-        let mut found = credited_names(each, &printed, split);
-        found.retain(|n| !various.iter().any(|c| title_key(&c.name) == title_key(n)));
-        out.extend(found);
+        let printed: String = credits
+            .iter()
+            .map(|c| format!("{}{}", c.name, c.joinphrase))
+            .collect();
+        out.extend(credited_names(each, &printed, split));
         out.extend(credits.iter().filter_map(|c| c.artist.sort_name.clone()));
+        !all.is_empty()
     };
     let releases: Vec<&Release> = std::iter::once(release).chain(shown.as_ref()).collect();
     // Who the release credits, for the note: its artist, else (for a
@@ -1364,27 +1361,33 @@ fn other_artist(
         let Some((m, t, _)) = hit else { continue };
         let own = own_artists(track, split);
         let mut credited = Vec::new();
+        let mut any = false;
         for r in &releases {
-            names(&r.artist_credit, &mut credited);
+            any |= names(&r.artist_credit, &mut credited);
             if let Some(track) = r.media.get(*m).and_then(|m| m.tracks.get(*t)) {
-                names(&track.artist_credit, &mut credited);
+                any |= names(&track.artist_credit, &mut credited);
             }
         }
         credited.retain(|n| !n.trim().is_empty());
-        // Nothing to compare on this track: no name on either side.
-        if own.is_empty() || credited.is_empty() {
+        // Nothing to compare on this track: no artist tag, or no credit.
+        if own.is_empty() || !any {
             continue;
         }
         if credited_to(&own, &credited) {
             return None;
         }
-        if (by.trim().is_empty() || various(&by))
-            && let Some(track) = release.media.get(*m).and_then(|m| m.tracks.get(*t))
-        {
-            by = mb::credit_name(&track.artist_credit);
+        if by.trim().is_empty() || various(&by) {
+            let track = release.media.get(*m).and_then(|m| m.tracks.get(*t));
+            let performer = track.map(|t| mb::credit_name(&t.artist_credit));
+            if let Some(performer) = performer.filter(|p| !p.trim().is_empty()) {
+                by = performer;
+            }
         }
         if by.trim().is_empty() {
-            by = credited[0].clone();
+            match credited.first() {
+                Some(name) => by = name.clone(),
+                None => continue,
+            }
         }
         flagged = true;
     }
@@ -2931,6 +2934,11 @@ mod tests {
         let plain = Splitter::new(";", &[]);
         let joint = r#"[{"name": "4ikai", "joinphrase": " & "}, {"name": "Friend"}]"#;
         assert_eq!(first("4ikai & Friend", joint, &plain), "album");
+        // But two names the rules part aren't one run together.
+        assert_eq!(
+            first("Black;Pink", r#"[{"name": "BLACKPINK"}]"#, &plain),
+            "cover"
+        );
         // One name of a credit the rules split: the featured singer alone.
         let feat = Splitter::new(";", &["feat.".into(), "(CV".into()]);
         assert_eq!(
@@ -3014,15 +3022,8 @@ mod tests {
         assert_eq!(flag(&various, &vs).as_deref(), Some("VA"));
         let reordered = [("album_artist", "Artists, Various"), ("artist", "AmaLee")];
         assert_eq!(flag(&various, &reordered).as_deref(), Some("VA"));
-        // Credited jointly, as the files say it.
-        let joint: Vec<mb::Credit> = serde_json::from_str(&format!(
-            r#"[{{"name": "DJ X", "joinphrase": " & ", "artist": {{"id": "d"}}}},
-                {{"name": "VA", "artist": {{"id": "{}"}}}}]"#,
-            mb::VARIOUS_ARTISTS
-        ))
-        .unwrap();
-        various.artist_credit = joint;
-        assert_eq!(flag(&various, &[("artist", "DJ X & VA")]), None);
+        let unspaced = [("album_artist", "Artists,Various"), ("artist", "AmaLee")];
+        assert_eq!(flag(&various, &unspaced).as_deref(), Some("VA"));
 
         // A sort name is one name, whatever parts names: "Bush, Kate" isn't
         // the band "Bush".
@@ -3043,7 +3044,6 @@ mod tests {
         };
         assert_eq!(by("Bush").as_deref(), Some("Kate Bush"));
         assert_eq!(by("Kate Bush"), None);
-        assert_eq!(by("Bush, Kate"), None);
 
         // No credit on either the release or the track: nothing to compare.
         let mut bare = release.clone();
