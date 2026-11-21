@@ -9,7 +9,7 @@
 //! [`LookupCache`] where they were made before, so an album identified once
 //! is identified again without asking either service.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
