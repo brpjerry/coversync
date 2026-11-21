@@ -1434,7 +1434,7 @@ fn summary(r: &Release) -> ReleaseSummary {
 /// copy writes them: for the other releases listed, which share them.
 struct Latin {
     titles: HashMap<String, String>,
-    /// Credits as printed.
+    /// Credits as printed, without their spaces (AcoustID's may have none).
     credits: HashMap<String, String>,
     /// Credited names, longest first: for credits printed otherwise.
     names: Vec<(String, String)>,
@@ -1463,7 +1463,7 @@ impl Latin {
             }
             let (printed, latin) = (mb::credit_name(credit), mb::credit_name(latin_credit));
             if changed(&printed, &latin) {
-                credits.entry(printed).or_insert(latin);
+                credits.entry(unspaced_credit(&printed)).or_insert(latin);
             }
             for (c, d) in credit.iter().zip(latin_credit) {
                 if changed(&c.name, &d.name) && !names.iter().any(|(n, _)| *n == c.name) {
@@ -1487,7 +1487,7 @@ impl Latin {
     }
 
     fn artist(&self, credit: &str) -> String {
-        if let Some(latin) = self.credits.get(credit) {
+        if let Some(latin) = self.credits.get(&unspaced_credit(credit)) {
             return latin.clone();
         }
         self.names
@@ -1496,6 +1496,10 @@ impl Latin {
                 out.replace(name, latin)
             })
     }
+}
+
+fn unspaced_credit(credit: &str) -> String {
+    credit.split_whitespace().collect()
 }
 
 fn summary_candidate(r: &Release) -> Candidate {
@@ -3079,6 +3083,7 @@ mod tests {
         assert_eq!(latin.title("かぐや様"), "かぐや様");
         let both = "Suzuki Masayuki feat. Ihara Rikka";
         assert_eq!(latin.artist("鈴木雅之 feat. 伊原六花"), both);
+        assert_eq!(latin.artist("鈴木雅之feat.伊原六花"), both);
         // A credit printed otherwise, or one of its artists alone.
         assert_eq!(
             latin.artist("鈴木雅之 & 伊原六花"),
