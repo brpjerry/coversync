@@ -448,6 +448,11 @@ export interface Identification {
 	 * AcoustID and MusicBrainz were asked just now.
 	 */
 	saved: number | null;
+	/**
+	 * The release's artist, when the album's tags name another and it credits
+	 * none of the album's names: not surely the album, so nothing is ticked.
+	 */
+	other_artist?: string | null;
 	/** Present when the release's titles or names don't sort A–Z. */
 	romanization: {
 		/** Suggestions are romanized, rather than in the original script. */

@@ -430,19 +430,26 @@
 	const opened = new SvelteSet<string>();
 
 	/**
-	 * A release with exactly the album's tracks, each paired: fill empty tags,
-	 * and romanize tags in the original script. Anything else (a box set
-	 * holding these recordings, say) starts unticked.
+	 * A release that's surely the album: fill empty tags, and romanize tags
+	 * in the original script. Anything else (a box set holding these
+	 * recordings, say, or another artist's cover) starts unticked.
 	 */
-	let complete = $derived(
-		!!result?.release &&
-			result.release.track_count === tracks.length &&
-			result.tracks.every((t) => t.via)
-	);
+	let complete = $derived(!!result && surely(result));
+	/**
+	 * Exactly the album's tracks, each paired, and not credited to another
+	 * artist than the album's tags name (a cover single has the right track
+	 * count, but not the album's tags to give).
+	 */
+	function surely(r: Identification) {
+		return (
+			!!r.release &&
+			r.release.track_count === tracks.length &&
+			r.tracks.every((t) => t.via) &&
+			!r.other_artist
+		);
+	}
 	function applyDefaults(r: Identification) {
-		const whole =
-			!!r.release && r.release.track_count === tracks.length && r.tracks.every((t) => t.via);
-		if (!whole) return;
+		if (!surely(r)) return;
 		for (const row of rows) {
 			// Never over what was typed in a field. A quick choice carried from the
 			// batch's album before may replace what the files have, though.
@@ -958,7 +965,8 @@
 				<span class="script-note">{scriptNote}</span>
 			</div>
 		{/if}
-		{#if result.release && !complete}
+		<!-- Not for a release that's only by someone else: its own note says so. -->
+		{#if result.release && (result.release.track_count !== tracks.length || unpaired.length)}
 			<p class="note warn" transition:slide={{ duration: 200 }}>
 				<TriangleAlert size={14} />
 				<span>
