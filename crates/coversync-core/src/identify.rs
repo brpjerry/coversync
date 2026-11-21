@@ -1281,6 +1281,15 @@ pub fn suggest(
     if let Some(c) = candidates.iter_mut().find(|c| c.id == release.id) {
         c.artist = Some(mb::credit_name(&release.artist_credit));
     }
+    // Romanized, the releases listed are too, as far as they share this
+    // one's titles and names: only this one is fetched in full.
+    if let Some(romanized) = &shown {
+        let latin = Latin::new(&release, romanized);
+        for c in &mut candidates {
+            c.title = latin.title(&c.title);
+            c.artist = c.artist.as_deref().map(|a| latin.artist(a));
+        }
+    }
     // Suggestions come from the romanized release when there is one, its
     // titles matched against the original's too.
     let (displayed, original): (&Release, Option<&Release>) = match &shown {
@@ -1418,6 +1427,74 @@ fn summary(r: &Release) -> ReleaseSummary {
         disambiguation: r.disambiguation.clone().filter(|d| !d.is_empty()),
         front_art: r.cover_art.as_ref().is_some_and(|c| c.front),
         release_group: r.release_group.as_ref().map(|g| g.id.clone()),
+    }
+}
+
+/// The titles and names a release has in another script, as its romanized
+/// copy writes them: for the other releases listed, which share them.
+struct Latin {
+    titles: HashMap<String, String>,
+    /// Credits as printed.
+    credits: HashMap<String, String>,
+    /// Credited names, longest first: for credits printed otherwise.
+    names: Vec<(String, String)>,
+}
+
+impl Latin {
+    fn new(release: &Release, romanized: &Release) -> Self {
+        let changed =
+            |from: &str, to: &str| !from.trim().is_empty() && from != to && !sorts_az(from);
+        let mut titles = HashMap::new();
+        let mut credits = HashMap::new();
+        let mut names = Vec::new();
+        let tracks = release
+            .media
+            .iter()
+            .zip(&romanized.media)
+            .flat_map(|(m, n)| m.tracks.iter().zip(&n.tracks));
+        let pairs = std::iter::once((
+            (&release.title, &release.artist_credit),
+            (&romanized.title, &romanized.artist_credit),
+        ))
+        .chain(tracks.map(|(t, u)| ((&t.title, &t.artist_credit), (&u.title, &u.artist_credit))));
+        for ((title, credit), (latin_title, latin_credit)) in pairs {
+            if changed(title, latin_title) {
+                titles.entry(title.clone()).or_insert(latin_title.clone());
+            }
+            let (printed, latin) = (mb::credit_name(credit), mb::credit_name(latin_credit));
+            if changed(&printed, &latin) {
+                credits.entry(printed).or_insert(latin);
+            }
+            for (c, d) in credit.iter().zip(latin_credit) {
+                if changed(&c.name, &d.name) && !names.iter().any(|(n, _)| *n == c.name) {
+                    names.push((c.name.clone(), d.name.clone()));
+                }
+            }
+        }
+        names.sort_by_key(|(n, _)| std::cmp::Reverse(n.chars().count()));
+        Latin {
+            titles,
+            credits,
+            names,
+        }
+    }
+
+    fn title(&self, title: &str) -> String {
+        self.titles
+            .get(title)
+            .cloned()
+            .unwrap_or_else(|| title.to_string())
+    }
+
+    fn artist(&self, credit: &str) -> String {
+        if let Some(latin) = self.credits.get(credit) {
+            return latin.clone();
+        }
+        self.names
+            .iter()
+            .fold(credit.to_string(), |out, (name, latin)| {
+                out.replace(name, latin)
+            })
     }
 }
 
@@ -2976,6 +3053,40 @@ mod tests {
         .unwrap();
         let (c, _) = audio_candidates(&[local(1, &[])], &[compilation], &plain);
         assert_eq!(c[0].artist.as_deref(), Some("Various Artists"));
+    }
+
+    #[test]
+    fn listed_releases_take_the_romanized_titles_and_names_they_share() {
+        let mut original = release();
+        original.title = "ラブ・ドラマティック".into();
+        original.artist_credit = serde_json::from_str(
+            r#"[{"name": "鈴木雅之", "joinphrase": " feat. ", "artist": {"id": "s"}},
+                {"name": "伊原六花", "artist": {"id": "i"}}]"#,
+        )
+        .unwrap();
+        original.media[0].tracks[1].title = "ラブ・ドラマティック (Instrumental)".into();
+        let mut romanized = original.clone();
+        romanized.title = "Love Dramatic".into();
+        romanized.artist_credit[0].name = "Suzuki Masayuki".into();
+        romanized.artist_credit[1].name = "Ihara Rikka".into();
+        romanized.media[0].tracks[1].title = "Love Dramatic (Instrumental)".into();
+        let latin = Latin::new(&original, &romanized);
+
+        assert_eq!(latin.title("ラブ・ドラマティック"), "Love Dramatic");
+        let instrumental = latin.title("ラブ・ドラマティック (Instrumental)");
+        assert_eq!(instrumental, "Love Dramatic (Instrumental)");
+        assert_eq!(latin.title("Funky Flag"), "Funky Flag");
+        assert_eq!(latin.title("かぐや様"), "かぐや様");
+        let both = "Suzuki Masayuki feat. Ihara Rikka";
+        assert_eq!(latin.artist("鈴木雅之 feat. 伊原六花"), both);
+        // A credit printed otherwise, or one of its artists alone.
+        assert_eq!(
+            latin.artist("鈴木雅之 & 伊原六花"),
+            "Suzuki Masayuki & Ihara Rikka"
+        );
+        assert_eq!(latin.artist("鈴木雅之"), "Suzuki Masayuki");
+        assert_eq!(latin.artist("Various Artists"), "Various Artists");
+        assert_eq!(latin.artist("藤澤慶昌"), "藤澤慶昌");
     }
 
     #[test]

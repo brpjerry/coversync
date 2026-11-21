@@ -238,7 +238,8 @@ used on a home server.
   album's were paired with (a disc with none paired, such as a DVD, as one
   line): what the album lacks, if it's that release. **Prefer English**
   suggests romanized or English titles and artist names for releases in other
-  scripts, and **Reverse first and last names** writes Chinese, Japanese and
+  scripts (the Release list writes the other releases' titles and artists so
+  too, where they're the picked release's), and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first. AcoustID's and MusicBrainz's answers are
   saved, so an album identified before (one imported again, say) is only
   fingerprinted; the dialog says when the lookup was made, and **Look up
