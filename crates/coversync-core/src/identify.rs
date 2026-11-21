@@ -413,7 +413,10 @@ fn name_key(name: &str) -> String {
 
 /// The generic credit of a compilation, which says nothing of who's on it.
 fn various(name: &str) -> bool {
-    name_keys(name).iter().any(|k| k == "variousartists")
+    matches!(
+        title_key(name).as_str(),
+        "variousartists" | "artistsvarious"
+    )
 }
 
 /// The names a track's artist and album artist tags give, split as the
@@ -1344,10 +1347,12 @@ fn other_artist(
                 .chain(c.artist.name.as_deref())
                 .chain(c.artist.aliases.iter().map(|a| a.name.as_str()))
         });
-        let printed: String = credits
-            .iter()
-            .map(|c| format!("{}{}", c.name, c.joinphrase))
-            .collect();
+        // A joint credit as printed, unless that's partly the entity's.
+        let printed = if credits.len() == all.len() {
+            mb::credit_name(all)
+        } else {
+            String::new()
+        };
         out.extend(credited_names(each, &printed, split));
         out.extend(credits.iter().filter_map(|c| c.artist.sort_name.clone()));
         !all.is_empty()
@@ -1384,10 +1389,7 @@ fn other_artist(
             }
         }
         if by.trim().is_empty() {
-            match credited.first() {
-                Some(name) => by = name.clone(),
-                None => continue,
-            }
+            by = credited.first().cloned().unwrap_or("another artist".into());
         }
         flagged = true;
     }
@@ -3024,6 +3026,21 @@ mod tests {
         assert_eq!(flag(&various, &reordered).as_deref(), Some("VA"));
         let unspaced = [("album_artist", "Artists,Various"), ("artist", "AmaLee")];
         assert_eq!(flag(&various, &unspaced).as_deref(), Some("VA"));
+        assert_eq!(flag(&various, &unspaced[..1]), None);
+        // Printed blank, it's still a credit.
+        various.artist_credit[0].name.clear();
+        let other = Some("another artist");
+        assert_eq!(flag(&various, &[("artist", "AmaLee")]).as_deref(), other);
+        // Between two others, it doesn't join them into a third.
+        various.artist_credit = serde_json::from_str(&format!(
+            r#"[{{"name": "Black", "joinphrase": " & ", "artist": {{"id": "b"}}}},
+                {{"name": "Various Artists", "joinphrase": " & ", "artist": {{"id": "{}"}}}},
+                {{"name": "Pink", "artist": {{"id": "p"}}}}]"#,
+            mb::VARIOUS_ARTISTS
+        ))
+        .unwrap();
+        let black = Some("Black & Various Artists & Pink");
+        assert_eq!(flag(&various, &[("artist", "BLACKPINK")]).as_deref(), black);
 
         // A sort name is one name, whatever parts names: "Bush, Kate" isn't
         // the band "Bush".
