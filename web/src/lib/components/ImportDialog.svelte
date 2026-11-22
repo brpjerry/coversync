@@ -32,6 +32,7 @@
 		type ImportPlan
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
+	import { readPref, writePref } from '#lib/browse.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import type { BatchControls } from '#lib/batch.svelte.ts';
 	import SuggestPanel, { type ChosenArt } from './SuggestPanel.svelte';
@@ -136,22 +137,23 @@
 	);
 	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
 	const hadCollection = consensus('collection');
-	/** In a batch, an album without a collection starts on the one picked last. */
-	const carried = untrack(() => (!hadCollection && batch?.batch.collection) || '');
-	/** Library setup's, any the tracks have, and the one carried over. */
+	/** The collection last picked, in this browser: the next dialog's. */
+	const COLLECTION_KEY = 'coversync.collection';
+	/** An album without one starts on the one picked last, if Library setup still has it. */
+	const last = readPref(COLLECTION_KEY, (v): v is string => typeof v === 'string', '');
+	const carried = untrack(() => (!hadCollection && collections.includes(last) && last) || '');
+	/** Library setup's, and any the tracks have. */
 	let collectionChoices = $derived([
-		...new Set(
-			[...collections, ...tracks.map((t) => t.values.collection ?? ''), carried].filter(Boolean)
-		)
+		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
 	]);
-	let collection = $state(hadCollection || carried);
-	// A collection picked here is the batch's next album's as soon as it's picked.
-	let picks = 0;
-	$effect(() => {
-		const picked = collection;
-		// Not the value it starts with; every change after, back to it too.
-		if (batch && picks++) untrack(() => (batch.batch.collection = picked));
-	});
+	let picked = $state(hadCollection || carried);
+	/** None if Library setup drops the one picked while the dialog is open. */
+	let collection = $derived(collectionChoices.includes(picked) ? picked : '');
+	/** A collection picked here is the next dialog's as soon as it's picked. */
+	function pickCollection(value: string) {
+		picked = value;
+		writePref(COLLECTION_KEY, value);
+	}
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
@@ -400,7 +402,7 @@
 
 	async function submit() {
 		if (!ready || done) return;
-		if (batch) batch.batch.collection = collection;
+		writePref(COLLECTION_KEY, collection);
 		busy = true;
 		error = null;
 		error = await onimport(
@@ -636,7 +638,10 @@
 				{#if collectionChoices.length || collectionRequired}
 					<label class="field collection">
 						<span class="field-label">Collection</span>
-						<select bind:value={collection} class:missing={collectionRequired && !collection}>
+						<select
+							bind:value={() => collection, pickCollection}
+							class:missing={collectionRequired && !collection}
+						>
 							<option value="">None</option>
 							{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
 						</select>
@@ -644,7 +649,7 @@
 							<span class="note bad">Add one in Library › Collections to import this album.</span>
 						{/if}
 						{#if carried && collection === carried}
-							<span class="note">Same as the last album</span>
+							<span class="note">Same as last time</span>
 						{/if}
 					</label>
 				{/if}
