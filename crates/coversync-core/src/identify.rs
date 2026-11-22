@@ -1514,10 +1514,14 @@ impl Latin {
 /// fullwidth ones too ("A B" isn't "AB"), as AcoustID prints some credits
 /// without them ("鈴木雅之feat.伊原六花").
 fn credit_key(credit: &str) -> String {
-    let latin = |c: char| romanize::latin(c) || c.is_ascii_digit() || ('０'..='９').contains(&c);
+    let latin = |c: char| {
+        c.is_alphabetic() && romanize::latin(c) || c.is_ascii_digit() || ('０'..='９').contains(&c)
+    };
+    // An accent may follow its letter as a mark of its own.
+    let accent = |c: char| ('\u{300}'..='\u{36f}').contains(&c);
     let mut out = String::new();
     for word in credit.split_whitespace() {
-        if out.ends_with(latin) && word.starts_with(latin) {
+        if out.trim_end_matches(accent).ends_with(latin) && word.starts_with(latin) {
             out.push(' ');
         }
         out.push_str(word);
@@ -3142,6 +3146,9 @@ mod tests {
         assert_eq!(latin.artist("雪 feat. AB"), "雪 feat. AB");
         assert_eq!(credit_key("雪 feat. Ａ Ｂ"), "雪feat.Ａ Ｂ");
         assert_eq!(credit_key("雪 feat. Mỹ Tâm"), "雪feat.Mỹ Tâm");
+        let decomposed = "雪 feat. My\u{303} Tâm";
+        assert_eq!(credit_key(decomposed), "雪feat.My\u{303} Tâm");
+        assert_eq!(credit_key("雪 \u{a789} A"), "雪\u{a789}A");
         assert_eq!(latin.artist("山田太郎"), "山田太郎");
     }
 
