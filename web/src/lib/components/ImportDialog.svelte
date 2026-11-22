@@ -146,14 +146,14 @@
 	let collectionChoices = $derived([
 		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
 	]);
-	let collection = $state(hadCollection || carried);
-	// A collection picked here is the next dialog's as soon as it's picked.
-	let picks = 0;
-	$effect(() => {
-		const picked = collection;
-		// Not the value it starts with; every change after, back to it too.
-		if (picks++) writePref(COLLECTION_KEY, picked);
-	});
+	let picked = $state(hadCollection || carried);
+	/** None if Library setup drops the one picked while the dialog is open. */
+	let collection = $derived(collectionChoices.includes(picked) ? picked : '');
+	/** A collection picked here is the next dialog's as soon as it's picked. */
+	function pickCollection(value: string) {
+		picked = value;
+		writePref(COLLECTION_KEY, value);
+	}
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
 	let trackValues = $state<Record<number, Record<string, string>>>(
@@ -638,7 +638,10 @@
 				{#if collectionChoices.length || collectionRequired}
 					<label class="field collection">
 						<span class="field-label">Collection</span>
-						<select bind:value={collection} class:missing={collectionRequired && !collection}>
+						<select
+							bind:value={() => collection, pickCollection}
+							class:missing={collectionRequired && !collection}
+						>
 							<option value="">None</option>
 							{#each collectionChoices as c (c)}<option value={c}>{c}</option>{/each}
 						</select>
@@ -646,7 +649,7 @@
 							<span class="note bad">Add one in Library › Collections to import this album.</span>
 						{/if}
 						{#if carried && collection === carried}
-							<span class="note">Same as the last album</span>
+							<span class="note">Same as last time</span>
 						{/if}
 					</label>
 				{/if}

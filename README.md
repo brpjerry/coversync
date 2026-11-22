@@ -154,8 +154,9 @@ used on a home server.
   suggestions a rule makes invalid (a date that isn't one) aren't offered.
 - **Collections** (under Library setup): groups of albums, all of a
   franchise say. The import dialog offers them for each album, starting on
-  the album's own collection, else the one last picked in that browser (None
-  at first), and writes the one picked to the files' `COLLECTION` tag (a
+  the album's own collection. An album without one starts on the collection
+  last picked (or imported with) in that browser if Library setup still has
+  it, else None. The one picked is written to the files' `COLLECTION` tag (a
   Vorbis comment, an ID3v2 `TXXX` frame, an MP4 `----:com.apple.iTunes`
   atom). A Library album's tag editor has a Collection dropdown of the same
   choices (and any collection its tracks are in already); saving another
@@ -205,9 +206,9 @@ used on a home server.
   leaves the album in the Inbox, and Alt+←/→ moves between albums without
   deciding. Lookups run ahead, one at a time, the current album's first. The
   suggestions' quick choice (Tick all, Only empty tags, None) carries to the
-  next album (the collection picked carries to any, see Collections). The
-  quick choice applies only to a release with exactly the album's tracks,
-  like the default ticks. **Stop**
+  next album, as the collection does (see Collections). The quick choice
+  applies only to a release with exactly the album's tracks, like the
+  default ticks. **Stop**
   ends the batch, and the albums left stay selected. A summary lists each
   album's outcome, with **Retry** for a failed one.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an

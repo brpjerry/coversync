@@ -48,10 +48,13 @@ const OLD_SORTS: Record<string, Sort> = {
 };
 export const migrateSort = (s: string) => OLD_SORTS[s] ?? s;
 
+/** Preferences storage refused (blocked, or full): kept for this page instead. */
+const unsaved = new Map<string, string>();
+
 /** A localStorage-backed preference; storage can be unavailable, so failures are ignored. */
 export function readPref<T>(key: string, valid: (v: unknown) => v is T, fallback: T): T {
 	try {
-		const v = localStorage.getItem(key);
+		const v = unsaved.get(key) ?? localStorage.getItem(key);
 		return valid(v) ? v : fallback;
 	} catch {
 		return fallback;
@@ -61,5 +64,8 @@ export function readPref<T>(key: string, valid: (v: unknown) => v is T, fallback
 export function writePref(key: string, value: string) {
 	try {
 		localStorage.setItem(key, value);
-	} catch {}
+		unsaved.delete(key);
+	} catch {
+		unsaved.set(key, value);
+	}
 }
