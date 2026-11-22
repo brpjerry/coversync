@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::musicbrainz::{Alias, Credit, Release, Track};
 
 /// A Latin letter, accented ones and fullwidth A–Z included.
-fn latin(c: char) -> bool {
+pub fn latin(c: char) -> bool {
     matches!(c as u32,
         0x41..=0x5A | 0x61..=0x7A | 0xAA | 0xBA | 0xC0..=0x24F | 0x1E00..=0x1EFF
         | 0x2C60..=0x2C7F | 0xA720..=0xA7FF | 0xAB30..=0xAB6F | 0xFF21..=0xFF3A | 0xFF41..=0xFF5A)
