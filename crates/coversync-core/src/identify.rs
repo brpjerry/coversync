@@ -1277,9 +1277,12 @@ pub fn suggest(
     if !candidates.iter().any(|c| c.id == release.id) {
         candidates.insert(0, summary_candidate(&release));
     }
-    // Search results carry the artist; fill it in for the picked release.
+    // The picked release as fetched, and suggested: search results lack the
+    // artist, AcoustID's the title at times.
     if let Some(c) = candidates.iter_mut().find(|c| c.id == release.id) {
-        c.artist = Some(mb::credit_name(&release.artist_credit));
+        let shown = shown.as_ref().unwrap_or(&release);
+        c.title = shown.title.clone();
+        c.artist = Some(mb::credit_name(&shown.artist_credit));
     }
     // Romanized, the releases listed are too, as far as they share this
     // one's titles and names: only this one is fetched in full.
@@ -1431,22 +1434,21 @@ fn summary(r: &Release) -> ReleaseSummary {
 }
 
 /// The titles and names a release has in another script, as its romanized
-/// copy writes them: for the other releases listed, which share them.
+/// copy writes them: for the other releases listed, which share them, whole.
+/// Text read two ways (two tracks titled 明日, Ashita and Asu) is left be.
 struct Latin {
-    titles: HashMap<String, String>,
-    /// Credits as printed, without their spaces (AcoustID's may have none).
-    credits: HashMap<String, String>,
-    /// Credited names, longest first: for credits printed otherwise.
-    names: Vec<(String, String)>,
+    titles: HashMap<String, Option<String>>,
+    /// Credits as printed, and each credited name alone, without spaces
+    /// (AcoustID prints some credits without).
+    credits: HashMap<String, Option<String>>,
 }
 
 impl Latin {
     fn new(release: &Release, romanized: &Release) -> Self {
-        let changed =
-            |from: &str, to: &str| !from.trim().is_empty() && from != to && !sorts_az(from);
-        let mut titles = HashMap::new();
-        let mut credits = HashMap::new();
-        let mut names = Vec::new();
+        let mut latin = Latin {
+            titles: HashMap::new(),
+            credits: HashMap::new(),
+        };
         let tracks = release
             .media
             .iter()
@@ -1458,43 +1460,43 @@ impl Latin {
         ))
         .chain(tracks.map(|(t, u)| ((&t.title, &t.artist_credit), (&u.title, &u.artist_credit))));
         for ((title, credit), (latin_title, latin_credit)) in pairs {
-            if changed(title, latin_title) {
-                titles.entry(title.clone()).or_insert(latin_title.clone());
-            }
-            let (printed, latin) = (mb::credit_name(credit), mb::credit_name(latin_credit));
-            if changed(&printed, &latin) {
-                credits.entry(unspaced_credit(&printed)).or_insert(latin);
-            }
+            Self::add(&mut latin.titles, title.clone(), latin_title);
+            let printed = unspaced_credit(&mb::credit_name(credit));
+            Self::add(&mut latin.credits, printed, &mb::credit_name(latin_credit));
             for (c, d) in credit.iter().zip(latin_credit) {
-                if changed(&c.name, &d.name) && !names.iter().any(|(n, _)| *n == c.name) {
-                    names.push((c.name.clone(), d.name.clone()));
-                }
+                Self::add(&mut latin.credits, unspaced_credit(&c.name), &d.name);
             }
         }
-        names.sort_by_key(|(n, _)| std::cmp::Reverse(n.chars().count()));
-        Latin {
-            titles,
-            credits,
-            names,
+        latin
+    }
+
+    fn add(map: &mut HashMap<String, Option<String>>, from: String, to: &str) {
+        if from.trim().is_empty() || from == to || sorts_az(&from) {
+            return;
         }
+        map.entry(from)
+            .and_modify(|v| {
+                if v.as_deref() != Some(to) {
+                    *v = None;
+                }
+            })
+            .or_insert_with(|| Some(to.to_string()));
     }
 
     fn title(&self, title: &str) -> String {
         self.titles
             .get(title)
             .cloned()
+            .flatten()
             .unwrap_or_else(|| title.to_string())
     }
 
     fn artist(&self, credit: &str) -> String {
-        if let Some(latin) = self.credits.get(&unspaced_credit(credit)) {
-            return latin.clone();
-        }
-        self.names
-            .iter()
-            .fold(credit.to_string(), |out, (name, latin)| {
-                out.replace(name, latin)
-            })
+        self.credits
+            .get(&unspaced_credit(credit))
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| credit.to_string())
     }
 }
 
@@ -3084,14 +3086,21 @@ mod tests {
         let both = "Suzuki Masayuki feat. Ihara Rikka";
         assert_eq!(latin.artist("鈴木雅之 feat. 伊原六花"), both);
         assert_eq!(latin.artist("鈴木雅之feat.伊原六花"), both);
-        // A credit printed otherwise, or one of its artists alone.
-        assert_eq!(
-            latin.artist("鈴木雅之 & 伊原六花"),
-            "Suzuki Masayuki & Ihara Rikka"
-        );
+        // One of its artists alone, but not within another name or credit.
         assert_eq!(latin.artist("鈴木雅之"), "Suzuki Masayuki");
+        assert_eq!(latin.artist("鈴木 雅之"), "Suzuki Masayuki");
+        assert_eq!(latin.artist("鈴木雅之とその仲間"), "鈴木雅之とその仲間");
+        assert_eq!(latin.artist("鈴木雅之 & 藤澤慶昌"), "鈴木雅之 & 藤澤慶昌");
         assert_eq!(latin.artist("Various Artists"), "Various Artists");
-        assert_eq!(latin.artist("藤澤慶昌"), "藤澤慶昌");
+
+        // A title read two ways is left as it is.
+        original.media[0].tracks[0].title = "明日".into();
+        original.media[0].tracks[1].title = "明日".into();
+        romanized.media[0].tracks[0].title = "Ashita".into();
+        romanized.media[0].tracks[1].title = "Asu".into();
+        let latin = Latin::new(&original, &romanized);
+        assert_eq!(latin.title("明日"), "明日");
+        assert_eq!(latin.title("ラブ・ドラマティック"), "Love Dramatic");
     }
 
     #[test]
