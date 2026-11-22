@@ -65,8 +65,6 @@ export class ImportBatch {
 	/** Smart suggestions were on when it started: its albums are looked up ahead. */
 	readonly suggest: boolean;
 	index = $state(0);
-	/** The collection last picked, for the next album without one; null until one is. */
-	collection = $state<string | null>(null);
 	/** The suggestions' quick choice last used, for the next album's. */
 	preset = $state<TickPreset | undefined>();
 	/** Stopped, or every album was imported or skipped: the summary shows. */

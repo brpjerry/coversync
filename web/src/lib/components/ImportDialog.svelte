@@ -32,6 +32,7 @@
 		type ImportPlan
 	} from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
+	import { readPref, writePref } from '#lib/browse.ts';
 	import { session } from '#lib/session.svelte.ts';
 	import type { BatchControls } from '#lib/batch.svelte.ts';
 	import SuggestPanel, { type ChosenArt } from './SuggestPanel.svelte';
@@ -136,21 +137,22 @@
 	);
 	/** The album's collection: the one its tracks have, offered even if Library setup has no such one; None if they have none. */
 	const hadCollection = consensus('collection');
-	/** In a batch, an album without a collection starts on the one picked last. */
-	const carried = untrack(() => (!hadCollection && batch?.batch.collection) || '');
-	/** Library setup's, any the tracks have, and the one carried over. */
+	/** The collection last picked, in this browser: the next dialog's. */
+	const COLLECTION_KEY = 'coversync.collection';
+	/** An album without one starts on the one picked last, if Library setup still has it. */
+	const last = readPref(COLLECTION_KEY, (v): v is string => typeof v === 'string', '');
+	const carried = untrack(() => (!hadCollection && collections.includes(last) && last) || '');
+	/** Library setup's, and any the tracks have. */
 	let collectionChoices = $derived([
-		...new Set(
-			[...collections, ...tracks.map((t) => t.values.collection ?? ''), carried].filter(Boolean)
-		)
+		...new Set([...collections, ...tracks.map((t) => t.values.collection ?? '')].filter(Boolean))
 	]);
 	let collection = $state(hadCollection || carried);
-	// A collection picked here is the batch's next album's as soon as it's picked.
+	// A collection picked here is the next dialog's as soon as it's picked.
 	let picks = 0;
 	$effect(() => {
 		const picked = collection;
 		// Not the value it starts with; every change after, back to it too.
-		if (batch && picks++) untrack(() => (batch.batch.collection = picked));
+		if (picks++) writePref(COLLECTION_KEY, picked);
 	});
 	/** Library setup requires one. */
 	const collectionRequired = initial.kinds.includes('collection');
@@ -400,7 +402,7 @@
 
 	async function submit() {
 		if (!ready || done) return;
-		if (batch) batch.batch.collection = collection;
+		writePref(COLLECTION_KEY, collection);
 		busy = true;
 		error = null;
 		error = await onimport(

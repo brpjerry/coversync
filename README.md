@@ -153,8 +153,9 @@ used on a home server.
   into `The Beatles`. A rule that would leave a tag empty is skipped, and
   suggestions a rule makes invalid (a date that isn't one) aren't offered.
 - **Collections** (under Library setup): groups of albums, all of a
-  franchise say. The import dialog offers them for each album, None by
-  default, and writes the one picked to the files' `COLLECTION` tag (a
+  franchise say. The import dialog offers them for each album, starting on
+  the album's own collection, else the one last picked in that browser (None
+  at first), and writes the one picked to the files' `COLLECTION` tag (a
   Vorbis comment, an ID3v2 `TXXX` frame, an MP4 `----:com.apple.iTunes`
   atom). A Library album's tag editor has a Collection dropdown of the same
   choices (and any collection its tracks are in already); saving another
@@ -203,9 +204,10 @@ used on a home server.
   you leave it with imports on their way) and moves on, **Skip**
   leaves the album in the Inbox, and Alt+←/→ moves between albums without
   deciding. Lookups run ahead, one at a time, the current album's first. The
-  collection picked, and the suggestions' quick choice (Tick all, Only empty
-  tags, None), carry to the next album. The quick choice applies only to a
-  release with exactly the album's tracks, like the default ticks. **Stop**
+  suggestions' quick choice (Tick all, Only empty tags, None) carries to the
+  next album (the collection picked carries to any, see Collections). The
+  quick choice applies only to a release with exactly the album's tracks,
+  like the default ticks. **Stop**
   ends the batch, and the albums left stay selected. A summary lists each
   album's outcome, with **Retry** for a failed one.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
