@@ -241,8 +241,8 @@ used on a home server.
   scripts, and **Reverse first and last names** writes Chinese, Japanese and
   Korean names family name first. The Release list shows another release's
   title or artist romanized too when it's the same as the picked release's
-  title, a track's title, its credit or one of its credited artists: only the
-  picked release is looked up in full. AcoustID's and MusicBrainz's answers are
+  title, a track's title, its credit or one of its credited artists, read as
+  the picked release's are: the other releases listed aren't each looked up. AcoustID's and MusicBrainz's answers are
   saved, so an album identified before (one imported again, say) is only
   fingerprinted; the dialog says when the lookup was made, and **Look up
   again** asks both services afresh. Answers that found nothing aren't
