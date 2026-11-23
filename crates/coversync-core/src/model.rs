@@ -144,6 +144,9 @@ pub struct AlbumDetail {
     /// (excluding hash publication), and for a Library album, the Library's id. A tag save
     /// sends it, to be told when the album has changed since.
     pub version: String,
+    /// A Library album whose import can be undone (see
+    /// [`Library::import_links`](crate::Library::import_links)).
+    pub undo_import: bool,
 }
 
 /// Which Library an index is of, and how far its changes go.

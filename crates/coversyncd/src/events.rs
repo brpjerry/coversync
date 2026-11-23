@@ -59,6 +59,14 @@ pub enum Notice {
         /// The Inbox album it came from.
         inbox_id: String,
     },
+    /// An import was undone: the Library album is gone, and the Inbox
+    /// album it came from shows again.
+    Unimported {
+        /// The album's id in the Library, as it was.
+        album_id: String,
+        /// The Inbox album shown again.
+        inbox_id: String,
+    },
     /// An album's tags were edited.
     AlbumChanged {
         /// The album's id after the edit.
@@ -92,6 +100,7 @@ impl Notice {
             Notice::Scan(_) => "scan",
             Notice::ScanFinished(_) => "scan_finished",
             Notice::Imported { .. } => "imported",
+            Notice::Unimported { .. } => "unimported",
             Notice::AlbumChanged { .. } => "album_changed",
             Notice::SetupSaved { .. } => "setup_saved",
             Notice::LookupFinished { .. } => "lookup_finished",

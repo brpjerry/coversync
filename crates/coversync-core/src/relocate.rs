@@ -601,6 +601,91 @@ fn prune(root: BorrowedFd<'_>, dirs: &[PathBuf]) {
     }
 }
 
+/// Delete `files`, tracks in the Library folder `root` (absolute paths),
+/// each reached as moves reach theirs, a name at a time without following
+/// a link; one already gone counts as deleted. Then an album folder they
+/// leave holding nothing but images (its cover) loses those, and folders
+/// left empty go, short of the Library folder. Returns how many of `files`,
+/// from the first, were deleted, and why the next one wasn't, if one wasn't:
+/// it and those after it are left as they are.
+pub fn remove(root: &Path, files: &[PathBuf]) -> (usize, Option<Error>) {
+    let root_fd = match open_root(root) {
+        Ok(fd) => fd,
+        Err(e) => return (0, Some(e.into())),
+    };
+    let root_fd = root_fd.as_fd();
+    let delete = |file: &Path| -> Result<PathBuf> {
+        let rel = file.strip_prefix(root).map_err(|_| not_in_library(file))?;
+        let (dir, name) = split(rel)?;
+        let fd = match open_dir(root_fd, dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(rel.to_path_buf()),
+            fd => fd?,
+        };
+        match entry(fd.as_fd(), name)? {
+            None => {}
+            Some(st) if kind(&st) == FileType::RegularFile => {
+                io(unlinkat(&fd, name, AtFlags::empty()))?;
+            }
+            Some(_) => {
+                return Err(Error::Invalid(format!(
+                    "{} isn't a file now.",
+                    rel.display()
+                )));
+            }
+        }
+        Ok(rel.to_path_buf())
+    };
+    let mut deleted = Vec::new();
+    let mut failed = None;
+    for file in files {
+        match delete(file) {
+            Ok(rel) => deleted.push(rel),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    // Each track's folder, and its album's above disc folders, the deepest
+    // first: a disc folder gone, the album's may hold only its cover.
+    let mut dirs: Vec<PathBuf> = deleted
+        .iter()
+        .flat_map(|rel| {
+            let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+            [dir, scan::album_dir(rel)]
+        })
+        .filter(|d| !d.as_os_str().is_empty() && !d.iter().any(own))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for dir in &dirs {
+        let (Ok(fd), Ok((parent, name))) = (open_dir(root_fd, dir), split(dir)) else {
+            continue;
+        };
+        let Ok(entries) = list(fd.as_fd()) else {
+            continue;
+        };
+        let only_images = entries.iter().all(|(name, what)| {
+            *what == FileType::RegularFile && !own(name) && cover::is_image(Path::new(name))
+        });
+        if only_images {
+            for (name, _) in &entries {
+                let _ = unlinkat(&fd, name.as_os_str(), AtFlags::empty());
+            }
+        }
+        if let Ok(parent) = open_dir(root_fd, parent) {
+            let _ = unlinkat(&parent, name, AtFlags::REMOVEDIR);
+        }
+    }
+    let above: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|d| d.parent().map(Path::to_path_buf))
+        .collect();
+    prune(root_fd, &above);
+    (deleted.len(), failed)
+}
+
 /// Remove those of `made` (folders a save made, relative to the Library
 /// folder) that are empty, and no other.
 fn unmake(root: BorrowedFd<'_>, made: &[PathBuf]) {
@@ -1126,6 +1211,69 @@ mod tests {
         // Which folders the save made isn't recorded, so they stay (empty).
         assert_eq!(fs::read_dir(&new).unwrap().count(), 0);
         assert!(s.lib.recorded_moves().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removed_tracks_take_their_albums_cover_and_folders_and_nothing_else() {
+        let s = scratch("remove");
+        let r = &s.root;
+        for f in [
+            "A/Rec/Disc 1/1.flac",
+            "A/Rec/Disc 2/2.flac",
+            "Shared/1.flac",
+            "Shared/2.flac",
+            "Other/x.flac",
+        ] {
+            touch(&r.join(f), "audio");
+        }
+        for f in [
+            "A/Rec/cover.jpg",
+            "A/Rec/Disc 1/cover.jpg",
+            "Shared/cover.jpg",
+        ] {
+            touch(&r.join(f), "art");
+        }
+        let files: Vec<PathBuf> = [
+            "A/Rec/Disc 1/1.flac",
+            "A/Rec/Disc 2/2.flac",
+            "Shared/1.flac",
+            "Gone/3.flac",
+        ]
+        .iter()
+        .map(|f| r.join(f))
+        .collect();
+        let (deleted, failed) = remove(r, &files);
+        assert!(failed.is_none(), "{failed:?}");
+        // One already gone counts.
+        assert_eq!(deleted, 4);
+        // The album's folders, its covers with them, up to the Library folder.
+        assert!(!r.join("A").exists());
+        // A folder other tracks stay in keeps its cover.
+        assert!(!r.join("Shared/1.flac").exists());
+        assert!(r.join("Shared/2.flac").exists());
+        assert!(r.join("Shared/cover.jpg").exists());
+
+        // A link on the way stops it there, and nothing outside is touched.
+        let outside = s.dir.join("outside");
+        touch(&outside.join("x.flac"), "outside");
+        std::os::unix::fs::symlink(&outside, r.join("Linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("x.flac"), r.join("Shared/l.flac")).unwrap();
+        for link in ["Linked/x.flac", "Shared/l.flac"] {
+            let files = [
+                r.join("Other/x.flac"),
+                r.join(link),
+                r.join("Shared/2.flac"),
+            ];
+            let (deleted, failed) = remove(r, &files);
+            assert!(failed.is_some(), "{link}");
+            assert_eq!(deleted, 1, "{link}");
+            assert_eq!(read(&outside.join("x.flac")), "outside");
+            assert!(
+                r.join("Shared/2.flac").exists(),
+                "{link}: those after it stay"
+            );
+        }
+        assert!(!r.join("Other").exists());
     }
 
     #[test]

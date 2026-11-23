@@ -21,7 +21,7 @@ use crate::model::Collection;
 use crate::scan::{self, Progress};
 use crate::split::Splitter;
 use crate::template::{self, Template};
-use crate::{Error, Library, Result, autofill, rules, tags};
+use crate::{Error, Library, Result, autofill, relocate, rules, tags};
 
 /// Tag values typed in by the user: track id -> kind id -> value.
 pub type Edits = HashMap<i64, HashMap<String, String>>;
@@ -704,6 +704,7 @@ pub fn execute(
     // The first import creates the Library folder and its database; nothing
     // is copied, hidden or deleted unless the database is there to index it.
     lib.prepare_library(&folder)?;
+    let root = lib.library_folder()?.ok_or(Error::NotFound)?;
 
     let mut sources = Vec::new();
     let mut written: Vec<PathBuf> = Vec::new();
@@ -792,6 +793,15 @@ pub fn execute(
         return Err(e);
     }
     let dest_dir = written[0].parent().unwrap_or(&folder).to_path_buf();
+    // As the index keeps them: under the resolved Library folder, each by
+    // its path under it as written (folders below it aren't resolved).
+    let copies: Vec<PathBuf> = written
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&folder)
+                .map_or_else(|_| p.clone(), |rel| root.join(rel))
+        })
+        .collect();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -809,23 +819,17 @@ pub fn execute(
         })
         .collect();
     if let Err(e) = scan::index_written_files(lib, stats, progress) {
-        // Rows are kept by the resolved Library folder plus each file's path
-        // under it as written (folders below it aren't resolved).
-        let indexed: Vec<PathBuf> = match folder.canonicalize() {
-            Ok(root) => written
-                .iter()
-                .filter_map(|p| p.strip_prefix(&folder).ok().map(|rel| root.join(rel)))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let _ = lib.remove_paths(&indexed);
+        let _ = lib.remove_paths(&copies);
         for f in written.iter().chain(&art_files) {
             let _ = fs::remove_file(f);
         }
         return Err(e);
     }
     match plan.mode {
-        IngestMode::Copy => lib.hide_paths(&sources, now)?,
+        IngestMode::Copy => {
+            let copied: Vec<(PathBuf, PathBuf)> = sources.iter().cloned().zip(copies).collect();
+            lib.hide_copied(&copied, now)?
+        }
         IngestMode::Move => {
             for src in &sources {
                 if let Err(e) = fs::remove_file(src) {
@@ -878,6 +882,61 @@ fn art_summary(file: Option<&PathBuf>, embedded: usize) -> Option<String> {
         (Some(f), Some(e)) => Some(format!("{f}, {e}")),
         (f, e) => f.or(e),
     }
+}
+
+/// What undoing an import did (see [`undo`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct Undone {
+    /// The Inbox album shown again: the first, should the Library album
+    /// have held more than one import.
+    pub inbox_id: String,
+    /// The Library files deleted.
+    pub files: usize,
+}
+
+/// Undo the import of Library album `album_id`, made in Copy mode: its files
+/// leave the Library, and the Inbox files they were copied from, never
+/// changed, show again. Only for an album every track of which is such a
+/// copy (see [`Library::import_links`]), and refused, with nothing changed,
+/// while any original is missing from the Inbox folder. Edits made to the
+/// album in the Library go with it.
+pub fn undo(
+    lib: &Library,
+    covers: &CoverCache,
+    album_id: &str,
+    progress: &Progress,
+) -> Result<Undone> {
+    let links = lib.import_links(album_id)?.ok_or_else(|| {
+        Error::Invalid(
+            "This album isn't one an import copied from the Inbox (or those files are showing there again), so there's no import to undo."
+                .into(),
+        )
+    })?;
+    if let Some(gone) = links
+        .iter()
+        .find(|l| !fs::metadata(&l.original).is_ok_and(|m| m.is_file()))
+    {
+        return Err(Error::Invalid(format!(
+            "{} isn't in the Inbox folder any more, so the import wasn't undone: the Library has the only copy.",
+            gone.original.display()
+        )));
+    }
+    let root = lib.library_folder()?.ok_or(Error::NotFound)?;
+    let copies: Vec<PathBuf> = links.iter().map(|l| l.copy.clone()).collect();
+    // Each original shows again once its copy is deleted, whatever stops the rest.
+    let (deleted, failed) = relocate::remove(&root, &copies);
+    lib.unimport(&links[..deleted])?;
+    scan::refresh_covers(lib, covers, progress)?;
+    if let Some(e) = failed {
+        return Err(Error::Invalid(format!(
+            "The import was undone for {deleted} of {} files: {e}",
+            links.len()
+        )));
+    }
+    Ok(Undone {
+        inbox_id: links[0].inbox_album.clone(),
+        files: deleted,
+    })
 }
 
 #[cfg(test)]

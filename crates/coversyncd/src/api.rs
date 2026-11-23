@@ -38,6 +38,7 @@ pub fn router() -> Router<Shared> {
         .route("/api/albums/{id}/cover", get(cover))
         .route("/api/albums/{id}/cover/full", get(full_cover))
         .route("/api/albums/{id}/tags", get(album_tags).put(write_tags))
+        .route("/api/albums/{id}/undo-import", post(undo_import))
         .route("/api/tracks/{id}/stream", get(stream))
         .route(
             "/api/library/setup",
@@ -821,6 +822,30 @@ async fn import_album(
     .await;
     crate::release_memory();
     result.map(Json)
+}
+
+/// Undo a Library album's import (see `import::undo`). Runs exclusively
+/// with scans, imports and tag writes.
+async fn undo_import(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<import::Undone>> {
+    exclusively(&state, move |s| {
+        // The album's files are where the index says: none of them left
+        // part way by a save that stopped (as an import makes sure).
+        if !s.lib.recorded_moves()?.is_empty() {
+            let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
+            moves_put_back(s, "undone")?;
+        }
+        let undone = import::undo(&s.lib, &s.covers, &id, &Progress::default())?;
+        s.events.publish(Notice::Unimported {
+            album_id: id,
+            inbox_id: undone.inbox_id.clone(),
+        });
+        Ok(undone)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -2839,6 +2864,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+
+        // The import is undone, wherever the saves moved its files.
+        assert!(renamed.files_moved > 0);
+        let path = Path(renamed.album_id.clone());
+        let Json(undone) = undo_import(State(state.clone()), path).await.unwrap();
+        assert_eq!(
+            (undone.inbox_id.as_str(), undone.files),
+            (inbox_id.as_str(), 1)
+        );
+        match heard.try_recv().unwrap() {
+            Notice::Unimported {
+                album_id,
+                inbox_id: back,
+            } => {
+                assert_eq!(album_id, renamed.album_id);
+                assert_eq!(back, inbox_id);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(state.lib.album(&inbox_id).unwrap().is_some());
         assert!(heard.try_recv().is_err());
     }
 

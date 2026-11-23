@@ -3,6 +3,7 @@
 	import Pause from '@lucide/svelte/icons/pause';
 	import Pencil from '@lucide/svelte/icons/pencil';
 	import FolderInput from '@lucide/svelte/icons/folder-input';
+	import Undo2 from '@lucide/svelte/icons/undo-2';
 	import ListMusic from '@lucide/svelte/icons/list-music';
 	import X from '@lucide/svelte/icons/x';
 	import Disc3 from '@lucide/svelte/icons/disc-3';
@@ -36,6 +37,8 @@
 		 * any tag edits. Their tags are edited only on the way (see `edit`).
 		 */
 		onimport?: (edits?: ImportEdits) => void;
+		/** Present for a Library album whose import can be undone: undo it. */
+		onundoimport?: () => void;
 		/** The album changed elsewhere (while its tags were being edited here, say); the sheet shows it as it was. */
 		changed?: boolean;
 		/**
@@ -62,6 +65,7 @@
 		onclose,
 		onsaved,
 		onimport,
+		onundoimport,
 		changed = false,
 		onreload,
 		ondraft,
@@ -279,6 +283,11 @@
 								<Pencil size={15} /> Edit tags
 							</button>
 						</div>{/if}
+					{#if onundoimport && mode !== 'edit'}
+						<button class="btn undo" onclick={onundoimport}>
+							<Undo2 size={16} /> Undo import
+						</button>
+					{/if}
 				</div>
 			</div>
 		</header>
@@ -579,7 +588,8 @@
 		padding: 0 22px;
 		font-size: 15px;
 	}
-	.actions .btn.import {
+	.actions .btn.import,
+	.actions .btn.undo {
 		height: 44px;
 		padding: 0 18px;
 		font-size: 15px;

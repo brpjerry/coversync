@@ -9,7 +9,7 @@ use coversync_core::cover::CoverCache;
 use coversync_core::import::{self, Edits, ImportPlan};
 use coversync_core::scan::{self, Progress};
 use coversync_core::substitute::Substitution;
-use coversync_core::{Collection, InboxSetup, Library, LibrarySetup, TagEdit, tags};
+use coversync_core::{Collection, HiddenStats, InboxSetup, Library, LibrarySetup, TagEdit, tags};
 
 struct Setup {
     root: PathBuf,
@@ -415,6 +415,58 @@ fn a_collection_picked_on_import_is_a_folder_and_none_is_none() {
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o644
     );
+}
+
+#[test]
+fn an_undone_import_leaves_the_library_and_shows_in_the_inbox_again() {
+    let s = setup("undo", "{collection}/{album}/<{track_number} - >{title}");
+    let dir = s.root.parent().unwrap().to_path_buf();
+    let covers = CoverCache::new(dir.join("cache")).unwrap();
+    let edits: Edits = s
+        .tracks
+        .iter()
+        .map(|id| (*id, HashMap::from([("collection".into(), "Saga".into())])))
+        .collect();
+    let progress = Progress::default();
+    let done = import::execute(&s.lib, &covers, &s.album, &edits, None, &progress).unwrap();
+    // A cover, as the art rule may place one.
+    fs::write(s.root.join("Saga/Record/cover.jpg"), "art").unwrap();
+    assert!(s.lib.album(&done.album_id).unwrap().unwrap().undo_import);
+    assert!(
+        s.lib.album(&s.album).unwrap().is_none(),
+        "hidden in the Inbox"
+    );
+
+    // Not while an original is missing: the Library has the only copy.
+    let original = dir.join("Inbox/Record/1.flac");
+    let aside = dir.join("1.flac");
+    fs::rename(&original, &aside).unwrap();
+    let err = import::undo(&s.lib, &covers, &done.album_id, &progress)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("only copy"), "{err}");
+    assert!(s.root.join("Saga/Record/01 - One.flac").exists());
+    fs::rename(&aside, &original).unwrap();
+
+    let undone = import::undo(&s.lib, &covers, &done.album_id, &progress).unwrap();
+    assert_eq!(
+        (undone.inbox_id.as_str(), undone.files),
+        (s.album.as_str(), 2)
+    );
+    // The Library folder holds only coversync's own database again.
+    let left: Vec<String> = fs::read_dir(&s.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.iter().all(|n| n.starts_with(".coversync")), "{left:?}");
+    assert!(s.lib.album(&done.album_id).unwrap().is_none());
+    assert_eq!(s.lib.hidden_stats().unwrap(), HiddenStats::default());
+    rescan(&s);
+    let back = s.lib.album(&s.album).unwrap().unwrap();
+    assert_eq!(back.tracks.len(), 2);
+    assert!(!back.undo_import);
+    // Nothing left to undo.
+    assert!(import::undo(&s.lib, &covers, &done.album_id, &progress).is_err());
 }
 
 /// A mono 8 kHz WAV of a second's ramp: 16-bit samples, or 32-bit floats

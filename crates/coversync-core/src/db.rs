@@ -39,9 +39,12 @@ PRAGMA synchronous = NORMAL;
 {}
 CREATE INDEX IF NOT EXISTS tracks_album ON tracks (album_id);
 -- Inbox files already copied into the Library; kept by path so rescans keep them hidden.
+-- `copy`: the file's copy in the Library (absolute; null from before v9), which
+-- undoing its import deletes.
 CREATE TABLE IF NOT EXISTS hidden (
     path      TEXT PRIMARY KEY,
-    hidden_at INTEGER NOT NULL
+    hidden_at INTEGER NOT NULL,
+    copy      TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -1028,6 +1031,17 @@ pub type IndexedFile = (FileStat, String, PathBuf, TrackTags);
 /// An album's stored cover source, colour and version (see `cover::Cover`).
 type CoverRow = (Option<String>, Option<String>, Option<String>);
 
+/// An Inbox file an import copied into the Library, hidden there since
+/// (see [`Library::import_links`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLink {
+    pub original: PathBuf,
+    /// Its copy, an absolute path in the Library folder.
+    pub copy: PathBuf,
+    /// The Inbox album the original is in.
+    pub inbox_album: String,
+}
+
 /// Where an album's cover comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoverSource {
@@ -1446,6 +1460,20 @@ fn migrate(conn: &Connection) -> Result<()> {
             inbox_pending_triggers()
         );
         autoincrement_tracks(conn, "main", inbox_tracks_table, &after, 8)?;
+    }
+    if version < 9 {
+        // v9 links each hidden file to its copy in the Library, so its
+        // import can be undone; files hidden before have no link.
+        let has_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('hidden') WHERE name = 'copy'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute_batch("ALTER TABLE hidden ADD COLUMN copy TEXT")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS hidden_copy ON hidden (copy);
+             PRAGMA user_version = 9;",
+        )?;
     }
     Ok(())
 }
@@ -1974,6 +2002,28 @@ impl Library {
                 .iter()
                 .map(|(from, to)| Ok((rel(from)?, rel(to)?)))
                 .collect::<Result<_>>()?;
+            // Hidden Inbox files stay linked to their copies (see
+            // `hide_copied`): each link found before any is changed, so
+            // tracks trading paths keep their own.
+            let mut links = Vec::new();
+            {
+                let mut copied =
+                    tx.prepare_cached("SELECT path FROM main.hidden WHERE copy = ?1")?;
+                for (from, to) in &pairs {
+                    let from = root.join(from);
+                    for original in
+                        copied.query_map([from.to_string_lossy()], |r| r.get::<_, String>(0))?
+                    {
+                        links.push((original?, root.join(to)));
+                    }
+                }
+            }
+            for (original, to) in links {
+                tx.execute(
+                    "UPDATE main.hidden SET copy = ?1 WHERE path = ?2",
+                    params![to.to_string_lossy(), original],
+                )?;
+            }
             let leaving: HashSet<&str> = pairs.iter().map(|(f, _)| f.as_str()).collect();
             // Out of the way first, under paths no file has (a NUL can't be
             // in one), so tracks can trade paths.
@@ -2149,6 +2199,23 @@ impl Library {
     /// that loses a row counts one change; the Library's records each file
     /// it lost as removed then (see `counter_schema`).
     pub fn remove_paths(&self, paths: &[PathBuf]) -> Result<()> {
+        self.forget(paths, &[])
+    }
+
+    /// Undo imports: forget each link's copy, deleted from the Library
+    /// folder, and show its original in the Inbox again (see
+    /// [`Self::import_links`]).
+    pub fn unimport(&self, links: &[ImportLink]) -> Result<()> {
+        let (copies, originals): (Vec<PathBuf>, Vec<PathBuf>) = links
+            .iter()
+            .map(|l| (l.copy.clone(), l.original.clone()))
+            .unzip();
+        self.forget(&copies, &originals)
+    }
+
+    /// [`Self::remove_paths`], and show the Inbox files at `shown` again
+    /// (see [`Self::hide_copied`]), in the same transaction.
+    fn forget(&self, paths: &[PathBuf], shown: &[PathBuf]) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let library = library_root(&tx)?;
@@ -2156,11 +2223,15 @@ impl Library {
         {
             let mut inbox = tx.prepare_cached("DELETE FROM main.tracks WHERE path = ?1")?;
             let mut lib = tx.prepare_cached("DELETE FROM lib.tracks WHERE path = ?1")?;
+            let mut show = tx.prepare_cached("DELETE FROM main.hidden WHERE path = ?1")?;
             for p in paths {
                 inbox_gone += inbox.execute([p.to_string_lossy()])?;
                 if let Some(rel) = library.as_deref().and_then(|r| p.strip_prefix(r).ok()) {
                     lib_gone += lib.execute([rel.to_string_lossy()])?;
                 }
+            }
+            for p in shown {
+                inbox_gone += show.execute([p.to_string_lossy()])?;
             }
         }
         if inbox_gone > 0 {
@@ -2368,12 +2439,47 @@ impl Library {
         let refs: Vec<&Track> = tracks.iter().collect();
         let added = album_added(collection, added.into_iter());
         let album = summarize(id, &refs, added, cover.as_ref());
+        let undo_import = collection == Collection::Library && self.import_links(id)?.is_some();
         Ok(Some(AlbumDetail {
             album,
             dir,
             tracks,
             version,
+            undo_import,
         }))
+    }
+
+    /// The Inbox originals of Library album `album_id`'s tracks, when its
+    /// import can be undone: every one of its tracks is the copy an import
+    /// made of an Inbox file, hidden and indexed there still (not shown again
+    /// by Show hidden files). None otherwise.
+    pub fn import_links(&self, album_id: &str) -> Result<Option<Vec<ImportLink>>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT t.path, h.path, i.album_id FROM temp.library_tracks t
+                LEFT JOIN main.hidden h ON h.copy = t.path
+                LEFT JOIN main.tracks i ON i.path = h.path
+             WHERE t.album_id = ?1",
+        )?;
+        let rows = stmt.query_map([album_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut links = Vec::new();
+        for row in rows {
+            let (copy, Some(original), Some(inbox_album)) = row? else {
+                return Ok(None);
+            };
+            links.push(ImportLink {
+                original: original.into(),
+                copy: copy.into(),
+                inbox_album,
+            });
+        }
+        Ok((!links.is_empty()).then_some(links))
     }
 
     /// The album most of `tracks` (ids, with their `rel_path`s) are in now
@@ -2842,16 +2948,24 @@ impl Library {
 
     /// Hide Inbox files, e.g. once they have been copied into the Library.
     /// Hiding any counts as a change to the Inbox.
-    pub fn hide_paths(&self, paths: &[PathBuf], now: i64) -> Result<()> {
+    /// Hide Inbox files an import copied into the Library: `copied` pairs
+    /// each one with its copy (an absolute path in the attached Library
+    /// folder), which undoing the import deletes (see [`Self::import_links`]).
+    pub fn hide_copied(&self, copied: &[(PathBuf, PathBuf)], now: i64) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut hidden = 0;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO hidden (path, hidden_at) VALUES (?1, ?2) ON CONFLICT (path) DO NOTHING",
+                "INSERT INTO hidden (path, hidden_at, copy) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (path) DO NOTHING",
             )?;
-            for p in paths {
-                hidden += stmt.execute(params![p.to_string_lossy(), now])?;
+            for (original, copy) in copied {
+                hidden += stmt.execute(params![
+                    original.to_string_lossy(),
+                    now,
+                    copy.to_string_lossy()
+                ])?;
             }
         }
         if hidden > 0 {
@@ -3108,7 +3222,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         // The Inbox's counter starts with the rows already there.
         assert_eq!(lib.index_versions().unwrap().inbox.generation, 0);
         let generation: i64 = lib
@@ -3405,11 +3519,11 @@ mod tests {
             file("/m/b/1.flac", "b", &["title"]),
         ])
         .unwrap();
-        lib.hide_paths(
+        lib.hide_copied(
             &[
-                "/m/a/1.flac".into(),
-                "/m/a/2.flac".into(),
-                "/m/gone.flac".into(),
+                ("/m/a/1.flac".into(), "/lib/A/1.flac".into()),
+                ("/m/a/2.flac".into(), "/lib/A/2.flac".into()),
+                ("/m/gone.flac".into(), "/lib/A/3.flac".into()),
             ],
             1,
         )
@@ -4343,9 +4457,11 @@ mod tests {
         lib.upsert(&[file("/m/a/2.flac", "a", &[])]).unwrap();
         assert_eq!((inbox(&lib), generations(&lib)), (2, vec![1, 2]));
         // Hiding and showing files changes what the Inbox lists.
-        lib.hide_paths(&["/m/a/1.flac".into()], 1).unwrap();
+        lib.hide_copied(&[("/m/a/1.flac".into(), "/lib/A/1.flac".into())], 1)
+            .unwrap();
         assert_eq!(inbox(&lib), 3);
-        lib.hide_paths(&["/m/a/1.flac".into()], 2).unwrap();
+        lib.hide_copied(&[("/m/a/1.flac".into(), "/lib/A/1.flac".into())], 2)
+            .unwrap();
         assert_eq!(inbox(&lib), 3, "it was hidden already");
         lib.unhide_all().unwrap();
         lib.unhide_all().unwrap();
@@ -4377,7 +4493,9 @@ mod tests {
             let lib = Library::open(&path).unwrap();
             let before = inbox(&lib);
             match what {
-                "hide" => lib.hide_paths(&["/m/a/1.flac".into()], 1).unwrap(),
+                "hide" => lib
+                    .hide_copied(&[("/m/a/1.flac".into(), "/lib/A/1.flac".into())], 1)
+                    .unwrap(),
                 "unhide" => assert_eq!(lib.unhide_all().unwrap(), 1),
                 _ => lib.remove_paths(&["/m/a/2.flac".into()]).unwrap(),
             }
@@ -4437,6 +4555,29 @@ mod tests {
     }
 
     #[test]
+    fn files_hidden_before_v9_stay_hidden_with_no_import_to_undo() {
+        let path = temp_db("inboxv8");
+        drop(Library::open(&path).unwrap());
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "DROP INDEX hidden_copy;
+             ALTER TABLE hidden DROP COLUMN copy;
+             INSERT INTO hidden (path, hidden_at) VALUES ('/m/a/1.flac', 1);
+             PRAGMA user_version = 8;",
+        )
+        .unwrap();
+        drop(old);
+        let lib = Library::open(&path).unwrap();
+        lib.upsert(&[file("/m/a/1.flac", "a", &[])]).unwrap();
+        assert_eq!(lib.hidden_stats().unwrap().files, 1);
+        let copy: Option<String> = lib
+            .conn()
+            .query_row("SELECT copy FROM hidden", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(copy, None);
+    }
+
+    #[test]
     fn an_inbox_from_before_autoincrement_stops_giving_out_removed_ids() {
         let path = temp_db("inboxv7");
         let lib = Library::open(&path).unwrap();
@@ -4455,7 +4596,7 @@ mod tests {
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(tracks_objects(&lib.conn(), "main"), objects);
         assert_eq!(track_id(&lib, "/m/a/1.flac"), Some(ids[0]));
         assert_eq!(track_id(&lib, "/m/a/2.flac"), Some(ids[1]));
@@ -4726,6 +4867,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lib.cover_jobs().unwrap().len(), 1, "looked at again");
+    }
+
+    #[test]
+    fn hidden_files_stay_linked_to_their_copies_as_these_move() {
+        let dir = temp_dir("importlinks", &["state", "Lib"]);
+        let lib = Library::open_in(&dir.join("state")).unwrap();
+        lib.set_library_setup(with_folder(&dir.join("Lib"), &[]))
+            .unwrap();
+        lib.prepare_library(&dir.join("Lib")).unwrap();
+        let root = lib.library_folder().unwrap().unwrap();
+        let copies = || {
+            [
+                library_file(&root, "A/1.flac", "A", 7),
+                library_file(&root, "A/2.flac", "A", 7),
+            ]
+        };
+        lib.upsert(&[file("/m/a/1.flac", "a", &[]), file("/m/a/2.flac", "a", &[])])
+            .unwrap();
+        lib.upsert(&copies()).unwrap();
+        let album = lib
+            .albums(
+                Collection::Library,
+                &[],
+                &[],
+                &Splitter::default(),
+                &[],
+                None,
+            )
+            .unwrap()[0]
+            .id
+            .clone();
+        let undoable = |lib: &Library| lib.album(&album).unwrap().unwrap().undo_import;
+        assert!(!undoable(&lib), "not an import's");
+        let copied = [
+            ("/m/a/1.flac".into(), root.join("A/1.flac")),
+            ("/m/a/2.flac".into(), root.join("A/2.flac")),
+        ];
+        lib.hide_copied(&copied, 1).unwrap();
+        assert!(undoable(&lib));
+
+        // Two copies trading names each keep their own original.
+        lib.upsert_moving(
+            &copies(),
+            &[
+                (root.join("A/1.flac"), root.join("A/2.flac")),
+                (root.join("A/2.flac"), root.join("A/1.flac")),
+            ],
+            None,
+        )
+        .unwrap();
+        let mut links = lib.import_links(&album).unwrap().unwrap();
+        links.sort_by(|a, b| a.original.cmp(&b.original));
+        let pairs: Vec<(PathBuf, PathBuf)> = links
+            .iter()
+            .map(|l| (l.original.clone(), l.copy.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("/m/a/1.flac".into(), root.join("A/2.flac")),
+                ("/m/a/2.flac".into(), root.join("A/1.flac")),
+            ]
+        );
+        assert!(links.iter().all(|l| l.inbox_album == "a"));
+
+        // A track no import made joins it: nothing to undo.
+        lib.upsert(&[library_file(&root, "A/3.flac", "A", 7)])
+            .unwrap();
+        assert!(!undoable(&lib));
+        lib.remove_paths(&[root.join("A/3.flac")]).unwrap();
+        assert!(undoable(&lib));
+
+        // Undone: the copies are forgotten and the originals show again.
+        lib.unimport(&links).unwrap();
+        assert!(lib.album(&album).unwrap().is_none());
+        assert_eq!(lib.album("a").unwrap().unwrap().tracks.len(), 2);
+        assert_eq!(lib.hidden_stats().unwrap(), HiddenStats::default());
+
+        // Shown again by Show hidden files: nothing to undo either.
+        lib.upsert(&copies()).unwrap();
+        lib.hide_copied(&copied, 2).unwrap();
+        assert!(undoable(&lib));
+        lib.unhide_all().unwrap();
+        assert!(!undoable(&lib));
     }
 
     #[test]
