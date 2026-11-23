@@ -2966,14 +2966,15 @@ impl Library {
         let tx = conn.transaction()?;
         let mut hidden = 0;
         {
-            // A copy is one original's: an earlier link to its path is stale.
-            let mut unlink = tx.prepare_cached("UPDATE hidden SET copy = NULL WHERE copy = ?1")?;
+            // A copy is one original's: another's link to its path is stale.
+            let mut unlink =
+                tx.prepare_cached("UPDATE hidden SET copy = NULL WHERE copy = ?1 AND path <> ?2")?;
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO hidden (path, hidden_at, copy) VALUES (?1, ?2, ?3)
                  ON CONFLICT (path) DO NOTHING",
             )?;
             for (original, copy) in copied {
-                unlink.execute([copy.to_string_lossy()])?;
+                unlink.execute([copy.to_string_lossy(), original.to_string_lossy()])?;
                 hidden += stmt.execute(params![
                     original.to_string_lossy(),
                     now,
@@ -4919,6 +4920,11 @@ mod tests {
         ];
         lib.hide_copied(&copied, 1).unwrap();
         assert!(undoable(&lib));
+        lib.hide_copied(&copied, 2).unwrap();
+        assert!(
+            undoable(&lib),
+            "the same copies recorded again keep their links"
+        );
 
         // Two copies trading names each keep their own original.
         lib.upsert_moving(

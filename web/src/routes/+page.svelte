@@ -1511,8 +1511,10 @@
 			);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'The import wasn’t undone', 'error', 8000);
-			// It may have been undone in part.
+			// It may have been undone in part; refused as changed, the sheet shows it as it is.
 			inboxChanged();
+			if (e instanceof ApiError && e.status === 409)
+				enqueue({ kind: 'notice', id: album.id, previous: null });
 		} finally {
 			leavingHere.delete(album.id);
 			dismiss(working);
