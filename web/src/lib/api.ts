@@ -74,6 +74,8 @@ export interface AlbumDetail extends Album {
 	tracks: Track[];
 	/** Changes whenever any of the album's tracks is written, or a track joins or leaves it. */
 	version: string;
+	/** A Library album copied from the Inbox by an import that can be undone. */
+	undo_import: boolean;
 }
 
 export interface ScanProgress {
@@ -926,6 +928,15 @@ export const api = {
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ album_id, edits, art, musicbrainz_art: musicbrainzArt })
 		}),
+	/**
+	 * Delete a Library album's files and show the Inbox album it was copied from again.
+	 * `version`: the album's, as shown; 409 if it has changed since.
+	 */
+	undoImport: (id: string, version: string) =>
+		request<{ inbox_id: string; files: number }>(
+			`/api/albums/${encodeURIComponent(id)}/undo-import`,
+			json('POST', { version })
+		),
 	appearance: () => request<AppearanceResponse>('/api/appearance'),
 	saveAppearance: (setup: AppearanceSetup) =>
 		request<AppearanceResponse>('/api/appearance', {

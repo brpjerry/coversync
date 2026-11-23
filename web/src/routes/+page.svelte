@@ -582,7 +582,7 @@
 				openId &&
 				(draft !== 'none' || moving) &&
 				!holding &&
-				!importingHere.has(openId) &&
+				!leavingHere.has(openId) &&
 				gone(openId)
 			)
 				hold(null, draft === 'draft');
@@ -1106,7 +1106,18 @@
 			enqueue({
 				kind: 'notice',
 				id: album_id,
-				previous: importingHere.has(inbox_id) ? null : inbox_id
+				previous: leavingHere.has(inbox_id) ? null : inbox_id
+			});
+		},
+		unimported({ album_id, inbox_id }) {
+			inboxSetup.refresh();
+			inboxChanged();
+			devices.readSyncAll();
+			// The Library album open moves to the Inbox (an undo made here closes its sheet itself).
+			enqueue({
+				kind: 'notice',
+				id: inbox_id,
+				previous: leavingHere.has(album_id) ? null : album_id
 			});
 		},
 		album_changed: albumChanged,
@@ -1227,8 +1238,11 @@
 		}
 	}
 
-	/** The Inbox albums this page is importing, whose sheets it closes itself. */
-	const importingHere = new Set<string>();
+	/**
+	 * The albums this page is moving between the Inbox and the Library (importing,
+	 * or undoing an import), whose sheets it closes itself.
+	 */
+	const leavingHere = new Set<string>();
 	/** Import requests on their way: leaving the page could stop those not sent yet. */
 	let importRequests = 0;
 	/** Returns an error message, or null when the album was imported. */
@@ -1242,7 +1256,7 @@
 		musicbrainzArt?: string
 	): Promise<string | null> {
 		const working = toast(`Importing “${album.title}”…`, 'progress', 0);
-		importingHere.add(album.id);
+		leavingHere.add(album.id);
 		try {
 			importRequests++;
 			const r = await api
@@ -1275,7 +1289,7 @@
 			if (!importing) toast(message, 'error', 8000, fixAction(message));
 			return message;
 		} finally {
-			importingHere.delete(album.id);
+			leavingHere.delete(album.id);
 			dismiss(working);
 		}
 	}
@@ -1369,11 +1383,11 @@
 	): Promise<string | null> {
 		if (!item.open || b.ended) return Promise.resolve(null);
 		const id = item.album.id;
-		importingHere.add(id);
+		leavingHere.add(id);
 		importRequests++;
 		void b.import(item, edits, art, musicbrainzArt).then(async () => {
 			importRequests--;
-			importingHere.delete(id);
+			leavingHere.delete(id);
 			await loadAlbums();
 			dataGeneration++;
 			batchProgress(b);
@@ -1474,22 +1488,56 @@
 		if (batch === b) batch = null;
 	}
 
+	/**
+	 * Undo the import of Library album `album`, as shown, once confirmed: its files are
+	 * deleted, and the Inbox album they were copied from shows again.
+	 */
+	async function undoImport(album: Detail) {
+		const asked = `Undo the import of “${album.title}”? Its files are deleted from the Library, with any changes made to them there, and the album shows in the Inbox again as it was.`;
+		// Once: a second click while the first waits (behind a scan, say) would be refused.
+		if (leavingHere.has(album.id) || !confirm(asked)) return;
+		leavingHere.add(album.id);
+		const working = toast(`Undoing the import of “${album.title}”…`, 'progress', 0);
+		try {
+			const r = await api.undoImport(album.id, album.version);
+			if (openId === album.id) await close();
+			await loadAlbums();
+			dataGeneration++;
+			toast(
+				`Undid the import of “${album.title}”: ${r.files} ${r.files === 1 ? 'file' : 'files'} deleted from the Library`,
+				'success',
+				7000,
+				{ label: 'Show', run: () => showIn('inbox', r.inbox_id) }
+			);
+		} catch (e) {
+			toast(e instanceof ApiError ? e.message : 'The import wasn’t undone', 'error', 8000);
+			// It may have been undone in part; refused as changed, the sheet shows it as it is.
+			inboxChanged();
+			if (e instanceof ApiError && e.status === 409)
+				enqueue({ kind: 'notice', id: album.id, previous: null });
+		} finally {
+			leavingHere.delete(album.id);
+			dismiss(working);
+		}
+	}
+
 	let shows = 0;
-	async function showInLibrary(id: string) {
+	const showInLibrary = (id: string) => showIn('library', id);
+	async function showIn(where: 'inbox' | 'library', id: string) {
 		const mine = ++shows;
-		await setView('library');
+		await setView(where);
 		const seen = openings;
-		// Just imported, the Library's list may not have it yet; if another
+		// Just imported (or back), the list may not have it yet; if another
 		// view or album is opened or closed meanwhile (Back and Forward too),
 		// that stays.
 		if (!byId.get(id)) {
 			await loadAlbums();
-			if (mine !== shows || view !== 'library' || openings !== seen) return;
+			if (mine !== shows || view !== where || openings !== seen) return;
 		}
 		await tick();
 		const album = byId.get(id);
 		if (album) open(album);
-		else toast("That album isn't in the Library now.", 'error');
+		else toast(`That album isn't in the ${where === 'inbox' ? 'Inbox' : 'Library'} now.`, 'error');
 	}
 
 	// Uploads: files and folders dropped on the Inbox, or picked with Upload.
@@ -1911,6 +1959,7 @@
 		onimport={sheetAlbum.collection === 'inbox'
 			? (edits) => startImport(sheetAlbum!, edits)
 			: undefined}
+		onundoimport={sheetDetail?.undo_import ? () => undoImport(sheetDetail!) : undefined}
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
 		{ondraft}

@@ -12,6 +12,8 @@ export interface Notices {
 	scan_finished: ScanProgress;
 	/** An Inbox album was imported: `album_id` is its id in the Library. */
 	imported: { album_id: string; inbox_id: string };
+	/** An import was undone: Library album `album_id` is gone, and Inbox album `inbox_id` shows again. */
+	unimported: { album_id: string; inbox_id: string };
 	/**
 	 * An album's tags were edited. `previous_id` is its id before, if the edit changed
 	 * it; `version` its version after, as its details give it (null if none of its
@@ -57,6 +59,7 @@ const NAMES = [
 	'scan',
 	'scan_finished',
 	'imported',
+	'unimported',
 	'album_changed',
 	'setup_saved',
 	'lookup_finished',
