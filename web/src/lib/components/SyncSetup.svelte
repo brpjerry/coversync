@@ -471,6 +471,7 @@
 											{#if syncDraft.own}
 												<StructureField
 													bind:value={syncDraft.structure}
+													separator={setup.saved.separator}
 													folder=""
 													suggestions={setup.suggestions}
 													variables={setup.variables}

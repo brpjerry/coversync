@@ -375,6 +375,14 @@ pub fn folder_setting(value: Option<String>, what: &str) -> Result<Option<String
 }
 
 impl LibrarySetup {
+    /// The folder structure, naming folders by the first of a tag's values.
+    pub fn template(&self) -> Result<crate::template::Template> {
+        Ok(
+            crate::template::Template::parse(&self.structure)?
+                .with_separator(&self.rules.separator),
+        )
+    }
+
     /// Validate, and store tag ids once, in catalog order.
     pub fn normalize(mut self) -> Result<Self> {
         self.folder = folder_setting(self.folder, "library folder")?;

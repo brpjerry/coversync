@@ -255,12 +255,10 @@ fn names_are_split_at_library_setups_phrases() {
     );
     assert_eq!(plan.tracks[0].autofilled["artist"], "Ado;Eve");
     assert_eq!(plan.tracks[1].autofilled["artist"], "Rin;Riho");
+    // The folder takes the first name.
     assert_eq!(
         s.dests(&plan),
-        [
-            "Ado;Eve/Record/01 - One.flac",
-            "Ado;Eve/Record/02 - Two.flac"
-        ]
+        ["Ado/Record/01 - One.flac", "Ado/Record/02 - Two.flac"]
     );
     // What's typed in the dialog stays as typed.
     let plan = s.plan([&[("artist", "Ado feat. Eve")], &[("artist", "Rin")]]);
@@ -278,11 +276,32 @@ fn names_are_split_at_library_setups_phrases() {
     )
     .unwrap();
     assert_eq!(done.files, 2);
-    let copy =
-        |name: &str| tags::read_kinds(&s.root.join("Ado;Eve/Record").join(name), false).unwrap();
+    let copy = |name: &str| tags::read_kinds(&s.root.join("Ado/Record").join(name), false).unwrap();
     assert_eq!(copy("01 - One.flac").values["artist"], "Ado;Eve");
     assert_eq!(copy("02 - Two.flac").values["artist"], "Rin;Riho");
     assert_eq!(copy("02 - Two.flac").values["album_artist"], "Ado;Eve");
+}
+
+#[test]
+fn tracks_need_only_the_first_album_artist_alike() {
+    let s = setup("first", "{album_artist}/{album}/<{track_number} - >{title}");
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    for (n, credit) in [(1, "Ado;Eve"), (2, "Ado;Rin")] {
+        let edit = TagEdit {
+            album_artist: Some(credit.into()),
+            ..Default::default()
+        };
+        tags::write(&inbox.join(format!("{n}.flac")), &edit).unwrap();
+    }
+    let plan = s.plan([&[], &[]]);
+    assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
+    assert_eq!(
+        s.dests(&plan),
+        ["Ado/Record/01 - One.flac", "Ado/Record/02 - Two.flac"]
+    );
+    // Not when the first differs.
+    let plan = s.plan([&[], &[("album_artist", "Eve;Ado")]]);
+    assert_eq!(plan.disagree, ["album_artist"]);
 }
 
 #[test]
@@ -615,12 +634,10 @@ fn an_album_artist_autofill_fills_from_the_artist_is_split_too() {
     );
     assert_eq!(plan.split, ["artist", "album_artist"]);
     assert_eq!(plan.tracks[0].autofilled["album_artist"], "Ado;Eve");
+    // The folder takes the first name.
     assert_eq!(
         s.dests(&plan),
-        [
-            "Ado;Eve/Record/01 - One.flac",
-            "Ado;Eve/Record/02 - Two.flac"
-        ]
+        ["Ado/Record/01 - One.flac", "Ado/Record/02 - Two.flac"]
     );
 }
 

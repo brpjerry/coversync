@@ -36,7 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sync_catalog(structure.is_some())?
                 .ok_or("no Library")?;
             let read = start.elapsed();
-            let paths = device_paths(catalog, 1, &settings)?;
+            // As `PathCache::paths`: only a device's own structure needs it.
+            let separator = match structure.is_some() {
+                true => library.library_setup()?.rules.separator,
+                false => String::new(),
+            };
+            let paths = device_paths(catalog, 1, &settings, &separator)?;
             println!(
                 "{}",
                 serde_json::json!({

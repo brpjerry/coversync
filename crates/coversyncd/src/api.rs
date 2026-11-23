@@ -633,6 +633,8 @@ async fn folder_check(
 #[derive(Deserialize)]
 struct PreviewQuery {
     structure: String,
+    /// The separator being edited; Library setup's when left out.
+    separator: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -658,7 +660,10 @@ async fn structure_preview(
 ) -> ApiResult<Json<Preview>> {
     blocking(&state, move |s| {
         let t = match Template::parse(&q.structure) {
-            Ok(t) => t,
+            Ok(t) => t.with_separator(&match q.separator {
+                Some(separator) => separator,
+                None => s.lib.library_setup()?.rules.separator,
+            }),
             Err(e) => {
                 return Ok(Preview {
                     error: Some(e.to_string()),
@@ -1183,7 +1188,7 @@ async fn write_tags(
             })?;
         }
         // The album keeps to the folder structure (see `relocate`).
-        let template = Template::parse(&s.lib.library_setup()?.structure)?;
+        let template = s.lib.library_setup()?.template()?;
         let layout = s.lib.library_folder()?.map(|root| (template, root));
         let named = |path: &FsPath, e: coversync_core::Error| {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -1554,7 +1559,7 @@ fn misplaced(s: &crate::AppState) -> coversync_core::Result<Misplaced> {
         let _files = s.tag_files.write().unwrap_or_else(|e| e.into_inner());
         moves_put_back(s, "moved")?;
     }
-    let template = Template::parse(&s.lib.library_setup()?.structure)?;
+    let template = s.lib.library_setup()?.template()?;
     let splitter = coversync_core::split::Splitter::default();
     let (mut to_move, mut failed) = (Vec::new(), Vec::new());
     for album in s
