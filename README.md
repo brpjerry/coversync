@@ -198,13 +198,14 @@ used on a home server.
 - **Undo import**: a Library album imported in Copy mode has **Undo import**
   on its sheet, as long as every one of its tracks is still such a copy, and
   its originals are still hidden in the Inbox (**Show hidden files** forgets
-  which copy each one is). Saves that move its files since don't count. Undo
-  deletes the album's files from the Library, with any edits made to them
-  there, and its cover with the last of them. Folders it leaves empty go
-  too. The untouched originals show in the Inbox again. Undo is refused
-  while any original is missing from the Inbox folder, as the Library then
-  has the only copy. Albums imported before this, or in Move mode, can't be
-  undone.
+  which copy each one is). Undo still works after a save moves the tracks,
+  but not once the Library folder itself has moved. Undo deletes the album's
+  files from the Library, with any edits made to them there. A folder left
+  holding only the cover file loses it, and folders left empty go; any
+  other file (a booklet scan) stays, in its folder. The untouched originals
+  show in the Inbox again. Undo is refused while any original is missing
+  from the Inbox folder, as the Library then has the only copy. Albums
+  imported before this, or in Move mode, can't be undone.
 - **Importing several albums**: **Select** in the Inbox's top bar (or an
   album's menu, or a Ctrl/⌘- or Shift-click) ticks albums. Ctrl/⌘+A ticks
   every album shown, and Esc stops. A bar counts them, including any the

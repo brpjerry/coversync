@@ -2018,6 +2018,13 @@ impl Library {
                     }
                 }
             }
+            // A link to a file gone from a path a copy moves to goes.
+            for (_, to) in &pairs {
+                tx.execute(
+                    "UPDATE main.hidden SET copy = NULL WHERE copy = ?1",
+                    [root.join(to).to_string_lossy()],
+                )?;
+            }
             for (original, to) in links {
                 tx.execute(
                     "UPDATE main.hidden SET copy = ?1 WHERE path = ?2",
@@ -2224,10 +2231,15 @@ impl Library {
             let mut inbox = tx.prepare_cached("DELETE FROM main.tracks WHERE path = ?1")?;
             let mut lib = tx.prepare_cached("DELETE FROM lib.tracks WHERE path = ?1")?;
             let mut show = tx.prepare_cached("DELETE FROM main.hidden WHERE path = ?1")?;
+            // A copy forgotten is no import's any more: a file put at its
+            // path later isn't one to undo.
+            let mut unlink =
+                tx.prepare_cached("UPDATE main.hidden SET copy = NULL WHERE copy = ?1")?;
             for p in paths {
                 inbox_gone += inbox.execute([p.to_string_lossy()])?;
                 if let Some(rel) = library.as_deref().and_then(|r| p.strip_prefix(r).ok()) {
                     lib_gone += lib.execute([rel.to_string_lossy()])?;
+                    unlink.execute([p.to_string_lossy()])?;
                 }
             }
             for p in shown {
@@ -2946,21 +2958,22 @@ impl Library {
         Ok(setup)
     }
 
-    /// Hide Inbox files, e.g. once they have been copied into the Library.
-    /// Hiding any counts as a change to the Inbox.
-    /// Hide Inbox files an import copied into the Library: `copied` pairs
-    /// each one with its copy (an absolute path in the attached Library
-    /// folder), which undoing the import deletes (see [`Self::import_links`]).
+    /// Hide the Inbox originals an import copied into the Library, each
+    /// linked to its copy (an absolute path in the attached Library folder)
+    /// for [`Self::import_links`]. Hiding any counts as a change to the Inbox.
     pub fn hide_copied(&self, copied: &[(PathBuf, PathBuf)], now: i64) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut hidden = 0;
         {
+            // A copy is one original's: an earlier link to its path is stale.
+            let mut unlink = tx.prepare_cached("UPDATE hidden SET copy = NULL WHERE copy = ?1")?;
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO hidden (path, hidden_at, copy) VALUES (?1, ?2, ?3)
                  ON CONFLICT (path) DO NOTHING",
             )?;
             for (original, copy) in copied {
+                unlink.execute([copy.to_string_lossy()])?;
                 hidden += stmt.execute(params![
                     original.to_string_lossy(),
                     now,
@@ -4938,6 +4951,16 @@ mod tests {
         assert!(!undoable(&lib));
         lib.remove_paths(&[root.join("A/3.flac")]).unwrap();
         assert!(undoable(&lib));
+
+        // A copy forgotten (gone in a scan) takes its link along: another
+        // file at its path later isn't the import's.
+        lib.remove_paths(&[root.join("A/1.flac")]).unwrap();
+        lib.upsert(&[library_file(&root, "A/1.flac", "A", 7)])
+            .unwrap();
+        assert!(!undoable(&lib));
+        lib.unhide_all().unwrap();
+        lib.hide_copied(&copied, 1).unwrap();
+        let links = lib.import_links(&album).unwrap().unwrap();
 
         // Undone: the copies are forgotten and the originals show again.
         lib.unimport(&links).unwrap();

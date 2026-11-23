@@ -899,7 +899,8 @@ pub struct Undone {
 /// changed, show again. Only for an album every track of which is such a
 /// copy (see [`Library::import_links`]), and refused, with nothing changed,
 /// while any original is missing from the Inbox folder. Edits made to the
-/// album in the Library go with it.
+/// album in the Library go with it, and so does its cover file (the art
+/// rule's) from a folder left with nothing else.
 pub fn undo(
     lib: &Library,
     covers: &CoverCache,
@@ -922,12 +923,21 @@ pub fn undo(
         )));
     }
     let root = lib.library_folder()?.ok_or(Error::NotFound)?;
+    let art = lib.library_setup()?.rules.art;
     let copies: Vec<PathBuf> = links.iter().map(|l| l.copy.clone()).collect();
     // Each original shows again once its copy is deleted, whatever stops the rest.
-    let (deleted, failed) = relocate::remove(&root, &copies);
+    let (deleted, failed) = relocate::remove(&root, &copies, |name| art.is_cover_file(name));
     lib.unimport(&links[..deleted])?;
-    scan::refresh_covers(lib, covers, progress)?;
     if let Some(e) = failed {
+        // What's left of the album may have lost the file its cover came from.
+        if deleted > 0
+            && let Err(err) = scan::refresh_covers(lib, covers, progress)
+        {
+            tracing::warn!(
+                album = album_id,
+                "covers not refreshed after a partial undo: {err}"
+            );
+        }
         return Err(Error::Invalid(format!(
             "The import was undone for {deleted} of {} files: {e}",
             links.len()

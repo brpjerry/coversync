@@ -1489,15 +1489,17 @@
 	}
 
 	/**
-	 * Undo the import of Library album `album`, once confirmed: its files are deleted,
-	 * and the Inbox album they were copied from shows again.
+	 * Undo the import of Library album `album`, as shown, once confirmed: its files are
+	 * deleted, and the Inbox album they were copied from shows again.
 	 */
-	async function undoImport(album: Album) {
+	async function undoImport(album: Detail) {
 		const asked = `Undo the import of “${album.title}”? Its files are deleted from the Library, with any changes made to them there, and the album shows in the Inbox again as it was.`;
-		if (!confirm(asked)) return;
+		// Once: a second click while the first waits (behind a scan, say) would be refused.
+		if (leavingHere.has(album.id) || !confirm(asked)) return;
 		leavingHere.add(album.id);
+		const working = toast(`Undoing the import of “${album.title}”…`, 'progress', 0);
 		try {
-			const r = await api.undoImport(album.id);
+			const r = await api.undoImport(album.id, album.version);
 			if (openId === album.id) await close();
 			await loadAlbums();
 			dataGeneration++;
@@ -1509,8 +1511,11 @@
 			);
 		} catch (e) {
 			toast(e instanceof ApiError ? e.message : 'The import wasn’t undone', 'error', 8000);
+			// It may have been undone in part.
+			inboxChanged();
 		} finally {
 			leavingHere.delete(album.id);
+			dismiss(working);
 		}
 	}
 
@@ -1952,7 +1957,7 @@
 		onimport={sheetAlbum.collection === 'inbox'
 			? (edits) => startImport(sheetAlbum!, edits)
 			: undefined}
-		onundoimport={sheetDetail?.undo_import ? () => undoImport(sheetAlbum!) : undefined}
+		onundoimport={sheetDetail?.undo_import ? () => undoImport(sheetDetail!) : undefined}
 		changed={holding?.changed ?? false}
 		onreload={reloadHeld}
 		{ondraft}

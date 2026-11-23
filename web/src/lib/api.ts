@@ -928,11 +928,14 @@ export const api = {
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ album_id, edits, art, musicbrainz_art: musicbrainzArt })
 		}),
-	/** Delete a Library album's files and show the Inbox album it was copied from again. */
-	undoImport: (id: string) =>
+	/**
+	 * Delete a Library album's files and show the Inbox album it was copied from again.
+	 * `version`: the album's, as shown; 409 if it has changed since.
+	 */
+	undoImport: (id: string, version: string) =>
 		request<{ inbox_id: string; files: number }>(
 			`/api/albums/${encodeURIComponent(id)}/undo-import`,
-			{ method: 'POST' }
+			json('POST', { version })
 		),
 	appearance: () => request<AppearanceResponse>('/api/appearance'),
 	saveAppearance: (setup: AppearanceSetup) =>

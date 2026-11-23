@@ -604,11 +604,16 @@ fn prune(root: BorrowedFd<'_>, dirs: &[PathBuf]) {
 /// Delete `files`, tracks in the Library folder `root` (absolute paths),
 /// each reached as moves reach theirs, a name at a time without following
 /// a link; one already gone counts as deleted. Then an album folder they
-/// leave holding nothing but images (its cover) loses those, and folders
-/// left empty go, short of the Library folder. Returns how many of `files`,
-/// from the first, were deleted, and why the next one wasn't, if one wasn't:
-/// it and those after it are left as they are.
-pub fn remove(root: &Path, files: &[PathBuf]) -> (usize, Option<Error>) {
+/// leave holding nothing but cover files (`is_cover` says which names are)
+/// loses those, and folders left empty go, short of the Library folder.
+/// Any other file (a booklet scan, say) keeps its folder. Returns how many
+/// of `files`, from the first, were deleted, and why the next one wasn't,
+/// if one wasn't: it and those after it are left as they are.
+pub fn remove(
+    root: &Path,
+    files: &[PathBuf],
+    is_cover: impl Fn(&str) -> bool,
+) -> (usize, Option<Error>) {
     let root_fd = match open_root(root) {
         Ok(fd) => fd,
         Err(e) => return (0, Some(e.into())),
@@ -647,7 +652,7 @@ pub fn remove(root: &Path, files: &[PathBuf]) -> (usize, Option<Error>) {
         }
     }
     // Each track's folder, and its album's above disc folders, the deepest
-    // first: a disc folder gone, the album's may hold only its cover.
+    // first: a disc folder gone, the album's may hold only its cover file.
     let mut dirs: Vec<PathBuf> = deleted
         .iter()
         .flat_map(|rel| {
@@ -666,10 +671,10 @@ pub fn remove(root: &Path, files: &[PathBuf]) -> (usize, Option<Error>) {
         let Ok(entries) = list(fd.as_fd()) else {
             continue;
         };
-        let only_images = entries.iter().all(|(name, what)| {
-            *what == FileType::RegularFile && !own(name) && cover::is_image(Path::new(name))
+        let only_covers = entries.iter().all(|(name, what)| {
+            *what == FileType::RegularFile && !own(name) && is_cover(&name.to_string_lossy())
         });
-        if only_images {
+        if only_covers {
             for (name, _) in &entries {
                 let _ = unlinkat(&fd, name.as_os_str(), AtFlags::empty());
             }
@@ -1228,30 +1233,39 @@ mod tests {
         }
         for f in [
             "A/Rec/cover.jpg",
-            "A/Rec/Disc 1/cover.jpg",
+            "A/Rec/Disc 1/cover.png",
             "Shared/cover.jpg",
+            "Booklet/1.flac",
+            "Booklet/cover.jpg",
+            "Booklet/booklet.png",
         ] {
             touch(&r.join(f), "art");
         }
+        let cover = |name: &str| name.starts_with("cover.");
         let files: Vec<PathBuf> = [
             "A/Rec/Disc 1/1.flac",
             "A/Rec/Disc 2/2.flac",
             "Shared/1.flac",
             "Gone/3.flac",
+            "Booklet/1.flac",
         ]
         .iter()
         .map(|f| r.join(f))
         .collect();
-        let (deleted, failed) = remove(r, &files);
+        let (deleted, failed) = remove(r, &files, cover);
         assert!(failed.is_none(), "{failed:?}");
         // One already gone counts.
-        assert_eq!(deleted, 4);
-        // The album's folders, its covers with them, up to the Library folder.
+        assert_eq!(deleted, 5);
+        // The album's folders, their cover files with them, up to the Library folder.
         assert!(!r.join("A").exists());
         // A folder other tracks stay in keeps its cover.
         assert!(!r.join("Shared/1.flac").exists());
         assert!(r.join("Shared/2.flac").exists());
         assert!(r.join("Shared/cover.jpg").exists());
+        // As does one with another file: a booklet scan isn't the cover.
+        assert!(!r.join("Booklet/1.flac").exists());
+        assert!(r.join("Booklet/cover.jpg").exists());
+        assert!(r.join("Booklet/booklet.png").exists());
 
         // A link on the way stops it there, and nothing outside is touched.
         let outside = s.dir.join("outside");
@@ -1264,7 +1278,7 @@ mod tests {
                 r.join(link),
                 r.join("Shared/2.flac"),
             ];
-            let (deleted, failed) = remove(r, &files);
+            let (deleted, failed) = remove(r, &files, cover);
             assert!(failed.is_some(), "{link}");
             assert_eq!(deleted, 1, "{link}");
             assert_eq!(read(&outside.join("x.flac")), "outside");

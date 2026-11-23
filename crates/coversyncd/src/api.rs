@@ -824,13 +824,31 @@ async fn import_album(
     result.map(Json)
 }
 
+#[derive(Deserialize)]
+struct UndoImport {
+    /// The album's `version` (from its details) the undo was asked on: if
+    /// it has changed since (tracks joined it, say), nothing is undone and
+    /// the answer is 409 Conflict.
+    version: String,
+}
+
 /// Undo a Library album's import (see `import::undo`). Runs exclusively
 /// with scans, imports and tag writes.
 async fn undo_import(
     State(state): State<Shared>,
     Path(id): Path<String>,
+    Json(req): Json<UndoImport>,
 ) -> ApiResult<Json<import::Undone>> {
     exclusively(&state, move |s| {
+        match s.lib.album(&id)? {
+            None => return Err(coversync_core::Error::NotFound),
+            Some(album) if album.version != req.version => {
+                return Err(coversync_core::Error::Conflict(
+                    "This album changed since it was shown, so its import wasn't undone: look at it again first.".into(),
+                ));
+            }
+            Some(_) => {}
+        }
         // The album's files are where the index says: none of them left
         // part way by a save that stopped (as an import makes sure).
         if !s.lib.recorded_moves()?.is_empty() {
@@ -2867,8 +2885,20 @@ mod tests {
 
         // The import is undone, wherever the saves moved its files.
         assert!(renamed.files_moved > 0);
+        // Not on a version from before the save.
         let path = Path(renamed.album_id.clone());
-        let Json(undone) = undo_import(State(state.clone()), path).await.unwrap();
+        let stale = Json(UndoImport {
+            version: kept.album.as_ref().unwrap().version.clone(),
+        });
+        let refused = undo_import(State(state.clone()), path, stale).await;
+        assert_eq!(refused.unwrap_err().0, StatusCode::CONFLICT);
+        let path = Path(renamed.album_id.clone());
+        let current = Json(UndoImport {
+            version: renamed.album.as_ref().unwrap().version.clone(),
+        });
+        let Json(undone) = undo_import(State(state.clone()), path, current)
+            .await
+            .unwrap();
         assert_eq!(
             (undone.inbox_id.as_str(), undone.files),
             (inbox_id.as_str(), 1)
