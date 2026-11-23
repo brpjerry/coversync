@@ -332,6 +332,7 @@ mod tests {
             },
             root: PathBuf::from("/music"),
             settings_version: 1,
+            separator: ";".into(),
             incomplete: 0,
             renamed: 0,
             files,

@@ -104,7 +104,9 @@ used on a home server.
   art or both, required or not, and the cover file's name); and the folder
   structure, a template such as
   `{album_artist}/{year} - {album}/{track_number} - {title}`.
-  `{track_number}` is zero-padded and the extension is added. `{album:40}`
+  `{track_number}` is zero-padded and the extension is added. A tag that
+  holds several values (album artists, genres: see Multiple values) gives
+  only its first, so `{album_artist}` of `Ado;Eve` is `Ado`. `{album:40}`
   keeps at most 40 characters of a value, cut at a word break when one is
   close. A part in `< >` is optional: it's left out when a variable in it
   has no value, when it holds `{disc_number}` and the album has one disc, or

@@ -12,6 +12,9 @@
 //! is left out with them. Variables only in optional parts aren't required.
 //! `{collection}` is optional wherever it is, as albums in none have no
 //! value: `{collection}/{album}` is just `{album}` for them.
+//! A tag that holds several values joined by Library setup's separator
+//! (artists, genres: see [`split::holds_several`]) gives a name its first:
+//! `{album_artist}` of `Ado;Eve` is `Ado`.
 //! The album's disc and track totals come from the `disc_total` and
 //! `track_total` values, or a `2/3` style number.
 //!
@@ -29,7 +32,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::{Error, Result, rules};
+use crate::{Error, Result, rules, split};
 
 /// A disc number only when the album has more than one disc, and a track
 /// number unless it's a single.
@@ -72,6 +75,8 @@ enum Part {
 #[derive(Debug, Clone)]
 pub struct Template {
     segments: Vec<Vec<Part>>,
+    /// Joins the values of a tag that holds several; blank splits nothing.
+    separator: String,
 }
 
 fn known(name: &str) -> Option<&'static str> {
@@ -227,7 +232,17 @@ impl Template {
                 "The file name (after the last /) needs at least one variable outside < >.".into(),
             );
         }
-        Ok(Self { segments })
+        Ok(Self {
+            segments,
+            separator: String::new(),
+        })
+    }
+
+    /// With names made from the first of the values `separator` joins, in
+    /// tags that hold several (Library setup's separator).
+    pub fn with_separator(mut self, separator: &str) -> Self {
+        self.separator = separator.to_string();
+        self
     }
 
     fn all_vars(&self) -> impl Iterator<Item = (&'static str, Option<usize>, bool)> + '_ {
@@ -254,7 +269,7 @@ impl Template {
             let shown: Vec<&'static str> = match part {
                 Part::Text(_) => continue,
                 Part::Var(v, _) => vec![*v],
-                Part::Optional(parts) if optional(parts, values).is_some() => {
+                Part::Optional(parts) if optional(parts, values, &self.separator).is_some() => {
                     vars(parts).map(|(v, _, _)| v).collect()
                 }
                 Part::Optional(_) => continue,
@@ -354,7 +369,7 @@ impl Template {
             for part in segment {
                 match part {
                     Part::Text(t) => text.push_str(t),
-                    Part::Var(v, limit) => match value(values, v) {
+                    Part::Var(v, limit) => match value(values, v, &self.separator) {
                         Some(val) => text.push_str(&shown(&val, *limit)),
                         None => {
                             if !missing.contains(v) {
@@ -363,7 +378,7 @@ impl Template {
                         }
                     },
                     Part::Optional(parts) => {
-                        if let Some(t) = optional(parts, values) {
+                        if let Some(t) = optional(parts, values, &self.separator) {
                             text.push_str(&t);
                             left_out = false;
                         }
@@ -404,7 +419,11 @@ fn shown(value: &str, limit: Option<usize>) -> String {
 }
 
 /// An optional part's text, or None when it's left out.
-fn optional(parts: &[Part], values: &HashMap<&'static str, String>) -> Option<String> {
+fn optional(
+    parts: &[Part],
+    values: &HashMap<&'static str, String>,
+    separator: &str,
+) -> Option<String> {
     let mut text = String::new();
     for part in parts {
         match part {
@@ -418,7 +437,7 @@ fn optional(parts: &[Part], values: &HashMap<&'static str, String>) -> Option<St
                 if only {
                     return None;
                 }
-                text.push_str(&shown(&value(values, v)?, *limit));
+                text.push_str(&shown(&value(values, v, separator)?, *limit));
             }
             Part::Optional(_) => unreachable!("optional parts don't nest"),
         }
@@ -454,7 +473,9 @@ pub fn one_disc(values: &HashMap<&'static str, String>) -> bool {
     }
 }
 
-fn value(values: &HashMap<&'static str, String>, var: &str) -> Option<String> {
+/// A variable's value as names use it: a tag that holds several gives its
+/// first (see [`Template::with_separator`]).
+fn value(values: &HashMap<&'static str, String>, var: &str, separator: &str) -> Option<String> {
     let get = |k: &str| values.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
     match var {
         YEAR => year(get("date")?).map(str::to_string),
@@ -470,6 +491,12 @@ fn value(values: &HashMap<&'static str, String>, var: &str) -> Option<String> {
             let v = get(var)?;
             Some(v.split('/').next().unwrap_or(v).trim().to_string())
         }
+        _ if split::holds_several(var) && !separator.trim().is_empty() => values
+            .get(var)?
+            .split(separator)
+            .map(str::trim)
+            .find(|v| !v.is_empty())
+            .map(str::to_string),
         _ => get(var).map(str::to_string),
     }
 }
@@ -637,6 +664,46 @@ mod tests {
         assert_eq!(
             t.render(&v, "FLAC").unwrap(),
             PathBuf::from("4ikai/Thaw/01 - Thaw.flac")
+        );
+    }
+
+    #[test]
+    fn names_take_the_first_of_several_values() {
+        let structure = "{album_artist}/{collection}/{album}/<{genre} - >{title}";
+        let t = Template::parse(structure).unwrap().with_separator("; ");
+        let v = vals(&[
+            ("album_artist", "Minase Inori; Hanazawa Kana"),
+            // One name, and tags that don't hold several, stay whole.
+            ("collection", "Steins; Gate"),
+            ("album", "Steins; Gate OST"),
+            ("genre", "; Anime; Pop"),
+            ("title", "A; B"),
+        ]);
+        assert_eq!(
+            t.render(&v, "flac").unwrap(),
+            PathBuf::from("Minase Inori/Steins; Gate/Steins; Gate OST/Anime - A; B.flac")
+        );
+        let with = |artist: &str| {
+            let mut v = v.clone();
+            v.insert("album_artist", artist.into());
+            t.render(&v, "flac")
+        };
+        // The separator as typed: "; " doesn't split "A;B".
+        assert_eq!(
+            with("A;B").unwrap(),
+            PathBuf::from("A;B/Steins; Gate/Steins; Gate OST/Anime - A; B.flac")
+        );
+        // Nothing but separators is no value.
+        assert_eq!(with(" ; ; ").unwrap_err(), ["album_artist"]);
+        // Without a separator, nothing is split.
+        assert_eq!(
+            Template::parse(structure)
+                .unwrap()
+                .render(&v, "flac")
+                .unwrap(),
+            PathBuf::from(
+                "Minase Inori; Hanazawa Kana/Steins; Gate/Steins; Gate OST/; Anime; Pop - A; B.flac"
+            )
         );
     }
 

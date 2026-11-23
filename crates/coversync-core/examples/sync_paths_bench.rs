@@ -36,7 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sync_catalog(structure.is_some())?
                 .ok_or("no Library")?;
             let read = start.elapsed();
-            let paths = device_paths(catalog, 1, &settings)?;
+            let separator = library.library_setup()?.rules.separator;
+            let paths = device_paths(catalog, 1, &settings, &separator)?;
             println!(
                 "{}",
                 serde_json::json!({

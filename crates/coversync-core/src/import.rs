@@ -346,7 +346,7 @@ pub fn plan(
     let setup = lib.library_setup()?;
     let inbox = lib.inbox_setup()?;
     let detail = lib.album(album_id)?.ok_or(Error::NotFound)?;
-    let template = Template::parse(&setup.structure)?;
+    let template = setup.template()?;
     let kinds = needed_kinds(&setup.rules.required_tags, &template);
     let reads = template.value_kinds();
     let folder = setup.folder.clone();

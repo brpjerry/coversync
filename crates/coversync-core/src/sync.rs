@@ -164,6 +164,9 @@ pub struct DevicePaths {
     #[serde(skip)]
     pub root: PathBuf,
     pub settings_version: i64,
+    /// Library setup's separator, whose first value names folders.
+    #[serde(skip)]
+    pub separator: String,
     /// Tracks with no value for a variable of the device's own folder
     /// structure, which was left empty.
     pub incomplete: usize,
@@ -190,11 +193,12 @@ pub fn device_paths(
     catalog: Catalog,
     settings_version: i64,
     settings: &DeviceSettings,
+    separator: &str,
 ) -> Result<DevicePaths> {
     let template = settings
         .structure
         .as_deref()
-        .map(Template::parse)
+        .map(|s| Template::parse(s).map(|t| t.with_separator(separator)))
         .transpose()?;
     let kinds = template
         .as_ref()
@@ -229,6 +233,7 @@ pub fn device_paths(
         library: catalog.library,
         root: catalog.root,
         settings_version,
+        separator: separator.to_string(),
         incomplete,
         renamed,
         files,
@@ -333,10 +338,12 @@ impl PathCache {
         let Some((library, root)) = lib.sync_location()? else {
             return Ok(None);
         };
+        let separator = lib.library_setup()?.rules.separator;
         if let Some(paths) = cached.as_ref()
             && paths.settings_version == sync.version
             && paths.library == library
             && paths.root == root
+            && paths.separator == separator
         {
             return Ok(Some(paths.clone()));
         }
@@ -344,7 +351,12 @@ impl PathCache {
         let Some(catalog) = lib.sync_catalog(own)? else {
             return Ok(None);
         };
-        let paths = Arc::new(device_paths(catalog, sync.version, &sync.settings)?);
+        let paths = Arc::new(device_paths(
+            catalog,
+            sync.version,
+            &sync.settings,
+            &separator,
+        )?);
         *cached = Some(paths.clone());
         Ok(Some(paths))
     }
@@ -388,7 +400,7 @@ mod tests {
                 .collect(),
         };
         let settings = settings.normalize().unwrap();
-        let p = device_paths(catalog, 1, &settings).unwrap();
+        let p = device_paths(catalog, 1, &settings, crate::rules::DEFAULT_SEPARATOR).unwrap();
         let files = p.files.into_iter().map(|f| f.path).collect();
         (files, p.incomplete, p.renamed)
     }
@@ -457,6 +469,17 @@ mod tests {
             ]
         );
         assert_eq!((incomplete, renamed), (1, 1));
+    }
+
+    #[test]
+    fn an_own_structure_names_folders_by_the_first_value() {
+        let track = r#"{"album_artist":"Ado;Eve","album":"Kyougen","title":"Usseewa"}"#;
+        let own = DeviceSettings {
+            structure: Some("{album_artist}/{album}/{title}".into()),
+            ..Default::default()
+        };
+        let (got, _, _) = paths(&[("x/1.flac", track)], own);
+        assert_eq!(got, ["Ado/Kyougen/Usseewa.flac"]);
     }
 
     #[test]
