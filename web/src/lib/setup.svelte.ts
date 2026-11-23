@@ -129,8 +129,12 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			substitutions: s.rules.substitutions,
 			collections: s.rules.collections
 		};
-		// A report on albums in another folder or structure goes.
-		if (this.saved.folder !== was.folder || this.saved.structure !== was.structure)
+		// A report on albums in another folder, structure or separator goes.
+		if (
+			this.saved.folder !== was.folder ||
+			this.saved.structure !== was.structure ||
+			this.saved.separator !== was.separator
+		)
 			this.unmoved = [];
 		const requiredKept =
 			this.required.size === was.required.length &&
@@ -199,11 +203,14 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 		if (this.moving) return;
 		this.moving = true;
 		const n = (k: number, one: string) => `${count(k)} ${k === 1 ? one : `${one}s`}`;
-		const { folder, structure } = this.saved;
+		const { folder, structure, separator } = this.saved;
 		try {
 			const r = await api.restructureLibrary();
-			// Kept only while it's about the folder and structure it was made in.
-			const kept = this.saved.folder === folder && this.saved.structure === structure;
+			// Kept only while it's about the folder, structure and separator it was made in.
+			const kept =
+				this.saved.folder === folder &&
+				this.saved.structure === structure &&
+				this.saved.separator === separator;
 			if (kept) this.unmoved = r.failed;
 			if (r.albums)
 				toast(
@@ -215,7 +222,7 @@ class LibrarySetupStore extends SetupStore<SetupResponse> {
 			if (r.failed.length)
 				toast(
 					`${n(r.failed.length, 'album')} couldn't be moved: ` +
-						(kept ? 'see Library setup' : 'the Library folder or structure changed meanwhile'),
+						(kept ? 'see Library setup' : 'the Library setup changed meanwhile'),
 					'error',
 					8000
 				);

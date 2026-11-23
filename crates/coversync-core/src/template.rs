@@ -475,7 +475,11 @@ pub fn one_disc(values: &HashMap<&'static str, String>) -> bool {
 
 /// A variable's value as names use it: a tag that holds several gives its
 /// first (see [`Template::with_separator`]).
-fn value(values: &HashMap<&'static str, String>, var: &str, separator: &str) -> Option<String> {
+pub(crate) fn value(
+    values: &HashMap<&'static str, String>,
+    var: &str,
+    separator: &str,
+) -> Option<String> {
     let get = |k: &str| values.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
     match var {
         YEAR => year(get("date")?).map(str::to_string),
@@ -491,12 +495,15 @@ fn value(values: &HashMap<&'static str, String>, var: &str, separator: &str) -> 
             let v = get(var)?;
             Some(v.split('/').next().unwrap_or(v).trim().to_string())
         }
-        _ if split::holds_several(var) && !separator.trim().is_empty() => values
-            .get(var)?
-            .split(separator)
-            .map(str::trim)
-            .find(|v| !v.is_empty())
-            .map(str::to_string),
+        _ if split::holds_several(var) && !separator.trim().is_empty() => {
+            let whole = get(var)?;
+            let first = values[var]
+                .split(separator)
+                .map(str::trim)
+                .find(|v| !v.is_empty());
+            // Nothing but separators: the value as it is.
+            Some(first.unwrap_or(whole).to_string())
+        }
         _ => get(var).map(str::to_string),
     }
 }
@@ -693,8 +700,11 @@ mod tests {
             with("A;B").unwrap(),
             PathBuf::from("A;B/Steins; Gate/Steins; Gate OST/Anime - A; B.flac")
         );
-        // Nothing but separators is no value.
-        assert_eq!(with(" ; ; ").unwrap_err(), ["album_artist"]);
+        // Nothing but separators stays as it is.
+        assert_eq!(
+            with(" ; ; ").unwrap(),
+            PathBuf::from("; ;/Steins; Gate/Steins; Gate OST/Anime - A; B.flac")
+        );
         // Without a separator, nothing is split.
         assert_eq!(
             Template::parse(structure)

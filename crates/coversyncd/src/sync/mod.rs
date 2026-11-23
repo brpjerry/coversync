@@ -31,7 +31,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use coversync_core::art::Art;
-use coversync_core::model::LibraryVersion;
 use coversync_protocol::Capabilities;
 use tokio::sync::{broadcast, watch};
 
@@ -84,8 +83,9 @@ pub struct SyncState {
 
 /// A target, with what it was worked out from.
 struct Cached {
-    library: LibraryVersion,
-    root: PathBuf,
+    /// The device's paths, as `PathCache` gave them: new ones (another
+    /// Library version or folder, or separator) make a new target.
+    paths: Arc<coversync_core::sync::DevicePaths>,
     settings_version: i64,
     capabilities: Capabilities,
     covers_made: u64,
@@ -179,8 +179,7 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
     {
         let cached = state.sync.targets.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cached.get(&device)
-            && c.library == paths.library
-            && c.root == paths.root
+            && Arc::ptr_eq(&c.paths, &paths)
             && c.art_seen == art_seen
             && c.settings_version == sync.version
             && c.capabilities == capabilities
@@ -225,8 +224,7 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         .insert(
             device,
             Cached {
-                library: paths.library.clone(),
-                root: paths.root.clone(),
+                paths: paths.clone(),
                 art_seen,
                 settings_version: sync.version,
                 capabilities,
@@ -341,7 +339,8 @@ fn make_cover(dir: &Path, w: &CoverWanted) -> anyhow::Result<CoverFile> {
 
 /// Watch for changes that move devices' targets: the Library's version
 /// (which also goes up as files are hashed) and folder, devices' settings,
-/// and albums' art. Each
+/// albums' art, and Library setup's separator (folder names a device's own
+/// structure makes take a tag's first value). Each
 /// device's target is worked out again then, so its `changed_at` is when
 /// the change happened rather than when the device next asked, and event
 /// streams hear of it.
@@ -381,7 +380,8 @@ pub fn spawn_watcher(state: Shared) {
                     digest.update(version.as_bytes());
                     digest.update(b"\n");
                 }
-                Some((library, settings, digest.finalize()))
+                let separator = s.lib.library_setup().ok()?.rules.separator;
+                Some((library, settings, digest.finalize(), separator))
             })
             .await
             .ok()

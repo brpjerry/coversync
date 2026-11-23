@@ -268,37 +268,26 @@ pub fn read_album(
 }
 
 /// Album-wide kinds among the folder structure's `variables` on which
-/// `tracks` differ, which would spread the album over several folders.
-/// Dates count by year when the structure shows only the year. A track
+/// `tracks` differ as names show them, which would spread the album over
+/// several folders: dates by year when the structure shows only the year,
+/// tags that hold several values by the first `separator` joins. A track
 /// without a value differs from one with it: an optional part would be left
 /// out for one and not the other.
 fn disagreeing(
     variables: &[&'static str],
     tracks: &[&HashMap<&'static str, String>],
+    separator: &str,
 ) -> Vec<&'static str> {
     let mut out = Vec::new();
     for v in variables {
-        let (kind, year) = if *v == template::YEAR {
-            ("date", true)
-        } else {
-            (*v, false)
-        };
+        let kind = if *v == template::YEAR { "date" } else { *v };
         if !rules::ALBUM_KINDS.contains(&kind) || out.contains(&kind) {
             continue;
         }
-        let mut seen: Vec<&str> = Vec::new();
-        for track in tracks {
-            let value = track.get(kind).map_or("", |v| v.trim());
-            let value = if year {
-                template::year(value).unwrap_or(value)
-            } else {
-                value
-            };
-            if !seen.contains(&value) {
-                seen.push(value);
-            }
-        }
-        if seen.len() > 1 {
+        let mut shown = tracks.iter().map(|t| template::value(t, v, separator));
+        if let Some(first) = shown.next()
+            && shown.any(|v| v != first)
+        {
             out.push(kind);
         }
     }
@@ -595,7 +584,7 @@ pub fn plan(
         .filter(|k| tracks.iter().any(|(_, t)| t.missing.contains(k)))
         .collect();
     let values: Vec<_> = tracks.iter().map(|(_, t)| &t.values).collect();
-    let mut disagree = disagreeing(&shown_vars, &values);
+    let mut disagree = disagreeing(&shown_vars, &values, &setup.rules.separator);
     // One album's discs are named alike only if every track counts the
     // same number of discs.
     if template.counts_discs()
@@ -927,15 +916,23 @@ mod tests {
         let c = track(&[("album", "chiptune collection 1"), ("title", "c")]);
         let vars = ["album_artist", "album", "year", "track_number", "title"];
         // Case alone makes another folder; one year is one folder.
-        assert_eq!(disagreeing(&vars, &[&a, &b]), ["album"]);
+        assert_eq!(disagreeing(&vars, &[&a, &b], ";"), ["album"]);
         // A track without a date differs from those with one.
-        assert_eq!(disagreeing(&vars, &[&a, &b, &c]), ["album", "date"]);
+        assert_eq!(disagreeing(&vars, &[&a, &b, &c], ";"), ["album", "date"]);
         // None has an album artist: that's alike.
-        assert!(!disagreeing(&vars, &[&a, &c]).contains(&"album_artist"));
+        assert!(!disagreeing(&vars, &[&a, &c], ";").contains(&"album_artist"));
         // The full date, when the structure shows it.
-        assert_eq!(disagreeing(&["date"], &[&a, &b]), ["date"]);
+        assert_eq!(disagreeing(&["date"], &[&a, &b], ";"), ["date"]);
         // Titles are per track.
-        assert!(disagreeing(&["title"], &[&a, &b]).is_empty());
+        assert!(disagreeing(&["title"], &[&a, &b], ";").is_empty());
+        // Names show a tag's first value: only that has to agree.
+        let ado = |credit: &str| track(&[("album_artist", credit)]);
+        let (eve, rin, first_eve) = (ado("Ado;Eve"), ado("Ado; Rin"), ado("Eve;Ado"));
+        assert!(disagreeing(&["album_artist"], &[&eve, &rin], ";").is_empty());
+        assert_eq!(
+            disagreeing(&["album_artist"], &[&eve, &first_eve], ";"),
+            ["album_artist"]
+        );
     }
 
     #[test]

@@ -164,7 +164,8 @@ pub struct DevicePaths {
     #[serde(skip)]
     pub root: PathBuf,
     pub settings_version: i64,
-    /// Library setup's separator, whose first value names folders.
+    /// Library setup's separator, whose first value names the folders of a
+    /// device's own structure; blank when it follows the Library's.
     #[serde(skip)]
     pub separator: String,
     /// Tracks with no value for a variable of the device's own folder
@@ -338,7 +339,12 @@ impl PathCache {
         let Some((library, root)) = lib.sync_location()? else {
             return Ok(None);
         };
-        let separator = lib.library_setup()?.rules.separator;
+        // Only a device's own structure names folders by tag values.
+        let own = sync.settings.structure.is_some();
+        let separator = match own {
+            true => lib.library_setup()?.rules.separator,
+            false => String::new(),
+        };
         if let Some(paths) = cached.as_ref()
             && paths.settings_version == sync.version
             && paths.library == library
@@ -347,7 +353,6 @@ impl PathCache {
         {
             return Ok(Some(paths.clone()));
         }
-        let own = sync.settings.structure.is_some();
         let Some(catalog) = lib.sync_catalog(own)? else {
             return Ok(None);
         };

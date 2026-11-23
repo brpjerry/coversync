@@ -283,6 +283,28 @@ fn names_are_split_at_library_setups_phrases() {
 }
 
 #[test]
+fn tracks_need_only_the_first_album_artist_alike() {
+    let s = setup("first", "{album_artist}/{album}/<{track_number} - >{title}");
+    let inbox = s.root.parent().unwrap().join("Inbox/Record");
+    for (n, credit) in [(1, "Ado;Eve"), (2, "Ado;Rin")] {
+        let edit = TagEdit {
+            album_artist: Some(credit.into()),
+            ..Default::default()
+        };
+        tags::write(&inbox.join(format!("{n}.flac")), &edit).unwrap();
+    }
+    let plan = s.plan([&[], &[]]);
+    assert!(plan.disagree.is_empty(), "{:?}", plan.disagree);
+    assert_eq!(
+        s.dests(&plan),
+        ["Ado/Record/01 - One.flac", "Ado/Record/02 - Two.flac"]
+    );
+    // Not when the first differs.
+    let plan = s.plan([&[], &[("album_artist", "Eve;Ado")]]);
+    assert_eq!(plan.disagree, ["album_artist"]);
+}
+
+#[test]
 fn substitutions_change_tags_on_import_once_names_are_split() {
     let s = setup(
         "substitute",

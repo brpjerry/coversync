@@ -900,8 +900,10 @@ export const api = {
 		request<MbArt | null>(
 			`/api/musicbrainz/art/${release_id}?front=${front}` + (group ? `&group=${group}` : '')
 		),
-	preview: (structure: string) =>
-		request<StructurePreview>(`/api/library/preview?structure=${encodeURIComponent(structure)}`),
+	preview: (structure: string, separator: string) =>
+		request<StructurePreview>(
+			`/api/library/preview?${new URLSearchParams({ structure, separator })}`
+		),
 	/** `uploads`: check it as an uploads folder, which only the folder holding it can make. */
 	checkFolder: (path: string, uploads = false) =>
 		request<FolderStatus | null>(

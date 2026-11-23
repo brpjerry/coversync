@@ -178,12 +178,13 @@
 
 	// Moving every album to fit the folder structure (see setup.moveAll): asked first.
 	let confirmingMove = $state(false);
-	/** Why albums can't be moved now, if they can't: only to the saved folder and structure. */
+	/** Why albums can't be moved now, if they can't: only to the saved folder, structure and separator. */
 	let moveBlocked = $derived.by(() => {
 		if (setup.saving) return 'Wait for Library setup to be saved';
 		if (!setup.saved.folder) return 'Choose a Library folder first';
 		if (setup.folder.trim() !== setup.saved.folder) return 'Save the new Library folder first';
 		if (setup.structure.trim() !== setup.saved.structure) return 'Save the new structure first';
+		if (setup.separator !== setup.saved.separator) return 'Save the new separator first';
 		return null;
 	});
 	async function moveAll() {
@@ -261,6 +262,7 @@
 			<div class="card-body">
 				<StructureField
 					bind:value={setup.structure}
+					separator={setup.separator}
 					folder={setup.folder}
 					suggestions={setup.suggestions}
 					variables={setup.variables}

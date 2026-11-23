@@ -10,6 +10,8 @@
 
 	interface Props {
 		value: string;
+		/** Library setup's separator: names take the first of a tag's values. */
+		separator: string;
 		/** The library folder, shown in front of the previewed paths. */
 		folder: string;
 		suggestions: string[];
@@ -20,6 +22,7 @@
 	}
 	let {
 		value = $bindable(),
+		separator,
 		folder,
 		suggestions,
 		variables,
@@ -36,10 +39,11 @@
 	$effect(() => {
 		void session.generation;
 		const structure = value.trim();
+		const sep = separator;
 		const mine = ++seq;
 		const timer = setTimeout(async () => {
 			try {
-				const p = await api.preview(structure);
+				const p = await api.preview(structure, sep);
 				if (mine === seq) preview = p;
 			} catch {
 				// The preview is a convenience; saving still validates.

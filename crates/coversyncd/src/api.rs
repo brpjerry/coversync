@@ -633,6 +633,8 @@ async fn folder_check(
 #[derive(Deserialize)]
 struct PreviewQuery {
     structure: String,
+    /// The separator being edited; Library setup's when left out.
+    separator: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -658,7 +660,10 @@ async fn structure_preview(
 ) -> ApiResult<Json<Preview>> {
     blocking(&state, move |s| {
         let t = match Template::parse(&q.structure) {
-            Ok(t) => t.with_separator(&s.lib.library_setup()?.rules.separator),
+            Ok(t) => t.with_separator(&match q.separator {
+                Some(separator) => separator,
+                None => s.lib.library_setup()?.rules.separator,
+            }),
             Err(e) => {
                 return Ok(Preview {
                     error: Some(e.to_string()),
