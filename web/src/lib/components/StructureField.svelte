@@ -43,7 +43,8 @@
 		const mine = ++seq;
 		const timer = setTimeout(async () => {
 			try {
-				const p = await api.preview(structure, sep);
+				// A device's goes by the daemon's saved separator, which this page may not have yet.
+				const p = await api.preview(structure, device ? undefined : sep);
 				if (mine === seq) preview = p;
 			} catch {
 				// The preview is a convenience; saving still validates.

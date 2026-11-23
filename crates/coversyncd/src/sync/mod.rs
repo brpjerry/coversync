@@ -26,7 +26,7 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -84,8 +84,9 @@ pub struct SyncState {
 /// A target, with what it was worked out from.
 struct Cached {
     /// The device's paths, as `PathCache` gave them: new ones (another
-    /// Library version or folder, or separator) make a new target.
-    paths: Arc<coversync_core::sync::DevicePaths>,
+    /// Library version or folder, or separator) make a new target. Weak, so
+    /// replaced paths are freed.
+    paths: Weak<coversync_core::sync::DevicePaths>,
     settings_version: i64,
     capabilities: Capabilities,
     covers_made: u64,
@@ -179,7 +180,7 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
     {
         let cached = state.sync.targets.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cached.get(&device)
-            && Arc::ptr_eq(&c.paths, &paths)
+            && c.paths.ptr_eq(&Arc::downgrade(&paths))
             && c.art_seen == art_seen
             && c.settings_version == sync.version
             && c.capabilities == capabilities
@@ -224,7 +225,7 @@ pub fn target(state: &Shared, device: i64) -> Result<Arc<Target>, NoTarget> {
         .insert(
             device,
             Cached {
-                paths: paths.clone(),
+                paths: Arc::downgrade(&paths),
                 art_seen,
                 settings_version: sync.version,
                 capabilities,
@@ -356,10 +357,17 @@ pub fn spawn_watcher(state: Shared) {
             let s = state.clone();
             let now = tokio::task::spawn_blocking(move || {
                 let library = s.lib.sync_location().ok()?;
-                let mut settings: Vec<(i64, i64)> = s
-                    .auth
-                    .device_syncs()
-                    .ok()?
+                let devices = s.auth.device_syncs().ok()?;
+                // Only a device's own structure names folders by tag values.
+                let separator = match library.is_some()
+                    && devices
+                        .iter()
+                        .any(|(_, sync)| sync.settings.structure.is_some())
+                {
+                    true => Some(s.lib.library_setup().ok()?.rules.separator),
+                    false => None,
+                };
+                let mut settings: Vec<(i64, i64)> = devices
                     .into_iter()
                     .map(|(id, sync)| (id, sync.version))
                     .collect();
@@ -380,7 +388,6 @@ pub fn spawn_watcher(state: Shared) {
                     digest.update(version.as_bytes());
                     digest.update(b"\n");
                 }
-                let separator = s.lib.library_setup().ok()?.rules.separator;
                 Some((library, settings, digest.finalize(), separator))
             })
             .await
