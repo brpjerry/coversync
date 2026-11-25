@@ -1058,8 +1058,7 @@
 		// a Library album's files are what devices sync.
 		if (collection === 'inbox') dataGeneration++;
 		else devices.readSyncAll();
-		// This page's own batch reloads the grids once it's done, not after each album.
-		if (collection === 'inbox' || !tagSaves.running) loadAlbums();
+		loadAlbums();
 		enqueue({ kind: 'notice', id, previous: previous_id, version });
 	}
 
@@ -1565,7 +1564,10 @@
 
 	/** The structure names the tag: `{kind}`, or with a length limit, `{kind:40}`. */
 	const names = (structure: string, kind: BatchKind) =>
-		new RegExp(`\\{\\s*${kind}\\s*(:\\s*\\+?\\d+\\s*)?\\}`).test(structure);
+		new RegExp(
+			`\\{\\p{White_Space}*${kind}\\p{White_Space}*(:\\p{White_Space}*\\+?\\d+\\p{White_Space}*)?\\}`,
+			'u'
+		).test(structure);
 	const inStructure = (kind: BatchKind) => names(setup.saved.structure, kind);
 	/**
 	 * Library setup needs the tag: a required one, or one the folder structure
@@ -1654,7 +1656,8 @@
 			bad.length ? 'error' : 'success',
 			// Kept until dismissed: it's the only way to the albums that need a look.
 			bad.length ? 0 : 7000,
-			bad.length ? { label: 'Show', run: () => (problems = bad) } : undefined
+			// Show stays: the list it opens may be read while another edit is open, to come back to.
+			bad.length ? { label: 'Show', run: () => (problems = bad), keep: true } : undefined
 		);
 	}
 

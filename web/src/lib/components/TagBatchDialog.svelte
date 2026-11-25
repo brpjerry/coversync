@@ -104,8 +104,14 @@
 	readAll();
 
 	/** A value as saving writes it: trimmed of white space as the daemon trims it (U+0085 too). */
-	const clean = (v: string | null) =>
-		v?.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '') ?? null;
+	function clean(v: string | null) {
+		// Each run of white space matched once (an unanchored `\s+$` retries along a long one).
+		return (
+			v?.replace(/\p{White_Space}+/gu, (space, at: number) =>
+				at === 0 || at + space.length === v.length ? '' : space
+			) ?? null
+		);
+	}
 	/** Whether the field was changed: a mixed text field left empty keeps each album's own. */
 	function changed(kind: BatchKind): boolean {
 		const value = clean(values[kind]);
@@ -145,7 +151,8 @@
 	}
 
 	function save() {
-		if (reading || !edited.length || blocked) return;
+		// Once: a second click (or Ctrl+Enter) while it closes would send the batch again.
+		if (closed || reading || !edited.length || blocked) return;
 		const set: BatchSet = {};
 		for (const kind of edited) set[kind] = clean(values[kind]) ?? '';
 		closed = true;
