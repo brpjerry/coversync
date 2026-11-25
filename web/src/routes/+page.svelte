@@ -1173,12 +1173,12 @@
 			{ label: 'Play', icon: Play, run: () => playAlbum(a) }
 		];
 		const chosen = selected.has(a.id);
+		items.push({
+			label: chosen ? 'Deselect' : 'Select',
+			icon: chosen ? Square : SquareCheck,
+			run: () => select(a, null)
+		});
 		if (a.collection === 'library') {
-			items.push({
-				label: chosen ? 'Deselect' : 'Select',
-				icon: chosen ? Square : SquareCheck,
-				run: () => select(a, null)
-			});
 			if (chosen && selected.size > 1)
 				items.push('separator', {
 					label: `Edit tags of ${selected.size} selected…`,
@@ -1189,11 +1189,6 @@
 		}
 		if (a.collection === 'inbox') {
 			items.push(
-				{
-					label: chosen ? 'Deselect' : 'Select',
-					icon: chosen ? Square : SquareCheck,
-					run: () => select(a, null)
-				},
 				'separator',
 				chosen && selected.size > 1
 					? {
@@ -1851,6 +1846,9 @@
 			selecting &&
 			gridShown &&
 			!overlay &&
+			// Not the albums behind an album sheet or import dialog.
+			!sheetAlbum &&
+			!importing &&
 			(e.ctrlKey || e.metaKey) &&
 			e.key.toLowerCase() === 'a' &&
 			!typing(e)

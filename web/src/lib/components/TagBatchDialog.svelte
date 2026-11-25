@@ -288,8 +288,7 @@
 					<FolderTree size={14} />
 					<span
 						>{moving.join(' and ')}
-						{moving.length === 1 ? 'is' : 'are'} in the folder structure: albums move to fit when they're
-						saved.</span
+						{moving.length === 1 ? 'is' : 'are'} in the folder structure: saving may move albums.</span
 					>
 				{/if}
 			</p>
@@ -325,12 +324,13 @@
 		width: min(560px, 100%);
 		max-height: calc(100dvh - 48px);
 		display: grid;
-		grid-template-rows: auto minmax(0, 1fr) auto;
+		/* A short window scrolls the dialog rather than squeeze its fields to nothing. */
+		grid-template-rows: auto minmax(6rem, 1fr) auto;
 		border-radius: 24px;
 		background: var(--bg-raised);
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 40px 120px -30px rgb(0 0 0 / 0.75);
-		overflow: hidden;
+		overflow: hidden auto;
 		outline: none;
 	}
 	header {

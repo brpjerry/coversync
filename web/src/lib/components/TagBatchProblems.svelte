@@ -56,6 +56,7 @@
 						{#if item.album.has_cover}<img
 								src={coverUrl(item.album, 256)}
 								alt=""
+								loading="lazy"
 								onerror={(e) => ((e.currentTarget as HTMLImageElement).hidden = true)}
 							/>{:else}<Disc3 size={18} strokeWidth={1.4} />{/if}
 					</span>
@@ -79,7 +80,8 @@
 	.scrim {
 		position: fixed;
 		inset: 0;
-		z-index: 45;
+		/* Over the import dialogs it can be opened on (45), under the toasts (50). */
+		z-index: 46;
 		display: grid;
 		grid-template-columns: minmax(0, 1fr);
 		place-items: center;
@@ -91,12 +93,13 @@
 		width: min(640px, 100%);
 		max-height: calc(100dvh - 48px);
 		display: grid;
-		grid-template-rows: auto minmax(0, 1fr) auto;
+		/* A short window scrolls the dialog rather than squeeze its list to nothing. */
+		grid-template-rows: auto minmax(6rem, 1fr) auto;
 		border-radius: 24px;
 		background: var(--bg-raised);
 		border: 1px solid var(--border-strong);
 		box-shadow: 0 40px 120px -30px rgb(0 0 0 / 0.75);
-		overflow: hidden;
+		overflow: hidden auto;
 	}
 	header {
 		padding: 22px 24px 12px;

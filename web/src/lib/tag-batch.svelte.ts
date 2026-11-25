@@ -129,6 +129,8 @@ export class TagSaves {
 			item.status = 'saving';
 			this.hooks.progress?.(this);
 			await save(item);
+			// Done with: the report keeps the album and what went wrong, not its tracks.
+			item.tags = null;
 			this.done++;
 		}
 		const all = this.items;
