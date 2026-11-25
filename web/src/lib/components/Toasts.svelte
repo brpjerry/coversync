@@ -26,7 +26,7 @@
 					class="action"
 					onclick={() => {
 						t.action?.run();
-						dismiss(t.id);
+						if (!t.action?.keep) dismiss(t.id);
 					}}>{t.action.label}</button
 				>
 			{/if}

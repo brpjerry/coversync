@@ -19,6 +19,9 @@
 	import ListChecks from '@lucide/svelte/icons/list-checks';
 	import SquareCheck from '@lucide/svelte/icons/square-check';
 	import Square from '@lucide/svelte/icons/square';
+	import Tags from '@lucide/svelte/icons/tags';
+	import FolderTree from '@lucide/svelte/icons/folder-tree';
+	import ChevronDown from '@lucide/svelte/icons/chevron-down';
 	import {
 		api,
 		ApiError,
@@ -56,6 +59,8 @@
 	import { notify } from '#lib/notify.ts';
 	import { dismiss, toast, update, type ToastAction } from '#lib/toast.svelte.ts';
 	import { ImportBatch, type BatchItem } from '#lib/batch.svelte.ts';
+	import { TagSaves, type BatchKind, type SaveItem, type SaveJob } from '#lib/tag-batch.svelte.ts';
+	import { drafts } from '#lib/drafts.svelte.ts';
 	import TopBar from '#lib/components/TopBar.svelte';
 	import SortMenu from '#lib/components/SortMenu.svelte';
 	import Sidebar from '#lib/components/Sidebar.svelte';
@@ -73,6 +78,8 @@
 	import SelectionBar from '#lib/components/SelectionBar.svelte';
 	import BatchBar from '#lib/components/BatchBar.svelte';
 	import BatchSummary from '#lib/components/BatchSummary.svelte';
+	import TagBatchDialog from '#lib/components/TagBatchDialog.svelte';
+	import TagBatchProblems from '#lib/components/TagBatchProblems.svelte';
 	import UploadButton from '#lib/components/UploadButton.svelte';
 	import UploadsPanel from '#lib/components/UploadsPanel.svelte';
 	import { uploads, UploadsUnavailable } from '#lib/uploads.svelte.ts';
@@ -242,23 +249,29 @@
 		filterKinds.includes('attention') && !!filters[browsing].attention?.length
 	);
 
-	// Selecting Inbox albums, to import them one after another (see ImportBatch).
+	// Selecting albums: Inbox ones to import them one after another (see
+	// ImportBatch), Library ones to edit their tags together (see TagSaves).
 	let selecting = $state(false);
-	/** The ids of the Inbox albums selected, those the search and filters hide included. */
+	/** The ids of the albums selected, in the grid browsed, those the search and filters hide included. */
 	const selected = new SvelteSet<string>();
 	/** The album a Shift-click selects from. */
 	let anchor: string | null = null;
-	// Albums that leave the Inbox (imported, hidden, gone in a rescan) leave the selection.
+	/** An album grid is shown (not a setup screen). */
+	let gridShown = $derived(view === 'inbox' || view === 'library');
+	// Each grid's selection is its own: going to the other one ends it.
 	$effect(() => {
-		const inbox = new Set(albums.map((a) => a.id));
+		void browsing;
+		untrack(stopSelecting);
+	});
+	// Albums that leave the grid (imported, hidden, gone in a rescan, moved by a save) leave the selection.
+	$effect(() => {
+		const here = new Set(source.map((a) => a.id));
 		untrack(() => {
-			for (const id of selected) if (!inbox.has(id)) selected.delete(id);
+			for (const id of selected) if (!here.has(id)) selected.delete(id);
 		});
 	});
-	/** Inbox albums the search and filters leave. */
-	let shownInbox = $derived(browsing === 'inbox' ? visible : []);
 	let selectedHidden = $derived.by(() => {
-		const shown = new Set(shownInbox.map((a) => a.id));
+		const shown = new Set(visible.map((a) => a.id));
 		return [...selected].filter((id) => !shown.has(id)).length;
 	});
 
@@ -266,7 +279,7 @@
 	function select(album: Album, e: MouseEvent | null) {
 		selecting = true;
 		if (e?.shiftKey && anchor && anchor !== album.id) {
-			const ids = shownInbox.map((a) => a.id);
+			const ids = visible.map((a) => a.id);
 			const [from, to] = [ids.indexOf(anchor), ids.indexOf(album.id)];
 			if (from >= 0 && to >= 0) {
 				for (const id of ids.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(id);
@@ -368,7 +381,8 @@
 	});
 
 	$effect(() => {
-		document.documentElement.style.overflow = sheetAlbum || importing || batchShown ? 'hidden' : '';
+		document.documentElement.style.overflow =
+			sheetAlbum || importing || batchShown || tagDialog || problems ? 'hidden' : '';
 	});
 
 	// Room the player takes at the bottom of the window, for bars that float above it.
@@ -1158,14 +1172,23 @@
 			{ label: 'Open', icon: PanelTopOpen, run: () => open(a) },
 			{ label: 'Play', icon: Play, run: () => playAlbum(a) }
 		];
+		const chosen = selected.has(a.id);
+		items.push({
+			label: chosen ? 'Deselect' : 'Select',
+			icon: chosen ? Square : SquareCheck,
+			run: () => select(a, null)
+		});
+		if (a.collection === 'library') {
+			if (chosen && selected.size > 1)
+				items.push('separator', {
+					label: `Edit tags of ${selected.size} selected…`,
+					icon: Tags,
+					primary: true,
+					run: editSelected
+				});
+		}
 		if (a.collection === 'inbox') {
-			const chosen = selected.has(a.id);
 			items.push(
-				{
-					label: chosen ? 'Deselect' : 'Select',
-					icon: chosen ? Square : SquareCheck,
-					run: () => select(a, null)
-				},
 				'separator',
 				chosen && selected.size > 1
 					? {
@@ -1330,12 +1353,12 @@
 		return true;
 	}
 
-	// Leaving the page while a batch's imports are on their way can stop those
-	// the browser hasn't sent yet: ask first.
+	// Leaving the page while a batch's imports, or tag saves, are on their way
+	// can stop those the browser hasn't sent yet: ask first.
 	onMount(() => {
 		const leaving = (e: BeforeUnloadEvent) => {
 			// Any batch's: a summary closed early leaves its imports going.
-			if (importRequests) e.preventDefault();
+			if (importRequests || tagSaves.running) e.preventDefault();
 		};
 		addEventListener('beforeunload', leaving);
 		return () => removeEventListener('beforeunload', leaving);
@@ -1488,6 +1511,167 @@
 		if (batch === b) batch = null;
 	}
 
+	// Several Library albums' tags edited together (Edit tags…, Collection ▾):
+	// saved one album after another, in the background.
+	const tagSaves = new TagSaves({ progress: savesProgress, finished: savesFinished });
+	/** The progress toast of the saves running. */
+	let savesToast: number | null = null;
+	/** The Edit tags dialog, for these albums. */
+	let tagDialog = $state<{ albums: Album[] } | null>(null);
+	/** The albums of the last run that weren't saved as asked, listed. */
+	let problems = $state<SaveItem[] | null>(null);
+	/** A dialog over the grid: the import batch, or Edit tags of several albums, or its problems. */
+	let overlay = $derived(batchShown || !!tagDialog || !!problems);
+	// Signing out asks first while saves are left.
+	$effect(() => {
+		drafts.saves = tagSaves.running;
+	});
+
+	/** The Library albums selected, in the grid's order. */
+	const selectedLibrary = () => sorted(library, activeSort).filter((a) => selected.has(a.id));
+	/** Edit tags… or Collection ▾ asked for last: the one that opens once setup is read. */
+	let opening = 0;
+
+	/**
+	 * Library setup is read, for what it needs (see `needed`) and its
+	 * collections, and the albums are still selected in the Library.
+	 */
+	async function tagSetupReady(): Promise<boolean> {
+		const mine = ++opening;
+		await setup.load();
+		if (mine !== opening) return false;
+		if (view !== 'library' || !selecting || !selected.size || overlay || sheetAlbum) return false;
+		if (!setup.loaded) toast("Couldn't read Library setup. Try again.", 'error', 6000);
+		return setup.loaded;
+	}
+
+	async function editSelected() {
+		if (await tagSetupReady()) tagDialog = { albums: selectedLibrary() };
+	}
+
+	/** Save these albums' tags; the selection clears for the next batch. */
+	function saveTags(jobs: SaveJob[]) {
+		tagDialog = null;
+		selected.clear();
+		anchor = null;
+		void tagSaves.add(jobs);
+	}
+
+	/** The structure names the tag: `{kind}`, or with a length limit, `{kind:40}`. */
+	const names = (structure: string, kind: BatchKind) =>
+		new RegExp(
+			`\\{\\p{White_Space}*${kind}\\p{White_Space}*(:\\p{White_Space}*\\+?\\d+\\p{White_Space}*)?\\}`,
+			'u'
+		).test(structure);
+	const inStructure = (kind: BatchKind) => names(setup.saved.structure, kind);
+	/**
+	 * Library setup needs the tag: a required one, or one the folder structure
+	 * can't leave out (outside its optional `< >` parts; `{collection}` it always can).
+	 */
+	const needed = (kind: BatchKind) =>
+		setup.saved.required.includes(kind) ||
+		(kind !== 'collection' && names(setup.saved.structure.replace(/<[^>]*>/g, ''), kind));
+
+	/** Values the Edit tags dialog suggests: the Library's album artists and genres. */
+	let tagSuggestions = $derived.by(() => {
+		const values = (pick: (a: Album) => string | null) =>
+			[...new Set(library.map(pick).filter((v): v is string => !!v))].sort(cmp);
+		return { album_artist: values((a) => a.artist), genre: values((a) => a.genre) };
+	});
+
+	// Collection ▾ in the Library's selection bar: move the albums selected to one.
+	let collectionMenu = $state<{ x: number; y: number } | null>(null);
+	/** Its button: the menu reads it as it closes (to give it focus back), so it outlives the menu. */
+	let collectionButton = $state<HTMLElement>();
+	// Closed with the selection it was opened for.
+	$effect(() => {
+		if (view !== 'library' || !selected.size) collectionMenu = null;
+	});
+	let collectionItems = $derived.by((): MenuEntry[] => [
+		// None only when Library setup doesn't require a collection.
+		...[...(needed('collection') ? [] : ['']), ...setup.saved.collections].map((c) => ({
+			label: c || 'None',
+			icon: FolderTree,
+			run: () => saveTags(selectedLibrary().map((album) => ({ album, set: { collection: c } })))
+		})),
+		'separator',
+		{ label: 'Collections…', icon: Settings2, run: () => setView('collections-setup') }
+	]);
+	async function openCollectionMenu(e: MouseEvent) {
+		const button = e.currentTarget as HTMLElement;
+		if (collectionMenu) return void (collectionMenu = null);
+		if (!(await tagSetupReady()) || !button.isConnected) return;
+		collectionButton = button;
+		const r = button.getBoundingClientRect();
+		collectionMenu = { x: r.left, y: r.top - 6 };
+	}
+
+	function savesProgress(s: TagSaves) {
+		if (!s.running) return;
+		const total = s.items.length;
+		const done = s.done;
+		const text = `Saving tags: ${count(Math.min(done + 1, total))} of ${count(total)} ${total === 1 ? 'album' : 'albums'}…`;
+		if (savesToast === null) savesToast = toast(text, 'progress', 0);
+		else update(savesToast, text);
+	}
+
+	/** One toast for the run: what was saved and moved, and which albums need a look. */
+	function savesFinished(items: SaveItem[]) {
+		if (savesToast !== null) dismiss(savesToast);
+		savesToast = null;
+		loadAlbums();
+		const albumsOf = (n: number) => `${count(n)} ${n === 1 ? 'album' : 'albums'}`;
+		const bad = items.filter((i) => i.problem);
+		const ok = items.filter((i) => i.status === 'saved' && !i.problem).length;
+		const same = items.filter((i) => i.status === 'unchanged').length;
+		const moved = items.reduce((n, i) => n + i.moved, 0);
+		if (!ok && !bad.length) {
+			toast(
+				same === 1
+					? 'Nothing to save: the album has these tags already'
+					: `Nothing to save: the ${albumsOf(same)} have these tags already`,
+				'info'
+			);
+			return;
+		}
+		const parts = [];
+		if (ok) parts.push(`Saved ${albumsOf(ok)}`);
+		if (moved)
+			parts.push(
+				`moved ${count(moved)} ${moved === 1 ? 'file' : 'files'} to fit the folder structure`
+			);
+		if (same) parts.push(`${count(same)} had these tags already`);
+		if (bad.length)
+			parts.push(
+				`${ok ? count(bad.length) : albumsOf(bad.length)} ${bad.length === 1 ? "wasn't" : "weren't"} saved as asked`
+			);
+		const text = parts.join(' · ');
+		toast(
+			text.charAt(0).toUpperCase() + text.slice(1),
+			bad.length ? 'error' : 'success',
+			// Kept until dismissed: it's the only way to the albums that need a look.
+			bad.length ? 0 : 7000,
+			// Show stays: the list it opens may be read while another edit is open, to come back to.
+			bad.length ? { label: 'Show', run: () => (problems = bad), keep: true } : undefined
+		);
+	}
+
+	/** Select the albums listed whose saves failed, those still in the Library, to try again. */
+	async function selectProblems() {
+		const ids = (problems ?? []).filter((i) => i.status === 'failed').map((i) => i.album.id);
+		problems = null;
+		if (view !== 'library') {
+			await setView('library');
+			// Going to the Library ends any selection first (see `browsing`).
+			await tick();
+		}
+		const here = new Set(library.map((a) => a.id));
+		selected.clear();
+		anchor = null;
+		for (const id of ids) if (here.has(id)) selected.add(id);
+		selecting = true;
+	}
+
 	/**
 	 * Undo the import of Library album `album`, as shown, once confirmed: its files are
 	 * deleted, and the Inbox album they were copied from shows again.
@@ -1542,7 +1726,7 @@
 
 	// Uploads: files and folders dropped on the Inbox, or picked with Upload.
 	/** Uploads go into the Inbox, so they're dropped on it, with nothing open over it. */
-	let canDrop = $derived(view === 'inbox' && !sheetAlbum && !importing && !batchShown);
+	let canDrop = $derived(view === 'inbox' && !sheetAlbum && !importing && !overlay);
 	/** Files are being dragged over the window. */
 	let dragging = $state(false);
 	/** dragenter and dragleave come for each element crossed, so they're counted. */
@@ -1638,6 +1822,8 @@
 		// The login view is up: keys are its own, and Escape mustn't close the
 		// album (and its unsaved edits) under it.
 		if (session.state === 'out') return;
+		// Edit tags of several albums, or its problems, is up: keys are its own.
+		if (tagDialog || problems) return;
 		if (e.key === 'Escape' && openId) {
 			e.preventDefault();
 			close();
@@ -1654,18 +1840,21 @@
 			// Its dialog moves on its own keys; while one waits for its plan, the batch does.
 			e.preventDefault();
 			jumpBatch(batch.index + (e.key === 'ArrowRight' ? 1 : -1));
-		} else if (e.key === 'Escape' && selecting && view === 'inbox' && !batchShown && !typing(e)) {
+		} else if (e.key === 'Escape' && selecting && gridShown && !overlay && !typing(e)) {
 			stopSelecting();
 		} else if (
 			selecting &&
-			view === 'inbox' &&
-			!batchShown &&
+			gridShown &&
+			!overlay &&
+			// Not the albums behind an album sheet or import dialog.
+			!sheetAlbum &&
+			!importing &&
 			(e.ctrlKey || e.metaKey) &&
 			e.key.toLowerCase() === 'a' &&
 			!typing(e)
 		) {
 			e.preventDefault();
-			for (const a of shownInbox) selected.add(a.id);
+			for (const a of visible) selected.add(a.id);
 		} else if (e.key === 'Escape' && isSetup(view) && !typing(e)) {
 			setView(browsing);
 		} else if (typing(e) || e.ctrlKey || e.metaKey || e.altKey) {
@@ -1748,7 +1937,7 @@
 <svelte:window {onkeydown} {ondragenter} {ondragover} {ondragleave} {ondrop} />
 
 <!-- The page under an open album: inert, and blurred (see .behind). -->
-<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum || batchShown}>
+<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum || overlay}>
 	<TopBar
 		bind:query
 		bind:search
@@ -1766,13 +1955,15 @@
 		{#snippet actions()}
 			{#if view === 'inbox'}
 				<UploadButton onpick={(files) => startUploads(() => uploads.pick(files))} />
+			{/if}
+			{#if gridShown}
 				<button
 					class="icon-btn select-btn"
 					class:on={selecting}
 					onclick={() => (selecting ? stopSelecting() : (selecting = true))}
 					aria-pressed={selecting}
 					aria-label="Select albums"
-					title="Select albums to import"
+					title={view === 'inbox' ? 'Select albums to import' : 'Select albums to edit'}
 				>
 					<ListChecks size={18} />
 				</button>
@@ -1927,12 +2118,13 @@
 							onplay={playAlbum}
 							onmenu={(a, x, y) => (menu = { album: a, x, y })}
 							flag={attentionView ? attentionFlag : undefined}
-							selecting={selecting && view === 'inbox'}
+							{selecting}
 							{selected}
-							onselect={view === 'inbox' ? select : undefined}
+							onselect={select}
+							busy={view === 'library' ? (a) => tagSaves.status(a.id) : undefined}
 						/>
 						<!-- Keeps the last row clear of the selection bar. -->
-						{#if selecting && view === 'inbox'}<div class="select-space"></div>{/if}
+						{#if selecting}<div class="select-space"></div>{/if}
 					{/if}
 				</div>
 			{/key}
@@ -2001,18 +2193,72 @@
 	/>
 {/if}
 
-{#if selecting && view === 'inbox' && !sheetAlbum && !batchShown}
+{#if selecting && gridShown && !sheetAlbum && !overlay}
 	<SelectionBar
 		selected={selected.size}
 		hidden={selectedHidden}
-		shown={shownInbox.length}
-		allShown={shownInbox.every((a) => selected.has(a.id))}
+		shown={visible.length}
+		allShown={visible.every((a) => selected.has(a.id))}
 		onclose={stopSelecting}
-		onall={() => shownInbox.forEach((a) => selected.add(a.id))}
+		onall={() => visible.forEach((a) => selected.add(a.id))}
 		onclear={() => selected.clear()}
-		onimport={importSelected}
+	>
+		{#if view === 'inbox'}
+			<button class="btn primary" onclick={importSelected} disabled={!selected.size}>
+				<FolderInput size={15} /> Import{selected.size ? ` ${count(selected.size)}` : ''}…
+			</button>
+		{:else}
+			<button
+				class="btn wide-only"
+				onclick={openCollectionMenu}
+				disabled={!selected.size}
+				aria-haspopup="menu"
+				aria-expanded={!!collectionMenu}
+				title="Move the albums selected to a collection"
+			>
+				<FolderTree size={15} /> Collection <ChevronDown size={14} />
+			</button>
+			<button class="btn primary" onclick={editSelected} disabled={!selected.size}>
+				<Tags size={15} /> Edit tags…
+			</button>
+		{/if}
+	</SelectionBar>
+{/if}
+{#if collectionMenu && selected.size}
+	<ContextMenu
+		x={collectionMenu.x}
+		y={collectionMenu.y}
+		title="Move {count(selected.size)} {selected.size === 1 ? 'album' : 'albums'} to"
+		items={collectionItems}
+		anchor={collectionButton}
+		onclose={() => (collectionMenu = null)}
 	/>
 {/if}
+<!-- One dialog per opening: one opened while the last still closes is new, not that one reused. -->
+{#each tagDialog ? [tagDialog] : [] as d (d)}
+	<TagBatchDialog
+		albums={d.albums}
+		collections={setup.saved.collections}
+		suggestions={tagSuggestions}
+		{needed}
+		moves={inStructure}
+		onsave={saveTags}
+		onclose={() => (tagDialog = null)}
+	/>
+{/each}
+{#each problems ? [problems] : [] as items (items)}
+	<TagBatchProblems
+		{items}
+		onselect={items.some((i) => i.status === 'failed') &&
+		!tagDialog &&
+		!sheetAlbum &&
+		!importing &&
+		!batchShown
+			? selectProblems
+			: undefined}
+		ondone={() => (problems = null)}
+	/>
+{/each}
 
 {#if batch}
 	{@const b = batch}

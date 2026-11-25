@@ -4,5 +4,7 @@
 
 export const drafts = $state({
 	/** The tag editor has unsaved changes. */
-	tags: false
+	tags: false,
+	/** Albums are waiting to have their tags saved (Edit tags… on several, see TagSaves). */
+	saves: false
 });

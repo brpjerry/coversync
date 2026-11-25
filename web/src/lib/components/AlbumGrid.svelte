@@ -19,6 +19,8 @@
 		selected?: ReadonlySet<string>;
 		/** Where albums can be selected. */
 		onselect?: (album: Album, e: MouseEvent) => void;
+		/** Whether an album's tags are being saved, or it's waiting its turn. */
+		busy?: (album: Album) => 'waiting' | 'saving' | null;
 	}
 	let {
 		albums,
@@ -29,7 +31,8 @@
 		flag,
 		selecting = false,
 		selected,
-		onselect
+		onselect,
+		busy
 	}: Props = $props();
 
 	// Only the rows near the viewport are in the DOM, each card placed by
@@ -157,6 +160,7 @@
 				{selecting}
 				checked={selected?.has(album.id) ?? false}
 				{onselect}
+				busy={busy?.(album) ?? null}
 			/>
 		</div>
 	{/each}

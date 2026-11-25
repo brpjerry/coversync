@@ -5,6 +5,8 @@ export type ToastKind = 'info' | 'success' | 'error' | 'progress';
 export interface ToastAction {
 	label: string;
 	run: () => void;
+	/** Running it leaves the toast up, to run again (it goes with its ×). */
+	keep?: boolean;
 }
 
 export interface Toast {

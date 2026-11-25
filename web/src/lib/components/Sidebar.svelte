@@ -128,7 +128,7 @@
 
 	async function signOut() {
 		// Signing out starts the page afresh: ask before unsaved edits go with it.
-		const unsaved = Object.values(dirty).some(Boolean) || drafts.tags;
+		const unsaved = Object.values(dirty).some(Boolean) || drafts.tags || drafts.saves;
 		if (unsaved && !confirm('Sign out? Your unsaved changes will be lost.')) return;
 		if (!(await session.logout())) toast('Signing out failed', 'error');
 	}

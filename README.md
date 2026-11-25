@@ -224,6 +224,22 @@ used on a home server.
   default ticks. **Stop**
   ends the batch, and the albums left stay selected. A summary lists each
   album's outcome, with **Retry** for a failed one.
+- **Editing several albums**: **Select** in the Library's top bar (or an
+  album's menu, or a Ctrl/⌘- or Shift-click) ticks albums, as in the Inbox.
+  **Collection ▾** moves them to a collection (or None) in one pick; on a
+  phone it's left out of the bar and Edit tags… has it. **Edit tags…** sets
+  Collection, Album artist and Genre on every track of each album: each
+  field shows how many albums have which value, and a field left as it is
+  keeps each album's own. A tag Library setup needs (a required one, or one
+  outside the folder structure's optional `< >` parts) can't be emptied, nor
+  can a required Collection be set to None. The albums are saved one after
+  another as the tag editor saves them (an album changed elsewhere since its
+  tags were read isn't saved), and those with the values already are left
+  alone. The selection clears when the saves start; the cards waiting show
+  dimmed, and a toast counts them (the page asks before you leave it with
+  saves on their way). Albums that weren't saved as asked (failed, or saved
+  but not moved) are listed by the toast's **Show**, which stays until it's
+  closed; **Select these** selects the ones whose saves failed, to try again.
 - **Inbox setup**: Copy or Move; Preserve modification date, which gives an
   imported album its Inbox date (its newest file's modification time) as its
   date added instead of the import time, so the Library's Recently added
