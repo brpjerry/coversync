@@ -89,7 +89,7 @@ export class TagSaves {
 
 	constructor(
 		private hooks: {
-			/** An album started or finished saving. */
+			/** Albums were added, or one started saving. */
 			progress?: (saves: TagSaves) => void;
 			finished?: (items: SaveItem[]) => void;
 		} = {}

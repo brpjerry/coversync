@@ -103,14 +103,17 @@
 	}
 	readAll();
 
+	/** A value as saving writes it: trimmed of white space as the daemon trims it (U+0085 too). */
+	const clean = (v: string | null) =>
+		v?.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '') ?? null;
 	/** Whether the field was changed: a mixed text field left empty keeps each album's own. */
 	function changed(kind: BatchKind): boolean {
-		const value = values[kind];
-		if (value === start[kind]) return false;
-		return !(mixed[kind] && kind !== 'collection' && !value?.trim());
+		const value = clean(values[kind]);
+		if (value === clean(start[kind])) return false;
+		return !(mixed[kind] && kind !== 'collection' && !value);
 	}
 	/** Emptied (or None), though Library setup needs it. */
-	const emptied = (kind: BatchKind) => changed(kind) && !values[kind]?.trim() && needed(kind);
+	const emptied = (kind: BatchKind) => changed(kind) && !clean(values[kind]) && needed(kind);
 
 	let edited = $derived(BATCH_KINDS.filter(changed));
 	let blocked = $derived(BATCH_KINDS.some(emptied));
@@ -144,12 +147,15 @@
 	function save() {
 		if (reading || !edited.length || blocked) return;
 		const set: BatchSet = {};
-		for (const kind of edited) set[kind] = (values[kind] ?? '').trim();
+		for (const kind of edited) set[kind] = clean(values[kind]) ?? '';
+		closed = true;
 		onsave(albums.map((album) => ({ album, set, tags: read.get(album.id) ?? null })));
 	}
 
 	function cancel() {
 		if (edited.length && !confirm('Discard these tag changes?')) return;
+		// No more reads, though it takes a moment to close.
+		closed = true;
 		onclose();
 	}
 
@@ -437,7 +443,8 @@
 		border-color: color-mix(in oklab, var(--accent) 55%, transparent);
 		background: color-mix(in oklab, var(--accent) 8%, var(--surface));
 	}
-	.invalid input {
+	.invalid input,
+	.invalid select {
 		border-color: var(--danger);
 		box-shadow: 0 0 0 3px color-mix(in oklab, var(--danger) 18%, transparent);
 	}

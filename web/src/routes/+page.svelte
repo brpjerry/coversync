@@ -1058,7 +1058,8 @@
 		// a Library album's files are what devices sync.
 		if (collection === 'inbox') dataGeneration++;
 		else devices.readSyncAll();
-		loadAlbums();
+		// This page's own batch reloads the grids once it's done, not after each album.
+		if (collection === 'inbox' || !tagSaves.running) loadAlbums();
 		enqueue({ kind: 'notice', id, previous: previous_id, version });
 	}
 
@@ -1534,13 +1535,17 @@
 
 	/** The Library albums selected, in the grid's order. */
 	const selectedLibrary = () => sorted(library, activeSort).filter((a) => selected.has(a.id));
+	/** Edit tags… or Collection ▾ asked for last: the one that opens once setup is read. */
+	let opening = 0;
 
 	/**
 	 * Library setup is read, for what it needs (see `needed`) and its
 	 * collections, and the albums are still selected in the Library.
 	 */
 	async function tagSetupReady(): Promise<boolean> {
+		const mine = ++opening;
 		await setup.load();
+		if (mine !== opening) return false;
 		if (view !== 'library' || !selecting || !selected.size || overlay || sheetAlbum) return false;
 		if (!setup.loaded) toast("Couldn't read Library setup. Try again.", 'error', 6000);
 		return setup.loaded;
@@ -1558,10 +1563,9 @@
 		void tagSaves.add(jobs);
 	}
 
-	/** Library setup needs the tag: a required one, or in the folder structure. Collection is optional there. */
 	/** The structure names the tag: `{kind}`, or with a length limit, `{kind:40}`. */
 	const names = (structure: string, kind: BatchKind) =>
-		new RegExp(`\\{\\s*${kind}\\s*(:\\s*\\d+\\s*)?\\}`).test(structure);
+		new RegExp(`\\{\\s*${kind}\\s*(:\\s*\\+?\\d+\\s*)?\\}`).test(structure);
 	const inStructure = (kind: BatchKind) => names(setup.saved.structure, kind);
 	/**
 	 * Library setup needs the tag: a required one, or one the folder structure
@@ -2244,7 +2248,13 @@
 {#each problems ? [problems] : [] as items (items)}
 	<TagBatchProblems
 		{items}
-		onselect={items.some((i) => i.status === 'failed') ? selectProblems : undefined}
+		onselect={items.some((i) => i.status === 'failed') &&
+		!tagDialog &&
+		!sheetAlbum &&
+		!importing &&
+		!batchShown
+			? selectProblems
+			: undefined}
 		ondone={() => (problems = null)}
 	/>
 {/each}
