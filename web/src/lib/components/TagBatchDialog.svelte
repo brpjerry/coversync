@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import { SvelteMap } from 'svelte/reactivity';
@@ -9,6 +10,7 @@
 	import { count } from '#lib/format.ts';
 	import {
 		BATCH_KINDS,
+		slim,
 		tally,
 		type BatchKind,
 		type BatchSet,
@@ -71,20 +73,25 @@
 		>
 	);
 
+	/** Closed: no more albums are read. */
+	let closed = false;
+	onDestroy(() => (closed = true));
+
 	async function readAll() {
 		// A few at a time: each is a local read of the album's files.
 		let next = 0;
 		const worker = async () => {
-			while (next < albums.length) {
+			while (!closed && next < albums.length) {
 				const album = albums[next++];
 				try {
-					read.set(album.id, await api.albumTags(album.id));
+					read.set(album.id, slim(await api.albumTags(album.id)));
 				} catch {
 					unread++;
 				}
 			}
 		};
 		await Promise.all(Array.from({ length: Math.min(4, albums.length) }, worker));
+		if (closed) return;
 		for (const kind of BATCH_KINDS) {
 			const found = tally([...read.values()], kind);
 			const one = !unread && found.length === 1 && found[0].value !== null;
@@ -102,19 +109,20 @@
 		if (value === start[kind]) return false;
 		return !(mixed[kind] && kind !== 'collection' && !value?.trim());
 	}
-	/** Emptied, though Library setup needs it. */
-	const emptied = (kind: BatchKind) =>
-		kind !== 'collection' && changed(kind) && !values[kind]?.trim() && needed(kind);
+	/** Emptied (or None), though Library setup needs it. */
+	const emptied = (kind: BatchKind) => changed(kind) && !values[kind]?.trim() && needed(kind);
 
 	let edited = $derived(BATCH_KINDS.filter(changed));
 	let blocked = $derived(BATCH_KINDS.some(emptied));
 	let moving = $derived(edited.filter(moves).map((k) => LABEL[k]));
 
-	/** The collections to pick from: Library setup's, then any an album is in. */
+	/** The collections to pick from: Library setup's, then any a track is in. */
 	let choices = $derived([
 		...new Set([
 			...collections,
-			...counts.collection.map((c) => c.value).filter((v): v is string => !!v)
+			...[...read.values()].flatMap((tags) =>
+				tags.tracks.map((t) => t.values.collection).filter(Boolean)
+			)
 		])
 	]);
 
@@ -126,7 +134,11 @@
 	}
 	function summary(kind: BatchKind) {
 		const all = counts[kind].map((c) => `${named(kind, c.value)} ${count(c.albums)}`);
-		return { shown: all.slice(0, 3).join(' · '), more: all.length - 3, all: all.join('\n') };
+		return {
+			shown: all.slice(0, 3).join(' · '),
+			more: all.length - 3,
+			rest: all.slice(3).join(' · ')
+		};
 	}
 
 	function save() {
@@ -238,13 +250,18 @@
 							{/if}
 							{#if emptied(kind)}
 								<span class="note error"
-									>{LABEL[kind]} can't be left empty: Library setup needs it.</span
+									>{LABEL[kind]} can't be {kind === 'collection' ? 'None' : 'left empty'}: Library
+									setup needs it.</span
 								>
+							{:else if sum.more > 0}
+								<details class="note tabular">
+									<summary
+										>{changed(kind) ? 'Was ' : ''}{sum.shown} · +{count(sum.more)} more</summary
+									>
+									{sum.rest}
+								</details>
 							{:else if sum.shown}
-								<span class="note tabular" title={sum.more > 0 ? sum.all : undefined}
-									>{changed(kind) ? 'Was ' : ''}{sum.shown}{#if sum.more > 0}
-										· +{count(sum.more)} more{/if}</span
-								>
+								<span class="note tabular">{changed(kind) ? 'Was ' : ''}{sum.shown}</span>
 							{/if}
 						</div>
 					{/each}
@@ -427,13 +444,16 @@
 	.note {
 		font-size: 12.5px;
 		color: var(--text-3);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		overflow-wrap: anywhere;
+	}
+	summary {
+		cursor: pointer;
+	}
+	summary:hover {
+		color: var(--text-2);
 	}
 	.note.error {
 		color: var(--danger);
-		white-space: normal;
 	}
 	footer {
 		display: flex;

@@ -31,6 +31,22 @@ export function tally(all: AlbumTags[], kind: string): { value: string | null; a
 		.sort((a, b) => +(a.value === null) - +(b.value === null) || b.albums - a.albums);
 }
 
+/**
+ * An album's tags as a batch keeps them: the version, each track's id and
+ * path, and the batch's tags (not its lyrics, say, for thousands of tracks).
+ */
+export function slim(tags: AlbumTags): AlbumTags {
+	return {
+		version: tags.version,
+		tracks: tags.tracks.map(({ id, rel_path, values }) => ({
+			id,
+			rel_path,
+			values: Object.fromEntries(BATCH_KINDS.map((k) => [k, values[k] ?? ''])),
+			other: []
+		}))
+	};
+}
+
 /** What saving `set` writes to the album: by track id, each kind the track doesn't have that value of yet. */
 export function batchEdits(tags: AlbumTags, set: BatchSet): Record<number, Record<string, string>> {
 	const out: Record<number, Record<string, string>> = {};
@@ -67,6 +83,8 @@ export interface SaveItem {
  */
 export class TagSaves {
 	items = $state<SaveItem[]>([]);
+	/** Albums of the run done with, in order: the next one waiting is `items[done]`. */
+	done = $state(0);
 	#run: Promise<void> | null = null;
 
 	constructor(
@@ -79,19 +97,14 @@ export class TagSaves {
 
 	/** Albums are waiting or saving. */
 	get running(): boolean {
-		return this.items.some((i) => i.status === 'waiting' || i.status === 'saving');
+		return this.done < this.items.length;
 	}
 
 	/** Whether the album with this id is waiting its turn or being saved. */
 	status(id: string): 'waiting' | 'saving' | null {
-		const item = this.items.find(
-			(i) => i.album.id === id && (i.status === 'waiting' || i.status === 'saving')
-		);
-		return (item?.status as 'waiting' | 'saving' | undefined) ?? null;
-	}
-
-	count(status: SaveStatus): number {
-		return this.items.filter((i) => i.status === status).length;
+		for (let i = this.done; i < this.items.length; i++)
+			if (this.items[i].album.id === id) return i === this.done ? 'saving' : 'waiting';
+		return null;
 	}
 
 	/** Save these albums after any already waiting. Resolves when the run is done. */
@@ -110,16 +123,18 @@ export class TagSaves {
 	}
 
 	async #saveAll() {
-		let item: SaveItem | undefined;
-		while ((item = this.items.find((i) => i.status === 'waiting'))) {
+		// Albums added meanwhile are at the end: they're saved in turn.
+		while (this.running) {
+			const item = this.items[this.done];
 			item.status = 'saving';
 			this.hooks.progress?.(this);
 			await save(item);
-			this.hooks.progress?.(this);
+			this.done++;
 		}
-		const done = this.items;
+		const all = this.items;
 		this.items = [];
-		this.hooks.finished?.(done);
+		this.done = 0;
+		this.hooks.finished?.(all);
 	}
 }
 
@@ -130,6 +145,11 @@ async function save(item: SaveItem) {
 		const tags = item.tags ?? (await api.albumTags(item.album.id));
 		const kinds = batchEdits(tags, item.set);
 		if (!Object.keys(kinds).length) {
+			// As read when the values were picked: it may have changed since.
+			if (item.tags) {
+				const now = await api.album(item.album.id);
+				if (now.version !== tags.version) throw new TagConflict('', now);
+			}
 			item.status = 'unchanged';
 			return;
 		}
@@ -143,11 +163,15 @@ async function save(item: SaveItem) {
 		item.problem = result.warning ?? null;
 	} catch (e) {
 		item.status = 'failed';
-		if (e instanceof TagConflict)
+		if (e instanceof TagConflict) {
+			// The album as it is now, under its new id if it has one, to select again.
+			if (e.album) item.album = e.album;
 			item.problem = e.album
 				? "It changed elsewhere after its tags were read, so it wasn't saved."
 				: GONE;
-		else if (e instanceof ApiError) item.problem = e.status === 404 ? GONE : e.message;
-		else item.problem = "It wasn't saved: the server couldn't be reached.";
+		} else if (e instanceof ApiError)
+			item.problem = e.status === 404 ? GONE : e.message || `The server answered HTTP ${e.status}.`;
+		// No answer: a save the daemon had begun goes on all the same.
+		else item.problem = "Couldn't confirm the save: look at the album before trying again.";
 	}
 }

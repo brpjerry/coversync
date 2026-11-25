@@ -1535,11 +1535,19 @@
 	/** The Library albums selected, in the grid's order. */
 	const selectedLibrary = () => sorted(library, activeSort).filter((a) => selected.has(a.id));
 
-	async function editSelected() {
-		// For what Library setup needs (see `needed`).
+	/**
+	 * Library setup is read, for what it needs (see `needed`) and its
+	 * collections, and the albums are still selected in the Library.
+	 */
+	async function tagSetupReady(): Promise<boolean> {
 		await setup.load();
-		const list = selectedLibrary();
-		if (selecting && list.length) tagDialog = { albums: list };
+		if (view !== 'library' || !selecting || !selected.size || overlay || sheetAlbum) return false;
+		if (!setup.loaded) toast("Couldn't read Library setup. Try again.", 'error', 6000);
+		return setup.loaded;
+	}
+
+	async function editSelected() {
+		if (await tagSetupReady()) tagDialog = { albums: selectedLibrary() };
 	}
 
 	/** Save these albums' tags; the selection clears for the next batch. */
@@ -1551,9 +1559,17 @@
 	}
 
 	/** Library setup needs the tag: a required one, or in the folder structure. Collection is optional there. */
-	const inStructure = (kind: BatchKind) => setup.saved.structure.includes(`{${kind}}`);
+	/** The structure names the tag: `{kind}`, or with a length limit, `{kind:40}`. */
+	const names = (structure: string, kind: BatchKind) =>
+		new RegExp(`\\{\\s*${kind}\\s*(:\\s*\\d+\\s*)?\\}`).test(structure);
+	const inStructure = (kind: BatchKind) => names(setup.saved.structure, kind);
+	/**
+	 * Library setup needs the tag: a required one, or one the folder structure
+	 * can't leave out (outside its optional `< >` parts; `{collection}` it always can).
+	 */
 	const needed = (kind: BatchKind) =>
-		kind !== 'collection' && (setup.saved.required.includes(kind) || inStructure(kind));
+		setup.saved.required.includes(kind) ||
+		(kind !== 'collection' && names(setup.saved.structure.replace(/<[^>]*>/g, ''), kind));
 
 	/** Values the Edit tags dialog suggests: the Library's album artists and genres. */
 	let tagSuggestions = $derived.by(() => {
@@ -1566,8 +1582,13 @@
 	let collectionMenu = $state<{ x: number; y: number } | null>(null);
 	/** Its button: the menu reads it as it closes (to give it focus back), so it outlives the menu. */
 	let collectionButton = $state<HTMLElement>();
+	// Closed with the selection it was opened for.
+	$effect(() => {
+		if (view !== 'library' || !selected.size) collectionMenu = null;
+	});
 	let collectionItems = $derived.by((): MenuEntry[] => [
-		...['', ...setup.saved.collections].map((c) => ({
+		// None only when Library setup doesn't require a collection.
+		...[...(needed('collection') ? [] : ['']), ...setup.saved.collections].map((c) => ({
 			label: c || 'None',
 			icon: FolderTree,
 			run: () => saveTags(selectedLibrary().map((album) => ({ album, set: { collection: c } })))
@@ -1575,17 +1596,19 @@
 		'separator',
 		{ label: 'Collections…', icon: Settings2, run: () => setView('collections-setup') }
 	]);
-	function openCollectionMenu(e: MouseEvent) {
-		collectionButton = e.currentTarget as HTMLElement;
+	async function openCollectionMenu(e: MouseEvent) {
+		const button = e.currentTarget as HTMLElement;
 		if (collectionMenu) return void (collectionMenu = null);
-		const r = collectionButton.getBoundingClientRect();
+		if (!(await tagSetupReady()) || !button.isConnected) return;
+		collectionButton = button;
+		const r = button.getBoundingClientRect();
 		collectionMenu = { x: r.left, y: r.top - 6 };
 	}
 
 	function savesProgress(s: TagSaves) {
 		if (!s.running) return;
 		const total = s.items.length;
-		const done = total - s.count('waiting') - s.count('saving');
+		const done = s.done;
 		const text = `Saving tags: ${count(Math.min(done + 1, total))} of ${count(total)} ${total === 1 ? 'album' : 'albums'}…`;
 		if (savesToast === null) savesToast = toast(text, 'progress', 0);
 		else update(savesToast, text);
@@ -1625,7 +1648,8 @@
 		toast(
 			text.charAt(0).toUpperCase() + text.slice(1),
 			bad.length ? 'error' : 'success',
-			bad.length ? 12000 : 7000,
+			// Kept until dismissed: it's the only way to the albums that need a look.
+			bad.length ? 0 : 7000,
 			bad.length ? { label: 'Show', run: () => (problems = bad) } : undefined
 		);
 	}
@@ -1641,6 +1665,7 @@
 		}
 		const here = new Set(library.map((a) => a.id));
 		selected.clear();
+		anchor = null;
 		for (const id of ids) if (here.has(id)) selected.add(id);
 		selecting = true;
 	}
@@ -1699,7 +1724,7 @@
 
 	// Uploads: files and folders dropped on the Inbox, or picked with Upload.
 	/** Uploads go into the Inbox, so they're dropped on it, with nothing open over it. */
-	let canDrop = $derived(view === 'inbox' && !sheetAlbum && !importing && !batchShown);
+	let canDrop = $derived(view === 'inbox' && !sheetAlbum && !importing && !overlay);
 	/** Files are being dragged over the window. */
 	let dragging = $state(false);
 	/** dragenter and dragleave come for each element crossed, so they're counted. */
@@ -1795,6 +1820,8 @@
 		// The login view is up: keys are its own, and Escape mustn't close the
 		// album (and its unsaved edits) under it.
 		if (session.state === 'out') return;
+		// Edit tags of several albums, or its problems, is up: keys are its own.
+		if (tagDialog || problems) return;
 		if (e.key === 'Escape' && openId) {
 			e.preventDefault();
 			close();
@@ -1905,7 +1932,7 @@
 <svelte:window {onkeydown} {ondragenter} {ondragover} {ondragleave} {ondrop} />
 
 <!-- The page under an open album: inert, and blurred (see .behind). -->
-<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum || batchShown}>
+<div class="page" class:behind={!!sheetAlbum} inert={!!sheetAlbum || overlay}>
 	<TopBar
 		bind:query
 		bind:search

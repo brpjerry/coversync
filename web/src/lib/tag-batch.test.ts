@@ -8,7 +8,7 @@ const calls: string[] = [];
 /** Saves' bodies, by album id. */
 const sent = new Map<string, TagWrite>();
 /** How a save of an album answers instead of saving it. */
-const refuse = new Map<string, 'conflict' | 'gone' | 'error' | 'warning'>();
+const refuse = new Map<string, 'conflict' | 'gone' | 'error' | 'warning' | 'blank' | 'lost'>();
 /** Saves running at once, and the most there were. */
 let running = 0;
 let most = 0;
@@ -34,6 +34,13 @@ vi.mock('./api', () => {
 		ApiError,
 		TagConflict,
 		api: {
+			album: (id: string) => {
+				calls.push(`album:${id}`);
+				const tags = stored.get(id);
+				return tags
+					? Promise.resolve({ id, title: `Title ${id}`, version: tags.version })
+					: Promise.reject(new ApiError(404, 'Not found'));
+			},
 			albumTags: (id: string) => {
 				calls.push(`read:${id}`);
 				const tags = stored.get(id);
@@ -46,9 +53,11 @@ vi.mock('./api', () => {
 				await new Promise((r) => setTimeout(r, 1));
 				running--;
 				const how = refuse.get(id);
-				if (how === 'conflict') throw new TagConflict('changed', { id });
+				if (how === 'conflict') throw new TagConflict('changed', { id: `renamed-${id}` });
 				if (how === 'gone') throw new TagConflict('gone', null);
 				if (how === 'error') throw new ApiError(400, 'The folder is already there: Anime/A');
+				if (how === 'blank') throw new ApiError(502, '');
+				if (how === 'lost') throw new TypeError('NetworkError when attempting to fetch resource.');
 				return {
 					album_id: `moved-${id}`,
 					files_written: Object.keys(body.kinds ?? {}).length,
@@ -61,7 +70,7 @@ vi.mock('./api', () => {
 	};
 });
 
-const { albumValue, batchEdits, tally, TagSaves } = await import('./tag-batch.svelte');
+const { albumValue, batchEdits, slim, tally, TagSaves } = await import('./tag-batch.svelte');
 
 const album = (id: string) => ({ id, title: `Title ${id}` }) as Album;
 /** Tags of an album whose tracks (ids from 1) have these values. */
@@ -106,6 +115,25 @@ describe('album values', () => {
 			{ value: 'Games', albums: 1 },
 			{ value: null, albums: 1 }
 		]);
+	});
+});
+
+describe('slim', () => {
+	// Bugs caught: 0, False positives: 0
+	it("keeps only what a batch needs of an album's tags: the version, track ids and paths, its three tags", () => {
+		const tags = tagsOf('v', { genre: 'Pop', lyrics: 'la '.repeat(1000), album_artist: 'A' });
+		tags.tracks[0].other = [['TITLE_JP', 'x']];
+		expect(slim(tags)).toEqual({
+			version: 'v',
+			tracks: [
+				{
+					id: 1,
+					rel_path: '1.flac',
+					values: { collection: '', album_artist: 'A', genre: 'Pop' },
+					other: []
+				}
+			]
+		});
 	});
 });
 
@@ -173,26 +201,62 @@ describe('saving', () => {
 		const [item] = finished.mock.calls[0][0];
 		expect(item.status).toBe('failed');
 		expect(item.problem).toMatch(/changed elsewhere/i);
+		// The album as it is now, under its new id: Select these finds it.
+		expect(item.album.id).toBe('renamed-a');
+	});
+
+	// Bugs caught: 0, False positives: 0
+	it('refuses an album whose tags read beforehand had the values, if it changed since', async () => {
+		stored.set('a', tagsOf('new', { genre: 'Jazz' }));
+		stored.set('b', tagsOf('same', { genre: 'Pop' }));
+		const finished = vi.fn();
+		const saves = new TagSaves({ finished });
+		await saves.add([
+			{ album: album('a'), set: { genre: 'Pop' }, tags: tagsOf('old', { genre: 'Pop' }) },
+			{ album: album('b'), set: { genre: 'Pop' }, tags: tagsOf('same', { genre: 'Pop' }) }
+		]);
+		expect(calls).toEqual(['album:a', 'album:b']);
+		const [a, b] = finished.mock.calls[0][0];
+		expect(a.status).toBe('failed');
+		expect(a.problem).toMatch(/changed elsewhere/i);
+		expect(b.status).toBe('unchanged');
 	});
 
 	// Bugs caught: 0, False positives: 0
 	it('goes on past an album that fails, and says why for each; one saved but not moved is a problem too', async () => {
-		for (const id of ['a', 'b', 'c', 'd']) stored.set(id, tagsOf(id, {}));
+		for (const id of ['a', 'b', 'c', 'd', 'e', 'f']) stored.set(id, tagsOf(id, {}));
 		refuse.set('a', 'error');
 		refuse.set('b', 'gone');
 		refuse.set('c', 'warning');
+		refuse.set('e', 'blank');
+		refuse.set('f', 'lost');
 		const finished = vi.fn();
 		const saves = new TagSaves({ finished });
 		await saves.add(
-			['a', 'b', 'c', 'd', 'missing'].map((id) => ({ album: album(id), set: { genre: 'Pop' } }))
+			['a', 'b', 'c', 'd', 'missing', 'e', 'f'].map((id) => ({
+				album: album(id),
+				set: { genre: 'Pop' }
+			}))
 		);
 		const items = finished.mock.calls[0][0] as { status: string; problem: string | null }[];
-		expect(items.map((i) => i.status)).toEqual(['failed', 'failed', 'saved', 'saved', 'failed']);
+		expect(items.map((i) => i.status)).toEqual([
+			'failed',
+			'failed',
+			'saved',
+			'saved',
+			'failed',
+			'failed',
+			'failed'
+		]);
 		expect(items[0].problem).toBe('The folder is already there: Anime/A');
 		expect(items[1].problem).toMatch(/no longer in the Library/);
 		expect(items[2].problem).toMatch(/weren't moved/);
 		expect(items[3].problem).toBe(null);
 		expect(items[4].problem).toMatch(/no longer in the Library/);
+		// An error with no message still says something, so it's listed.
+		expect(items[5].problem).toMatch(/HTTP 502/);
+		// No answer: the daemon may have saved it all the same.
+		expect(items[6].problem).toMatch(/couldn't confirm/i);
 	});
 
 	// Bugs caught: 0, False positives: 0

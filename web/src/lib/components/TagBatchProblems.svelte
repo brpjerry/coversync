@@ -50,7 +50,7 @@
 			</h2>
 		</header>
 		<ol class="list">
-			{#each items as item (item.album.id)}
+			{#each items as item (item)}
 				<li>
 					<span class="art">
 						{#if item.album.has_cover}<img
