@@ -3,7 +3,8 @@
 	import Disc3 from '@lucide/svelte/icons/disc-3';
 	import CircleAlert from '@lucide/svelte/icons/circle-alert';
 	import Check from '@lucide/svelte/icons/check';
-	import { scale } from 'svelte/transition';
+	import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+	import { fade, scale } from 'svelte/transition';
 	import { coverUrl, type Album } from '#lib/api.ts';
 	import { accent, shade } from '#lib/color.ts';
 	import { player } from '#lib/player.svelte.ts';
@@ -29,6 +30,8 @@
 		 * Shift click (which starts selecting); none where albums can't be.
 		 */
 		onselect?: (album: Album, e: MouseEvent) => void;
+		/** Its tags are being saved, or it's waiting its turn (see TagSaves). */
+		busy?: 'waiting' | 'saving' | null;
 	}
 	let {
 		album,
@@ -40,7 +43,8 @@
 		flagTitle,
 		selecting = false,
 		checked = false,
-		onselect
+		onselect,
+		busy = null
 	}: Props = $props();
 
 	function click(e: MouseEvent) {
@@ -75,6 +79,7 @@
 	class="card"
 	class:selecting
 	class:checked
+	class:waiting={busy === 'waiting'}
 	data-album={album.id}
 	style:--tint={shade(album.color, 16)}
 	style:--glow={accent(album.color)}
@@ -133,6 +138,11 @@
 			{/if}
 			{#if playing}
 				<span class="now" aria-hidden="true"><i></i><i></i><i></i></span>
+			{/if}
+			{#if busy === 'saving'}
+				<span class="saving" title="Saving its tags…" transition:fade={{ duration: 180 }}>
+					<LoaderCircle size={22} />
+				</span>
 			{/if}
 			{#if selecting}
 				<span class="check" aria-hidden="true" transition:scale={{ start: 0.5, duration: 180 }}>
@@ -292,6 +302,26 @@
 		scale: 0.92;
 		outline: 3px solid var(--accent);
 		outline-offset: 3px;
+	}
+	/* Saving tags (see TagSaves): dimmed while waiting its turn, a spinner while saved. */
+	.waiting .cover {
+		opacity: 0.55;
+	}
+	.saving {
+		position: absolute;
+		inset: 0;
+		display: grid;
+		place-items: center;
+		color: #fff;
+		background: rgb(0 0 0 / 0.45);
+	}
+	.saving :global(svg) {
+		animation: spin 900ms linear infinite;
+	}
+	@keyframes spin {
+		to {
+			rotate: 360deg;
+		}
 	}
 	.selecting .flag {
 		left: 40px;

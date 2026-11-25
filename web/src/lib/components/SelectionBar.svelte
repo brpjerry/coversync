@@ -1,6 +1,6 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import X from '@lucide/svelte/icons/x';
-	import FolderInput from '@lucide/svelte/icons/folder-input';
 	import { fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import { count } from '#lib/format.ts';
@@ -17,9 +17,10 @@
 		onclose: () => void;
 		onall: () => void;
 		onclear: () => void;
-		onimport: () => void;
+		/** What can be done with the albums selected: Import in the Inbox, Collection and Edit tags in the Library. */
+		children: Snippet;
 	}
-	let { selected, hidden, shown, allShown, onclose, onall, onclear, onimport }: Props = $props();
+	let { selected, hidden, shown, allShown, onclose, onall, onclear, children }: Props = $props();
 </script>
 
 <div
@@ -47,9 +48,7 @@
 		{#if selected}
 			<button class="link" onclick={onclear}>Clear</button>
 		{/if}
-		<button class="btn primary" onclick={onimport} disabled={!selected}>
-			<FolderInput size={15} /> Import{selected ? ` ${count(selected)}` : ''}…
-		</button>
+		{@render children()}
 	</div>
 </div>
 
@@ -125,6 +124,10 @@
 		}
 		.buttons {
 			margin-left: auto;
+		}
+		/* The first to go when there's no room: what Edit tags… also does. */
+		.buttons :global(.wide-only) {
+			display: none;
 		}
 	}
 </style>
